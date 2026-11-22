@@ -1281,12 +1281,12 @@ fn counted_inner_words_include_whitespace_runs() {
 }
 
 #[test]
-fn counted_text_objects_materialize_the_document_once() {
+fn counted_text_objects_materialize_the_document_at_most_once() {
     use crate::editor::text::ByteOffset;
-    for (unit, motion) in [
-        ("word ", "a_word"),
-        ("word! ", "a_big_word"),
-        ("word\n\n", "a_paragraph"),
+    for (unit, motion, materializations) in [
+        ("word ", "a_word", 1),
+        ("word! ", "a_big_word", 1),
+        ("word\n\n", "a_paragraph", 0),
     ] {
         let text = TextBuffer::from_text(&unit.repeat(10_000));
         let before = TextBuffer::test_materializations().1;
@@ -1301,7 +1301,7 @@ fn counted_text_objects_materialize_the_document_once() {
         .unwrap();
         assert_eq!(
             TextBuffer::test_materializations().1 - before,
-            1,
+            materializations,
             "{motion}"
         );
         assert_eq!(range.end.get(), text.len_bytes());

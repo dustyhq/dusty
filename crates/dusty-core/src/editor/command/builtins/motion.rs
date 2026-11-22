@@ -34,8 +34,6 @@ use crate::editor::command::CommandError;
 
 use crate::editor::CommandInvocation;
 
-use crate::editor::command::builtins::text_object::text_object;
-
 use crate::editor::command::builtins::transaction::failed;
 
 use crate::editor::command::builtins::transaction::integer_argument;
@@ -443,53 +441,83 @@ pub fn visual_ranges(
     }
 }
 
+fn vertical_destination(
+    text: &TextBuffer,
+    line: usize,
+    motion: &str,
+    count: usize,
+    folds: &FoldedLines,
+) -> usize {
+    if motion == "up" {
+        folds.backward(line, count)
+    } else {
+        let last = text.visible_lines().saturating_sub(1).max(line);
+        folds.forward(line, count, last)
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn operator_range(
     buffer: &Buffer,
     cursor: ByteOffset,
     motion: &str,
     count: usize,
-    change_word: bool,
+    operator: &str,
     linewise: bool,
     character: Option<char>,
     policy: EditingPolicy,
     folds: &FoldedLines,
-) -> Result<ByteRange, CommandError> {
+) -> Result<Option<(ByteRange, RegisterShape)>, CommandError> {
     let text = &buffer.text;
     let objects = buffer.current_syntax_objects();
-    if let Some(range) = text_object(text, objects, cursor, motion, count)? {
-        return Ok(range);
-    }
+    let shape = if linewise {
+        RegisterShape::Line
+    } else {
+        RegisterShape::Character
+    };
+    let ranged = |start, end| {
+        ByteRange::new(start, end)
+            .map(|range| Some((range, shape)))
+            .map_err(failed)
+    };
     if let Some(target) =
         crate::editor::command::builtins::structural::motion_target(objects, cursor, motion, count)
     {
         let target = target?;
-        return ByteRange::new(cursor.min(target), cursor.max(target)).map_err(failed);
+        return ranged(cursor.min(target), cursor.max(target));
     }
+    let vertical = if matches!(motion, "up" | "down") {
+        let line = text.byte_to_line(cursor).map_err(failed)?;
+        let target = vertical_destination(text, line, motion, count, folds);
+        if target == folds.header(line) {
+            // With or without folds, a motion that took no visible step has no range.
+            return Ok(None);
+        }
+        Some(target)
+    } else {
+        None
+    };
     if linewise {
+        let motion = change_word_motion(operator, motion, text, cursor);
         // `dd` covers `count` lines; `dj`, `dk`, `dG`… cover every line up to the target.
         let cursor_line = text.byte_to_line(cursor).map_err(failed)?;
         let (line, last) = if motion == "line" {
-            (cursor_line, cursor_line + count.saturating_sub(1))
+            let last = text.visible_lines().saturating_sub(1).max(cursor_line);
+            (
+                cursor_line,
+                cursor_line + count.saturating_sub(1).min(last - cursor_line),
+            )
+        } else if let Some(target_line) = vertical {
+            (
+                cursor_line.min(target_line),
+                folds.end(cursor_line.max(target_line)),
+            )
         } else {
             let target = motion_target(
                 buffer, cursor, motion, count, character, policy, None, folds,
             )?;
             let target_line = text.byte_to_line(target).map_err(failed)?;
-            let last = cursor_line.max(target_line);
-            (
-                cursor_line.min(target_line),
-                if matches!(motion, "up" | "down") {
-                    let end = folds.end(last);
-                    if cursor_line == target_line && end != last {
-                        // No visible step: don't let an operator act on the closed fold.
-                        return Ok(ByteRange::empty(text.line_to_byte(last).map_err(failed)?));
-                    }
-                    end
-                } else {
-                    last
-                },
-            )
+            (cursor_line.min(target_line), cursor_line.max(target_line))
         };
         let start = text.line_to_byte(line).map_err(failed)?;
         let after = last.saturating_add(1);

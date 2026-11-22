@@ -74,7 +74,9 @@ use crate::editor::command::builtins::pairs::build_surround_change;
 
 use crate::editor::command::builtins::pairs::empty_pair_end;
 
-use crate::editor::command::builtins::text_object::text_object;
+use crate::editor::command::builtins::text_object::{
+    is_linewise_inner_block, shaped_text_object, visual_text_object,
+};
 
 use crate::editor::command::builtins::transaction::bool_argument;
 
@@ -202,20 +204,54 @@ pub(super) fn execute_builtin<E>(
                 };
             // In Visual mode a text object selects its range.
             if let Some(mut selection) = view.selection
-                && let Some(range) = text_object(
+                && let Some((range, object_shape)) = visual_text_object(
                     &buffer.text,
                     buffer.current_syntax_objects(),
                     view.cursor,
+                    selection,
                     motion,
                     count,
                 )?
             {
+                if range.is_empty() && motion == "inner_paragraph" {
+                    // A zero-byte inner paragraph still selects the logical empty line.
+                    transaction.operations.push(EditorOperation::SetMode {
+                        view: view_id,
+                        mode: EditorMode::VisualLine,
+                    });
+                    return Ok(CommandOutcome {
+                        transaction: Some(transaction),
+                        ..CommandOutcome::empty()
+                    });
+                }
+                if range.is_empty()
+                    && matches!(
+                        motion,
+                        "inner_paren" | "inner_bracket" | "inner_brace" | "inner_angle"
+                    )
+                {
+                    // An empty bracket object must not replace the existing Visual selection.
+                    return Ok(CommandOutcome::empty());
+                }
                 let head = if range.is_empty() {
                     range.start
                 } else {
                     previous_grapheme_boundary(&buffer.text, range.end)
                 };
+                if object_shape == RegisterShape::Line
+                    || matches!(
+                        invocation.arguments.get("linewise"),
+                        Some(CommandValue::Bool(true))
+                    )
+                {
+                    selection.kind = crate::editor::SelectionKind::Line;
+                    transaction.operations.push(EditorOperation::SetMode {
+                        view: view_id,
+                        mode: EditorMode::VisualLine,
+                    });
+                }
                 selection.anchor = range.start;
+                selection.head = head;
                 transaction.operations.push(EditorOperation::SetSelection {
                     view: view_id,
                     selection: Some(selection),
@@ -885,6 +921,8 @@ pub(super) fn execute_builtin<E>(
         }
         "edit.operator" | "edit.repeat_visual" => {
             let operator = string_argument(invocation, "operator")?;
+            let mut keep_line_indent = true;
+            let mut yank_to_range_start = false;
             let (ranges, shape) = if invocation.arguments.contains_key("start") {
                 (
                     vec![checked_range(invocation, &buffer.text)?],
@@ -898,32 +936,52 @@ pub(super) fn execute_builtin<E>(
                 repeat_visual_ranges(&buffer.text, view, invocation, state.policy)?
             } else {
                 let motion = counted_motion(string_argument(invocation, "motion")?, invocation);
-                let original_motion = motion;
-                let motion = change_word_motion(operator, motion, &buffer.text, view.cursor);
                 let requested_linewise =
                     bool_argument(invocation, "linewise")? || motion == "percentage";
                 if motion == "visual" {
                     visual_ranges(&buffer.text, view, state.policy)?
                 } else {
-                    let range = operator_range(
-                        buffer,
+                    let character = character_argument(
+                        invocation,
+                        if operator == "surround_add" {
+                            "find_character"
+                        } else {
+                            "character"
+                        },
+                    )?;
+                    let resolved_range = if let Some((range, shape)) = shaped_text_object(
+                        &buffer.text,
+                        buffer.current_syntax_objects(),
                         view.cursor,
                         motion,
                         count,
-                        motion != original_motion,
-                        requested_linewise,
-                        character_argument(
-                            invocation,
-                            if operator == "surround_add" {
-                                "find_character"
-                            } else {
-                                "character"
-                            },
-                        )?,
-                        state.policy,
-                        &view.folded_lines,
-                    )?;
-                    if requested_linewise && range.is_empty() && matches!(motion, "up" | "down") {
+                    )? {
+                        yank_to_range_start = true;
+                        // Whole-line block objects keep a newline, not body indentation.
+                        keep_line_indent = !is_linewise_inner_block(&buffer.text, motion, range)?;
+                        let shape = if requested_linewise {
+                            RegisterShape::Line
+                        } else {
+                            shape
+                        };
+                        Some((range, shape))
+                    } else {
+                        operator_range(
+                            buffer,
+                            view.cursor,
+                            motion,
+                            count,
+                            operator,
+                            requested_linewise,
+                            character,
+                            state.policy,
+                            &view.folded_lines,
+                        )?
+                    };
+                    let Some((range, shape)) = resolved_range else {
+                        if view.mode != EditorMode::OperatorPending {
+                            return Ok(CommandOutcome::empty());
+                        }
                         transaction.undo_policy = UndoPolicy::Ignore;
                         transaction.operations.push(EditorOperation::SetMode {
                             view: view_id,
@@ -933,15 +991,8 @@ pub(super) fn execute_builtin<E>(
                             transaction: Some(transaction),
                             ..CommandOutcome::empty()
                         });
-                    }
-                    (
-                        vec![range],
-                        if requested_linewise {
-                            RegisterShape::Line
-                        } else {
-                            RegisterShape::Character
-                        },
-                    )
+                    };
+                    (vec![range], shape)
                 }
             };
             let first_range = *ranges
@@ -1144,23 +1195,28 @@ pub(super) fn execute_builtin<E>(
                     "unknown operator `{operator}`"
                 )));
             }
-            let text = ranges
-                .iter()
-                .map(|range| buffer.text.slice(*range).map_err(failed))
-                .collect::<Result<Vec<_>, _>>()?
-                .join(if shape == RegisterShape::Block {
-                    "\n"
-                } else {
-                    ""
+            // A zero-width characterwise delete or change (such as an adjacent `T`)
+            // removes nothing. An empty yank, unlike a delete or change, still records it.
+            if operator == "yank" || shape != RegisterShape::Character || !whole_range.is_empty() {
+                let text = ranges
+                    .iter()
+                    .map(|range| buffer.text.slice(*range).map_err(failed))
+                    .collect::<Result<Vec<_>, _>>()?
+                    .join(if shape == RegisterShape::Block {
+                        "\n"
+                    } else {
+                        ""
+                    });
+                transaction.operations.push(EditorOperation::SetRegister {
+                    name: invocation.register.unwrap_or('"'),
+                    text: register_text(text, shape),
+                    shape,
                 });
-            transaction.operations.push(EditorOperation::SetRegister {
-                name: invocation.register.unwrap_or('"'),
-                text,
-                shape,
-            });
-            // Like Vim's `cc` with autoindent, a linewise change keeps one line and its indent.
+            }
+            // A linewise change keeps one line and, for motions like `cc`, its indent.
             let (ranges, first_range) = if operator == "change" && shape == RegisterShape::Line {
-                let range = linewise_change_range(&buffer.text, whole_range).map_err(failed)?;
+                let range = linewise_change_range(&buffer.text, whole_range, keep_line_indent)
+                    .map_err(failed)?;
                 (vec![range], range)
             } else {
                 (ranges, first_range)
@@ -1217,10 +1273,12 @@ pub(super) fn execute_builtin<E>(
                     view: view_id,
                     ranges,
                 });
-                if matches!(
-                    view.mode,
-                    EditorMode::VisualChar | EditorMode::VisualLine | EditorMode::VisualBlock
-                ) {
+                if yank_to_range_start
+                    || matches!(
+                        view.mode,
+                        EditorMode::VisualChar | EditorMode::VisualLine | EditorMode::VisualBlock
+                    )
+                {
                     transaction.operations.push(EditorOperation::SetCursor {
                         view: view_id,
                         position: first_range.start,
@@ -1519,34 +1577,27 @@ fn counted_motion<'a>(motion: &'a str, invocation: &CommandInvocation) -> &'a st
     }
 }
 
-/// `cw` on a word changes to the word's end and keeps the space after it, as in Vim.
-fn change_word_motion<'a>(
-    operator: &str,
-    motion: &'a str,
-    text: &crate::editor::text::TextBuffer,
-    cursor: ByteOffset,
-) -> &'a str {
-    let next = crate::editor::text::next_grapheme_boundary(text, cursor);
-    let on_word = ByteRange::new(cursor, next)
-        .ok()
-        .and_then(|range| text.slice(range).ok())
-        .and_then(|character| character.chars().next())
-        .is_some_and(|character| !character.is_whitespace());
-    match (operator, motion) {
-        ("change", "word_forward") if on_word => "word_end",
-        ("change", "big_word_forward") if on_word => "big_word_end",
-        _ => motion,
+/// Line registers include the terminator even if the edit range did not.
+fn register_text(mut text: String, shape: RegisterShape) -> String {
+    if shape == RegisterShape::Line && !text.ends_with('\n') {
+        text.push('\n');
     }
+    text
 }
 
-/// The part of whole lines that a linewise change replaces: from after the first line's
-/// indent to before the final newline.
+/// The part of whole lines a linewise change replaces, leaving the final newline and
+/// optionally the first line's indent.
 fn linewise_change_range(
     text: &crate::editor::text::TextBuffer,
     lines: ByteRange,
+    keep_indent: bool,
 ) -> Result<ByteRange, crate::editor::text::PositionError> {
     let covered = text.slice(lines)?;
-    let indent = covered.len() - covered.trim_start_matches([' ', '\t']).len();
+    let indent = if keep_indent {
+        covered.len() - covered.trim_start_matches([' ', '\t']).len()
+    } else {
+        0
+    };
     let end = lines.end.get() - usize::from(covered.ends_with('\n'));
     let start = (lines.start.get() + indent).min(end);
     ByteRange::new(ByteOffset(start), ByteOffset(end))

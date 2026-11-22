@@ -1008,6 +1008,376 @@ mod tests {
     }
 
     #[test]
+    fn empty_visual_bracket_objects_keep_the_selection_and_caret() {
+        use crate::editor::RegisterShape;
+
+        for (source, enter_visual, object, expected, deleted) in [
+            ("x()y\n", "lv", "i(", "x)y\n", "("),
+            ("x()y\n", "2lv", "i(", "x(y\n", ")"),
+            ("{\n}\n", "v", "i{", "\n}\n", "{"),
+        ] {
+            let mut editor = HeadlessEditor::with_text(source);
+            for key in enter_visual.chars() {
+                editor.feed(KeyEvent::character(key)).expect("enter Visual");
+            }
+            let view = editor.active_view();
+            let selection = editor.state.views[view].selection;
+            let cursor = editor.state.views[view].cursor;
+            for key in object.chars() {
+                editor.feed(KeyEvent::character(key)).expect("empty object");
+            }
+            assert_eq!(editor.state.views[view].selection, selection);
+            assert_eq!(editor.state.views[view].cursor, cursor);
+            editor.feed(KeyEvent::character('d')).expect("delete");
+            assert_eq!(editor.text(), expected);
+            let register = editor.state.registers.get('"').expect("deleted delimiter");
+            assert_eq!(register.text, deleted);
+            assert_eq!(register.shape, RegisterShape::Character);
+        }
+        assert_eq!(edited("x()y\n", "lci(X\u{1b}"), "x(X)y\n");
+    }
+
+    #[test]
+    fn empty_visual_quote_objects_select_both_delimiters() {
+        use crate::editor::RegisterShape;
+
+        for (source, keys, deleted) in [
+            ("x\"\"y\n", "vi\"d", "\"\""),
+            ("x''y\n", "vi'd", "''"),
+            ("x``y\n", "vi`d", "``"),
+        ] {
+            let mut editor = HeadlessEditor::with_text(source);
+            for key in keys.chars() {
+                editor.feed(KeyEvent::character(key)).expect("quote object");
+            }
+            assert_eq!(editor.text(), "xy\n", "{keys}");
+            let register = editor.state.registers.get('"').expect("deleted delimiters");
+            assert_eq!(register.text, deleted, "{keys}");
+            assert_eq!(register.shape, RegisterShape::Character, "{keys}");
+        }
+        assert_eq!(edited("x\"\"y\n", "ci\"X\u{1b}"), "x\"X\"y\n");
+    }
+
+    #[test]
+    fn empty_brace_objects_exclude_the_closing_line_indentation() {
+        use crate::editor::RegisterShape;
+
+        let source = "{\n  }\n";
+        let indented = "  {\n  }\n";
+        let with_tail = "{\n  }\ntail\n";
+        for (input, keys, expected, yanked) in [
+            (with_tail, "j0v2li{d", "{\n\ntail\n", Some("  }")),
+            (with_tail, "j0vi{d", "{\n }\ntail\n", Some(" ")),
+            (with_tail, "j0lvli{d", "{ }\ntail\n", Some("\n ")),
+            (with_tail, "j02lv2hi{d", "{\n\ntail\n", Some("  }")),
+            (with_tail, "j02lvhi{d", "{ }\ntail\n", Some("\n ")),
+            (source, "j02lvi{d", "{ }\n", Some("\n ")),
+            (source, "vi{d", "\n  }\n", Some("{")),
+            ("{\n}\n", "j0vi{d", "{\n\n", Some("}")),
+            (indented, "j02lvi{d", "  { }\n", Some("\n ")),
+            (indented, "j0lvi{d", "  { }\n", Some("\n ")),
+            ("{\n    }\n", "j04lvi{d", "{   }\n", Some("\n ")),
+            ("{\n\t }\n", "j02lvi{d", "{ }\n", Some("\n\t")),
+            ("{\n  \n}\n", "G0vi{d", "{ \n}\n", Some("\n ")),
+            (source, "j0vi{d", "{\n }\n", Some(" ")),
+            (indented, "j02lyi{", indented, Some("")),
+            (indented, "j02ldi{", indented, None),
+        ] {
+            let mut editor = HeadlessEditor::with_text(input);
+            for key in keys.chars() {
+                editor.feed(KeyEvent::character(key)).expect("brace object");
+            }
+            assert_eq!(editor.text(), expected, "{keys} on {input:?}");
+            let register = editor.state.registers.get('"');
+            assert_eq!(
+                register.map(|value| value.text.as_str()),
+                yanked,
+                "{keys} on {input:?}"
+            );
+            if let Some(register) = register {
+                assert_eq!(
+                    register.shape,
+                    RegisterShape::Character,
+                    "{keys} on {input:?}"
+                );
+            }
+        }
+        assert_eq!(edited(source, "ci{X\u{1b}"), "{\nX  }\n");
+    }
+
+    #[test]
+    fn counted_inner_paragraph_objects_include_separate_blank_runs() {
+        use crate::editor::{CommandError, RegisterShape};
+        use crate::testing::HarnessError;
+
+        for (keys, expected, deleted) in [
+            ("d2ip", "b\n\nc\n", "a\n\n"),
+            ("v2ipd", "b\n\nc\n", "a\n\n"),
+            ("d2ap", "c\n", "a\n\nb\n\n"),
+        ] {
+            let mut editor = HeadlessEditor::with_text("a\n\nb\n\nc\n");
+            for key in keys.chars() {
+                editor
+                    .feed(KeyEvent::character(key))
+                    .unwrap_or_else(|error| panic!("key {key:?} in {keys:?}: {error}"));
+            }
+            assert_eq!(editor.text(), expected, "{keys}");
+            let register = editor.state.registers.get('"').expect("deleted lines");
+            assert_eq!(register.text, deleted, "{keys}");
+            assert_eq!(register.shape, RegisterShape::Line, "{keys}");
+        }
+
+        for prefix in ["d2i", "d2a"] {
+            let mut editor = HeadlessEditor::with_text("a\n");
+            for key in prefix.chars() {
+                editor.feed(KeyEvent::character(key)).expect("operator");
+            }
+            assert!(matches!(
+                editor.feed(KeyEvent::character('p')),
+                Err(HarnessError::Command(CommandError::Unavailable(_)))
+            ));
+            assert_eq!(editor.text(), "a\n");
+        }
+    }
+
+    #[test]
+    fn vim_object_empty_word_in_visual_mode_deletes_only_the_blank_line() {
+        use crate::editor::RegisterShape;
+
+        for keys in ["jviwd", "jviWd"] {
+            let mut editor = HeadlessEditor::with_text("a\n\nb\n");
+            for key in keys.chars() {
+                editor.feed(KeyEvent::character(key)).expect("word object");
+            }
+            assert_eq!(editor.text(), "a\nb\n", "{keys}");
+            let register = editor.state.registers.get('"').expect("deleted newline");
+            assert_eq!(register.text, "\n");
+            assert_eq!(register.shape, RegisterShape::Character);
+        }
+    }
+
+    #[test]
+    fn vim_object_counted_around_paragraph_includes_the_leading_separator_at_eof() {
+        use crate::editor::RegisterShape;
+
+        for keys in ["2jd2ap", "2jv2apd"] {
+            let mut editor = HeadlessEditor::with_text("a\n\nb\n\nc\n");
+            for key in keys.chars() {
+                editor
+                    .feed(KeyEvent::character(key))
+                    .expect("paragraph object");
+            }
+            assert_eq!(editor.text(), "a\n", "{keys}");
+            let register = editor.state.registers.get('"').expect("deleted lines");
+            assert_eq!(register.text, "\nb\n\nc\n");
+            assert_eq!(register.shape, RegisterShape::Line);
+        }
+    }
+
+    #[test]
+    fn vim_object_inner_brace_preserves_indent_only_lines_but_selects_empty_lines() {
+        use crate::editor::RegisterShape;
+
+        let indented = "{\n \n }\n";
+        for (source, expected, deleted) in
+            [(indented, "\n \n }\n", "{"), ("{\n\n}\n", "{\n}\n", "\n")]
+        {
+            let mut editor = HeadlessEditor::with_text(source);
+            for key in "vi{d".chars() {
+                editor.feed(KeyEvent::character(key)).expect("brace object");
+            }
+            assert_eq!(editor.text(), expected);
+            let register = editor.state.registers.get('"').expect("deleted text");
+            assert_eq!(register.text, deleted);
+            assert_eq!(register.shape, RegisterShape::Character);
+        }
+        assert_eq!(edited(indented, "ci{X\u{1b}"), "{\nX \n }\n");
+    }
+
+    #[test]
+    fn vim_object_inner_brace_operators_use_line_shape_only_for_whole_lines() {
+        use crate::editor::RegisterShape::{Character, Line};
+
+        let body = "{\nbody\n}\n";
+        let indented = "{ \n    \n}\n";
+        let empty = "{ \n\n}\n";
+        for (source, keys, expected, deleted, shape) in [
+            (body, "ci{X\u{1b}", "{\nX\n}\n", "body\n", Line),
+            (body, "di{", "{\n}\n", "body\n", Line),
+            (body, "vi{d", "{\n}\n", "body\n", Character),
+            (
+                "{\n  a\n  b\n}\n",
+                "ci{X\u{1b}",
+                "{\nX\n}\n",
+                "  a\n  b\n",
+                Line,
+            ),
+            ("{\n\n}\n", "ci{X\u{1b}", "{\nX\n}\n", "\n", Line),
+            (indented, "vi{d", "{    \n}\n", " \n", Character),
+            (indented, "ci{X\u{1b}", "{X\n    \n}\n", " ", Character),
+            (empty, "vi{d", "{}\n", " \n\n", Character),
+            (empty, "ci{X\u{1b}", "{X\n}\n", " \n", Character),
+        ] {
+            let mut editor = HeadlessEditor::with_text(source);
+            for key in keys.chars() {
+                let event = if key == '\u{1b}' {
+                    KeyEvent::plain(crate::editor::input::KeyCode::Escape)
+                } else {
+                    KeyEvent::character(key)
+                };
+                editor.feed(event).expect("brace object");
+            }
+            assert_eq!(editor.text(), expected, "{keys} on {source:?}");
+            let register = editor.state.registers.get('"').expect("deleted inner text");
+            assert_eq!(register.text, deleted, "{keys} on {source:?}");
+            assert_eq!(register.shape, shape, "{keys} on {source:?}");
+        }
+    }
+
+    #[test]
+    fn vim_object_yank_moves_to_the_range_start() {
+        use crate::editor::RegisterShape::{Character, Line};
+
+        let body = "{\nbody\n}\n";
+        let two_body_lines = "{\nbody\nmore\n}\n";
+        let inline = "a (b\nc) d\n";
+        let lines = "  one\n  two\nthree\n";
+        for (source, keys, expected, yanked, shape, position) in [
+            (body, "G0yi{", body, "body\n", Line, (2, 1)),
+            (body, "G0yi{p", "{\nbody\nbody\n}\n", "body\n", Line, (3, 1)),
+            (
+                two_body_lines,
+                "G0yi{",
+                two_body_lines,
+                "body\nmore\n",
+                Line,
+                (2, 1),
+            ),
+            (body, "gg0yi{", body, "body\n", Line, (2, 1)),
+            (inline, "gg02lyi(", inline, "b\nc", Character, (1, 4)),
+            (lines, "gg03lyy", lines, "  one\n", Line, (1, 4)),
+            (lines, "gg03lyj", lines, "  one\n  two\n", Line, (1, 4)),
+            (body, "G0vi{y", body, "body\n", Character, (2, 1)),
+        ] {
+            let mut editor = HeadlessEditor::with_text(source);
+            for key in keys.chars() {
+                editor.feed(KeyEvent::character(key)).expect("yank");
+            }
+            assert_eq!(editor.text(), expected, "{keys} on {source:?}");
+            let register = editor.state.registers.get('"').expect("yanked text");
+            assert_eq!(register.text, yanked, "{keys} on {source:?}");
+            assert_eq!(register.shape, shape, "{keys} on {source:?}");
+            let view = &editor.state.views[editor.active_view()];
+            let text = &editor.state.buffers[editor.state.active_buffer_id().unwrap()].text;
+            let line = text.byte_to_line(view.cursor).unwrap();
+            let column = view.cursor.get() - text.line_to_byte(line).unwrap().get();
+            assert_eq!((line + 1, column + 1), position, "{keys} on {source:?}");
+        }
+    }
+
+    #[test]
+    fn vim_object_forward_count_finds_a_later_pair_at_the_requested_depth() {
+        use crate::editor::RegisterShape;
+
+        for (source, expected) in [
+            ("a (x) ((y))\n", "a (x) (())\n"),
+            ("a (x)\n((y))\n", "a (x)\n(())\n"),
+        ] {
+            for keys in ["d2i(", "v2i(d"] {
+                let mut editor = HeadlessEditor::with_text(source);
+                for key in keys.chars() {
+                    editor
+                        .feed(KeyEvent::character(key))
+                        .expect("counted bracket object");
+                }
+                assert_eq!(editor.text(), expected, "{keys} on {source:?}");
+                let register = editor.state.registers.get('"').expect("deleted inner text");
+                assert_eq!(register.text, "y");
+                assert_eq!(register.shape, RegisterShape::Character);
+            }
+        }
+    }
+
+    #[test]
+    fn vim_object_forward_count_accounts_for_an_unmatched_closer() {
+        use crate::editor::CommandError;
+        use crate::testing::HarnessError;
+
+        let source = "a ) ((y))\n";
+        for prefix in ["d2i", "v2i"] {
+            let mut editor = HeadlessEditor::with_text(source);
+            for key in prefix.chars() {
+                editor
+                    .feed(KeyEvent::character(key))
+                    .expect("object prefix");
+            }
+            assert!(matches!(
+                editor.feed(KeyEvent::character('(')),
+                Err(HarnessError::Command(CommandError::Unavailable(_)))
+            ));
+            assert_eq!(editor.text(), source);
+            if prefix == "v2i" {
+                editor
+                    .feed(KeyEvent::character('d'))
+                    .expect("delete original selection");
+                assert_eq!(editor.text(), " ) ((y))\n");
+            }
+        }
+        for (source, movement, expected) in [
+            (source, "2l", "a ) (())\n"),
+            ("a ) (((y)))\n", "", "a ) ((()))\n"),
+        ] {
+            for keys in ["d2i(", "v2i(d"] {
+                let mut editor = HeadlessEditor::with_text(source);
+                for key in movement.chars().chain(keys.chars()) {
+                    editor
+                        .feed(KeyEvent::character(key))
+                        .expect("counted bracket object");
+                }
+                assert_eq!(editor.text(), expected, "{movement}{keys} on {source:?}");
+                let register = editor.state.registers.get('"').expect("deleted inner text");
+                assert_eq!(register.text, "y");
+                assert_eq!(register.shape, crate::editor::RegisterShape::Character);
+            }
+        }
+    }
+
+    #[test]
+    fn counted_bracket_objects_search_inward_only_when_the_cursor_precedes_a_pair() {
+        use crate::editor::CommandError;
+        use crate::testing::HarnessError;
+
+        for prefix in ["d2i", "v2i"] {
+            let mut editor = HeadlessEditor::with_text("a (one) (two)\n");
+            for key in prefix.chars() {
+                editor
+                    .feed(KeyEvent::character(key))
+                    .expect("object prefix");
+            }
+            assert!(matches!(
+                editor.feed(KeyEvent::character('(')),
+                Err(HarnessError::Command(CommandError::Unavailable(_)))
+            ));
+            assert_eq!(editor.text(), "a (one) (two)\n");
+            if prefix == "v2i" {
+                editor
+                    .feed(KeyEvent::character('d'))
+                    .expect("delete selection");
+                assert_eq!(editor.text(), " (one) (two)\n");
+            }
+        }
+        for (keys, expected) in [
+            ("d2i(", "a (()) (two)\n"),
+            ("v2i(d", "a (()) (two)\n"),
+            ("5ld2i(", "a () (two)\n"),
+            ("5lv2i(d", "a () (two)\n"),
+        ] {
+            assert_eq!(edited("a ((one)) (two)\n", keys), expected, "{keys}");
+        }
+        assert_eq!(edited("a (one) (two)\n", "gsd)"), "a one (two)\n");
+    }
+
+    #[test]
     fn linewise_motions_after_operators_cover_every_line_to_the_target() {
         assert_eq!(edited("a\nb\nc\n", "dj"), "c\n");
         assert_eq!(edited("a\nb\nc\n", "jdk"), "c\n");
