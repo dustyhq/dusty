@@ -2602,7 +2602,7 @@ fn conflict_provenance_reports_the_three_sides_from_the_index_on_demand() {
 }
 
 /// Build a repository paused in a real merge conflict, returning the working directory.
-fn conflicted_fixture(root: &std::path::Path) -> (git2::Oid, git2::Oid) {
+pub(crate) fn conflicted_fixture(root: &std::path::Path) -> (git2::Oid, git2::Oid) {
     conflicted_fixture_with_extra(root, None)
 }
 
@@ -2766,13 +2766,16 @@ fn continue_requires_identity_and_preserves_every_merge_parent() {
     let mut index = repo.index().unwrap();
     index.add_path(Path::new("shared.txt")).unwrap();
     index.write().unwrap();
+    // Ask Git to keep the synthetic octopus parents, even if one is redundant.
+    std::fs::write(repo.path().join("MERGE_MODE"), "no-ff").unwrap();
     repo.config().unwrap().set_str("user.name", "").unwrap();
     repo.config().unwrap().set_str("user.email", "").unwrap();
     let error = continue_operation(dir.path(), "merge").unwrap_err();
     assert!(
         error
-            .to_string()
-            .contains("configure Git user.name and user.email")
+            .details()
+            .is_some_and(|details| details.contains("empty ident name")),
+        "Git should report why it could not commit: {error}"
     );
     assert_eq!(repo.head().unwrap().target(), Some(ours));
     assert_eq!(repo.state(), git2::RepositoryState::Merge);
@@ -2810,10 +2813,8 @@ fn continue_requires_identity_and_preserves_every_merge_parent() {
     assert_eq!(repo.state(), git2::RepositoryState::Clean);
 }
 
-#[cfg(unix)]
 #[test]
-fn continue_reports_committed_revision_when_cleanup_fails_and_retry_only_cleans_up() {
-    use std::os::unix::fs::PermissionsExt;
+fn merge_remains_resumable_if_git_cannot_lock_the_index() {
     let dir = tempdir().unwrap();
     let (ours, theirs) = conflicted_fixture(dir.path());
     let repo = git2::Repository::open(dir.path()).unwrap();
@@ -2821,27 +2822,73 @@ fn continue_reports_committed_revision_when_cleanup_fails_and_retry_only_cleans_
     let mut index = repo.index().unwrap();
     index.add_path(Path::new("shared.txt")).unwrap();
     index.write().unwrap();
-    let permissions = std::fs::metadata(repo.path()).unwrap().permissions();
-    std::fs::set_permissions(repo.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
-    let result = continue_operation(dir.path(), "merge");
-    std::fs::set_permissions(repo.path(), permissions).unwrap();
-    let outcome = result.unwrap();
-    let oid = outcome.commit.unwrap();
-    assert!(outcome.cleanup_warning.unwrap().contains(&oid.to_string()));
-    assert_eq!(repo.head().unwrap().target(), Some(oid));
+    let lock = repo.path().join("index.lock");
+    std::fs::write(&lock, "").unwrap();
+
+    assert!(continue_operation(dir.path(), "merge").is_err());
+    assert_eq!(repo.head().unwrap().target(), Some(ours));
+    assert_eq!(repo.state(), git2::RepositoryState::Merge);
+
+    std::fs::remove_file(lock).unwrap();
+    let outcome = continue_operation(dir.path(), "merge").unwrap();
     assert_eq!(
-        repo.find_commit(oid)
+        repo.find_commit(outcome.commit.unwrap())
             .unwrap()
             .parent_ids()
             .collect::<Vec<_>>(),
         vec![ours, theirs]
     );
-    assert_eq!(repo.state(), git2::RepositoryState::Merge);
-    let retry = continue_operation(dir.path(), "retry").unwrap();
-    assert_eq!(retry.commit, Some(oid));
-    assert!(retry.cleanup_warning.is_none());
-    assert_eq!(repo.head().unwrap().target(), Some(oid));
+    assert!(outcome.cleanup_warning.is_none());
     assert_eq!(repo.state(), git2::RepositoryState::Clean);
+}
+
+#[cfg(unix)]
+#[test]
+fn merge_continue_honors_a_rejecting_commit_msg_hook() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempdir().unwrap();
+    let (ours, _) = conflicted_fixture(dir.path());
+    let repo = git2::Repository::open(dir.path()).unwrap();
+    std::fs::write(dir.path().join("shared.txt"), "resolved\n").unwrap();
+    let mut index = repo.index().unwrap();
+    index.add_path(Path::new("shared.txt")).unwrap();
+    index.write().unwrap();
+
+    let hooks = repo.path().join("hooks");
+    std::fs::create_dir_all(&hooks).unwrap();
+    repo.config()
+        .unwrap()
+        .set_str("core.hooksPath", ".git/hooks")
+        .unwrap();
+    let hook = hooks.join("commit-msg");
+    std::fs::write(
+        &hook,
+        "#!/bin/sh\nprintf 'Rejected: '; head -n 1 \"$1\"\nexit 1\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let merge_head = repo.path().join("MERGE_HEAD");
+    let before = std::fs::read(&merge_head).unwrap();
+
+    let error = continue_operation(dir.path(), "reviewed merge").unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "Git didn't create a commit. You can retry the merge."
+    );
+    assert!(
+        error
+            .details()
+            .is_some_and(|details| details.contains("Rejected: reviewed merge"))
+    );
+    assert_eq!(repo.head().unwrap().target(), Some(ours));
+    assert_eq!(std::fs::read(&merge_head).unwrap(), before);
+
+    std::fs::remove_file(hook).unwrap();
+    let outcome = continue_operation(dir.path(), "reviewed merge").unwrap();
+    let commit = repo.find_commit(outcome.commit.unwrap()).unwrap();
+    assert_eq!(commit.summary(), Some("reviewed merge"));
+    assert!(!merge_head.exists());
 }
 
 #[test]
@@ -3213,7 +3260,7 @@ fn conflict_replacement_rejects_symlink_aliases_and_normalizes_relative_paths() 
         GitConflictChoice::Ours,
     )
     .unwrap();
-    assert_eq!(plan.files[0].0, destination);
+    assert_eq!(plan.files()[0].0, destination);
     apply_replacement(&plan).unwrap();
     assert_eq!(std::fs::read_to_string(destination).unwrap(), "ours\n");
 }
@@ -3239,7 +3286,7 @@ fn conflict_replacement_preserves_selected_executable_mode_and_refuses_symlink_s
         GitConflictChoice::Ours,
     )
     .unwrap();
-    assert_eq!(plan.files[0].2, 0o100755);
+    assert_eq!(plan.files()[0].2, 0o100755);
     apply_replacement(&plan).unwrap();
     assert_eq!(std::fs::read_to_string(&path).unwrap(), "ours\n");
     assert_ne!(
@@ -3272,28 +3319,143 @@ fn conflict_replacement_preserves_selected_executable_mode_and_refuses_symlink_s
     assert_eq!(std::fs::read(&path).unwrap(), before);
 }
 
+fn copy_conflict_stages(root: &Path, path: &str) {
+    let repo = git2::Repository::open(root).unwrap();
+    let mut index = repo.index().unwrap();
+    for stage in 1..=3 {
+        let mut entry = index.get_path(Path::new("shared.txt"), stage).unwrap();
+        entry.path = path.as_bytes().to_vec();
+        index.add(&entry).unwrap();
+    }
+    index.write().unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn take_side_never_matches_a_case_folded_index_path() {
+    let dir = tempdir().unwrap();
+    conflicted_fixture(dir.path());
+    copy_conflict_stages(dir.path(), "File.txt");
+    let repo = git2::Repository::open(dir.path()).unwrap();
+    repo.config()
+        .unwrap()
+        .set_bool("core.ignorecase", true)
+        .unwrap();
+
+    let conflicted = dir.path().join("File.txt");
+    std::fs::write(&conflicted, "conflicted version").unwrap();
+    let draft = dir.path().join("file.txt");
+    if draft.exists() {
+        // This fixture needs a case-sensitive worktree.
+        return;
+    }
+    std::fs::write(&draft, "separate draft").unwrap();
+    assert!(matches!(
+        plan_replacement(
+            dir.path(),
+            std::slice::from_ref(&draft),
+            GitConflictChoice::Ours
+        ),
+        Err(GitConflictResolveError::NoConflict(_))
+    ));
+    assert!(plan_replacement(dir.path(), &[conflicted], GitConflictChoice::Ours).is_ok());
+    assert_eq!(std::fs::read(draft).unwrap(), b"separate draft");
+}
+
+#[test]
+fn conflict_replacement_checks_every_reviewed_file_before_writing() {
+    let dir = tempdir().unwrap();
+    conflicted_fixture(dir.path());
+    copy_conflict_stages(dir.path(), "second.txt");
+    let first = dir.path().join("shared.txt");
+    let second = dir.path().join("second.txt");
+    let original = std::fs::read(&first).unwrap();
+    std::fs::write(&second, &original).unwrap();
+    let plan = plan_replacement(
+        dir.path(),
+        &[first.clone(), second.clone()],
+        GitConflictChoice::Ours,
+    )
+    .unwrap();
+
+    std::fs::write(&second, "newer draft\n").unwrap();
+    let error = apply_replacement(&plan).unwrap_err();
+    assert_eq!(error.error, GitConflictResolveError::Changed);
+    assert_eq!(error.path, second);
+    assert!(error.written.is_empty());
+    assert_eq!(std::fs::read(&first).unwrap(), original);
+    assert_eq!(std::fs::read(&second).unwrap(), b"newer draft\n");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn conflict_replacement_counts_file_published_before_directory_sync_failed() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempdir().unwrap();
+    conflicted_fixture(dir.path());
+    copy_conflict_stages(dir.path(), "nested/second.txt");
+    let parent = dir.path().join("nested");
+    std::fs::create_dir(&parent).unwrap();
+    let first = dir.path().join("shared.txt");
+    let second = parent.join("second.txt");
+    std::fs::write(&second, "draft\n").unwrap();
+    let plan = plan_replacement(
+        dir.path(),
+        &[first.clone(), second.clone()],
+        GitConflictChoice::Ours,
+    )
+    .unwrap();
+
+    let original_mode = std::fs::metadata(&parent).unwrap().permissions();
+    std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o300)).unwrap();
+    if std::fs::File::open(&parent).is_ok() {
+        // Privileged test runners can bypass directory mode bits.
+        std::fs::set_permissions(&parent, original_mode).unwrap();
+        return;
+    }
+    let result = apply_replacement(&plan);
+    std::fs::set_permissions(&parent, original_mode).unwrap();
+    let error = result.unwrap_err();
+
+    assert_eq!(error.path, second);
+    assert_eq!(error.written, vec![first.clone(), second.clone()]);
+    assert!(
+        matches!(&error.error, GitConflictResolveError::PublishedSyncFailed { path, .. }
+        if path == &second)
+    );
+    let message = error.to_string();
+    assert!(
+        message.contains("couldn't sync its folder · permission denied"),
+        "{message}"
+    );
+    assert!(!message.contains("Couldn't replace"), "{message}");
+    assert_eq!(std::fs::read(&first).unwrap(), b"ours\n");
+    assert_eq!(std::fs::read(&second).unwrap(), b"ours\n");
+}
+
 #[test]
 fn conflict_replacement_failure_reports_files_already_written() {
     let dir = tempdir().unwrap();
-    let first = dir.path().join("first");
+    conflicted_fixture(dir.path());
+    copy_conflict_stages(dir.path(), "missing/second");
+    let first = dir.path().join("shared.txt");
     let second = dir.path().join("missing/second");
-    std::fs::write(&first, "old\n").unwrap();
-    let plan = GitReplacementPlan {
-        choice: GitConflictChoice::Ours,
-        files: vec![
-            (first.clone(), "new\n".into(), 0o100644),
-            (second.clone(), "second\n".into(), 0o100644),
-        ],
-    };
+    let plan = plan_replacement(
+        dir.path(),
+        &[first.clone(), second.clone()],
+        GitConflictChoice::Ours,
+    )
+    .unwrap();
     let error = apply_replacement(&plan).unwrap_err();
     assert_eq!(error.written, vec![first.clone()]);
     assert_eq!(error.path, second);
-    assert_eq!(std::fs::read(&first).unwrap(), b"new\n");
+    assert_eq!(std::fs::read(&first).unwrap(), b"ours\n");
     assert!(!second.exists());
     let message = error.to_string();
     assert!(message.contains(&first.display().to_string()));
     assert!(message.contains(&second.display().to_string()));
-    assert!(message.contains("already replaced"));
+    assert!(message.contains("Already replaced"));
 }
 
 #[test]
@@ -3321,10 +3483,11 @@ fn whole_file_replacement_previews_cancels_and_applies_exactly_its_file_list() {
     )
     .expect("a conflicted path plans a replacement");
     // The preview names the file AND the side.
-    assert_eq!(plan.files.len(), 1);
-    assert_eq!(plan.files[0].0, conflicted);
+    assert_eq!(plan.files().len(), 1);
+    assert_eq!(plan.files()[0].0, conflicted);
     assert_eq!(
-        plan.files[0].1, "theirs\n",
+        plan.files()[0].1,
+        "theirs\n",
         "the plan carries the side's real blob content"
     );
     let preview = plan.preview();
@@ -4530,7 +4693,6 @@ fn nested_worktree_exclusion_does_not_hide_siblings() {
 #[test]
 fn conflict_replacement_is_atomic_and_restores_missing_working_copies() {
     use crate::conflict::GitConflictChoice;
-    use crate::conflict::GitReplacementPlan;
     use crate::conflict::apply_replacement;
     use crate::conflict::plan_replacement;
     let dir = tempdir().unwrap();
@@ -4539,11 +4701,13 @@ fn conflict_replacement_is_atomic_and_restores_missing_working_copies() {
     let backup = dir.path().join("original");
     std::fs::hard_link(&path, &backup).unwrap();
     let original = std::fs::read(&backup).unwrap();
-    apply_replacement(&GitReplacementPlan {
-        choice: GitConflictChoice::Ours,
-        files: vec![(path.clone(), "ours\n".into(), 0o100644)],
-    })
+    let plan = plan_replacement(
+        dir.path(),
+        std::slice::from_ref(&path),
+        GitConflictChoice::Ours,
+    )
     .unwrap();
+    apply_replacement(&plan).unwrap();
     assert_eq!(std::fs::read(&backup).unwrap(), original);
     std::fs::remove_file(&path).unwrap();
     let plan = plan_replacement(

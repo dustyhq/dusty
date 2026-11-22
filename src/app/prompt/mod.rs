@@ -550,7 +550,7 @@ impl App {
                 let replacement = self.git.take_pending_replacement();
                 let action = self.git.take_pending_destructive();
                 self.close_prompt();
-                // Rebuild the replacement against current repository state before applying it.
+                // The replacement carries the files and conflict state the user reviewed.
                 if let Some(replacement) = replacement {
                     self.apply_git_replacement(replacement, selected);
                     return;

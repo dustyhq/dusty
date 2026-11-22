@@ -10,6 +10,7 @@ use super::github::keymap::{self, Key, Preset, To};
 use super::preview::Preview;
 use super::*;
 use crate::GitFileStatus;
+use crate::conflict::ConflictReview;
 
 /// Reader row marks (`PreviewRow::marker`) for a conflicted file's source: ours, theirs and
 /// base lines, and the marker lines themselves.
@@ -428,6 +429,26 @@ fn files(repository: &git2::Repository, root: &Path) -> Vec<FileConflicts> {
     files
 }
 
+/// Build the reader's source and its write expectation from the same raw bytes.
+pub(super) fn reviewed_preview(
+    root: &Path,
+    relative: &PathBuf,
+    context: Option<&Context>,
+) -> Option<(Preview, Option<usize>)> {
+    let review =
+        ConflictReview::capture(root, std::slice::from_ref(relative), MAXIMUM_BYTES).ok()?;
+    let text = review.files.first()?.text()?;
+    let mut end = text.len().min(128 * 1024);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    let shown = &text[..end];
+    let mut preview = Preview::source(relative, shown);
+    let first = decorate(&mut preview, shown, context);
+    preview.conflict_review = Some(review);
+    Some((preview, first))
+}
+
 /// Labels each conflict's marker rows in a conflicted file's source preview and marks its
 /// sides for the reader's bands; returns the row of the first conflict, for the cursor.
 pub(super) fn decorate(
@@ -715,14 +736,25 @@ impl GitScreen {
         self.allow_write()?;
         let relative = self.conflicted_row().ok_or("Select a conflicted file")?;
         let name = relative.display().to_string();
-        let path = self.root.join(&relative);
-        let text = read_text(&path)
-            .ok_or_else(|| format!("{name} is not a text file to pick in; e opens it"))?;
-        let found = hunks(&text);
-        if found.is_empty() {
-            return Err(format!("{name} has no conflict markers left; s stages it"));
-        }
         self.normalize_preview_cursor();
+        let Some(review) = self.preview.conflict_review.as_ref() else {
+            return Err(format!("{name} is not a text file to pick in; e opens it"));
+        };
+        let file = &review.files[0];
+        if file.relative() != relative.as_path()
+            || review.validate_file(file, &file.expectation).is_err()
+        {
+            return self.reload_changed_conflict();
+        }
+        let text = file
+            .text()
+            .ok_or_else(|| format!("{name} is not a text file to pick in; e opens it"))?;
+        let found = hunks(text);
+        if found.is_empty() {
+            return Err(format!(
+                "{name} has no conflict markers left. Review it, then press s in Changes."
+            ));
+        }
         let line = self
             .preview_cursor
             .and_then(|cursor| self.preview.rows.get(cursor))
@@ -732,7 +764,7 @@ impl GitScreen {
             .and_then(|line| found.iter().find(|hunk| hunk.contains(line)))
             .copied()
             .ok_or("Move the cursor into a conflict, then o t or b picks a side")?;
-        // The reader must still show this text: an edit since it loaded moves the conflicts.
+        // The reader may show only a prefix. Never pick a hunk it didn't show in full.
         let markers = [
             Some(hunk.start),
             hunk.base,
@@ -745,10 +777,7 @@ impl GitScreen {
             })
         });
         if !shown {
-            self.load_preview();
-            return Err(format!(
-                "{name} changed since it was shown; check the conflict and pick again"
-            ));
+            return Err("Open the file to resolve a conflict that isn't shown in full.".into());
         }
         let pick = match pick {
             Some(pick) => pick,
@@ -756,27 +785,32 @@ impl GitScreen {
                 .and_then(|line| hunk.side(line))
                 .ok_or("On a marker line: o t or b picks; on a side, Enter takes it")?,
         };
-        let resolved = resolve(&text, &hunk, pick)?;
+        let resolved = resolve(text, &hunk, pick)?;
         #[cfg(unix)]
         let executable = {
             use std::os::unix::fs::PermissionsExt;
-            std::fs::metadata(&path)
+            std::fs::metadata(&file.path)
                 .is_ok_and(|metadata| metadata.permissions().mode() & 0o111 != 0)
         };
         #[cfg(not(unix))]
         let executable = false;
-        crate::files::atomic_write_with_executable(&path, resolved.as_bytes(), executable)
-            .map_err(|error| {
-                let reason = match &error {
-                    crate::files::VfsError::Io { source, .. }
-                    | crate::files::VfsError::RootIo { source, .. } => {
-                        super::words::io_reason(source)
-                    }
-                    _ => String::new(),
-                };
-                format!("Couldn't save {name}{reason}")
-            })?;
+        if let Err(error) = file.write(resolved.as_bytes(), executable) {
+            if error == GitConflictResolveError::Changed {
+                return self.reload_changed_conflict();
+            }
+            if error.published() {
+                self.load_preview();
+                let _ = self.refresh();
+                return Err(error.to_string());
+            }
+            let reason = match &error {
+                GitConflictResolveError::SaveIo(reason) => reason.as_str(),
+                _ => "",
+            };
+            return Err(format!("Couldn't save {name}{reason}"));
+        }
         let left = found.len() - 1;
+        let mut staged = false;
         self.notice = if left > 0 {
             format!(
                 "Took {} · {left} conflict{} left in {name}",
@@ -784,16 +818,26 @@ impl GitScreen {
                 if left == 1 { "" } else { "s" }
             )
         } else {
-            match crate::conflict::stage_resolved(&self.root, &relative) {
-                Ok(()) => format!("Took {} · {name} is resolved and staged", pick.word()),
+            match review.stage_resolution(file, resolved.into_bytes()) {
+                Ok(()) => {
+                    staged = true;
+                    format!("Took {} · {name} is resolved and staged", pick.word())
+                }
+                Err(GitConflictResolveError::Changed) => {
+                    self.load_preview();
+                    let _ = self.refresh();
+                    return Err(format!(
+                        "{name} changed and was not staged. Review it before staging."
+                    ));
+                }
                 Err(_) => format!(
-                    "Used {} · {name} is resolved but couldn't be staged",
+                    "Took {} · {name} was not staged. Review it, then press s in Changes.",
                     pick.word()
                 ),
             }
         };
         self.refresh_conflicts();
-        if left == 0
+        if staged
             && self
                 .conflict
                 .as_ref()
@@ -808,6 +852,12 @@ impl GitScreen {
         self.load_preview();
         self.refresh()
     }
+
+    fn reload_changed_conflict(&mut self) -> Result<(), String> {
+        self.load_preview();
+        let _ = self.refresh();
+        Err("Changed since you reviewed it. Check the conflict and pick again.".into())
+    }
 }
 
 #[cfg(test)]
@@ -816,6 +866,265 @@ mod tests {
 
     const DIFF3: &str =
         "one\n<<<<<<< HEAD\nmain\n||||||| base\nbase\n=======\nfeature\n>>>>>>> feature\nend\n";
+
+    #[test]
+    fn whole_file_confirmation_refuses_a_saved_edit_after_opening() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = crate::files::canonicalize(dir.path()).unwrap();
+        crate::tests::conflicted_fixture(&root);
+        let relative = PathBuf::from("shared.txt");
+        let file = root.join(&relative);
+        let mut screen = GitScreen::open(&root).unwrap();
+        screen.conflict_form(relative, "ours").unwrap();
+
+        std::fs::write(&file, "newer resolution\n").unwrap();
+        let form = screen.form.as_mut().unwrap();
+        form.move_focus(form.fields.len());
+        let error = screen.submit().unwrap_err();
+        assert_eq!(error, GitConflictResolveError::Changed.to_string());
+        assert!(screen.form.is_none(), "a new review is required");
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "newer resolution\n"
+        );
+    }
+
+    fn open_test_conflict_reader(root: &Path) -> GitScreen {
+        let mut screen = GitScreen::open(root).unwrap();
+        let snapshot = crate::status::read_status(
+            GitStatusRequestId(1),
+            &GitStatusPolicy {
+                root: root.to_path_buf(),
+                root_revision: 1,
+                maximum_files: 100,
+                maximum_path_bytes: 4096,
+                deadline: Duration::from_secs(10),
+            },
+            &[],
+            &std::sync::atomic::AtomicBool::new(false),
+        )
+        .unwrap();
+        screen.install_status(snapshot, None);
+        screen.selected[0] = screen
+            .rows(0)
+            .iter()
+            .position(|row| row.value == Path::new("shared.txt"))
+            .unwrap();
+        screen.focus = 4;
+        screen.load_preview();
+        assert!(screen.conflict_reader());
+        assert_eq!(screen.preview_cursor, Some(2));
+        screen
+    }
+
+    #[test]
+    fn final_hunk_stages_the_native_clean_conversion_of_crlf() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = crate::files::canonicalize(dir.path()).unwrap();
+        crate::tests::conflicted_fixture(&root);
+        std::fs::write(root.join(".gitattributes"), "*.txt text eol=crlf\n").unwrap();
+        let file = root.join("shared.txt");
+        std::fs::write(&file, DIFF3.replace('\n', "\r\n")).unwrap();
+        let mut screen = open_test_conflict_reader(&root);
+
+        assert!(screen.conflict_key(&KeyEvent::character('o')));
+        assert!(
+            screen.notice.contains("is resolved and staged"),
+            "{}",
+            screen.notice
+        );
+        assert_eq!(std::fs::read(&file).unwrap(), b"one\r\nmain\r\nend\r\n");
+        let repo = git2::Repository::open(&root).unwrap();
+        let index = repo.index().unwrap();
+        assert!(!index.has_conflicts());
+        let staged = index.get_path(Path::new("shared.txt"), 0).unwrap();
+        assert_eq!(
+            repo.find_blob(staged.id).unwrap().content(),
+            b"one\nmain\nend\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn final_hunk_uses_stage_two_for_text_auto_and_filemode_and_runs_the_hook() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = crate::files::canonicalize(dir.path()).unwrap();
+        crate::tests::conflicted_fixture(&root);
+        let repo = git2::Repository::open(&root).unwrap();
+        let mut config = repo.config().unwrap();
+        config.set_bool("core.filemode", false).unwrap();
+        let mut index = repo.index().unwrap();
+        let relative = Path::new("shared.txt");
+        let mut ours = index.get_path(relative, 2).unwrap();
+        ours.id = repo.blob(b"one\r\nmain\r\nend\r\n").unwrap();
+        ours.mode = 0o100755;
+        index.add(&ours).unwrap();
+        index.write().unwrap();
+
+        let hooks = root.join("test-hooks");
+        std::fs::create_dir(&hooks).unwrap();
+        config.set_str("core.hooksPath", "test-hooks").unwrap();
+        let hook = hooks.join("post-index-change");
+        std::fs::write(&hook, "#!/bin/sh\necho ran >> stage-hook-log\n").unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(root.join(".gitattributes"), "*.txt text=auto\n").unwrap();
+        let file = root.join(relative);
+        std::fs::write(&file, DIFF3.replace('\n', "\r\n")).unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let mut screen = open_test_conflict_reader(&root);
+
+        assert!(screen.conflict_key(&KeyEvent::character('o')));
+        assert!(
+            screen.notice.contains("is resolved and staged"),
+            "{}",
+            screen.notice
+        );
+        index.read(true).unwrap();
+        assert!(!index.has_conflicts());
+        let staged = index.get_path(relative, 0).unwrap();
+        assert_eq!(
+            repo.find_blob(staged.id).unwrap().content(),
+            b"one\r\nmain\r\nend\r\n"
+        );
+        assert_eq!(staged.mode, 0o100755);
+        assert_eq!(
+            std::fs::read(root.join("stage-hook-log")).unwrap(),
+            b"ran\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn final_hunk_reports_staged_when_hook_output_is_truncated() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = crate::files::canonicalize(dir.path()).unwrap();
+        crate::tests::conflicted_fixture(&root);
+        let repo = git2::Repository::open(&root).unwrap();
+        let hooks = root.join("test-hooks");
+        std::fs::create_dir(&hooks).unwrap();
+        repo.config()
+            .unwrap()
+            .set_str("core.hooksPath", "test-hooks")
+            .unwrap();
+        let hook = hooks.join("post-index-change");
+        // One 2 MiB line exceeds JobPolicy's default 1 MiB line cap.
+        std::fs::write(
+            &hook,
+            "#!/bin/sh\nset -e\nhead -c 2097152 /dev/zero | tr '\\000' x >&2\nprintf '\\n' >&2\necho ran > stage-hook-log\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let relative = Path::new("shared.txt");
+        std::fs::write(root.join(relative), DIFF3).unwrap();
+        let mut screen = open_test_conflict_reader(&root);
+
+        assert!(screen.conflict_key(&KeyEvent::character('o')));
+        assert_eq!(
+            std::fs::read(root.join("stage-hook-log")).unwrap(),
+            b"ran\n"
+        );
+        let index = repo.index().unwrap();
+        assert!(!index.has_conflicts());
+        let staged = index.get_path(relative, 0).unwrap();
+        assert_eq!(
+            repo.find_blob(staged.id).unwrap().content(),
+            b"one\nmain\nend\n"
+        );
+        assert!(
+            screen.notice.contains("shared.txt is resolved and staged"),
+            "{}",
+            screen.notice
+        );
+    }
+
+    #[test]
+    fn final_hunk_with_a_locked_index_directs_staging_to_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = crate::files::canonicalize(dir.path()).unwrap();
+        crate::tests::conflicted_fixture(&root);
+        let file = root.join("shared.txt");
+        std::fs::write(&file, DIFF3).unwrap();
+        let mut screen = open_test_conflict_reader(&root);
+        let repo = git2::Repository::open(&root).unwrap();
+        std::fs::write(repo.path().join("index.lock"), "").unwrap();
+
+        assert!(screen.conflict_key(&KeyEvent::character('o')));
+        assert_eq!(
+            screen.notice,
+            "Took ours · shared.txt was not staged. Review it, then press s in Changes."
+        );
+        assert_eq!(std::fs::read(&file).unwrap(), b"one\nmain\nend\n");
+        assert!(repo.index().unwrap().has_conflicts());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn hunk_pick_explains_a_denied_write_without_staging() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = crate::files::canonicalize(dir.path()).unwrap();
+        crate::tests::conflicted_fixture(&root);
+        let file = root.join("shared.txt");
+        std::fs::write(&file, DIFF3).unwrap();
+        let mut screen = open_test_conflict_reader(&root);
+        let original_mode = std::fs::metadata(&root).unwrap().permissions();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let probe = root.join(".write-probe");
+        if std::fs::write(&probe, "").is_ok() {
+            // Privileged test runners can bypass directory mode bits.
+            std::fs::set_permissions(&root, original_mode).unwrap();
+            std::fs::remove_file(probe).unwrap();
+            return;
+        }
+
+        let handled = screen.conflict_key(&KeyEvent::character('o'));
+        std::fs::set_permissions(&root, original_mode).unwrap();
+        assert!(handled);
+        assert_eq!(
+            screen.notice,
+            "Couldn't save shared.txt · permission denied"
+        );
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), DIFF3);
+        assert_eq!(
+            crate::read_conflict_state(&root).unwrap().conflicts.len(),
+            1
+        );
+    }
+
+    #[test]
+    fn hunk_pick_requires_a_new_review_when_the_same_lines_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = crate::files::canonicalize(dir.path()).unwrap();
+        crate::tests::conflicted_fixture(&root);
+        let file = root.join("shared.txt");
+        std::fs::write(&file, DIFF3).unwrap();
+        let mut screen = open_test_conflict_reader(&root);
+
+        let edited = DIFF3.replace("feature\n", "newer edit\n");
+        std::fs::write(&file, &edited).unwrap();
+        assert!(screen.conflict_key(&KeyEvent::character('o')));
+        assert!(screen.notice.contains("pick again"));
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), edited);
+        assert_eq!(
+            crate::read_conflict_state(&root).unwrap().conflicts.len(),
+            1
+        );
+
+        // The refusal loaded the edited text, so a fresh pick can now resolve it.
+        assert!(screen.conflict_key(&KeyEvent::character('o')));
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "one\nmain\nend\n");
+        assert!(
+            crate::read_conflict_state(&root)
+                .unwrap()
+                .conflicts
+                .is_empty()
+        );
+    }
 
     #[test]
     fn hunks_find_each_conflict_with_its_optional_base() {

@@ -22,6 +22,7 @@ pub use conflict::GitConflictError;
 pub use conflict::GitConflictResolveError;
 pub use conflict::GitConflictSide;
 pub use conflict::GitConflictState;
+pub use conflict::GitContinueWorker;
 pub use conflict::GitOperationAction;
 pub use conflict::GitOperationBar;
 pub use conflict::GitOperationStop;

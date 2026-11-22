@@ -1093,6 +1093,8 @@ fn rebase_lifecycle_checks_authorization_unrelated_data_and_captured_replay_befo
             );
         }
         submit(&mut screen);
+        // Continue checks the index on a worker and reports the refusal when polled.
+        finished(&mut screen);
         assert!(
             view(&mut screen).contains("would discard"),
             "{}",

@@ -22,7 +22,7 @@ pub use modal::InputMode;
 mod tree;
 mod tutor;
 mod warm;
-mod words;
+pub(super) mod words;
 pub use warm::enable as enable_warm_cache;
 
 use super::*;
@@ -137,7 +137,7 @@ enum FormAction {
     Github(github::Action),
     Command,
     SourceSearch,
-    Conflict(PathBuf),
+    Conflict(Box<super::conflict::ConflictReview>),
     /// `M` (lazygit's `m`) while an operation is paused: continue, skip or abort it.
     OperationMenu,
     /// Pull, undo, redo, a history rewrite or a tag push (`ops.rs`).
@@ -457,6 +457,7 @@ pub struct GitScreen {
     branches: GitBranchWorker,
     refs: Option<GitBranchList>,
     mutation: GitMutationWorker,
+    continue_worker: GitContinueWorker,
     rewrite: super::rewrite::Worker,
     /// The last unacknowledged rewrite failure, independent of refresh notices.
     rewrite_diagnostic: Option<String>,
@@ -619,6 +620,7 @@ impl GitScreen {
             branches: GitBranchWorker::default(),
             refs: None,
             mutation: GitMutationWorker::default(),
+            continue_worker: GitContinueWorker::default(),
             rewrite: super::rewrite::Worker::default(),
             rewrite_diagnostic: None,
             hunks: GitHunkWorker::default(),
@@ -1439,6 +1441,7 @@ impl GitScreen {
             self.load_preview();
         }
         changed |= self.poll_checkout();
+        changed |= self.poll_conflict_continue();
         self.save_warm();
         // Forge lessons end on forge state too (a page, a reader tab, a confirmed write).
         let tutor_changed = if changed || github_changed || self.tutor_waiting() {
@@ -1453,6 +1456,52 @@ impl GitScreen {
         }
         changed || github_changed || tutor_changed
     }
+    fn poll_conflict_continue(&mut self) -> bool {
+        let Some(result) = self.continue_worker.poll() else {
+            return false;
+        };
+        self.busy = false;
+        self.refreshing_after_write = self.refresh().is_ok();
+        let (summary, details) = match result {
+            Ok(outcome) => {
+                let warning = outcome.continue_warning();
+                self.record_replay_stop(GitOperationAction::Continue, &outcome);
+                (
+                    warning.unwrap_or_default(),
+                    outcome.details.unwrap_or_default(),
+                )
+            }
+            Err(error) => (
+                error.to_string(),
+                error.details().unwrap_or_default().to_owned(),
+            ),
+        };
+        if !details.is_empty() {
+            self.show_action_message(&summary, details);
+        }
+        self.notice = summary;
+        true
+    }
+
+    fn record_replay_stop(&mut self, action: GitOperationAction, outcome: &GitRecoveryOutcome) {
+        self.receipt = outcome.stopped.as_ref().map(|stop| {
+            let mut name = outcome.operation.chars();
+            let name = name
+                .next()
+                .map(|first| first.to_uppercase().chain(name).collect::<String>())
+                .unwrap_or_default();
+            let verb = if action == GitOperationAction::Skip {
+                "commit skipped"
+            } else {
+                "continued"
+            };
+            (
+                ReceiptTone::Notice,
+                format!("{name} {verb} · {}", stop.summary()),
+            )
+        });
+    }
+
     fn clamp(&mut self) {
         for pane in 0..4 {
             let slot = self.slot(pane);
@@ -1615,16 +1664,26 @@ impl GitScreen {
                     .as_ref()
                     .and_then(|s| memo::entry(&s.entries, &row.value));
                 let untracked = entry.is_some_and(|e| e.status == GitFileStatus::Untracked);
-                if self.all_files
-                    || (untracked
-                        || entry.is_some_and(|entry| entry.status == GitFileStatus::Conflicted))
-                        && !self.preview_staged()
-                {
+                let conflicted = entry.is_some_and(|e| e.status == GitFileStatus::Conflicted);
+                if self.all_files || (untracked || conflicted) && !self.preview_staged() {
                     self.preview_args = None;
                     if !std::fs::symlink_metadata(self.root.join(&row.value))
                         .is_ok_and(|m| m.file_type().is_file())
                     {
                         self.preview = "Preview unavailable for a symlink or special file".into();
+                        return;
+                    }
+                    if conflicted
+                        && let Some((preview, first)) = conflicts::reviewed_preview(
+                            &self.root,
+                            &row.value,
+                            self.conflict.as_ref(),
+                        )
+                    {
+                        self.update_preview(preview);
+                        if self.preview_cursor.is_none() {
+                            self.preview_cursor = first;
+                        }
                         return;
                     }
                     match std::fs::File::open(self.root.join(&row.value)) {
@@ -1824,16 +1883,8 @@ impl GitScreen {
         }
     }
     fn write(&mut self, args: Vec<OsString>) -> Result<(), String> {
-        self.write_with_input(args, None)
-    }
-    fn write_with_input(
-        &mut self,
-        args: Vec<OsString>,
-        stdin: Option<Vec<u8>>,
-    ) -> Result<(), String> {
         self.allow_write()?;
-        self.jobs
-            .start_with_input(&self.root, Request::Write, args, stdin)?;
+        self.jobs.start(&self.root, Request::Write, args)?;
         self.busy = true;
         self.notice = "Running Git…".into();
         Ok(())
@@ -2489,11 +2540,33 @@ impl GitScreen {
                 self.form = None;
                 return self.operation_form(action);
             }
-            FormAction::Conflict(path) => {
+            FormAction::Conflict(review) => {
                 let choice = GitConflictChoice::parse(&values[0]).ok_or("Choose ours or theirs")?;
-                let plan = plan_replacement(&self.root, std::slice::from_ref(path), choice)
-                    .map_err(|error| error.to_string())?;
-                apply_replacement(&plan).map_err(|error| error.to_string())?;
+                let result = match review.replacements(choice) {
+                    Ok(replacements) => review.apply(&replacements).map_err(|error| {
+                        let refresh = error.error == GitConflictResolveError::Changed
+                            || !error.written.is_empty();
+                        let notice = if error.error == GitConflictResolveError::Changed
+                            && error.written.is_empty()
+                        {
+                            error.error.to_string()
+                        } else {
+                            error.to_string()
+                        };
+                        (notice, refresh)
+                    }),
+                    Err(error) => {
+                        Err((error.to_string(), error == GitConflictResolveError::Changed))
+                    }
+                };
+                if let Err((notice, refresh)) = result {
+                    if refresh {
+                        self.form = None;
+                        self.load_preview();
+                        let _ = self.refresh();
+                    }
+                    return Err(notice);
+                }
                 self.refresh()?;
             }
             FormAction::Operation {
@@ -3326,7 +3399,7 @@ impl GitScreen {
                             if let Some(row) = self.selected_row()
                                 && !row.directory
                             {
-                                self.conflict_form(
+                                let result = self.conflict_form(
                                     row.value,
                                     if key.code == KeyCode::Char('o') {
                                         "ours"
@@ -3334,6 +3407,7 @@ impl GitScreen {
                                         "theirs"
                                     },
                                 );
+                                self.report(result);
                             }
                         }
                         KeyCode::Char('c') => self.commit_form(),
@@ -3457,7 +3531,8 @@ impl GitScreen {
                                                 && entry.status == GitFileStatus::Conflicted
                                         })
                                     }) {
-                                        self.conflict_form(row.value, "ours");
+                                        let result = self.conflict_form(row.value, "ours");
+                                        self.report(result);
                                     } else if self.tutor.is_some() {
                                         self.focus = 4;
                                     } else {

@@ -2802,22 +2802,26 @@ fn commit_atomic_write(
         }
         WriteExpectation::Missing => persist_missing(path, temporary)?,
         WriteExpectation::Exact(expected) => {
-            match read_file(path) {
-                Ok(bytes) if bytes == *expected => {}
-                Ok(_) => return Err(VfsError::ExternalModification(path.to_path_buf())),
-                Err(VfsError::Io { source, .. }) if source.kind() == io::ErrorKind::NotFound => {
-                    return Err(VfsError::ExternalModification(path.to_path_buf()));
-                }
-                Err(error) => return Err(error),
-            }
+            verify_exact_destination(path, expected)?;
             replace_exact(path, temporary, expected)?;
         }
     }
-    sync_parent(
-        path.parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .unwrap_or(Path::new(".")),
-    )
+    // Publication is complete; a directory flush failure does not undo the replacement.
+    sync_directory(write_parent(path)).map_err(|source| VfsError::PublishedSyncFailed {
+        path: path.into(),
+        source,
+    })
+}
+
+fn verify_exact_destination(path: &Path, expected: &[u8]) -> Result<(), VfsError> {
+    match read_file(path) {
+        Ok(bytes) if bytes == expected => Ok(()),
+        Ok(_) => Err(VfsError::ExternalModification(path.into())),
+        Err(VfsError::Io { source, .. }) if source.kind() == io::ErrorKind::NotFound => {
+            Err(VfsError::ExternalModification(path.into()))
+        }
+        Err(error) => Err(error),
+    }
 }
 
 fn persist_missing(path: &Path, temporary: NamedTempFile) -> Result<(), VfsError> {
@@ -2837,18 +2841,45 @@ fn persist_missing(path: &Path, temporary: NamedTempFile) -> Result<(), VfsError
 
 #[cfg(unix)]
 fn replace_exact(path: &Path, temporary: NamedTempFile, expected: &[u8]) -> Result<(), VfsError> {
-    use rustix::fs::CWD;
-    use rustix::fs::RenameFlags;
-    use rustix::fs::renameat_with;
-    // Keep the displaced entry until its bytes have been checked as well: another
-    // writer can replace the destination between final validation and this exchange.
-    renameat_with(CWD, temporary.path(), CWD, path, RenameFlags::EXCHANGE).map_err(|source| {
-        VfsError::Io {
-            operation: "replace destination",
-            path: path.to_path_buf(),
-            source: source.into(),
+    use rustix::fs::{CWD, RenameFlags, renameat_with};
+
+    replace_exact_with(path, temporary, expected, |from, to| {
+        renameat_with(CWD, from, CWD, to, RenameFlags::EXCHANGE)
+    })
+}
+
+#[cfg(unix)]
+fn replace_exact_with(
+    path: &Path,
+    temporary: NamedTempFile,
+    expected: &[u8],
+    exchange: impl FnOnce(&Path, &Path) -> rustix::io::Result<()>,
+) -> Result<(), VfsError> {
+    use rustix::io::Errno;
+
+    // An exchange lets us inspect the displaced file, including an edit made after
+    // the last comparison. On mounts without exchange, recheck before a plain rename.
+    match exchange(temporary.path(), path) {
+        Ok(()) => {}
+        Err(Errno::NOSYS | Errno::NOTSUP | Errno::INVAL) => {
+            verify_exact_destination(path, expected)?;
+            return temporary
+                .persist(path)
+                .map(|_| ())
+                .map_err(|error| VfsError::Io {
+                    operation: "replace destination",
+                    path: path.into(),
+                    source: error.error,
+                });
         }
-    })?;
+        Err(source) => {
+            return Err(VfsError::Io {
+                operation: "replace destination",
+                path: path.into(),
+                source: source.into(),
+            });
+        }
+    }
     if read_file(temporary.path()).is_ok_and(|bytes| bytes == expected) {
         return Ok(());
     }
@@ -2857,14 +2888,11 @@ fn replace_exact(path: &Path, temporary: NamedTempFile, expected: &[u8]) -> Resu
         path: path.to_path_buf(),
         source: error.error,
     })?;
-    sync_parent(preserved.parent().unwrap_or(Path::new(".")))?;
-    Err(VfsError::Io {
-        operation: "save",
-        path: path.to_path_buf(),
-        source: io::Error::other(format!(
-            "destination changed during replacement; displaced file preserved at {}",
-            preserved.display()
-        )),
+    // A sync error must not hide the name of the draft we already kept.
+    let _ = sync_parent(write_parent(&preserved));
+    Err(VfsError::ReplacedWithDraft {
+        path: path.into(),
+        draft: preserved,
     })
 }
 
@@ -3044,6 +3072,16 @@ pub fn atomic_write_with_executable(
     bytes: &[u8],
     executable: bool,
 ) -> Result<(), VfsError> {
+    checked_atomic_write_with_executable(path, bytes, executable, &WriteExpectation::Any)
+}
+
+/// Apply Git's executable flag and verify the expected destination before replacing it.
+pub fn checked_atomic_write_with_executable(
+    path: &Path,
+    bytes: &[u8],
+    executable: bool,
+    expectation: &WriteExpectation,
+) -> Result<(), VfsError> {
     let temporary = stage_atomic_write(path, bytes)?;
     #[cfg(windows)]
     let _ = executable;
@@ -3067,7 +3105,7 @@ pub fn atomic_write_with_executable(
             source,
         })?;
     }
-    commit_atomic_write(path, temporary, &WriteExpectation::Any)
+    commit_atomic_write(path, temporary, expectation)
 }
 
 fn write_parent(path: &Path) -> &Path {
@@ -3375,7 +3413,10 @@ mod lifecycle_tests {
             let temporary = stage_atomic_write(&path, b"editor").unwrap();
             let preserved = temporary.path().to_path_buf();
             let error = replace_exact(&path, temporary, b"external").unwrap_err();
-            assert!(error.to_string().contains(&preserved.display().to_string()));
+            assert!(
+                matches!(error, VfsError::ReplacedWithDraft { path: replaced, draft }
+                if replaced == path && draft == preserved)
+            );
             assert_eq!(fs::read(&preserved).unwrap(), b"newer");
             assert_eq!(fs::read(&path).unwrap(), b"editor");
 
@@ -3393,6 +3434,29 @@ mod lifecycle_tests {
                     .is_symlink()
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exact_write_without_exchange_rechecks_before_using_rename() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("file");
+        fs::write(&path, b"reviewed").unwrap();
+        let temporary = stage_atomic_write(&path, b"replacement").unwrap();
+        replace_exact_with(&path, temporary, b"reviewed", |_, _| {
+            Err(rustix::io::Errno::NOTSUP)
+        })
+        .unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"replacement");
+
+        let temporary = stage_atomic_write(&path, b"second replacement").unwrap();
+        let error = replace_exact_with(&path, temporary, b"replacement", |_, _| {
+            fs::write(&path, b"newer").unwrap();
+            Err(rustix::io::Errno::NOTSUP)
+        })
+        .unwrap_err();
+        assert!(matches!(error, VfsError::ExternalModification(changed) if changed == path));
+        assert_eq!(fs::read(&path).unwrap(), b"newer");
     }
 
     #[test]

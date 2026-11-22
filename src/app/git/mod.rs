@@ -94,6 +94,8 @@ pub(super) struct Git {
     /// One change inside the selected hunk, when the cursor picked one out of several.
     selected_change: Vec<u32>,
     mutation: GitMutationWorker,
+    continue_worker: crate::git::GitContinueWorker,
+    continue_root_revision: Option<u64>,
     mutation_request_id: Option<GitMutationRequestId>,
     branches: GitBranchWorker,
     branch_request_id: Option<GitBranchRequestId>,
@@ -3269,6 +3271,7 @@ impl App {
 
 impl App {
     pub(in crate::app) fn process_git_mutation_events(&mut self) {
+        self.process_git_continue();
         match self.git.poll_mutation() {
             Ok(Some(crate::app::git::GitMutationOutcome::Reset)) => {
                 self.input.clear_pending_stage();
@@ -3776,8 +3779,7 @@ impl App {
 
 impl App {
     /// Preview replacing whole files with one side, then ask. Nothing is written until the
-    /// confirmation is answered, and the plan is REBUILT when it is, so a preview taken against
-    /// one repository state is never applied to another.
+    /// confirmation is answered. Keep the reviewed files and conflict state with the question.
     pub(in crate::app) fn preview_git_replacement(&mut self, side: &str, files: &str) {
         let Some(choice) = crate::git::GitConflictChoice::parse(side) else {
             self.show_error("choose base, ours or theirs");
@@ -3823,9 +3825,7 @@ impl App {
 }
 
 impl App {
-    /// Apply the previewed replacement once it is confirmed. The plan is rebuilt from the same
-    /// list and side, so the write is decided by current repository state rather than by a plan
-    /// captured before the question was asked.
+    /// Apply only the replacement the user confirmed, in the same repository.
     pub(in crate::app) fn apply_git_replacement(
         &mut self,
         previewed: crate::git::GitReplacementPlan,
@@ -3838,19 +3838,11 @@ impl App {
         let Some(repository) = self.conflict_repository() else {
             return;
         };
-        let paths = previewed
-            .files
-            .iter()
-            .map(|(path, _, _)| path.clone())
-            .collect::<Vec<_>>();
-        let plan = match crate::git::plan_replacement(&repository, &paths, previewed.choice) {
-            Ok(plan) => plan,
-            Err(error) => {
-                self.show_error(error.to_string());
-                return;
-            }
-        };
-        match crate::git::apply_replacement(&plan) {
+        if repository.as_path() != previewed.repository() {
+            self.show_error(crate::git::GitConflictResolveError::Changed.to_string());
+            return;
+        }
+        match crate::git::apply_replacement(&previewed) {
             Ok(written) => self.notify_message(
                 format!(
                     "Replaced {} file(s); saving and staging are separate steps",
@@ -3888,8 +3880,28 @@ impl App {
         let Some(repository) = self.conflict_repository() else {
             return;
         };
-        match crate::git::continue_operation(&repository, "") {
+        match self.git.continue_worker.start(repository) {
+            Ok(()) => self.git.continue_root_revision = Some(self.workspace.root_revision()),
+            Err(error) => self.show_error(error),
+        }
+    }
+
+    fn process_git_continue(&mut self) {
+        let Some(result) = self.git.continue_worker.poll() else {
+            return;
+        };
+        if self.git.continue_root_revision.take() != Some(self.workspace.root_revision()) {
+            return;
+        }
+
+        self.after_conflict_recovery();
+        match result {
             Ok(outcome) => {
+                if let Some(warning) = outcome.continue_warning() {
+                    self.notify_warning(warning);
+                    self.record_git_continue_details(outcome.details.as_deref(), false);
+                    return;
+                }
                 self.notify_message(
                     match &outcome.stopped {
                         // The step was recorded and Git paused on the next one.
@@ -3907,15 +3919,18 @@ impl App {
                     },
                     false,
                 );
-                if let Some(warning) = outcome.cleanup_warning {
-                    self.show_error(warning);
-                }
-                self.after_conflict_recovery();
             }
             Err(refusal) => {
-                self.after_conflict_recovery();
-                self.show_error(refusal.to_string());
+                self.show_error(&refusal);
+                self.record_git_continue_details(refusal.details(), true);
             }
+        }
+    }
+
+    fn record_git_continue_details(&mut self, details: Option<&str>, error: bool) {
+        if let Some(details) = details.filter(|details| !details.is_empty()) {
+            self.notices
+                .record_history(format!("Git details:\n{details}"), error);
         }
     }
 }
@@ -3924,6 +3939,10 @@ impl App {
     /// Abandon the paused operation. There is no hard-reset fallback: when the working tree holds
     /// changes the abort would destroy, it is refused and names them.
     pub(in crate::app) fn abort_git_conflict(&mut self) {
+        if self.git.continue_worker.is_running() {
+            self.show_error("Git is already continuing the operation.");
+            return;
+        }
         let Some(repository) = self.conflict_repository() else {
             return;
         };

@@ -75,12 +75,36 @@ impl GitOutput {
     }
 }
 
+enum Capture {
+    Strict,
+    Discard,
+}
+
 /// Bound Git and its hooks while retaining raw stderr and NUL-delimited paths.
 pub(super) fn supervised_git_output(
     root: &Path,
     args: &[OsString],
     extra: &[(String, OsString)],
     timeout: Duration,
+) -> Result<GitOutput, String> {
+    supervised_git(root, args, extra, timeout, Capture::Strict)
+}
+
+/// Run a Git write whose success depends only on Git's exit status, not on captured output.
+pub(super) fn supervised_git_status(
+    root: &Path,
+    args: &[OsString],
+    timeout: Duration,
+) -> Result<bool, String> {
+    supervised_git(root, args, &[], timeout, Capture::Discard).map(|output| output.success())
+}
+
+fn supervised_git(
+    root: &Path,
+    args: &[OsString],
+    extra: &[(String, OsString)],
+    timeout: Duration,
+    capture: Capture,
 ) -> Result<GitOutput, String> {
     let program =
         crate::process::discover_executable("git").ok_or("Git is not installed or not on PATH")?;
@@ -104,6 +128,7 @@ pub(super) fn supervised_git_output(
     })
     .map_err(|_| "Can't start Git")?;
 
+    let strict_capture = matches!(capture, Capture::Strict);
     let mut stdout = Vec::new();
     let mut stderr = Vec::new();
     let mut incomplete = false;
@@ -117,7 +142,7 @@ pub(super) fn supervised_git_output(
                     truncated,
                     abandoned,
                     ..
-                } => {
+                } if strict_capture => {
                     let output = match stream {
                         JobStream::Stdout => &mut stdout,
                         JobStream::Stderr => &mut stderr,
@@ -125,9 +150,10 @@ pub(super) fn supervised_git_output(
                     output.extend(bytes);
                     incomplete |= truncated || abandoned;
                 }
+                JobEvent::Output { .. } => {}
                 JobEvent::Exited {
                     timed_out: true, ..
-                } => return Err("Git took too long".into()),
+                } if strict_capture => return Err("Git took too long".into()),
                 JobEvent::Exited { code, .. } => {
                     if incomplete {
                         return Err("Git's output was incomplete".into());

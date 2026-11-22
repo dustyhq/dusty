@@ -3,12 +3,15 @@
 //! Conflict views show base/ours/theirs/result; choosing a side edits the result buffer through
 //! ordinary transactions. Saving and staging are separate steps.
 //!
-//! Nothing here is cached. A conflict is a state of the repository that changes underneath the
-//! editor, so every read goes back to the index and to the repository's own operation state.
+//! Conflict state is read from the repository. A write keeps the reviewed state so it can
+//! refuse to replace a file that changed after it was shown.
 use std::path::Path;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use thiserror::Error;
+
+use crate::files::{self, VfsError, WriteExpectation};
 
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum GitConflictError {
@@ -295,6 +298,27 @@ pub enum GitConflictResolveError {
     SideAbsent { path: String, side: &'static str },
     #[error("`{0}` is not text this editor can edit")]
     NotText(String),
+    #[error("Changed since you reviewed it. Refresh and try again.")]
+    Changed,
+    #[error("Couldn't save the file.")]
+    SaveFailed,
+    #[error("Couldn't save the file{0}.")]
+    SaveIo(String),
+    #[error("Couldn't check which Git operation is in progress.")]
+    OperationUnknown,
+    #[error("Replaced {}, but it changed during the write. The newer draft was kept at {}.", path.display(), draft.display())]
+    ReplacedWithDraft { path: PathBuf, draft: PathBuf },
+    #[error("Replaced {}, but couldn't sync its folder{reason}.", path.display())]
+    PublishedSyncFailed { path: PathBuf, reason: String },
+}
+
+impl GitConflictResolveError {
+    pub(super) fn published(&self) -> bool {
+        matches!(
+            self,
+            Self::ReplacedWithDraft { .. } | Self::PublishedSyncFailed { .. }
+        )
+    }
 }
 
 /// Read ONE side of a conflicted path from the index, on demand, and return its content.
@@ -321,51 +345,74 @@ fn read_side(
     let index = repo
         .index()
         .map_err(|error| GitConflictResolveError::Backend(error.message().to_owned()))?;
-    let mut conflicts = index
-        .conflicts()
-        .map_err(|error| GitConflictResolveError::Backend(error.message().to_owned()))?;
-    let mut found: Option<git2::IndexConflict> = None;
-    for conflict in conflicts.by_ref() {
-        let conflict = conflict
-            .map_err(|error| GitConflictResolveError::Backend(error.message().to_owned()))?;
-        let entry = conflict
-            .ancestor
-            .as_ref()
-            .or(conflict.our.as_ref())
-            .or(conflict.their.as_ref());
-        if let Some(entry) = entry {
-            // Index paths are bytes; compare against the caller's relativized path directly.
-            if git_path(&entry.path).as_deref() == Some(wanted.as_path()) {
-                found = Some(conflict);
-                break;
-            }
-        }
+    read_reviewed_side(&repo, &conflict_entries(&index, &wanted)?, choice)
+}
+
+fn conflict_entries(
+    index: &git2::Index,
+    path: &Path,
+) -> Result<GitConflictEntry, GitConflictResolveError> {
+    let no_conflict = || GitConflictResolveError::NoConflict(path.display().to_string());
+    // git2's get_path assumes a valid, nonempty index path.
+    if !matches!(
+        path.components().next(),
+        Some(std::path::Component::Normal(_))
+    ) || path.as_os_str().as_encoded_bytes().contains(&0)
+        || cfg!(windows) && path.to_str().is_none()
+    {
+        return Err(no_conflict());
     }
-    drop(conflicts);
-    let conflict =
-        found.ok_or_else(|| GitConflictResolveError::NoConflict(wanted.display().to_string()))?;
+    let side = |stage| {
+        exact_index_entry(index, path, stage)
+            .as_ref()
+            .map(GitConflictSide::from_entry)
+    };
+    let entry = GitConflictEntry {
+        path: path.to_path_buf(),
+        base: side(1),
+        ours: side(2),
+        theirs: side(3),
+    };
+    if entry.base.is_none() && entry.ours.is_none() && entry.theirs.is_none() {
+        return Err(no_conflict());
+    }
+    Ok(entry)
+}
+
+fn exact_index_entry(index: &git2::Index, path: &Path, stage: i32) -> Option<git2::IndexEntry> {
+    // libgit2 can do a case-insensitive lookup even on a case-sensitive worktree.
+    index
+        .get_path(path, stage)
+        .filter(|entry| git_path(&entry.path).as_deref() == Some(path))
+}
+
+fn read_reviewed_side(
+    repo: &git2::Repository,
+    entry: &GitConflictEntry,
+    choice: GitConflictChoice,
+) -> Result<(String, u32), GitConflictResolveError> {
     let side = match choice {
-        GitConflictChoice::Base => conflict.ancestor,
-        GitConflictChoice::Ours => conflict.our,
-        GitConflictChoice::Theirs => conflict.their,
+        GitConflictChoice::Base => entry.base,
+        GitConflictChoice::Ours => entry.ours,
+        GitConflictChoice::Theirs => entry.theirs,
     };
     let Some(side) = side else {
         return Err(GitConflictResolveError::SideAbsent {
-            path: wanted.display().to_string(),
+            path: entry.path.display().to_string(),
             side: choice.name(),
         });
     };
     if !matches!(side.mode, 0o100644 | 0o100755) {
         return Err(GitConflictResolveError::NotText(
-            wanted.display().to_string(),
+            entry.path.display().to_string(),
         ));
     }
     let blob = repo
-        .find_blob(side.id)
+        .find_blob(side.oid)
         .map_err(|error| GitConflictResolveError::Backend(error.message().to_owned()))?;
     String::from_utf8(blob.content().to_vec())
         .map(|content| (content, side.mode))
-        .map_err(|_| GitConflictResolveError::NotText(wanted.display().to_string()))
+        .map_err(|_| GitConflictResolveError::NotText(entry.path.display().to_string()))
 }
 
 pub(super) fn git_path(bytes: &[u8]) -> Option<PathBuf> {
@@ -425,6 +472,21 @@ pub enum GitRecoveryRefusal {
     NoRecordedStart,
     #[error("the recovery action failed: {0}")]
     Backend(String),
+    #[error("{summary}")]
+    MergeCommit {
+        summary: &'static str,
+        details: String,
+    },
+}
+
+impl GitRecoveryRefusal {
+    /// Native Git output, kept separate from the user-facing summary.
+    pub fn details(&self) -> Option<&str> {
+        match self {
+            Self::MergeCommit { details, .. } => Some(details),
+            _ => None,
+        }
+    }
 }
 
 /// What a recovered operation left behind, so the caller can report the real revision.
@@ -434,8 +496,22 @@ pub struct GitRecoveryOutcome {
     pub commit: Option<git2::Oid>,
     pub restored_to: Option<git2::Oid>,
     pub cleanup_warning: Option<String>,
+    /// Native Git output from a command that failed after publishing the merge.
+    pub details: Option<String>,
     /// Set when the operation advanced but paused again instead of finishing.
     pub stopped: Option<GitOperationStop>,
+}
+
+impl GitRecoveryOutcome {
+    pub fn continue_warning(&self) -> Option<String> {
+        self.cleanup_warning.clone().or_else(|| {
+            let oid = self.commit?;
+            self.details.as_ref()?;
+            Some(format!(
+                "Created commit {oid}, but Git reported an error afterward."
+            ))
+        })
+    }
 }
 
 /// Where a resumed replay paused again. Git exits non-zero when a continued or skipped
@@ -667,6 +743,7 @@ pub fn abort_operation(repository: &Path) -> Result<GitRecoveryOutcome, GitRecov
         commit: None,
         restored_to: Some(recorded),
         cleanup_warning: None,
+        details: None,
         stopped: None,
     })
 }
@@ -1070,15 +1147,325 @@ fn risky_changes(
     Ok(risky)
 }
 
+/// The paused step, including the starting HEAD and Git's recorded incoming commit(s).
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ReviewedOperation {
+    state: git2::RepositoryState,
+    head: Option<git2::Oid>,
+    markers: Vec<Option<Vec<u8>>>,
+}
+
+impl ReviewedOperation {
+    fn read(repo: &git2::Repository) -> Result<Self, GitConflictResolveError> {
+        use git2::RepositoryState::{
+            CherryPick, CherryPickSequence, Merge, Revert, RevertSequence,
+        };
+
+        let state = repo.state();
+        let names: &[&str] = match state {
+            Merge => &["MERGE_HEAD"],
+            CherryPick | CherryPickSequence => &["CHERRY_PICK_HEAD", "sequencer/head"],
+            Revert | RevertSequence => &["REVERT_HEAD", "sequencer/head"],
+            _ if operation_name(state).as_deref() == Some("rebase") => &[
+                "REBASE_HEAD",
+                "rebase-merge/orig-head",
+                "rebase-merge/onto",
+                "rebase-merge/head-name",
+                "rebase-merge/stopped-sha",
+                "rebase-merge/msgnum",
+                "rebase-apply/orig-head",
+                "rebase-apply/onto",
+                "rebase-apply/head-name",
+                "rebase-apply/original-commit",
+                "rebase-apply/next",
+            ],
+            _ => &[],
+        };
+        let markers = std::iter::once("HEAD")
+            .chain(names.iter().copied())
+            .map(|name| match std::fs::read(repo.path().join(name)) {
+                Ok(bytes) => Ok(Some(bytes)),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(_) => Err(GitConflictResolveError::OperationUnknown),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self {
+            state,
+            head: repo.head().ok().and_then(|head| head.target()),
+            markers,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct ReviewedConflictFile {
+    pub(super) path: PathBuf,
+    entries: GitConflictEntry,
+    pub(super) expectation: WriteExpectation,
+}
+
+impl ReviewedConflictFile {
+    pub(super) fn relative(&self) -> &Path {
+        &self.entries.path
+    }
+
+    pub(super) fn text(&self) -> Option<&str> {
+        let WriteExpectation::Exact(bytes) = &self.expectation else {
+            return None;
+        };
+        let text = std::str::from_utf8(bytes).ok()?;
+        (!text.contains('\0')).then_some(text)
+    }
+
+    fn validate(
+        &self,
+        index: &git2::Index,
+        workdir: &Path,
+        expected: &WriteExpectation,
+    ) -> Result<(), GitConflictResolveError> {
+        let changed = GitConflictResolveError::Changed;
+        if conflict_entries(index, self.relative()).as_ref() != Ok(&self.entries) {
+            return Err(changed);
+        }
+        // Read at most the expected length. A newly larger file cannot match.
+        let maximum = match expected {
+            WriteExpectation::Exact(bytes) => bytes.len() as u64,
+            _ => 0,
+        };
+        match worktree_expectation(workdir, &self.path, maximum) {
+            Ok(actual) if &actual == expected => Ok(()),
+            _ => Err(changed),
+        }
+    }
+
+    pub(super) fn write(
+        &self,
+        bytes: &[u8],
+        executable: bool,
+    ) -> Result<(), GitConflictResolveError> {
+        files::checked_atomic_write_with_executable(
+            &self.path,
+            bytes,
+            executable,
+            &self.expectation,
+        )
+        .map_err(|error| match error {
+            VfsError::ExternalModification(_) | VfsError::DestinationExists(_) => {
+                GitConflictResolveError::Changed
+            }
+            VfsError::ReplacedWithDraft { path, draft } => {
+                GitConflictResolveError::ReplacedWithDraft { path, draft }
+            }
+            VfsError::PublishedSyncFailed { path, source } => {
+                GitConflictResolveError::PublishedSyncFailed {
+                    path,
+                    reason: crate::screen::words::io_reason(&source),
+                }
+            }
+            VfsError::Io { source, .. } | VfsError::RootIo { source, .. } => {
+                let reason = crate::screen::words::io_reason(&source);
+                if reason.is_empty() {
+                    GitConflictResolveError::SaveFailed
+                } else {
+                    GitConflictResolveError::SaveIo(reason)
+                }
+            }
+            _ => GitConflictResolveError::SaveFailed,
+        })
+    }
+}
+
+/// The operation and exact bytes shown or authorized by a conflict review.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct ConflictReview {
+    workdir: PathBuf,
+    git_dir: PathBuf,
+    operation: ReviewedOperation,
+    pub(super) files: Vec<ReviewedConflictFile>,
+}
+
+impl ConflictReview {
+    pub(super) fn capture(
+        repository: &Path,
+        paths: &[PathBuf],
+        maximum_bytes: u64,
+    ) -> Result<Self, GitConflictResolveError> {
+        if paths.is_empty() {
+            return Err(GitConflictResolveError::NoConflict(
+                "(no paths given)".into(),
+            ));
+        }
+        let repo = git2::Repository::open(repository)
+            .map_err(|_| GitConflictResolveError::NotRepository)?;
+        let workdir = repo
+            .workdir()
+            .ok_or(GitConflictResolveError::NotRepository)?;
+        let operation = ReviewedOperation::read(&repo)?;
+        let index = repo
+            .index()
+            .map_err(|error| GitConflictResolveError::Backend(error.message().to_owned()))?;
+        let mut reviewed = Vec::new();
+        let mut seen = std::collections::BTreeSet::new();
+        for path in paths {
+            let relative = conflict_relative_path(&repo, path)?;
+            if !seen.insert(relative.clone()) {
+                continue;
+            }
+            let entries = conflict_entries(&index, &relative)?;
+            let path = workdir.join(relative);
+            let expectation = worktree_expectation(workdir, &path, maximum_bytes)?;
+            reviewed.push(ReviewedConflictFile {
+                path,
+                entries,
+                expectation,
+            });
+        }
+        Ok(Self {
+            workdir: workdir.to_path_buf(),
+            git_dir: repo.path().to_path_buf(),
+            operation,
+            files: reviewed,
+        })
+    }
+
+    fn current_repository(&self) -> Result<git2::Repository, GitConflictResolveError> {
+        let changed = GitConflictResolveError::Changed;
+        let repo = git2::Repository::open(&self.workdir).map_err(|_| changed.clone())?;
+        if repo.workdir() != Some(self.workdir.as_path())
+            || repo.path() != self.git_dir.as_path()
+            || ReviewedOperation::read(&repo).as_ref() != Ok(&self.operation)
+        {
+            return Err(changed);
+        }
+        Ok(repo)
+    }
+
+    pub(super) fn validate_file(
+        &self,
+        file: &ReviewedConflictFile,
+        expected: &WriteExpectation,
+    ) -> Result<(), GitConflictResolveError> {
+        let index = self
+            .current_repository()?
+            .index()
+            .map_err(|_| GitConflictResolveError::Changed)?;
+        file.validate(&index, &self.workdir, expected)
+    }
+
+    /// Check the just-written resolution before letting Git stage it with its normal rules.
+    pub(super) fn stage_resolution(
+        &self,
+        file: &ReviewedConflictFile,
+        resolved: Vec<u8>,
+    ) -> Result<(), GitConflictResolveError> {
+        let args = [
+            "--literal-pathspecs".into(),
+            "add".into(),
+            "--".into(),
+            file.relative().as_os_str().to_owned(),
+        ];
+        // Git reopens the file, so a write after this check can still race with add.
+        self.validate_file(file, &WriteExpectation::Exact(resolved))?;
+        match super::command::supervised_git_status(&self.workdir, &args, OPERATION_TIMEOUT) {
+            Ok(true) => Ok(()),
+            _ => Err(GitConflictResolveError::SaveFailed),
+        }
+    }
+
+    pub(super) fn replacements(
+        &self,
+        choice: GitConflictChoice,
+    ) -> Result<Vec<(PathBuf, String, u32)>, GitConflictResolveError> {
+        let repo = self.current_repository()?;
+        self.files
+            .iter()
+            .map(|file| {
+                let (content, mode) = read_reviewed_side(&repo, &file.entries, choice)?;
+                Ok((file.path.clone(), content, mode))
+            })
+            .collect()
+    }
+
+    pub(super) fn apply(
+        &self,
+        replacements: &[(PathBuf, String, u32)],
+    ) -> Result<Vec<PathBuf>, GitReplacementError> {
+        let index = self
+            .current_repository()
+            .and_then(|repo| repo.index().map_err(|_| GitConflictResolveError::Changed))
+            .map_err(|error| GitReplacementError {
+                path: self.files[0].path.clone(),
+                written: Vec::new(),
+                error,
+            })?;
+        for file in &self.files {
+            file.validate(&index, &self.workdir, &file.expectation)
+                .map_err(|error| GitReplacementError {
+                    path: file.path.clone(),
+                    written: Vec::new(),
+                    error,
+                })?;
+        }
+
+        let mut written = Vec::new();
+        for (file, (_, content, mode)) in self.files.iter().zip(replacements) {
+            record_replacement(
+                &mut written,
+                &file.path,
+                file.write(content.as_bytes(), *mode == 0o100755),
+            )?;
+        }
+        Ok(written)
+    }
+}
+
+fn worktree_expectation(
+    workdir: &Path,
+    path: &Path,
+    maximum_bytes: u64,
+) -> Result<WriteExpectation, GitConflictResolveError> {
+    // Do not replace an alias or follow a new link in a parent directory.
+    let not_text = || GitConflictResolveError::NotText(path.display().to_string());
+    let mut entry = path;
+    while entry != workdir {
+        match std::fs::symlink_metadata(entry) {
+            Ok(metadata) if entry == path && metadata.is_file() => {}
+            Ok(metadata) if entry != path && metadata.is_dir() => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            _ => return Err(not_text()),
+        }
+        entry = entry.parent().ok_or_else(not_text)?;
+    }
+    match files::read_file_bounded(path, maximum_bytes) {
+        Ok(bytes) => Ok(WriteExpectation::Exact(bytes)),
+        Err(VfsError::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {
+            Ok(WriteExpectation::Missing)
+        }
+        Err(_) => Err(not_text()),
+    }
+}
+
 /// What a whole-file replacement WOULD do, computed before anything is written.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GitReplacementPlan {
-    pub choice: GitConflictChoice,
-    /// Every path the replacement would write, with its content and Git file mode.
-    pub files: Vec<(PathBuf, String, u32)>,
+    review: ConflictReview,
+    choice: GitConflictChoice,
+    files: Vec<(PathBuf, String, u32)>,
 }
 
 impl GitReplacementPlan {
+    /// The checkout the confirmation was opened for.
+    #[must_use]
+    pub fn repository(&self) -> &Path {
+        &self.review.workdir
+    }
+
+    /// Every path the replacement would write, with its content and Git file mode.
+    #[must_use]
+    pub fn files(&self) -> &[(PathBuf, String, u32)] {
+        &self.files
+    }
+
     /// The list a confirmation must show: the files and the side they would take.
     #[must_use]
     pub fn preview(&self) -> String {

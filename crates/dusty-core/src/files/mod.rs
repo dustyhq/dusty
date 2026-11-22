@@ -37,6 +37,7 @@ pub use vfs::atomic_write;
 pub use vfs::atomic_write_with_executable;
 pub use vfs::canonicalize;
 pub use vfs::checked_atomic_write;
+pub use vfs::checked_atomic_write_with_executable;
 #[cfg(unix)]
 pub use vfs::directory_open_flags;
 pub use vfs::is_symlink_error;

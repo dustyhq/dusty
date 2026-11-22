@@ -25,6 +25,14 @@ pub enum VfsError {
     },
     #[error("refusing to overwrite externally modified file `{}`; reload or force the write", .0.display())]
     ExternalModification(PathBuf),
+    #[error("Replaced {}, but it changed during the write. The newer draft was kept at {}.", path.display(), draft.display())]
+    ReplacedWithDraft { path: PathBuf, draft: PathBuf },
+    #[error("Replaced {}, but couldn't sync its folder: {source}", path.display())]
+    PublishedSyncFailed {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
     #[error("{} is read-only. Use :w! to overwrite it.",
         .0.file_name().unwrap_or_default().to_string_lossy()
     )]

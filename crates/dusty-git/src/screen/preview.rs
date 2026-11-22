@@ -51,6 +51,7 @@ pub(super) struct Preview {
     pub rows: Vec<PreviewRow>,
     pub split: Vec<SplitRow>,
     pub patch: bool,
+    pub conflict_review: Option<crate::conflict::ConflictReview>,
     pub search: super::search::SourceSearch,
     /// A byte within the real code cursor's row; independent of search feedback.
     pub cursor_byte: Option<(usize, usize)>,
@@ -59,10 +60,7 @@ impl From<&str> for Preview {
     fn from(text: &str) -> Self {
         Self {
             rows: text.lines().map(PreviewRow::message).collect(),
-            split: Vec::new(),
-            patch: false,
-            search: super::search::SourceSearch::default(),
-            cursor_byte: None,
+            ..Self::default()
         }
     }
 }
@@ -110,10 +108,7 @@ impl Preview {
         );
         Self {
             rows,
-            split: Vec::new(),
-            patch: false,
-            search: super::search::SourceSearch::default(),
-            cursor_byte: None,
+            ..Self::default()
         }
     }
 
