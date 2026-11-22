@@ -784,8 +784,8 @@ fn parse_local_pull_requests(output: &[u8]) -> Vec<(u64, PathBuf)> {
     local
 }
 
-/// A bare host name (`[forge.hosts]` keys, `ForgeTarget::host`), lower-cased.
-fn valid_host(host: &str) -> Result<String, String> {
+/// Validate a bare configuration host name, without a port.
+fn valid_config_host(host: &str) -> Result<String, String> {
     if host.is_empty()
         || host.chars().any(|c| c.is_whitespace() || c.is_control())
         || host.contains(['/', '\\', '@', '?', '#', ':'])
@@ -1052,7 +1052,7 @@ mod tests {
 
     #[test]
     fn forge_hosts_are_validated_and_normalised() {
-        assert_eq!(valid_host("GitHub.COM.").unwrap(), "github.com");
+        assert_eq!(valid_config_host("GitHub.COM.").unwrap(), "github.com");
         for host in [
             "",
             " ",
@@ -1062,7 +1062,36 @@ mod tests {
             "x\n.test",
             "https://github.com",
         ] {
-            assert!(valid_host(host).is_err(), "{host:?}");
+            assert!(valid_config_host(host).is_err(), "{host:?}");
+        }
+    }
+
+    #[test]
+    fn explicit_forge_targets_resolve_with_their_port() {
+        let root = Path::new(".");
+        for (input, expected_port) in [
+            ("Git.Example.Test.:8443", 8443),
+            ("git.example.test:443", 443),
+        ] {
+            let expected = transport::HostKey {
+                host: "git.example.test".into(),
+                port: Some(expected_port),
+            };
+            let (host, repo) = ForgeTarget::repository(input, "o/r").resolve(root).unwrap();
+            assert_eq!(host, expected);
+            assert_eq!(repo.unwrap().full(), "o/r");
+            let (host, repo) = ForgeTarget::host(input).resolve(root).unwrap();
+            assert_eq!(host, expected);
+            assert!(repo.is_none());
+        }
+        for host in [
+            "git.example.test:",
+            "git.example.test:+8443",
+            "git.example.test:65536",
+            "git.example.test:abc",
+            "git.example.test:8443/path",
+        ] {
+            assert!(ForgeTarget::host(host).resolve(root).is_err(), "{host}");
         }
     }
 

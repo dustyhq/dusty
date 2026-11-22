@@ -100,6 +100,9 @@ fn fixture_child(name: &str) -> bool {
     std::fs::write(root.join("untouched.txt"), "local content\n").unwrap();
     let output = server
         .configure(&mut Command::new(std::env::current_exe().unwrap()))
+        // Direct HTTP with a token scoped to the fake server: gh passthrough would talk to
+        // api.github.com, not the address Dusty is configured with, so Dusty refuses it.
+        .env("DUSTY_FORGE_TOKEN", forge_fake::FAKE_TOKEN)
         .args(["--exact", name, "--nocapture"])
         .env("DUSTY_GITHUB_READING_CHILD", "1")
         // `wait_timeline` takes the timeline's request as the sign that the item read before

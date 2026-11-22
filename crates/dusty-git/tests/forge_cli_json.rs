@@ -302,7 +302,96 @@ fn every_read_verb_answers_with_the_schema_on_every_provider() {
     assert!(failures.is_empty(), "\n{}", failures.join("\n\n"));
 }
 
-/// The second run is served by the shared disk cache without a request; `--refresh` asks
+#[test]
+fn signed_job_log_failures_keep_safe_addresses_on_stderr_and_in_the_cache() {
+    use dusty_forge::cache::{Cache, CacheKey};
+    use dusty_forge::model::ItemId;
+    use dusty_forge::provider::RepoRef;
+    use dusty_forge::request::Read;
+    use dusty_forge::transport::HostKey;
+
+    let world = World::new(Forge::GitHub);
+    let port = world.server.port;
+    let path = "/_blob/signed/42";
+    let run_path = "/actions/runs/42/logs";
+    let safe_address = format!("http://localhost:{port}{path}");
+    let url = format!("{safe_address}?sig=fixture-absolute");
+    let echo = format!(
+        "expired {run_path}?sig=fixture-relative; see http://fixture-user:fixture-pass@localhost:{port}{path}?sig=fixture-absolute#fixture-fragment"
+    );
+    let cache = Cache::at(world.cache_dir());
+    for (status, kind) in [(403, "Forbidden"), (404, "NotFound")] {
+        world.update(|state| {
+            state["fail"] = json!([{
+                "path":"actions/jobs/42/logs","status":302,"location":url,"times":1
+            }]);
+            state["blob_failures"] = json!({(path): {"status":status, "message":echo}});
+        });
+        let run = forge(&world, &["log", "42"]);
+        let error = run.error();
+        assert_eq!(error["kind"], kind);
+        let message = error["message"].as_str().unwrap();
+        assert!(message.contains(run_path) && message.contains(&safe_address));
+        assert!(!run.stderr.contains("sig=") && !run.stderr.contains("fixture-"));
+    }
+    let repo = RepoRef::parse("example/demo").unwrap();
+    let account =
+        dusty_forge::transport::AccountNamespace::signed_in(HostKey::new("github.com"), "rowan")
+            .unwrap();
+    let key = CacheKey::new(&account, Some(&repo), &Read::JobLog(ItemId::new(42)));
+    let missing = cache.get::<String>(&key.missing()).unwrap();
+    assert!(missing.data.contains(run_path) && missing.data.contains(&safe_address));
+    assert!(!missing.data.contains("sig=") && !missing.data.contains("fixture-"));
+    assert!(
+        world.state()["blob_requests"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|request| request["authorization"] == "absent")
+    );
+}
+
+#[test]
+fn remembered_cache_works_offline_and_refresh_moves_to_the_live_account() {
+    let world = World::new(Forge::GitHub);
+    let pull = Forge::GitHub.pull().to_string();
+    let sign_in = |login: &str| {
+        world.update(|state| {
+            state["fail"] = json!([{
+                "path": "user", "status": 200, "body": {"login": login}, "times": 2
+            }]);
+        });
+    };
+    sign_in("alice");
+    let first = forge(&world, &["pr", &pull]);
+    ok(&first);
+    assert_eq!(first.object()["source"], "network");
+    assert_eq!(first.object()["data"]["row"]["title"], "Native review");
+    let same_account = forge_with(&world, &["pr", &pull], None, |command| {
+        command.env("DUSTY_FORGE_OFFLINE", "1");
+    });
+    ok(&same_account);
+    assert_eq!(same_account.object()["source"], "cache");
+
+    sign_in("bob");
+    world.update(|state| state["pr_title"] = json!("Bob's pull request"));
+    let second = forge(&world, &["pr", &pull, "--refresh"]);
+    ok(&second);
+    assert_eq!(second.object()["source"], "network");
+    assert_eq!(
+        second.object()["data"]["row"]["title"],
+        "Bob's pull request"
+    );
+    let cached = forge_with(&world, &["pr", &pull], None, |command| {
+        command.env("DUSTY_FORGE_OFFLINE", "1");
+    });
+    ok(&cached);
+    let cached = cached.object();
+    assert_eq!(cached["source"], "cache");
+    assert_eq!(cached["data"]["row"]["title"], "Bob's pull request");
+}
+
+/// The second run uses the remembered disk cache without going online; `--refresh` asks
 /// again; `cache stats|clear` see and drop the entries.
 #[test]
 fn second_reads_come_from_the_shared_cache() {
@@ -324,8 +413,11 @@ fn second_reads_come_from_the_shared_cache() {
             assert_eq!(cached["provider"], forge_kind.name());
             assert_eq!(cached["data"], first.object()["data"]);
             assert_eq!(
-                world.api_requests().len(),
-                before,
+                world.api_requests()[before..]
+                    .iter()
+                    .filter(|request| request["path"] != "user")
+                    .count(),
+                0,
                 "a fresh cache entry was asked again: {:?}",
                 &world.api_requests()[before..]
             );

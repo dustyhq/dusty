@@ -327,6 +327,24 @@ fn graphql_for(kind: ProviderKind, api_base: &str) -> Option<String> {
     }
 }
 
+/// The standard REST path under a self-hosted forge's installation root.
+pub(crate) fn rest_api_suffix(kind: ProviderKind) -> &'static str {
+    match kind {
+        ProviderKind::GitHub => "/api/v3",
+        ProviderKind::GitLab => "/api/v4",
+        ProviderKind::Gitea | ProviderKind::Forgejo => "/api/v1",
+    }
+}
+
+/// The GitHub REST override has priority over the host's saved configuration.
+pub(crate) fn github_api_base_override(kind: ProviderKind, env: &Env) -> Option<String> {
+    if kind == ProviderKind::GitHub {
+        env.get("DUSTY_FORGE_API_BASE")
+    } else {
+        None
+    }
+}
+
 /// API bases per provider, then `api_base` from config, then `DUSTY_FORGE_API_BASE` /
 /// `DUSTY_FORGE_GRAPHQL_URL` (both with `{host}`).
 pub fn endpoints_for(
@@ -342,23 +360,21 @@ pub fn endpoints_for(
         ProviderKind::GitLab => Endpoints {
             kind,
             host: host.clone(),
-            api_base: format!("{root}/api/v4"),
+            api_base: format!("{root}{}", rest_api_suffix(kind)),
             graphql: Some(format!("{root}/api/graphql")),
             web_base,
         },
         ProviderKind::Gitea | ProviderKind::Forgejo => Endpoints {
             kind,
             host: host.clone(),
-            api_base: format!("{root}/api/v1"),
+            api_base: format!("{root}{}", rest_api_suffix(kind)),
             graphql: None,
             web_base,
         },
     };
     let name = host.to_string();
     // F1's `DUSTY_FORGE_API_BASE` names a GitHub REST base; other kinds use the origin.
-    let base = env
-        .get("DUSTY_FORGE_API_BASE")
-        .filter(|_| kind == ProviderKind::GitHub)
+    let base = github_api_base_override(kind, env)
         .map(|base| base.replace("{host}", &name))
         .or_else(|| api_base.map(str::to_owned));
     if let Some(base) = base {
@@ -733,10 +749,26 @@ pub fn detect_with(
         .get("DUSTY_FORGE_PROVIDER")
         .as_deref()
         .and_then(parse_kind)
-        && inputs
-            .env
-            .get("DUSTY_FORGE_HOST")
-            .is_none_or(|scope| HostKey::new(&scope) == *host)
+        && inputs.env.get("DUSTY_FORGE_HOST").is_none_or(|scope| {
+            credential::url_host(&scope).as_ref() == Some(host)
+                || scope.contains("://")
+                    && crate::transport::api_origin(&scope).is_some_and(|origin| {
+                        crate::transport::api_origin(
+                            &endpoints_for(
+                                kind,
+                                host,
+                                inputs
+                                    .config
+                                    .hosts
+                                    .get(host)
+                                    .and_then(|config| config.api_base.as_deref()),
+                                &inputs.env,
+                            )
+                            .api_base,
+                        )
+                        .is_some_and(|api| api == origin)
+                    })
+        })
     {
         return Ok(build(kind, DetectSource::Env, None, None));
     }
@@ -880,6 +912,22 @@ pub fn forget() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explicit_forge_state_inputs_do_not_consult_the_process() {
+        assert_eq!(hosts_path(&Env::from_pairs([] as [(&str, &str); 0])), None);
+        assert_eq!(
+            hosts_path(&Env::from_pairs([
+                ("DUSTY_FORGE_STATE_DIR", "forge-fixture"),
+                ("HOME", "ignored"),
+            ])),
+            Some(PathBuf::from("forge-fixture").join("hosts.json")),
+        );
+        assert_eq!(
+            hosts_path(&Env::from_pairs([("HOME", "fixture-home")])),
+            Some(PathBuf::from("fixture-home").join(".local/state/dusty/forge/hosts.json")),
+        );
+    }
 
     #[test]
     fn remote_forms_parse_to_host_and_repo() {

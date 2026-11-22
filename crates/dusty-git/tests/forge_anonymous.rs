@@ -145,8 +145,8 @@ fn login_hint(forge: Forge) -> String {
 fn token_hint(forge: Forge) -> String {
     match forge {
         Forge::GitHub if forge.host() == "github.com" => "GH_TOKEN=<token>".into(),
-        Forge::GitHub => "GH_ENTERPRISE_TOKEN=<token>".into(),
-        Forge::GitLab => "GITLAB_TOKEN=<token>".into(),
+        Forge::GitHub => format!("GH_ENTERPRISE_TOKEN=<token> GH_HOST={}", forge.host()),
+        Forge::GitLab => format!("GITLAB_TOKEN=<token> GITLAB_HOST={}", forge.host()),
         Forge::Gitea | Forge::Forgejo => {
             format!("FORGEJO_TOKEN=<token> FORGEJO_URL=https://{}", forge.host())
         }

@@ -92,8 +92,10 @@ impl World {
         Env::from_pairs(all)
     }
 
+    // Keep the default origins for credential-scope checks. Fake CLIs route their
+    // own requests to the loopback server via the sidecar, independently of these URLs.
     fn endpoints(&self, kind: ProviderKind, host: &str) -> Endpoints {
-        let env = self.env(&[("DUSTY_FORGE_API_BASE", &self.server.api_base())]);
+        let env = Env::from_pairs([] as [(&str, &str); 0]);
         detect::endpoints_for(kind, &HostKey::new(host), None, &env)
     }
 
@@ -163,8 +165,9 @@ fn github_precedence_is_dusty_then_gh_variables_then_gh() {
         source(&lookup(&dotcom, &options, &world.env(&scoped))),
         Some(CredentialSource::Env("GH_TOKEN"))
     );
+    let enterprise = world.env(&[all[2], ("GH_HOST", "ghe.cred.test")]);
     assert_eq!(
-        source(&lookup(&ghes, &options, &world.env(&scoped))),
+        source(&lookup(&ghes, &options, &enterprise)),
         Some(CredentialSource::Env("GH_ENTERPRISE_TOKEN")),
         "GHES hosts read the enterprise variables, never GH_TOKEN"
     );
@@ -280,8 +283,11 @@ fn gitea_and_forgejo_read_variables_fj_keys_and_tea_config() {
         source(&lookup(&tea_host, &options, &scoped)),
         Some(CredentialSource::Env("GITEA_SERVER_TOKEN"))
     );
-    // FORGEJO_TOKEN applies to any Gitea-family host unless a URL scopes it.
-    let forgejo = world.env(&[("FORGEJO_TOKEN", OTHER_TOKEN)]);
+    // An explicit scope selects the self-hosted instance.
+    let forgejo = world.env(&[
+        ("FORGEJO_TOKEN", OTHER_TOKEN),
+        ("FORGEJO_URL", "https://fj.cred.test"),
+    ]);
     assert_eq!(
         source(&lookup(&fj_host, &options, &forgejo)),
         Some(CredentialSource::Env("FORGEJO_TOKEN"))
@@ -355,15 +361,25 @@ fn surprising_yaml_skips_the_store_instead_of_guessing() {
 #[test]
 fn a_token_is_validated_live_before_use_and_a_rejected_one_falls_back() {
     let world = World::new(json!({"tokens": [GLAB_TOKEN], "viewer": "maya"}));
+    // glab's api_host is the fake server's origin, which the fixture endpoints route to.
+    let api = world.server.url();
     let config = world.file(
         "glab-cli/config.yml",
-        &format!("hosts:\n    live.cred.test:\n        token: {GLAB_TOKEN}\n    stale.cred.test:\n        token: glpat-revokedfixture0123456789\n"),
+        &format!("hosts:\n    live.cred.test:\n        api_host: {api}\n        token: {GLAB_TOKEN}\n    stale.cred.test:\n        api_host: {api}\n        token: glpat-revokedfixture0123456789\n"),
     );
     let options = world.options(Stores {
         glab_config: Some(config),
         ..Stores::default()
     });
-    let live = world.endpoints(ProviderKind::GitLab, "live.cred.test");
+    let fixture = |host: &str| {
+        detect::endpoints_for(
+            ProviderKind::GitLab,
+            &HostKey::new(host),
+            None,
+            &world.env(&[]),
+        )
+    };
+    let live = fixture("live.cred.test");
     let chosen = transport::for_host(&live, &options, &AtomicBool::new(false)).unwrap();
     assert_eq!(
         chosen.kind(),
@@ -385,9 +401,18 @@ fn a_token_is_validated_live_before_use_and_a_rejected_one_falls_back() {
     assert!(matches!(account.state, HostState::Ready { .. }));
 
     // A token the server refuses is not used: glab passthrough instead.
-    let stale = world.endpoints(ProviderKind::GitLab, "stale.cred.test");
+    let stale = fixture("stale.cred.test");
     let chosen = transport::for_host(&stale, &options, &AtomicBool::new(false)).unwrap();
     assert_eq!(chosen.kind(), TransportKind::Cli(Cli::Glab));
+    assert!(
+        world.requests().iter().any(|request| {
+            request["host"] == "stale.cred.test"
+                && request["path"] == "user"
+                && request["transport"] == "http"
+                && request["auth"] == "invalid"
+        }),
+        "the rejected token must have been checked over direct HTTP before falling back"
+    );
     let response = chosen
         .send(
             &HostKey::new("stale.cred.test"),

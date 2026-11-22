@@ -1057,7 +1057,7 @@ impl GitHub {
         let send = |document: &str, variables: Value| {
             let response = ctx.send(&ApiRequest::graphql(document, variables), cancel)?;
             if !response.success() {
-                return Err(crate::http::classify(&ctx.endpoints, &response));
+                return Err(ctx.response_error(&response));
             }
             graphql_data(response.json()?)
         };
@@ -1399,7 +1399,7 @@ impl GitHub {
             request.class = class;
             let response = ctx.send(&request, cancel)?;
             if !response.success() {
-                return Err(crate::http::classify(&ctx.endpoints, &response));
+                return Err(ctx.response_error(&response));
             }
             let data = match graphql_data(response.json()?) {
                 Err(ForgeError::NotFound(_)) => return Ok(Default::default()),
@@ -1536,7 +1536,7 @@ impl GitHub {
                     return Ok(Fetched::NotModified);
                 }
                 if !response.success() {
-                    return Err(crate::http::classify(&ctx.endpoints, &response));
+                    return Err(ctx.response_error(&response));
                 }
                 let etag = response.header("etag").map(str::to_owned);
                 return Ok(Fetched::Payload {
@@ -1768,7 +1768,7 @@ impl GitHub {
                 let (text, truncated) = match response {
                     Ok(response) if response.success() => (response.text(), false),
                     Ok(response) => {
-                        return Err(crate::http::classify(&ctx.endpoints, &response));
+                        return Err(ctx.response_error(&response));
                     }
                     Err(ForgeError::BadResponse(message)) if message.contains("exceeds") => (
                         format!(
@@ -1915,7 +1915,7 @@ impl GitHub {
     ) -> Result<Value, ForgeError> {
         let response = ctx.send(&ApiRequest::graphql(document, variables), cancel)?;
         if !response.success() {
-            return Err(crate::http::classify(&ctx.endpoints, &response));
+            return Err(ctx.response_error(&response));
         }
         let body = response.json()?;
         if let Some(error) = body["errors"].as_array().and_then(|errors| errors.first()) {

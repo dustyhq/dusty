@@ -139,15 +139,22 @@ impl ForgeContext {
         if !self.anonymous() || local || write.porcelain() {
             return Ok(());
         }
-        Err(ForgeError::NotAuthenticated {
+        Err(self.with_sign_in_advice(ForgeError::NotAuthenticated {
             host: self.host().to_string(),
             hint: crate::credential::login_hint(self.endpoints.kind, self.host()),
-        })
+        }))
     }
 
     /// One read that needs a sign-in while anonymous (`read logs`, `see notifications`).
     pub fn sign_in_to(&self, what: &str) -> ForgeError {
-        crate::credential::sign_in_to(what, self.endpoints.kind, self.host())
+        let transport = self.transport();
+        match transport.sign_in_advice() {
+            Some(advice) => ForgeError::Unsupported {
+                capability: "sign_in",
+                reason: format!("Sign in to {what} · {advice}"),
+            },
+            None => crate::credential::sign_in_to(what, self.endpoints.kind, self.host()),
+        }
     }
 
     /// A context whose transport refuses to send; `describe()` and plans use it.
@@ -205,7 +212,9 @@ impl ForgeContext {
         cancel: &AtomicBool,
     ) -> Result<ApiResponse, ForgeError> {
         // Every REST GET revalidates what this process already holds.
-        let conditional = crate::etag::key(&self.endpoints.api_base, request);
+        let conditional = self
+            .account()
+            .and_then(|account| crate::etag::key(account, &self.endpoints.api_base, request));
         let prepared;
         let request = match &conditional {
             Some(key) => {
@@ -224,11 +233,14 @@ impl ForgeContext {
         };
         match &result {
             Ok(response) => {
-                crate::host_state::observe_response(&self.endpoints, &self.transport().kind());
+                crate::host_state::observe_connection_response(
+                    &self.endpoints,
+                    self.transport().as_ref(),
+                );
                 // A 401 or an exhausted quota reached the forge but still says the host is
                 // signed out or paused; item-level and server errors leave the state alone.
                 if matches!(response.status, 401 | 403 | 429) {
-                    let error = crate::http::classify(&self.endpoints, response);
+                    let error = self.response_error(response);
                     crate::host_state::observe_error(&self.endpoints, &error);
                 }
             }
@@ -279,7 +291,19 @@ impl ForgeContext {
         let next = match kind {
             TransportKind::Http { .. } => {
                 transport::evict(&self.endpoints, &self.options);
-                transport::passthrough(&self.endpoints, &self.options).ok()
+                match transport::verified_passthrough(&self.endpoints, &self.options, cancel) {
+                    Ok(cli) => Some(cli),
+                    Err(ForgeError::NotAuthenticated { hint, .. })
+                        if crate::credential::is_sign_in_advice(&hint) =>
+                    {
+                        let error = match result {
+                            Ok(response) => self.response_error(&response),
+                            Err(error) => error,
+                        };
+                        return Err(Self::apply_sign_in_advice(error, &hint));
+                    }
+                    Err(_) => None,
+                }
             }
             TransportKind::Cli(_) => transport::demote(&self.endpoints, &self.options),
             TransportKind::Anonymous => None,
@@ -299,7 +323,7 @@ impl ForgeContext {
     }
 
     fn transport_error(&self, error: TransportError) -> ForgeError {
-        match ForgeError::from(error) {
+        let error = match ForgeError::from(error) {
             ForgeError::NotAuthenticated { host, hint } if host.is_empty() => {
                 ForgeError::NotAuthenticated {
                     host: self.host().to_string(),
@@ -307,7 +331,29 @@ impl ForgeContext {
                 }
             }
             error => error,
+        };
+        self.with_sign_in_advice(error)
+    }
+
+    /// Classify a response without discarding the selected connection's sign-in advice.
+    pub(super) fn response_error(&self, response: &ApiResponse) -> ForgeError {
+        self.with_sign_in_advice(crate::http::classify(&self.endpoints, response))
+    }
+
+    fn with_sign_in_advice(&self, error: ForgeError) -> ForgeError {
+        match self.transport().sign_in_advice() {
+            Some(advice) => Self::apply_sign_in_advice(error, advice),
+            None => error,
         }
+    }
+
+    fn apply_sign_in_advice(mut error: ForgeError, advice: &str) -> ForgeError {
+        match &mut error {
+            ForgeError::NotAuthenticated { hint, .. } => *hint = advice.to_owned(),
+            ForgeError::SignInRequired { hints, .. } => *hints = vec![advice.to_owned()],
+            _ => {}
+        }
+        error
     }
 
     /// Send and require a 2xx, classifying anything else.
@@ -316,7 +362,7 @@ impl ForgeContext {
         if response.success() {
             Ok(response)
         } else {
-            Err(crate::http::classify(&self.endpoints, &response))
+            Err(self.response_error(&response))
         }
     }
 

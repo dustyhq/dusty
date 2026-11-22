@@ -133,6 +133,10 @@ fn activate(screen: &mut GitScreen, label: &str) {
 fn calls() -> Vec<Vec<String>> {
     forge_fake::calls(Path::new(&std::env::var("DUSTY_GITHUB_FIXTURE").unwrap()))
 }
+fn requests() -> Vec<serde_json::Value> {
+    forge_fake::requests(Path::new(&std::env::var("DUSTY_GITHUB_FIXTURE").unwrap()))
+}
+
 fn is_call(args: &[String], prefix: &[&str]) -> bool {
     args.iter()
         .take(prefix.len())
@@ -184,6 +188,18 @@ fn git(root: &Path, args: &[&str]) {
     );
 }
 
+fn set_forge_remote(root: &Path, host: &str, repository: &str) {
+    git(
+        root,
+        &[
+            "remote",
+            "set-url",
+            "origin",
+            &format!("https://{host}/{repository}.git"),
+        ],
+    );
+}
+
 fn fixture_child(name: &str) -> bool {
     if std::env::var_os("DUSTY_GITHUB_CHILD").is_none() {
         let owner = tempfile::tempdir().unwrap();
@@ -209,6 +225,10 @@ fn fixture_child(name: &str) -> bool {
         );
         let output = server
             .configure(&mut Command::new(std::env::current_exe().unwrap()))
+            // Direct HTTP with a token scoped to the fake server: gh passthrough would talk to
+            // api.github.com, not the address Dusty is configured with, so Dusty refuses it.
+            .env("DUSTY_FORGE_TOKEN", forge_fake::FAKE_TOKEN)
+            .env("DUSTY_FORGE_PROVIDER", "github")
             .args(["--exact", name, "--nocapture"])
             .env("DUSTY_GITHUB_CHILD", "1")
             // These tests gate single reads and read the request log's order as the order
@@ -361,13 +381,16 @@ fn native_github_controls_forms_reviews_and_workflow_logs() {
     );
     wait(&mut screen, "Create a branch");
     activate(&mut screen, "Create a branch");
+    wait(&mut screen, "issue-7");
+    // Linked branches are gh-only. gh's API origin does not match the fixture's,
+    // so the action must fail before running the command even though HTTP writes work.
     control(&mut screen, KeyCode::Enter);
     idle(&mut screen);
+    wait(&mut screen, "Not signed in to github.com");
     assert!(
-        calls()
+        !calls()
             .iter()
-            .any(|args| args.starts_with(&["issue".into(), "develop".into()])
-                && args.contains(&"issue-7".into()))
+            .any(|args| is_call(args, &["issue", "develop"]))
     );
     activate(&mut screen, "#9 Native review");
     wait(&mut screen, "into main from feature/native");
@@ -1545,6 +1568,8 @@ fn github_warm_list_empty_missing_and_failed_details_are_truthful_and_scoped() {
         return;
     }
     let state_path = std::env::var("DUSTY_GITHUB_FIXTURE").unwrap();
+    let root = std::env::var("DUSTY_GITHUB_ROOT").unwrap();
+    let root = Path::new(&root);
     // Reopening with the same item number under another repository/host must
     // never borrow a previous workspace's summary or full metadata.
     for (name, host, repo, body, missing, fail) in [
@@ -1566,6 +1591,7 @@ fn github_warm_list_empty_missing_and_failed_details_are_truthful_and_scoped() {
             true,
         ),
     ] {
+        set_forge_remote(root, host, repo);
         std::fs::write(
             &state_path,
             serde_json::json!({
@@ -1578,8 +1604,7 @@ fn github_warm_list_empty_missing_and_failed_details_are_truthful_and_scoped() {
             .to_string(),
         )
         .unwrap();
-        let mut screen =
-            GitScreen::open(Path::new(&std::env::var("DUSTY_GITHUB_ROOT").unwrap())).unwrap();
+        let mut screen = GitScreen::open(root).unwrap();
         goto(&mut screen, 0, 1);
         wait_call(&mut screen, |args| is_call(args, &["issue", "view", "7"]));
         let pending = view(&mut screen);
@@ -1627,15 +1652,31 @@ fn github_warm_list_empty_missing_and_failed_details_are_truthful_and_scoped() {
                 .count(),
             1
         );
-        for args in calls()
-            .into_iter()
-            .filter(|args| is_call(args, &["issue", "list"]) || is_call(args, &["issue", "view"]))
-        {
-            assert!(
-                args.windows(2)
-                    .any(|pair| pair[0] == "--repo" && pair[1] == format!("{host}/{repo}"))
-            );
+        let mut saw_list = false;
+        let mut saw_detail = false;
+        for request in requests() {
+            match request["operation"].as_str() {
+                Some("IssueList") => {
+                    let scope = format!("repo:{repo}");
+                    for field in ["q", "other"] {
+                        if let Some(query) = request["variables"][field].as_str() {
+                            assert!(query.split_whitespace().any(|term| term == scope));
+                        }
+                    }
+                    saw_list = true;
+                }
+                Some("IssueDetail") => {
+                    let (owner, name) = repo.split_once('/').unwrap();
+                    assert_eq!(request["variables"]["owner"], owner);
+                    assert_eq!(request["variables"]["name"], name);
+                    saw_detail = true;
+                }
+                _ => continue,
+            }
+            assert_eq!(request["transport"], "http");
+            assert_eq!(request["host"], host);
         }
+        assert!(saw_list && saw_detail);
         assert_read_only_github_calls();
     }
 }
@@ -1727,8 +1768,10 @@ fn queued_github_write_survives_navigation_and_clears_only_its_own_draft() {
         .to_string(),
     )
     .unwrap();
-    let mut screen =
-        GitScreen::open(Path::new(&std::env::var("DUSTY_GITHUB_ROOT").unwrap())).unwrap();
+    let root = std::env::var("DUSTY_GITHUB_ROOT").unwrap();
+    let root = Path::new(&root);
+    set_forge_remote(root, "git.example.test", "example/demo");
+    let mut screen = GitScreen::open(root).unwrap();
     goto(&mut screen, 0, 1);
     wait(&mut screen, "Write fixture ready");
     key(&mut screen, KeyCode::Char('j'));
@@ -1766,17 +1809,17 @@ fn queued_github_write_survives_navigation_and_clears_only_its_own_draft() {
         is_call(&log[old + 1], &["issue", "comment", "7"]),
         "{log:?}"
     );
-    let write = &log[old + 1];
-    assert!(
-        write
-            .windows(2)
-            .any(|pair| pair[0] == "--repo" && pair[1] == "git.example.test/example/demo")
-    );
-    assert!(
-        write
-            .windows(2)
-            .any(|pair| pair[0] == "--body" && pair[1] == "Scoped queued draft seven")
-    );
+    let log = requests();
+    let writes: Vec<_> = log
+        .iter()
+        .filter(|request| request["method"] == "POST" && request["path"] != "graphql")
+        .collect();
+    assert_eq!(writes.len(), 1);
+    let write = writes[0];
+    assert_eq!(write["transport"], "http");
+    assert_eq!(write["host"], "git.example.test");
+    assert_eq!(write["path"], "repos/example/demo/issues/7/comments");
+    assert_eq!(write["body"]["body"], "Scoped queued draft seven");
     key(&mut screen, KeyCode::Char('C'));
     assert!(view(&mut screen).contains("Independent draft one"));
     assert!(!view(&mut screen).contains("Scoped queued draft seven"));
@@ -2232,6 +2275,7 @@ fn saved_github_views_isolate_host_repository_page_and_refuse_unsafe_local_write
         ("github.com", "other/demo", 1, "author:@me"),
         ("git.example.test", "example/demo", 1, "assignee:@me"),
     ] {
+        set_forge_remote(root, host, repository);
         let fixture = serde_json::json!({"calls":[],"comments":["scope fixture ready"],"host":host,"repository":repository});
         std::fs::write(&state_path, fixture.to_string()).unwrap();
         let mut screen = GitScreen::open(root).unwrap();
@@ -2278,6 +2322,7 @@ fn saved_github_views_isolate_host_repository_page_and_refuse_unsafe_local_write
     }
 
     // Canonical host/repository casing must reopen the original preference.
+    set_forge_remote(root, "GitHub.COM", "Example/Demo");
     std::fs::write(&state_path, serde_json::json!({"calls":[],"comments":[],"host":"GitHub.COM","repository":"Example/Demo"}).to_string()).unwrap();
     let mut screen = GitScreen::open(root).unwrap();
     goto(&mut screen, 0, 1);

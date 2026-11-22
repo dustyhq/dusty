@@ -554,6 +554,11 @@ pub enum Payload {
     Fingerprints(Vec<(u64, Fingerprint)>),
     Timeline(Vec<TimelineEvent>),
     Threads(Vec<ReviewThread>),
+    /// A pull request patch and the head its line numbers describe.
+    Diff {
+        head: String,
+        text: String,
+    },
     Text(String),
     Viewed(Vec<(String, bool)>),
     Workflows(Vec<Workflow>),
@@ -633,13 +638,20 @@ impl std::fmt::Display for ForgeError {
                 cli.name()
             ),
             ForgeError::NotAuthenticated { host, hint } => {
-                if host.is_empty() {
-                    write!(formatter, "Not signed in · run {hint}")
+                formatter.write_str("Not signed in")?;
+                if !host.is_empty() {
+                    write!(formatter, " to {host}")?;
+                }
+                if crate::credential::is_sign_in_advice(hint) {
+                    write!(formatter, " · {hint}")
                 } else {
-                    write!(formatter, "Not signed in to {host} · run {hint}")
+                    write!(formatter, " · run {hint}")
                 }
             }
             ForgeError::SignInRequired { host, hints } => match hints.first() {
+                Some(hint) if crate::credential::is_sign_in_advice(hint) => {
+                    write!(formatter, "{host} requires sign-in · {hint}")
+                }
                 Some(hint) => write!(formatter, "{host} requires sign-in · run {hint}"),
                 None => write!(formatter, "{host} requires sign-in"),
             },

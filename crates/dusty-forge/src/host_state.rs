@@ -150,6 +150,21 @@ impl HostState {
         matches!(self, HostState::Ready { .. } | HostState::Anonymous { .. })
     }
 
+    /// The specific remedy to show instead of the usual sign-in instructions.
+    pub fn sign_in_advice(&self) -> Option<&str> {
+        let hint = match self {
+            HostState::SignedOut { hint, .. } | HostState::Anonymous { hint, .. } => hint,
+            HostState::SignInRequired { hints, .. } => {
+                return hints
+                    .iter()
+                    .map(String::as_str)
+                    .find(|hint| crate::credential::is_sign_in_advice(hint));
+            }
+            _ => return None,
+        };
+        crate::credential::is_sign_in_advice(hint).then_some(hint)
+    }
+
     /// Reads only: every write capability is `Cap::No("Sign in to …")`.
     pub fn read_only(&self) -> bool {
         matches!(self, HostState::Anonymous { .. })
@@ -227,7 +242,11 @@ impl HostState {
                         .max(Duration::from_secs(1));
                     text.push_str(&format!(" · resets in {}", age(left)));
                 }
-                text.push_str(&format!(" · sign in: {hint}"));
+                if crate::credential::is_sign_in_advice(hint) {
+                    text.push_str(" · @ sign in");
+                } else {
+                    text.push_str(&format!(" · sign in: {hint}"));
+                }
                 (
                     format!("○ {text}"),
                     if low { Tone::Warning } else { Tone::Muted },
@@ -345,15 +364,23 @@ impl Account {
                         Tone::Normal
                     },
                 ));
-                lines.push((
-                    format!("  sign in to write: {}", crate::cli::redact(hint)),
-                    Tone::Muted,
-                ));
+                if let Some(advice) = self.state.sign_in_advice() {
+                    lines.extend(advice_lines(advice));
+                } else {
+                    lines.push((
+                        format!("  sign in to write: {}", crate::cli::redact(hint)),
+                        Tone::Muted,
+                    ));
+                }
             }
             HostState::SignInRequired { hints, .. } => {
                 lines.push((format!("○ {host} · {}", self.state.label()), Tone::Warning));
-                for hint in hints {
-                    lines.push((format!("  {}", crate::cli::redact(hint)), Tone::Muted));
+                if let Some(advice) = self.state.sign_in_advice() {
+                    lines.extend(advice_lines(advice));
+                } else {
+                    for hint in hints {
+                        lines.push((format!("  {}", crate::cli::redact(hint)), Tone::Muted));
+                    }
                 }
             }
             state => {
@@ -387,7 +414,9 @@ impl Account {
                     | HostState::Anonymous { .. }
                     | HostState::SignInRequired { .. } => None,
                 };
-                if let Some(instruction) = instruction {
+                if let Some(advice) = state.sign_in_advice() {
+                    lines.extend(advice_lines(advice));
+                } else if let Some(instruction) = instruction {
                     lines.push((
                         format!("  {}", crate::cli::redact(&instruction)),
                         Tone::Muted,
@@ -397,6 +426,12 @@ impl Account {
         }
         lines
     }
+}
+
+fn advice_lines(advice: &str) -> impl Iterator<Item = (String, Tone)> + '_ {
+    advice
+        .lines()
+        .map(|line| (format!("  {}", crate::cli::redact(line)), Tone::Muted))
 }
 
 fn registry() -> &'static Mutex<BTreeMap<HostKey, Account>> {
@@ -459,7 +494,14 @@ pub fn observe_transport(endpoints: &Endpoints, transport: TransportKind) {
 }
 
 /// An anonymous state seeded from what the rate limiter last saw for anonymous requests.
-fn anonymous_state(endpoints: &Endpoints) -> HostState {
+fn anonymous_hint(endpoints: &Endpoints, advice: Option<&str>) -> String {
+    advice.map_or_else(
+        || crate::credential::anonymous_hint(endpoints.kind, &endpoints.host),
+        str::to_owned,
+    )
+}
+
+fn anonymous_state(endpoints: &Endpoints, advice: Option<&str>) -> HostState {
     let snapshot = crate::ratelimit::global().snapshot(crate::ratelimit::Fingerprint::anonymous(
         &endpoints.api_base,
     ));
@@ -468,13 +510,21 @@ fn anonymous_state(endpoints: &Endpoints) -> HostState {
         remaining: quota.remaining,
         limit: quota.limit,
         reset: None,
-        hint: crate::credential::anonymous_hint(endpoints.kind, &endpoints.host),
+        hint: anonymous_hint(endpoints, advice),
     }
 }
 
 /// An anonymous response's quota headers, for the chip (`52/60 requests left`). GitHub's
 /// separate search quota is left out.
 pub fn observe_quota(endpoints: &Endpoints, response: &crate::transport::ApiResponse) {
+    observe_quota_with_advice(endpoints, response, None);
+}
+
+pub(crate) fn observe_quota_with_advice(
+    endpoints: &Endpoints,
+    response: &crate::transport::ApiResponse,
+    advice: Option<&str>,
+) {
     if response
         .header("x-ratelimit-resource")
         .is_some_and(|resource| resource.contains("search"))
@@ -490,7 +540,7 @@ pub fn observe_quota(endpoints: &Endpoints, response: &crate::transport::ApiResp
             account.state,
             HostState::Unreachable { .. } | HostState::RateLimited { .. } | HostState::Unknown(_)
         ) {
-            account.state = anonymous_state(endpoints);
+            account.state = anonymous_state(endpoints, advice);
         }
         if let HostState::Anonymous {
             remaining,
@@ -508,10 +558,15 @@ pub fn observe_quota(endpoints: &Endpoints, response: &crate::transport::ApiResp
     });
 }
 
-fn endpoints_tea_login(endpoints: &Endpoints) -> Option<CredentialSource> {
-    let stores = crate::credential::Stores::from_env(&crate::credential::Env::process());
-    let login = crate::credential::tea_login(stores.tea_config.as_deref()?, &endpoints.host)?;
-    Some(CredentialSource::TeaConfig(login.name))
+pub(crate) fn observe_tea_login(endpoints: &Endpoints, login: &crate::credential::TeaLogin) {
+    update(&endpoints.host, Some(endpoints.kind), |account| {
+        account.source = Some(CredentialSource::TeaConfig(login.name.clone()));
+        account.login = login.user.clone();
+        account.state = HostState::Ready {
+            transport: TransportKind::Cli(Cli::Tea),
+            account: account.login.clone(),
+        };
+    });
 }
 
 /// An error from connecting or sending; item-level errors leave the host's state alone.
@@ -544,6 +599,17 @@ fn keeps_anonymous(current: &HostState, next: &HostState) -> bool {
 
 /// A response arrived: a host that was unreachable or paused is back.
 pub fn observe_response(endpoints: &Endpoints, transport: &TransportKind) {
+    observe_response_kind(endpoints, transport.clone(), None);
+}
+
+pub(crate) fn observe_connection_response(
+    endpoints: &Endpoints,
+    transport: &dyn crate::transport::Transport,
+) {
+    observe_response_kind(endpoints, transport.kind(), transport.sign_in_advice());
+}
+
+fn observe_response_kind(endpoints: &Endpoints, transport: TransportKind, advice: Option<&str>) {
     let stale = registry()
         .lock()
         .unwrap_or_else(|error| error.into_inner())
@@ -557,7 +623,7 @@ pub fn observe_response(endpoints: &Endpoints, transport: &TransportKind) {
             )
         });
     if stale {
-        observe_transport(endpoints, transport.clone());
+        observe_transport_kind(endpoints, transport, advice);
     }
 }
 
@@ -596,6 +662,166 @@ pub fn forget(host: &HostKey) {
         .remove(host);
 }
 
+#[derive(Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+struct RememberedAccount {
+    authority: String,
+    // None means an observed anonymous transport, not an unverified sign-in.
+    login: Option<String>,
+    provider: String,
+}
+
+fn account_state_directory(host: &HostKey) -> Option<std::path::PathBuf> {
+    if crate::sandbox::active() {
+        return None;
+    }
+    let state = crate::detect::forge_state_directory(&crate::credential::Env::process())?;
+    Some(crate::cache::host_directory(&state.join("accounts"), host))
+}
+
+fn remembered_path(host: &HostKey) -> Option<std::path::PathBuf> {
+    Some(account_state_directory(host)?.join("last.json"))
+}
+
+/// Which session may use pre-namespace local drafts and notification marks.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LegacyAccess {
+    /// No login has ever been verified here. An unverified sign-in uses the old locations.
+    Unclaimed,
+    /// This is the first verified login, which owns the old local data.
+    Owner,
+    /// This session cannot use the old local data.
+    Blocked,
+}
+
+fn legacy_access_at(
+    path: &std::path::Path,
+    host: &HostKey,
+    account: Option<&AccountNamespace>,
+) -> LegacyAccess {
+    match std::fs::read_to_string(path) {
+        Ok(owner)
+            if account.is_some_and(|account| {
+                account.host() == host && account.login() == Some(owner.as_str())
+            }) =>
+        {
+            LegacyAccess::Owner
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && account.is_none() => {
+            LegacyAccess::Unclaimed
+        }
+        _ => LegacyAccess::Blocked,
+    }
+}
+
+/// The legacy owner is fixed by the first live verification, not by a warm cache paint.
+pub fn legacy_access(host: &HostKey, account: Option<&AccountNamespace>) -> LegacyAccess {
+    account_state_directory(host).map_or(LegacyAccess::Blocked, |directory| {
+        legacy_access_at(&directory.join("legacy-owner"), host, account)
+    })
+}
+
+fn claim_legacy(path: &std::path::Path, login: &str) -> std::io::Result<()> {
+    if path.exists() {
+        return Ok(());
+    }
+    let Some(parent) = path.parent() else {
+        return Ok(());
+    };
+    std::fs::create_dir_all(parent)?;
+    let mut file = tempfile::NamedTempFile::new_in(parent)?;
+    std::io::Write::write_all(&mut file, login.as_bytes())?;
+    // Never overwrite another process's claim. Readers only see complete logins.
+    match file.persist_noclobber(path) {
+        Ok(_) => Ok(()),
+        Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(error) => Err(error.error),
+    }
+}
+
+fn read_remembered(path: &std::path::Path) -> Option<RememberedAccount> {
+    serde_json::from_slice(&std::fs::read(path).ok()?).ok()
+}
+
+/// The last observed namespace for a host, usable for an offline or first paint only.
+/// This is not evidence about credentials currently available to the worker.
+pub fn remembered_account(host: &HostKey) -> Option<(AccountNamespace, ProviderKind)> {
+    let saved = read_remembered(&remembered_path(host)?)?;
+    if saved.authority != host.to_string() {
+        return None;
+    }
+    let kind = crate::detect::parse_kind(&saved.provider)?;
+    let account = match saved.login {
+        Some(login) => AccountNamespace::signed_in(host.clone(), &login)?,
+        None => AccountNamespace::anonymous(host.clone()),
+    };
+    Some((account, kind))
+}
+
+pub(crate) fn remember_account(account: &AccountNamespace, kind: ProviderKind) {
+    let Some(path) = remembered_path(account.host()) else {
+        return;
+    };
+    if let Some(login) = account.login() {
+        let _ = claim_legacy(&path.with_file_name("legacy-owner"), login);
+    }
+    let record = RememberedAccount {
+        authority: account.host().to_string(),
+        login: account.login().map(str::to_owned),
+        provider: crate::detect::kind_word(kind).into(),
+    };
+    let _ = (|| -> std::io::Result<()> {
+        if let Some(previous) = read_remembered(&path)
+            && (previous == record || record.login.is_none() && previous.login.is_some())
+        {
+            // An anonymous fallback doesn't establish a different login.
+            return Ok(());
+        }
+        let Some(directory) = path.parent() else {
+            return Ok(());
+        };
+        std::fs::create_dir_all(directory)?;
+        let mut file = tempfile::NamedTempFile::new_in(directory)?;
+        serde_json::to_writer(&mut file, &record)?;
+        file.persist(path).map_err(|error| error.error)?;
+        Ok(())
+    })();
+}
+
+#[cfg(test)]
+#[test]
+fn legacy_claim_never_changes_owner_and_is_per_authority() {
+    let state = tempfile::tempdir().unwrap();
+    let host = HostKey::new("forge.test:8443");
+    let other_port = HostKey::new("forge.test:9443");
+    let path_for = |host| crate::cache::host_directory(state.path(), host).join("legacy-owner");
+    let path = path_for(&host);
+    let alice = AccountNamespace::signed_in(host.clone(), "alice").unwrap();
+    let bob = AccountNamespace::signed_in(host.clone(), "bob").unwrap();
+    assert_eq!(
+        legacy_access_at(&path, &host, None),
+        LegacyAccess::Unclaimed
+    );
+    assert_eq!(
+        legacy_access_at(&path, &host, Some(&alice)),
+        LegacyAccess::Blocked
+    );
+    claim_legacy(&path, "alice").unwrap();
+    claim_legacy(&path, "bob").unwrap();
+    assert_eq!(
+        legacy_access_at(&path, &host, Some(&alice)),
+        LegacyAccess::Owner
+    );
+    assert_eq!(
+        legacy_access_at(&path, &host, Some(&bob)),
+        LegacyAccess::Blocked
+    );
+    assert_eq!(legacy_access_at(&path, &host, None), LegacyAccess::Blocked);
+    assert_eq!(
+        legacy_access_at(&path_for(&other_port), &other_port, None),
+        LegacyAccess::Unclaimed
+    );
+}
+
 /// `r` in the accounts popover: forget credentials, transport choices, detection and pauses so
 /// the next request discovers everything again.
 pub fn recheck() {
@@ -603,6 +829,10 @@ pub fn recheck() {
     crate::transport::forget_selections();
     crate::detect::forget();
     crate::ratelimit::global().clear();
+    registry()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .clear();
 }
 
 #[cfg(test)]

@@ -102,7 +102,10 @@ pub fn connect_to(
     if detected.sign_in_required && transport.kind().anonymous() {
         let error = ForgeError::SignInRequired {
             host: endpoints.host.to_string(),
-            hints: crate::credential::sign_in_hints(endpoints.kind, &endpoints.host),
+            hints: transport.sign_in_advice().map_or_else(
+                || crate::credential::sign_in_hints(endpoints.kind, &endpoints.host),
+                |advice| vec![advice.to_owned()],
+            ),
         };
         crate::host_state::observe_error(&endpoints, &error);
         return Err(error);
@@ -195,7 +198,7 @@ pub fn fetch_through(
     if let (Err(error @ ForgeError::NotFound(_)), Some(cache)) = (&result, &cache) {
         cache.store_since(
             &key.missing(),
-            error.to_string(),
+            redact(&error.to_string()),
             cache::MISSING_TTL,
             None,
             None,
@@ -282,18 +285,39 @@ pub fn write_through(
         _ => target.clone(),
     };
     let (provider, ctx) = connect(root, &target, commands.cancelled)?;
-    // Anonymous: refused before anything is sent, and before a PR's branch is pushed.
+    dispatch_write(
+        provider.as_ref(),
+        &ctx,
+        write,
+        confirmation,
+        commands.cancelled,
+        |request| super::pull_request::push_reviewed(commands, root, request).map_err(failed),
+    )
+}
+
+fn dispatch_write(
+    provider: &dyn Provider,
+    ctx: &ForgeContext,
+    write: &Write,
+    confirmation: Confirmation<'_>,
+    cancel: &AtomicBool,
+    push_reviewed: impl FnOnce(&super::pull_request::CreatePullRequest) -> Result<(), ForgeError>,
+) -> Result<Receipt, ForgeError> {
+    // Compare before either a provider write or a PR's prerequisite push.
+    if let Confirmation::Captured(expected) = confirmation {
+        check_confirmation(expected, ctx.account())?;
+    }
     ctx.require_credential(write, local_write(provider.kind(), write))?;
     let pushed = match write {
         Write::CreatePullRequest(request) => {
-            super::pull_request::push_reviewed(commands, root, request).map_err(failed)?;
+            push_reviewed(request)?;
             request.push.is_some()
         }
         _ => false,
     };
-    let written = provider.write(&ctx, write, commands.cancelled);
+    let written = provider.write(ctx, write, cancel);
     if let Ok(receipt) = &written {
-        invalidate(&ctx, &receipt.invalidates);
+        invalidate(ctx, &receipt.invalidates);
         if let Write::CreatePullRequest(request) = write {
             crate::template::set_merge_base(root, &request.head_branch, &request.base_branch);
         }
@@ -304,6 +328,22 @@ pub fn write_through(
         }
         error => error,
     })
+}
+
+pub(super) fn check_confirmation(
+    expected: Option<&AccountNamespace>,
+    connected: Option<&AccountNamespace>,
+) -> Result<(), ForgeError> {
+    match (expected, connected) {
+        (None, _) => Ok(()),
+        (Some(expected), Some(connected)) if expected == connected => Ok(()),
+        (Some(expected), Some(connected))
+            if expected.login().is_some() && connected.login().is_some() =>
+        {
+            Err(ForgeError::Failed(ACCOUNT_CHANGED.into()))
+        }
+        (Some(_), _) => Err(ForgeError::Failed(UNVERIFIED_SIGN_IN.into())),
+    }
 }
 
 /// Writes a provider serves without the forge's write API: viewed files kept on this computer

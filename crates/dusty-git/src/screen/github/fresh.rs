@@ -172,11 +172,22 @@ impl Fresh {
         self.cache.is_some()
     }
 
-    /// A different repository: nothing known about the old one applies.
-    pub(super) fn forget(&mut self) {
-        self.meta.clear();
+    /// Abandon pending checks without dropping any cached data.
+    pub(super) fn abandon_checks(&mut self) {
+        if self.warm_active.take().is_some() {
+            self.warm.cancel();
+        }
         self.implicit.clear();
         self.warm_queue.clear();
+        self.warm_disk.clear();
+    }
+
+    /// A different repository: nothing known about the old one applies.
+    pub(super) fn forget(&mut self) {
+        self.abandon_checks();
+        self.meta.clear();
+        self.remote = None;
+        self.rows = Default::default();
         self.prefetched.clear();
         self.flash.clear();
         self.live = None;
@@ -314,7 +325,14 @@ impl Workspace {
                 (host, Some(repo))
             }
         };
-        Some(CacheKey::for_read(&host, repo.as_deref(), read))
+        let host = HostKey::new(&host);
+        if self.account.is_none() && !self.skip_remembered_account {
+            self.skip_remembered_account = true;
+            self.account =
+                crate::forge::host_state::remembered_account(&host).map(|(account, _)| account);
+        }
+        let account = self.account.as_ref()?;
+        (host == *account.host()).then(|| CacheKey::for_read(account, repo.as_deref(), read))
     }
 
     /// Fill a memory miss from disk within this turn's budget (`load_disk_soon`). Returns
@@ -462,16 +480,8 @@ impl Workspace {
         {
             return false;
         }
-        if *key == Key::Repository {
-            let host = reqwest::Url::parse(string(&value, "url"))
-                .ok()
-                .and_then(|url| url.host_str().map(str::to_owned))
-                .unwrap_or_default();
-            let name = string(&value, "nameWithOwner").to_owned();
-            if name.is_empty() {
-                return false;
-            }
-            self.change_repository(name, host);
+        if *key == Key::Repository && !self.apply_repository(&value, Some(routing_host)) {
+            return false;
         }
         if let Read::List { page, .. } | Read::Search { page, .. } = read {
             self.list_limits.insert(key.clone(), page.per_page as usize);
@@ -653,15 +663,6 @@ impl Workspace {
             }
             Err(error) => Err(error),
         };
-        if request.key == Key::Repository
-            && let Ok(reply) = &parsed
-        {
-            let host = reqwest::Url::parse(string(&reply.value, "url"))
-                .ok()
-                .and_then(|url| url.host_str().map(str::to_owned))
-                .unwrap_or_default();
-            self.change_repository(string(&reply.value, "nameWithOwner").into(), host);
-        }
         if background && parsed.is_err() && !cached {
             // A failed warm-up leaves the key to the interactive worker.
             return;
@@ -708,7 +709,10 @@ impl Workspace {
                 }
             }
             Ok(mut reply) => {
-                let unchanged = cached && self.value(&request.key) == Some(&reply.value);
+                let unchanged = cached
+                    && self.value(&request.key) == Some(&reply.value)
+                    && (!matches!(request.key, Key::Diff(_))
+                        || self.raw(&request.key) == Some(reply.text.as_str()));
                 if !unchanged {
                     if implicit
                         && cached
@@ -1399,6 +1403,136 @@ impl Workspace {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn repository_metadata_keeps_the_remote_port_on_disk_and_wire() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = git2::Repository::init(root.path()).unwrap();
+        repo.remote("origin", "https://git.example.test:8443/o/r")
+            .unwrap();
+        let target = ForgeTarget::remote();
+        let (host, repo) = target.resolve(root.path()).unwrap();
+        let read = Read::Repository;
+        let account = crate::forge::transport::AccountNamespace::anonymous(host.clone());
+        let key = CacheKey::new(&account, repo.as_ref(), &read);
+        for url in [
+            "https://git.example.test:8443/o/r",
+            "https://git.example.test/o/r",
+            "https://public.example.test/o/r",
+        ] {
+            for from_disk in [false, true] {
+                let mut workspace = Workspace::new(root.path().into());
+                workspace.fresh = Fresh::with(None);
+                let payload = Payload::Repo(crate::forge::model::Repo {
+                    full_name: "o/r".into(),
+                    web_url: url.into(),
+                    ..Default::default()
+                });
+                if from_disk {
+                    let envelope = cache::Envelope::new(&key, payload, Duration::from_secs(60));
+                    assert!(workspace.apply_disk(
+                        &Key::Repository,
+                        &read,
+                        &host,
+                        super::super::disk::Found::Payload(envelope),
+                    ));
+                } else {
+                    workspace.apply(
+                        Request {
+                            key: Key::Repository,
+                            op: Op::Read(target.clone(), read.clone()),
+                        },
+                        Some(host.clone()),
+                        Ok(Fetched::payload(payload)),
+                        false,
+                    );
+                }
+
+                let expected = ForgeTarget::repository("git.example.test:8443", "o/r");
+                assert_eq!(workspace.target(), expected);
+                assert_eq!(workspace.target().resolve(root.path()).unwrap().0, host);
+                assert_eq!(
+                    string(workspace.value(&Key::Repository).unwrap(), "url"),
+                    url
+                );
+                workspace.page = 1;
+                let list = workspace.list_read(LIST_BATCH);
+                for op in [
+                    workspace.read(Read::Repository),
+                    workspace.read(Read::Issue(1)),
+                    list,
+                ] {
+                    let Op::Read(target, _) = op else {
+                        panic!("expected a forge read");
+                    };
+                    assert_eq!(target, expected);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn first_list_paint_only_looks_up_the_verified_account() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = Arc::new(Cache::at(root.path()));
+        let host = crate::forge::transport::HostKey::new("forge.test:8443");
+        let a =
+            crate::forge::transport::AccountNamespace::signed_in(host.clone(), "alice").unwrap();
+        let b = crate::forge::transport::AccountNamespace::signed_in(host.clone(), "bob").unwrap();
+        let public = crate::forge::transport::AccountNamespace::anonymous(host.clone());
+        let mut first = Workspace::new(root.path().into());
+        first.host = host.to_string();
+        first.repo = "o/r".into();
+        first.page = 1;
+        let key = first.list_key();
+        let op = first.list_read(LIST_BATCH);
+        let Op::Read(_, read) = &op else {
+            panic!("list read")
+        };
+        let payload = Payload::Rows(crate::forge::request::PageOf {
+            items: vec![crate::forge::model::ItemRow {
+                number: 7,
+                title: "Alice's private issue".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        let ttl = Duration::from_secs(60);
+        assert!(cache.store(
+            &CacheKey::for_read(&a, Some("o/r"), read),
+            &payload,
+            ttl,
+            None,
+            None
+        ));
+        let mut public_payload = payload.clone();
+        if let Payload::Rows(rows) = &mut public_payload {
+            rows.items[0].title = "Public issue".into();
+        }
+        assert!(cache.store(
+            &CacheKey::for_read(&public, Some("o/r"), read),
+            public_payload,
+            ttl,
+            None,
+            None
+        ));
+        drop(first);
+
+        let mut restarted = Workspace::new(root.path().into());
+        restarted.fresh = Fresh::with(Some(Arc::new(Cache::at(root.path()))));
+        restarted.host = host.to_string();
+        restarted.repo = "o/r".into();
+        restarted.page = 1;
+        assert!(!restarted.load_disk_now(&key, &op));
+        restarted.account = Some(b);
+        assert!(!restarted.load_disk_now(&key, &op));
+        assert!(restarted.value(&key).is_none());
+        restarted.reset_account(Some(public));
+        assert!(restarted.load_disk_now(&key, &op));
+        let rendered = restarted.value(&key).unwrap().to_string();
+        assert!(rendered.contains("Public issue"));
+        assert!(!rendered.contains("Alice's private issue"));
+    }
 
     #[test]
     fn local_search_understands_common_qualifiers() {

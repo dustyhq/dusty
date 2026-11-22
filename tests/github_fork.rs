@@ -115,6 +115,9 @@ fn fork_submission_reviews_exact_targets_and_recovers_after_push() {
         }}).to_string()).unwrap();
         let output = server
             .configure(&mut Command::new(std::env::current_exe().unwrap()))
+            // Direct HTTP with a token scoped to the fake server: gh passthrough would talk to
+            // api.github.com, not the address Dusty is configured with, so Dusty refuses it.
+            .env("DUSTY_FORGE_TOKEN", forge_fake::FAKE_TOKEN)
             .args([
                 "--exact",
                 "fork_submission_reviews_exact_targets_and_recovers_after_push",

@@ -15,7 +15,7 @@ use crate::transport::TransportError;
 use crate::transport::TransportKind;
 use std::collections::BTreeMap;
 use std::ffi::OsString;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
@@ -27,6 +27,10 @@ pub struct CliTransport {
     executable: PathBuf,
     /// tea login / glab alias for passthrough (`[forge.hosts.H].login`, F2).
     login: Option<String>,
+    api_origin: Option<String>,
+    sign_in_advice: Option<&'static str>,
+    token: Option<crate::credential::Secret>,
+    verified_login: Option<String>,
 }
 
 impl CliTransport {
@@ -35,11 +39,112 @@ impl CliTransport {
             cli,
             executable,
             login,
+            api_origin: None,
+            sign_in_advice: None,
+            token: None,
+            verified_login: None,
         }
+    }
+
+    /// Keep a CLI subprocess from following a different active sign-in after verification.
+    /// Tea already takes an explicit named login in its arguments.
+    pub(crate) fn pin_sign_in(
+        &mut self,
+        endpoints: &crate::transport::Endpoints,
+        options: &crate::transport::ConnectOptions,
+        cancel: &AtomicBool,
+    ) {
+        self.token = match self.cli {
+            Cli::Gh => crate::credential::gh_auth_token(&self.executable, &endpoints.host, cancel)
+                .ok()
+                .flatten(),
+            Cli::Glab => crate::credential::glab_saved_token(endpoints, options, cancel),
+            Cli::Tea => None,
+        };
+    }
+
+    pub(crate) fn check_viewer(
+        &mut self,
+        endpoints: &crate::transport::Endpoints,
+        cancel: &AtomicBool,
+    ) -> Result<(), ForgeError> {
+        let response = self.send(&endpoints.host, &ApiRequest::get("user"), cancel)?;
+        if !response.success() {
+            return Err(crate::http::classify(endpoints, &response));
+        }
+        if self.token.is_some() || (self.cli == Cli::Tea && self.login.is_some()) {
+            let viewer = response.json()?;
+            self.verified_login = viewer["login"]
+                .as_str()
+                .or_else(|| viewer["username"].as_str())
+                .map(str::trim)
+                .filter(|login| !login.is_empty())
+                .map(str::to_owned);
+        }
+        Ok(())
+    }
+
+    fn sign_in_env(&self) -> BTreeMap<String, OsString> {
+        let mut env = stored_sign_in_env();
+        if let Some(token) = &self.token {
+            let names = match self.cli {
+                Cli::Gh => &["GH_TOKEN", "GH_ENTERPRISE_TOKEN"][..],
+                Cli::Glab => &["GITLAB_TOKEN"][..],
+                Cli::Tea => &[][..],
+            };
+            for &name in names {
+                env.insert(name.into(), token.expose().into());
+            }
+        }
+        env
+    }
+
+    /// Run a porcelain change under the same pinned sign-in used for API verification.
+    pub(crate) fn change(
+        &self,
+        cwd: &Path,
+        arguments: &[&str],
+        cancel: &AtomicBool,
+    ) -> Result<(), ForgeError> {
+        let output = run_process(
+            &ProcessSpec {
+                program: self.executable.clone(),
+                args: arguments.iter().map(|arg| (*arg).to_owned()).collect(),
+                cwd: cwd.to_path_buf(),
+                env: self.sign_in_env(),
+                stdin: None,
+                timeout: Duration::from_secs(60),
+                cap: 16 * 1024 * 1024,
+            },
+            cancel,
+        )?;
+        if output.code == Some(0) {
+            Ok(())
+        } else {
+            Err(classify(
+                self.cli,
+                &String::from_utf8_lossy(&output.stderr),
+                output.code,
+            ))
+        }
+    }
+
+    pub(crate) fn with_connection_details(
+        mut self,
+        api_origin: String,
+        sign_in_advice: Option<&'static str>,
+    ) -> Self {
+        self.api_origin = Some(api_origin);
+        self.sign_in_advice = sign_in_advice;
+        self
     }
 }
 
 impl Transport for CliTransport {
+    fn verified_login(&self) -> Option<&str> {
+        self.verified_login.as_deref()
+    }
+
     fn kind(&self) -> TransportKind {
         TransportKind::Cli(self.cli)
     }
@@ -50,6 +155,18 @@ impl Transport for CliTransport {
         request: &ApiRequest,
         cancel: &AtomicBool,
     ) -> Result<ApiResponse, TransportError> {
+        // The CLI owns its sign-in. Only give it relative API paths so it can't attach
+        // that sign-in to a URL supplied by a server (for example a pagination link).
+        if let Target::Absolute(url) = &request.target {
+            let origin = crate::transport::api_origin(url);
+            let message = match (origin.as_deref(), self.api_origin.as_deref()) {
+                (Some(actual), Some(expected)) if actual != expected => {
+                    "Dusty stopped loading because the next page is at a different address."
+                }
+                _ => "Dusty couldn't open the link to the next page.",
+            };
+            return Err(TransportError::Insecure(message.into()));
+        }
         let fingerprint = crate::ratelimit::Fingerprint::cli(host, self.cli, &self.executable);
         let limiter = crate::ratelimit::global();
         limiter
@@ -70,7 +187,7 @@ impl Transport for CliTransport {
                 None
             }
         };
-        let mut env = child_env();
+        let mut env = self.sign_in_env();
         env.extend(extra.into_iter().map(|(key, value)| (key, value.into())));
         let spec = ProcessSpec {
             program: self.executable.clone(),
@@ -90,7 +207,7 @@ impl Transport for CliTransport {
             return Ok(response);
         }
         let stderr = redact(&String::from_utf8_lossy(&output.stderr));
-        if let ForgeError::RateLimited { .. } = classify(self.cli, &stderr, output.code) {
+        if let ForgeError::RateLimited { .. } = classify_redacted(self.cli, &stderr, output.code) {
             let until = limiter.trip(fingerprint, None, Instant::now());
             return Err(TransportError::RateLimited { until });
         }
@@ -103,6 +220,10 @@ impl Transport for CliTransport {
 
     fn graphql_batching(&self) -> bool {
         self.cli != Cli::Tea
+    }
+
+    fn sign_in_advice(&self) -> Option<&str> {
+        self.sign_in_advice
     }
 }
 
@@ -237,8 +358,14 @@ fn split_head(output: &[u8]) -> Option<(&[u8], &[u8])> {
 
 /// A CLI failure without an HTTP response (`gh: Not Found (HTTP 404)`, glab `404 Not Found`).
 pub fn classify(cli: Cli, stderr: &str, code: Option<i32>) -> ForgeError {
-    let text = redact(stderr);
-    let lower = text.to_ascii_lowercase();
+    classify_redacted(cli, &redact(stderr), code)
+}
+
+fn classify_redacted(cli: Cli, text: &str, code: Option<i32>) -> ForgeError {
+    // Repository and host names are diagnostic context, not cues such as "abuse".
+    let lower = diagnostic_targets()
+        .replace_all(text, " ")
+        .to_ascii_lowercase();
     let line = text
         .lines()
         .map(str::trim)
@@ -299,11 +426,6 @@ fn redaction_patterns() -> &'static [(regex::Regex, &'static str)] {
                 r#"(?i)((?:\b|_)token"?\s*[:=]\s*"?)[A-Za-z0-9_\-\.]{16,}"#,
                 "${1}<redacted>",
             ),
-            // Credentials in URLs: `https://user:secret@host`.
-            (
-                r"(?i)(\b[a-z][a-z0-9+.\-]*://[^/\s:@]+:)[^@\s/]+@",
-                "${1}<redacted>@",
-            ),
         ]
         .into_iter()
         .map(|(pattern, replacement)| {
@@ -342,9 +464,36 @@ pub fn remember_secret(token: &str) {
     secrets.push(token.to_owned());
 }
 
-/// Strip anything token-shaped before text reaches a notice, the command log or a test log.
+fn diagnostic_targets() -> &'static regex::Regex {
+    static TARGETS: OnceLock<regex::Regex> = OnceLock::new();
+    TARGETS.get_or_init(|| {
+        // A relative target cannot consume a key before an absolute URL (e.g. url=https://...).
+        regex::Regex::new(
+            r#"(?i)(?:(?<prefix>\b[a-z][a-z0-9+.-]*://|//)|/|[a-z0-9_.%~-][^\s<>"'=:?#]*[?#])(?:<redacted>|[^\s<>"'])+"#,
+        )
+        .expect("diagnostic URL pattern")
+    })
+}
+
+/// Keep the diagnostic address, without userinfo, query, or fragment.
+fn redact_urls(text: &str) -> std::borrow::Cow<'_, str> {
+    diagnostic_targets().replace_all(text, |captures: &regex::Captures<'_>| {
+        let address = captures[0].split(['?', '#']).next().unwrap_or_default();
+        if let Some(prefix) = captures.name("prefix") {
+            let start = prefix.as_str().len();
+            let rest = &address[start..];
+            let authority = rest.split('/').next().unwrap_or_default();
+            if let Some(at) = authority.rfind('@') {
+                return format!("{}{}", &address[..start], &rest[at + 1..]);
+            }
+        }
+        address.to_owned()
+    })
+}
+
+/// Strip sensitive URLs and token values before text reaches a notice, cache or command output.
 pub fn redact(text: &str) -> String {
-    let mut text = text.to_owned();
+    let mut text = redact_urls(text).into_owned();
     for secret in remembered()
         .lock()
         .unwrap_or_else(|error| error.into_inner())
@@ -468,6 +617,28 @@ pub fn child_env() -> BTreeMap<String, OsString> {
         environment.insert(key.into(), value.into());
     }
     environment
+}
+
+/// Environment for commands using the CLI's saved sign-ins, not env tokens whose scope
+/// the CLI may interpret differently from Dusty (including in an auth status command).
+pub(crate) fn stored_sign_in_env() -> BTreeMap<String, OsString> {
+    let mut env = child_env();
+    for name in [
+        "DUSTY_FORGE_TOKEN",
+        "GH_TOKEN",
+        "GITHUB_TOKEN",
+        "GH_ENTERPRISE_TOKEN",
+        "GITHUB_ENTERPRISE_TOKEN",
+        "GITLAB_TOKEN",
+        "GLAB_TOKEN",
+        "OAUTH_TOKEN",
+        "GITEA_SERVER_TOKEN",
+        "GITEA_TOKEN",
+        "FORGEJO_TOKEN",
+    ] {
+        env.remove(name);
+    }
+    env
 }
 
 pub struct ProcessSpec {
@@ -682,6 +853,46 @@ mod tests {
             assert!(!redacted.contains(leak), "{leak} leaked: {redacted}");
         }
         assert_eq!(redact("nothing to hide"), "nothing to hide");
+    }
+
+    #[test]
+    fn cli_errors_keep_only_the_safe_parts_of_request_addresses() {
+        let error = classify(
+            Cli::Gh,
+            "expired https://fixture-user:fixture-pass@blob.test:8443/log/42?sig=fixture-outer#fixture-fragment or /logs/42?sig=fixture-inner (HTTP 404)",
+            Some(1),
+        );
+        assert_eq!(
+            error.to_string(),
+            "Not found · gh: expired https://blob.test:8443/log/42 or /logs/42 (HTTP 404)"
+        );
+        assert_eq!(
+            redact("use https://git.example.test/tools/code/api/v4"),
+            "use https://git.example.test/tools/code/api/v4"
+        );
+        assert_eq!(
+            redact("denied: https://fixture-user@blob.test/log"),
+            "denied: https://blob.test/log"
+        );
+        // Older cached errors may have already masked just the password.
+        assert_eq!(
+            redact("denied: https://fixture-user:<redacted>@blob.test/log"),
+            "denied: https://blob.test/log"
+        );
+    }
+
+    #[test]
+    fn an_abuse_report_repository_name_does_not_trip_the_rate_limiter() {
+        let safe = "https://api.example.test/repos/o/abuse-reports";
+        let error = classify(
+            Cli::Gh,
+            &format!(r#"Get "{safe}?sig=fixture-signature": connection refused"#),
+            Some(1),
+        );
+        assert_eq!(
+            error,
+            ForgeError::Network(format!(r#"gh: Get "{safe}": connection refused"#))
+        );
     }
 
     #[test]

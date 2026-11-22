@@ -167,6 +167,7 @@ impl ForgeServer {
         command
             .env("DUSTY_FORGE_API_BASE", self.api_base())
             .env("DUSTY_FORGE_ORIGIN", self.origin())
+            .env("DUSTY_FORGE_HOST", self.url())
             .env("DUSTY_FORGE_STATE_DIR", self.state_dir())
     }
 }

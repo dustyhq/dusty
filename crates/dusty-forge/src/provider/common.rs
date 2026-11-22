@@ -151,10 +151,16 @@ pub(super) fn repos_path(ctx: &ForgeContext, tail: &str) -> Result<String, Forge
 
 /// A `Link` URL as a path under the API base when it is one (passthrough needs paths).
 pub(super) fn link_target(ctx: &ForgeContext, url: &str) -> Target {
-    match url.strip_prefix(&format!("{}/", ctx.endpoints.api_base)) {
-        Some(path) => Target::Rest(path.to_owned()),
-        None => Target::Absolute(url.to_owned()),
-    }
+    let under_base = || {
+        let base = reqwest::Url::parse(&ctx.endpoints.api_base).ok()?;
+        let next = reqwest::Url::parse(url).ok()?;
+        let prefix = format!("{}/", base.as_str().trim_end_matches('/'));
+        let path = next.as_str().strip_prefix(&prefix)?;
+        // A CLI accepts absolute URLs too; never give it an address disguised as a path.
+        (!path.starts_with('/') && !path.split(['/', '?', '#']).next()?.contains(':'))
+            .then(|| path.to_owned())
+    };
+    under_base().map_or_else(|| Target::Absolute(url.to_owned()), Target::Rest)
 }
 
 /// Up to `limit` REST pages following `Link: rel="next"`; a page that is not a list counts as
@@ -186,4 +192,32 @@ pub(super) fn link_pages(
         };
     }
     Ok(all)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::transport::Endpoints;
+    use crate::transport::HostKey;
+
+    #[test]
+    fn a_pagination_link_accepts_the_explicit_default_port_but_not_another_port() {
+        let endpoints = Endpoints {
+            kind: crate::provider::ProviderKind::GitHub,
+            host: HostKey::new("git.example.test"),
+            api_base: "https://git.example.test/api/v3".into(),
+            graphql: None,
+            web_base: "https://git.example.test".into(),
+        };
+        let ctx = ForgeContext::offline(endpoints, None);
+        assert_eq!(
+            link_target(&ctx, "https://git.example.test:443/api/v3/issues?page=2"),
+            Target::Rest("issues?page=2".into())
+        );
+        let other_port = "https://git.example.test:8443/api/v3/issues?page=2";
+        assert_eq!(
+            link_target(&ctx, other_port),
+            Target::Absolute(other_port.into())
+        );
+    }
 }

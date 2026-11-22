@@ -169,6 +169,9 @@ fn child(name: &str) -> bool {
     }
     let output = server
         .configure(&mut Command::new(std::env::current_exe().unwrap()))
+        // Direct HTTP with a token scoped to the fake server: gh passthrough would talk to
+        // api.github.com, not the address Dusty is configured with, so Dusty refuses it.
+        .env("DUSTY_FORGE_TOKEN", forge_fake::FAKE_TOKEN)
         .args(["--exact", name, "--nocapture"])
         .env("DUSTY_REVIEW_LAYOUT_CHILD", "1")
         .env("DUSTY_GITHUB_FIXTURE", &state)

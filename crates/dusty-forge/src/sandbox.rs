@@ -59,6 +59,20 @@ pub fn active() -> bool {
     read().is_some()
 }
 
+/// Bind the practice sign-in to the loopback API configured in the same sandbox.
+pub(crate) fn practice_token(host: &HostKey, origin: &str) -> Option<String> {
+    let vars = read();
+    let vars = vars.as_ref()?;
+    let api_base = vars
+        .get("DUSTY_FORGE_API_BASE")?
+        .replace("{host}", &host.to_string());
+    (HostKey::new(vars.get("DUSTY_FORGE_HOST")?) == *host
+        && crate::transport::Endpoints::check_scheme(&api_base).is_ok()
+        && crate::transport::api_origin(&api_base).as_deref() == Some(origin))
+    .then(|| vars.get("DUSTY_FORGE_TOKEN").cloned())
+    .flatten()
+}
+
 /// The variable from the sandbox while one is active, else from the process environment.
 pub fn var(name: &str) -> Option<String> {
     match &*read() {

@@ -214,6 +214,7 @@ pub fn fixture_child(name: &str, world: Value) -> bool {
         .env("DUSTY_GITHUB_CHILD", "1")
         .env("DUSTY_GITHUB_FIXTURE", &state)
         .env("DUSTY_GITHUB_ROOT", &root)
+        .env("DUSTY_FORGE_TOKEN", forge_fake::FAKE_TOKEN)
         .env("DUSTY_FORGE_CACHE_DIR", owner.path().join("cache"))
         .env_remove("DUSTY_FORGE_WARM")
         .env(

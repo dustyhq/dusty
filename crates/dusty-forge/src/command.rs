@@ -201,7 +201,17 @@ impl Failure {
 
 impl From<ForgeError> for Failure {
     fn from(error: ForgeError) -> Self {
-        let message = crate::redact(&error.to_string());
+        let api_path_hint = match &error {
+            ForgeError::NotFound(detail) => {
+                detail.strip_prefix(crate::credential::API_PATH_NOT_FOUND)
+            }
+            _ => None,
+        };
+        let message = if api_path_hint.is_some() {
+            format!("Not found · {}", crate::credential::API_PATH_NOT_FOUND)
+        } else {
+            error.to_string()
+        };
         let (kind, code, hint) = match &error {
             ForgeError::CliMissing(cli) => (
                 "CliMissing",
@@ -239,7 +249,11 @@ impl From<ForgeError> for Failure {
             ),
             ForgeError::Network(_) => ("Network", EXIT_NETWORK, String::new()),
             ForgeError::Timeout => ("Timeout", EXIT_NETWORK, String::new()),
-            ForgeError::NotFound(_) => ("NotFound", EXIT_OTHER, String::new()),
+            ForgeError::NotFound(_) => (
+                "NotFound",
+                EXIT_OTHER,
+                api_path_hint.unwrap_or_default().trim_start().to_owned(),
+            ),
             ForgeError::Forbidden(_) => ("Forbidden", EXIT_OTHER, String::new()),
             ForgeError::Conflict(_) => ("Conflict", EXIT_OTHER, String::new()),
             ForgeError::Cancelled => ("Cancelled", EXIT_OTHER, String::new()),
@@ -248,7 +262,7 @@ impl From<ForgeError> for Failure {
         };
         Self {
             kind,
-            message,
+            message: crate::redact(&message),
             hint: crate::redact(&hint),
             code,
         }
@@ -353,6 +367,10 @@ fn stamped(value: Value) -> Value {
 
 /// The payload's own value, without the enum tag (`{"PullRequest": {…}}` → `{…}`).
 fn untagged(payload: &Payload) -> Value {
+    // The CLI's diff command still prints the patch as text.
+    if let Payload::Diff { text, .. } = payload {
+        return Value::String(text.clone());
+    }
     match serde_json::to_value(payload).unwrap_or(Value::Null) {
         Value::Object(mut fields) if fields.len() == 1 => {
             let key = fields.keys().next().cloned().unwrap_or_default();
@@ -414,7 +432,7 @@ impl Scope {
         header
     }
 
-    /// `read` through the shared cache: a fresh entry answers without connecting at all.
+    /// Use a fresh remembered cache entry; refreshes and misses resolve the live account.
     fn read(
         &self,
         read: &Read,
@@ -422,12 +440,10 @@ impl Scope {
         cancel: &AtomicBool,
     ) -> Result<(Payload, Served, Option<ProviderKind>), Failure> {
         if !refresh
-            && let Some(payload) = worker::cached_fresh(&self.host, self.repo.as_ref(), read)
+            && let Some((payload, kind)) =
+                worker::remembered_read(&self.host, self.repo.as_ref(), read)
         {
-            let kind = detect::detect(&self.host, &ConnectOptions::from_env(), cancel)
-                .ok()
-                .map(|detected| detected.kind);
-            return Ok((payload, Served::Cache, kind));
+            return Ok((payload, Served::Cache, Some(kind)));
         }
         let (provider, ctx) =
             worker::connect_to(&self.root, &self.host, self.repo.clone(), cancel)?;
@@ -589,7 +605,7 @@ fn run(cli: &ForgeCli, cancel: &AtomicBool) -> Result<Output, Failure> {
 fn write_verb(cli: &ForgeCli, write: Write, cancel: &AtomicBool) -> Result<Output, Failure> {
     let root = root_of(&cli.repo)?;
     let commands = ForgeCommands { cancelled: cancel };
-    let receipt = worker::write_through(&commands, &root, &ForgeTarget::remote(), &write)?;
+    let receipt = worker::write_now(&commands, &root, &ForgeTarget::remote(), &write)?;
     Ok(Output::Object(stamped(json!({
         "ok": true,
         "summary": receipt.summary,
@@ -846,7 +862,10 @@ mod tests {
 
     #[test]
     fn payloads_print_without_their_tag_and_with_the_schema() {
-        let payload = Payload::Text("diff --git a b".into());
+        let payload = Payload::Diff {
+            head: "a".repeat(40),
+            text: "diff --git a b".into(),
+        };
         assert_eq!(untagged(&payload), json!("diff --git a b"));
         let row = stamped(json!({ "number": 3, "schema": 9 }));
         assert_eq!(row, json!({ "schema": 1, "number": 3 }));

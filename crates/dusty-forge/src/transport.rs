@@ -258,11 +258,17 @@ impl ApiRequest {
         operation_name(body["query"].as_str()?)
     }
 
-    /// One log-safe line: method, path or operation, never headers or the body.
+    /// Describe a request plan without headers, the body, queries or an absolute URL.
     pub fn describe(&self) -> String {
+        let method = self.method.as_str();
         match (&self.target, self.graphql_operation()) {
             (Target::GraphQl, Some(operation)) => format!("POST graphql {operation}"),
-            _ => format!("{} {}", self.method.as_str(), self.path_and_query()),
+            (Target::GraphQl, None) => format!("{method} graphql"),
+            (Target::Absolute(_), _) => format!("{method} (full URL hidden)"),
+            (Target::Rest(path), _) => {
+                let path = path.split(['?', '#']).next().unwrap_or_default();
+                format!("{method} {}", crate::cli::redact(path))
+            }
         }
     }
 }
@@ -499,21 +505,10 @@ impl Endpoints {
     /// `DUSTY_FORGE_API_BASE` / `DUSTY_FORGE_GRAPHQL_URL` override them (tests, odd installs).
     pub fn github(host: &HostKey) -> Self {
         let name = host.to_string();
-        let (api_base, graphql) = if host.host == "github.com" {
-            (
-                "https://api.github.com".to_owned(),
-                "https://api.github.com/graphql".to_owned(),
-            )
-        } else if host.host.ends_with(".ghe.com") {
-            (
-                format!("https://api.{name}"),
-                format!("https://api.{name}/graphql"),
-            )
-        } else {
-            (
-                format!("https://{name}/api/v3"),
-                format!("https://{name}/api/graphql"),
-            )
+        let api_base = Self::default_github_api_base(host);
+        let graphql = match api_base.strip_suffix("/api/v3") {
+            Some(root) => format!("{root}/api/graphql"),
+            None => format!("{api_base}/graphql"),
         };
         let mut endpoints = Self {
             kind: ProviderKind::GitHub,
@@ -523,9 +518,10 @@ impl Endpoints {
             web_base: format!("https://{name}"),
         };
         // `{host}` lets one loopback test server stand in for several hosts.
-        if let Some(base) =
-            crate::sandbox::var("DUSTY_FORGE_API_BASE").filter(|base| !base.is_empty())
-        {
+        if let Some(base) = crate::detect::github_api_base_override(
+            ProviderKind::GitHub,
+            &credential::Env::process(),
+        ) {
             endpoints.override_api_base(&base.replace("{host}", &name));
         }
         if let Some(url) =
@@ -545,10 +541,31 @@ impl Endpoints {
         self.api_base = base;
     }
 
+    /// The REST address gh expects, without Dusty's routing overrides.
+    pub(crate) fn default_github_api_base(host: &HostKey) -> String {
+        if host.host == "github.com" && host.port.is_none_or(|p| p == 443) {
+            "https://api.github.com".into()
+        } else if host.host.ends_with(".ghe.com") {
+            format!("https://api.{host}")
+        } else {
+            format!("https://{host}/api/v3")
+        }
+    }
+
+    /// The HTTPS API origin for a host, independent of routing overrides and discovery.
+    pub(crate) fn default_api_origin(kind: ProviderKind, host: &HostKey) -> Option<String> {
+        if kind == ProviderKind::GitHub {
+            api_origin(&Self::default_github_api_base(host))
+        } else {
+            api_origin(&format!("https://{host}"))
+        }
+    }
+
     /// Plain `http://` is only for a loopback test server.
     pub fn check_scheme(url: &str) -> Result<(), TransportError> {
-        let parsed = reqwest::Url::parse(url)
-            .map_err(|_| TransportError::Insecure(format!("invalid forge URL {url}")))?;
+        let parsed = reqwest::Url::parse(url).map_err(|_| {
+            TransportError::Insecure("The forge request address is invalid.".into())
+        })?;
         match parsed.scheme() {
             "https" => Ok(()),
             "http" if matches!(parsed.host_str(), Some("127.0.0.1" | "localhost" | "[::1]")) => {
@@ -559,6 +576,14 @@ impl Endpoints {
             )),
         }
     }
+}
+
+pub(crate) const INVALID_API_ADDRESS: &str = "The forge's API address is invalid.";
+
+/// Normalized HTTP origin, including the effective port and never URL userinfo or path.
+pub(crate) fn api_origin(address: &str) -> Option<String> {
+    let url = reqwest::Url::parse(address).ok()?;
+    matches!(url.scheme(), "http" | "https").then(|| url.origin().ascii_serialization())
 }
 
 /// Explicit choices for one connection; `from_env` reads them for the app.
@@ -675,8 +700,8 @@ pub fn read_only() -> bool {
 }
 
 /// `DUSTY_FORGE_READONLY_LOG=<path>`: one line per request of a read-only run, for counting
-/// against anonymous rate limits: host, transport, outcome, milliseconds and `describe()` (method and
-/// path only, never headers, tokens or bodies).
+/// against anonymous rate limits: host, transport, outcome, milliseconds and method.
+/// Do not log a request URL: even its path may have come from a signed server link.
 fn read_only_log(
     kind: &TransportKind,
     host: &HostKey,
@@ -692,7 +717,7 @@ fn read_only_log(
     let line = format!(
         "{host} {kind} {outcome} {}ms {}\n",
         took.as_millis(),
-        request.describe()
+        request.method.as_str()
     );
     if let Ok(mut file) = std::fs::OpenOptions::new()
         .create(true)
@@ -756,7 +781,7 @@ impl Transport for ReadOnly {
     ) -> Result<ApiResponse, TransportError> {
         if request.method != Method::Get && !read_only_query(request) {
             read_only_log(&self.0.kind(), host, request, "refused", Duration::ZERO);
-            return Err(TransportError::ReadOnly(request.describe()));
+            return Err(TransportError::ReadOnly(request.method.as_str().into()));
         }
         // `DUSTY_FORGE_READONLY_MAX=<n>`: at most n requests per host for the whole process,
         // so a runaway poll cannot hammer a real forge.
@@ -765,8 +790,8 @@ impl Transport for ReadOnly {
         if !read_only_admit(host, cap) {
             read_only_log(&self.0.kind(), host, request, "capped", Duration::ZERO);
             return Err(TransportError::ReadOnly(format!(
-                "{} (request cap reached)",
-                request.describe()
+                "{} (request limit reached)",
+                request.method.as_str()
             )));
         }
         let started = Instant::now();
@@ -794,6 +819,10 @@ impl Transport for ReadOnly {
 
     fn graphql_batching(&self) -> bool {
         false
+    }
+
+    fn sign_in_advice(&self) -> Option<&str> {
+        self.0.sign_in_advice()
     }
 }
 
@@ -825,10 +854,13 @@ pub fn for_host(
         .unwrap_or_else(|error| error.into_inner())
         .get(&key)
         && at.elapsed() < SELECTION_TTL
+        && !matches!(transport.kind(), TransportKind::Cli(_))
     {
         return Ok(transport.clone());
     }
-    let transport = match choose(endpoints, options, cancel) {
+    let transport = match choose(endpoints, options, cancel, || {
+        credential::resolve(endpoints, options, cancel)
+    }) {
         Ok(transport) if read_only() => Arc::new(ReadOnly(transport)) as Arc<dyn Transport>,
         Ok(transport) => transport,
         Err(error) => {
@@ -836,7 +868,10 @@ pub fn for_host(
             return Err(error);
         }
     };
-    crate::host_state::observe_transport(endpoints, transport.kind());
+    crate::host_state::observe_connection(endpoints, transport.as_ref());
+    if let Some(account) = crate::provider::account_of(&endpoints.host, transport.as_ref()) {
+        crate::host_state::remember_account(&account, endpoints.kind);
+    }
     selected()
         .lock()
         .unwrap_or_else(|error| error.into_inner())
@@ -848,15 +883,26 @@ fn choose(
     endpoints: &Endpoints,
     options: &ConnectOptions,
     cancel: &AtomicBool,
+    resolve: impl FnOnce() -> CredentialState,
 ) -> Result<Arc<dyn Transport>, ForgeError> {
+    if api_origin(&endpoints.api_base).is_none() {
+        return Err(ForgeError::Failed(INVALID_API_ADDRESS.into()));
+    }
+    let mut address_advice = None;
     if options.force != Some(Force::Cli) {
-        match credential::resolve(endpoints, options, cancel) {
+        match resolve() {
             CredentialState::Present(credential) => {
                 let http = crate::http::HttpTransport::new(endpoints.clone(), credential)?;
                 match http.check_viewer(cancel) {
                     Ok(()) => return Ok(Arc::new(http)),
                     Err(ForgeError::NotAuthenticated { .. }) => {
                         credential::evict(endpoints, options);
+                    }
+                    Err(ForgeError::NotFound(message)) => {
+                        address_advice = credential::rest_path_advice(endpoints, options);
+                        if options.force == Some(Force::Http) {
+                            return Err(ForgeError::NotFound(address_advice.unwrap_or(message)));
+                        }
                     }
                     Err(error) if options.force == Some(Force::Http) => return Err(error),
                     Err(ForgeError::Cancelled) => return Err(ForgeError::Cancelled),
@@ -879,6 +925,9 @@ fn choose(
                     hint,
                 });
             }
+            CredentialState::Missing { hint, .. } if credential::is_sign_in_advice(&hint) => {
+                address_advice = Some(hint);
+            }
             CredentialState::Crashed(error) if options.force == Some(Force::Http) => {
                 return Err(ForgeError::Failed(error));
             }
@@ -891,22 +940,49 @@ fn choose(
             });
         }
     }
-    match passthrough(endpoints, options) {
-        // No CLI (or one that cannot sign in): public repositories stay readable.
-        Err(
-            ForgeError::CliMissing(_)
-            | ForgeError::CliTooOld { .. }
-            | ForgeError::NotAuthenticated { .. },
-        ) if options.force.is_none() && !options.no_anonymous => anonymous(endpoints),
+    match verified_passthrough(endpoints, options, cancel) {
+        Err(error) => {
+            let advice = address_advice.or_else(|| match &error {
+                ForgeError::NotAuthenticated { hint, .. }
+                    if credential::is_sign_in_advice(hint) =>
+                {
+                    Some(hint.clone())
+                }
+                _ => None,
+            });
+            // No CLI (or one that cannot sign in): public repositories stay readable.
+            if options.force.is_none()
+                && !options.no_anonymous
+                && matches!(
+                    error,
+                    ForgeError::CliMissing(_)
+                        | ForgeError::CliTooOld { .. }
+                        | ForgeError::NotAuthenticated { .. }
+                )
+            {
+                return anonymous_with_advice(endpoints, advice);
+            }
+            Err(match (error, advice) {
+                (ForgeError::NotAuthenticated { .. }, Some(hint)) => sign_in_error(endpoints, hint),
+                (error, _) => error,
+            })
+        }
         result => result,
     }
 }
 
 /// Direct HTTP without a credential: GETs (and GitLab GraphQL queries) only.
 pub fn anonymous(endpoints: &Endpoints) -> Result<Arc<dyn Transport>, ForgeError> {
-    Ok(Arc::new(crate::http::HttpTransport::anonymous(
-        endpoints.clone(),
-    )?))
+    anonymous_with_advice(endpoints, None)
+}
+
+fn anonymous_with_advice(
+    endpoints: &Endpoints,
+    advice: Option<String>,
+) -> Result<Arc<dyn Transport>, ForgeError> {
+    Ok(Arc::new(
+        crate::http::HttpTransport::anonymous(endpoints.clone())?.with_sign_in_advice(advice),
+    ))
 }
 
 /// A passthrough CLI turned out to be signed out (`gh` installed, never logged in): reads of
@@ -923,8 +999,35 @@ pub fn demote(endpoints: &Endpoints, options: &ConnectOptions) -> Option<Arc<dyn
             (endpoints.clone(), options.clone()),
             (transport.clone(), Instant::now()),
         );
-    crate::host_state::observe_transport(endpoints, transport.kind());
+    crate::host_state::observe_connection(endpoints, transport.as_ref());
     Some(transport)
+}
+
+fn sign_in_error(endpoints: &Endpoints, hint: String) -> ForgeError {
+    ForgeError::NotAuthenticated {
+        host: endpoints.host.to_string(),
+        hint,
+    }
+}
+
+/// Verify the CLI's own sign-in, independently of any direct HTTP credential.
+pub(crate) fn verified_passthrough(
+    endpoints: &Endpoints,
+    options: &ConnectOptions,
+    cancel: &AtomicBool,
+) -> Result<Arc<dyn Transport>, ForgeError> {
+    Ok(Arc::new(verified_cli(endpoints, options, cancel)?))
+}
+
+pub(crate) fn verified_cli(
+    endpoints: &Endpoints,
+    options: &ConnectOptions,
+    cancel: &AtomicBool,
+) -> Result<crate::cli::CliTransport, ForgeError> {
+    let mut cli = passthrough_cli(endpoints, options)?;
+    cli.pin_sign_in(endpoints, options, cancel);
+    cli.check_viewer(endpoints, cancel)?;
+    Ok(cli)
 }
 
 /// The CLI transport for a host, regardless of credentials.
@@ -932,6 +1035,59 @@ pub fn passthrough(
     endpoints: &Endpoints,
     options: &ConnectOptions,
 ) -> Result<Arc<dyn Transport>, ForgeError> {
+    Ok(Arc::new(passthrough_cli(endpoints, options)?))
+}
+
+fn passthrough_cli(
+    endpoints: &Endpoints,
+    options: &ConnectOptions,
+) -> Result<crate::cli::CliTransport, ForgeError> {
+    let expected = api_origin(&endpoints.api_base)
+        .ok_or_else(|| ForgeError::Failed(INVALID_API_ADDRESS.into()))?;
+    let env = credential::Env::process();
+    let advice = (options.force == Some(Force::Cli))
+        .then(|| credential::direct_token_advice(endpoints, &env))
+        .flatten();
+    let choice = cli_for_origin(endpoints, options, &env, &expected);
+    match choice {
+        Ok(cli) => Ok(cli.with_connection_details(expected, advice)),
+        Err(error) => Err(match advice {
+            Some(advice) => {
+                let hint = match error {
+                    ForgeError::NotAuthenticated { hint, .. }
+                        if credential::is_sign_in_advice(&hint) =>
+                    {
+                        format!("{hint}\n{advice}")
+                    }
+                    _ => advice.into(),
+                };
+                sign_in_error(endpoints, hint)
+            }
+            None => error,
+        }),
+    }
+}
+
+fn cli_for_origin(
+    endpoints: &Endpoints,
+    options: &ConnectOptions,
+    env: &credential::Env,
+    expected: &str,
+) -> Result<crate::cli::CliTransport, ForgeError> {
+    let not_authenticated = || {
+        sign_in_error(
+            endpoints,
+            credential::login_hint(endpoints.kind, &endpoints.host),
+        )
+    };
+    let require_origin = |cli, address: Option<credential::SignInAddress>| match address {
+        Some(address) if address.origin == expected => Ok(()),
+        Some(address) => Err(sign_in_error(
+            endpoints,
+            credential::address_advice(cli, &address, endpoints, env, false),
+        )),
+        None => Err(not_authenticated()),
+    };
     match endpoints.kind {
         ProviderKind::GitHub => {
             let gh = options.gh.clone().ok_or(ForgeError::CliMissing(Cli::Gh))?;
@@ -940,7 +1096,8 @@ pub fn passthrough(
             if !gh.is_file() {
                 return Err(ForgeError::CliMissing(Cli::Gh));
             }
-            Ok(Arc::new(crate::cli::CliTransport::new(Cli::Gh, gh, None)))
+            require_origin(Cli::Gh, credential::SignInAddress::default_for(endpoints))?;
+            Ok(crate::cli::CliTransport::new(Cli::Gh, gh, None))
         }
         ProviderKind::GitLab => {
             let glab = options
@@ -948,41 +1105,24 @@ pub fn passthrough(
                 .clone()
                 .ok_or(ForgeError::CliMissing(Cli::Glab))?;
             crate::cli::check_version(Cli::Glab, &glab, &AtomicBool::new(false))?;
-            Ok(Arc::new(crate::cli::CliTransport::new(
-                Cli::Glab,
-                glab,
-                None,
-            )))
+            require_origin(Cli::Glab, credential::glab_cli_api(endpoints, options))?;
+            Ok(crate::cli::CliTransport::new(Cli::Glab, glab, None))
         }
         ProviderKind::Gitea | ProviderKind::Forgejo => {
             let tea = options
                 .tea
                 .clone()
                 .ok_or(ForgeError::CliMissing(Cli::Tea))?;
-            // tea passthrough needs a login for the host; without one tea is signed out. A
-            // configured `login` wins over the tea login whose URL matches the host.
-            let login = options
-                .logins
-                .get(&endpoints.host)
-                .cloned()
-                .or_else(|| {
-                    options
-                        .stores
-                        .tea_config
-                        .as_deref()
-                        .and_then(|path| credential::tea_login(path, &endpoints.host))
-                        .map(|login| login.name)
-                })
-                .ok_or_else(|| ForgeError::NotAuthenticated {
-                    host: endpoints.host.to_string(),
-                    hint: credential::login_hint(endpoints.kind, &endpoints.host),
-                })?;
+            let login = credential::tea_cli_login(endpoints, options, env)
+                .map_err(|hint| sign_in_error(endpoints, hint))?
+                .ok_or_else(not_authenticated)?;
             crate::cli::check_version(Cli::Tea, &tea, &AtomicBool::new(false))?;
-            Ok(Arc::new(crate::cli::CliTransport::new(
+            crate::host_state::observe_tea_login(endpoints, &login);
+            Ok(crate::cli::CliTransport::new(
                 Cli::Tea,
                 tea,
-                Some(login),
-            )))
+                Some(login.name),
+            ))
         }
     }
 }
@@ -999,6 +1139,79 @@ pub fn evict(endpoints: &Endpoints, options: &ConnectOptions) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn forge_sign_in_stays_with_its_origin() {
+        use crate::credential::{Env, Stores};
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::TcpListener;
+        use std::sync::atomic::AtomicBool;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind the fixture");
+        let host = listener.local_addr().expect("get the fixture address");
+        let directory = tempfile::tempdir().expect("create a test repository");
+        let repository = git2::Repository::init(directory.path()).expect("init test repository");
+        repository
+            .remote("origin", &format!("http://{host}/owner/repo.git"))
+            .expect("set the repo's forge remote");
+        let remote = crate::detect::choose_remote_with(directory.path(), None)
+            .expect("resolve the repo's forge remote");
+        let base = format!("http://{host}/api/v1");
+        let empty = Env::from_pairs([] as [(&str, &str); 0]);
+        let endpoints =
+            crate::detect::endpoints_for(ProviderKind::Forgejo, &remote.host, Some(&base), &empty);
+
+        let tea_config = directory.path().join("tea.yml");
+        std::fs::write(
+            &tea_config,
+            format!(
+                "logins:\n  - name: work\n    url: http://localhost:{}\n    token: synthetic-sign-in\n  - name: work\n    url: http://{host}\n",
+                host.port()
+            ),
+        )
+        .expect("write the fixture sign-in for a different host");
+        let options = ConnectOptions {
+            stores: Stores {
+                tea_config: Some(tea_config),
+                ..Stores::default()
+            },
+            ..ConnectOptions::default()
+        };
+
+        let server = std::thread::spawn(move || {
+            [(); 2].map(|()| {
+                let (mut socket, _) = listener.accept().expect("accept fixture request");
+                let authenticated = BufReader::new(&mut socket)
+                    .lines()
+                    .map(|line| line.expect("read request headers"))
+                    .take_while(|line| !line.is_empty())
+                    .any(|line| line.to_ascii_lowercase().starts_with("authorization:"));
+                socket
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+                    )
+                    .expect("answer fixture request");
+                authenticated
+            })
+        });
+        let cancel = AtomicBool::new(false);
+        let bare = Env::from_pairs([("FORGEJO_TOKEN", "synthetic-default-sign-in")]);
+        for (env, options) in [(&empty, &options), (&bare, &ConnectOptions::default())] {
+            let transport = choose(&endpoints, options, &cancel, || {
+                credential::lookup(&endpoints, options, env, &cancel)
+            })
+            .expect("connect to the repo's forge");
+            // Authenticated connections already made a request to check the sign-in.
+            if transport.kind().anonymous() {
+                transport
+                    .send(&remote.host, &ApiRequest::get("repos/owner/repo"), &cancel)
+                    .expect("read the repo");
+            }
+        }
+        let [other_host, bare] = server.join().expect("read the fixture results");
+        assert!(!other_host, "sent a saved sign-in for the other host");
+        assert!(!bare, "sent a bare Forgejo sign-in to a self-hosted forge");
+    }
 
     #[test]
     fn a_read_only_run_sends_gets_and_refuses_everything_else_unsent() {
@@ -1138,6 +1351,16 @@ mod tests {
             request.path_and_query(),
             "repos/o/r/issues?state=open&q=a%20b"
         );
+    }
+
+    #[test]
+    fn request_descriptions_hide_signed_targets() {
+        let mut request =
+            ApiRequest::get("/repos/o/r/issues?sig=fixture-signature").query("page", "2");
+        assert_eq!(request.describe(), "GET repos/o/r/issues");
+        request.target =
+            Target::Absolute("https://fixture-user@blob.test/log?sig=fixture-signature".into());
+        assert_eq!(request.describe(), "GET (full URL hidden)");
     }
 
     #[test]

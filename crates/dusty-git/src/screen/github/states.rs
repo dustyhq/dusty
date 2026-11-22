@@ -40,7 +40,11 @@ impl Words {
 }
 
 /// How to sign in to this forge, in its own tool or page.
-pub(super) fn sign_in_how(kind: Option<ProviderKind>, host: &str) -> String {
+pub(super) fn sign_in_how(
+    kind: Option<ProviderKind>,
+    host: &str,
+    web_site: Option<&str>,
+) -> String {
     let host = if host.is_empty() { "the forge" } else { host };
     match kind {
         Some(ProviderKind::GitHub) if host == "github.com" => "run gh auth login".into(),
@@ -48,7 +52,8 @@ pub(super) fn sign_in_how(kind: Option<ProviderKind>, host: &str) -> String {
         Some(ProviderKind::GitLab) if host == "gitlab.com" => "run glab auth login".into(),
         Some(ProviderKind::GitLab) => format!("run glab auth login --hostname {host}"),
         Some(ProviderKind::Gitea | ProviderKind::Forgejo) => {
-            format!("make a token at https://{host}/user/settings/applications")
+            let site = web_site.map_or_else(|| format!("https://{host}"), str::to_owned);
+            format!("make a token at {site}/user/settings/applications")
         }
         None => "@ shows how".into(),
     }
@@ -113,20 +118,22 @@ pub(super) fn cli_missing_words(cli: &str) -> Words {
     )
 }
 
-/// The variable Dusty Git reads a token from for this forge (`DUSTY_FORGE_TOKEN` works for
-/// every forge).
-pub(super) fn token_variable(kind: Option<ProviderKind>) -> &'static str {
-    match kind {
-        Some(ProviderKind::GitHub) => "GH_TOKEN",
-        Some(ProviderKind::GitLab) => "GITLAB_TOKEN",
-        Some(ProviderKind::Gitea) => "GITEA_TOKEN",
-        Some(ProviderKind::Forgejo) => "FORGEJO_TOKEN",
-        None => "DUSTY_FORGE_TOKEN",
-    }
+/// The same host-scoped token example the forge uses in its sign-in hints.
+pub(super) fn token_example(kind: Option<ProviderKind>, host: &str) -> String {
+    use crate::forge::transport::HostKey;
+    let host = HostKey::new(host);
+    kind.and_then(|kind| crate::forge::credential::sign_in_hints(kind, &host).pop())
+        .unwrap_or_else(|| format!("DUSTY_FORGE_TOKEN=<token> DUSTY_FORGE_HOST={host}"))
 }
 
 /// Where a token gets more scopes on this forge.
-fn scope_fix(kind: Option<ProviderKind>, host: &str, scopes: &str) -> String {
+fn scope_fix(
+    kind: Option<ProviderKind>,
+    host: &str,
+    scopes: &str,
+    web_site: Option<&str>,
+) -> String {
+    let site = || web_site.map_or_else(|| format!("https://{host}"), str::to_owned);
     match kind {
         Some(ProviderKind::GitHub) => {
             let scopes = scopes.replace(", ", ",");
@@ -137,18 +144,28 @@ fn scope_fix(kind: Option<ProviderKind>, host: &str, scopes: &str) -> String {
             }
         }
         Some(ProviderKind::GitLab) => {
-            format!("add it at https://{host}/-/user_settings/personal_access_tokens")
+            format!(
+                "add it at {}/-/user_settings/personal_access_tokens",
+                site()
+            )
         }
         Some(ProviderKind::Gitea | ProviderKind::Forgejo) => {
-            format!("add it at https://{host}/user/settings/applications")
+            format!("add it at {}/user/settings/applications", site())
         }
         None => "@ shows how".into(),
     }
 }
 
 /// `@ sign in · run gh auth login`.
-pub(super) fn sign_in_hint(kind: Option<ProviderKind>, host: &str) -> String {
-    format!("{SIGN_IN_KEY} sign in · {}", sign_in_how(kind, host))
+pub(super) fn sign_in_hint(
+    kind: Option<ProviderKind>,
+    host: &str,
+    web_site: Option<&str>,
+) -> String {
+    format!(
+        "{SIGN_IN_KEY} sign in · {}",
+        sign_in_how(kind, host, web_site)
+    )
 }
 
 /// `45s`, `12m`, `3h`, `2d`.
@@ -157,7 +174,12 @@ pub(super) fn span(duration: Duration) -> String {
 }
 
 /// A failed read's error (`ForgeError`'s Display, perhaps wrapped by a notice) in words.
-pub(super) fn explain(error: &str, kind: Option<ProviderKind>, host: &str) -> Words {
+fn explain_at(
+    error: &str,
+    kind: Option<ProviderKind>,
+    host: &str,
+    web_site: Option<&str>,
+) -> Words {
     let host = if host.is_empty() { "the forge" } else { host };
     let error = error
         .trim()
@@ -167,8 +189,15 @@ pub(super) fn explain(error: &str, kind: Option<ProviderKind>, host: &str) -> Wo
         .unwrap_or_default()
         .trim();
     let (head, detail) = error.split_once(" · ").unwrap_or((error, ""));
-    let sign_in = || sign_in_hint(kind, host);
+    let sign_in = || sign_in_hint(kind, host, web_site);
+    let specific_sign_in = || {
+        crate::forge::credential::is_sign_in_advice(detail)
+            .then(|| format!("{SIGN_IN_KEY} sign in · {}", detail.replace('\n', " ")))
+    };
     if head.starts_with("Not signed in") {
+        if let Some(hint) = specific_sign_in() {
+            return Words::new(format!("Not signed in to {host}"), hint);
+        }
         if crate::forge::credential::refused(host) {
             return Words::new(
                 format!("{host} refused your token · it expired or was revoked"),
@@ -181,9 +210,15 @@ pub(super) fn explain(error: &str, kind: Option<ProviderKind>, host: &str) -> Wo
         return Words::new(format!("Not signed in to {host}"), sign_in());
     }
     if head.ends_with("requires sign-in") {
-        return Words::new(format!("{host} shows nothing until you sign in"), sign_in());
+        return Words::new(
+            format!("{host} shows nothing until you sign in"),
+            specific_sign_in().unwrap_or_else(sign_in),
+        );
     }
     if let Some(what) = head.strip_prefix("Sign in to ") {
+        if let Some(hint) = specific_sign_in() {
+            return Words::new(format!("Sign in to {what}"), hint);
+        }
         if crate::forge::credential::refused(host) {
             return Words::new(
                 format!("{host} refused your token · it expired or was revoked"),
@@ -201,7 +236,7 @@ pub(super) fn explain(error: &str, kind: Option<ProviderKind>, host: &str) -> Wo
             };
             return Words::new(
                 format!("Your token for {host} needs the {scopes} {plural}"),
-                format!("{} · then R", scope_fix(kind, host, scopes)),
+                format!("{} · then R", scope_fix(kind, host, scopes, web_site)),
             );
         }
         return Words::new(
@@ -219,7 +254,7 @@ pub(super) fn explain(error: &str, kind: Option<ProviderKind>, host: &str) -> Wo
                 Some(wait) => format!("Rate limited by {host} · resets in {wait}"),
                 None => format!("Rate limited by {host}"),
             },
-            "R retry once it resets",
+            RETRY_AFTER_RESET,
         );
     }
     if head == "Network error" {
@@ -242,6 +277,10 @@ pub(super) fn explain(error: &str, kind: Option<ProviderKind>, host: &str) -> Wo
         );
     }
     if head == "Not found" {
+        let api_path_not_found = crate::forge::credential::API_PATH_NOT_FOUND;
+        if let Some(advice) = detail.strip_prefix(api_path_not_found) {
+            return Words::new(api_path_not_found, advice.trim_start().replace('\n', " "));
+        }
         return Words::new(
             format!("Not found on {host} · deleted, moved or private"),
             format!("R retry · {SIGN_IN_KEY} accounts"),
@@ -321,9 +360,14 @@ impl Workspace {
             let kind = crate::forge::host_state::account(&key)
                 .and_then(|account| account.kind)
                 .or_else(|| crate::forge::detect::known_host(&key));
-            return explain(error, kind, &host);
+            return explain_at(error, kind, &host, None);
         }
-        let words = explain(error, self.forge_kind(), &self.host);
+        let words = explain_at(
+            error,
+            self.forge_kind(),
+            &self.host,
+            self.advertised_site_base().as_deref(),
+        );
         // Signed out, a 404 inside a repository the forge did show is the forge keeping that
         // part for signed-in users (gitea.com's pull list of an archived repository), not a
         // missing repository.
@@ -511,6 +555,10 @@ pub(super) fn fit(parts: &[String], width: usize) -> String {
 mod tests {
     use super::*;
 
+    fn explain(error: &str, kind: Option<ProviderKind>, host: &str) -> Words {
+        explain_at(error, kind, host, None)
+    }
+
     const RAW: [&str; 6] = [
         "{",
         "Network error",
@@ -548,6 +596,33 @@ mod tests {
             words(error, ProviderKind::Forgejo, "codeberg.org")
                 .ends_with("make a token at https://codeberg.org/user/settings/applications")
         );
+    }
+
+    #[test]
+    fn scoped_sign_in_advice_keeps_its_heading_and_shortcut() {
+        let host = "git.states.test";
+        let hint = "glab's saved API address and Dusty's API address don't match. Set api_base to https://api.states.test/tools/code/api/v4.";
+        let error = crate::forge::request::ForgeError::NotAuthenticated {
+            host: host.into(),
+            hint: hint.into(),
+        };
+        let explained = explain(&error.to_string(), Some(ProviderKind::GitLab), host);
+        assert_eq!(explained.headline, "Not signed in to git.states.test");
+        assert_eq!(explained.hint, format!("@ sign in · {hint}"));
+    }
+
+    #[test]
+    fn missing_api_path_explains_the_setting_without_a_sign_in_prompt() {
+        let heading = crate::forge::credential::API_PATH_NOT_FOUND;
+        let hint = "Set api_base to https://api.states.test/tools/code/api/v4.";
+        let error = crate::forge::request::ForgeError::NotFound(format!("{heading} {hint}"));
+        let explained = explain(
+            &error.to_string(),
+            Some(ProviderKind::GitLab),
+            "git.states.test",
+        );
+        assert_eq!(explained.headline, heading);
+        assert_eq!(explained.hint, hint);
     }
 
     /// Without its CLI, a forge never says "run gh auth login": it names the missing tool and
@@ -615,7 +690,7 @@ mod tests {
                 ProviderKind::GitHub,
                 "github.com"
             ),
-            "Rate limited by github.com · resets in 12m · R retry once it resets"
+            "Rate limited by github.com · resets in 12m · R retry after reset"
         );
         assert_eq!(
             words(

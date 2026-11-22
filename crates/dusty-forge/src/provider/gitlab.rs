@@ -1642,7 +1642,7 @@ impl GitLab {
     ) -> Result<Value, ForgeError> {
         let response = ctx.send(&ApiRequest::graphql(document, variables), cancel)?;
         if !response.success() {
-            return Err(crate::http::classify(&ctx.endpoints, &response));
+            return Err(ctx.response_error(&response));
         }
         graphql_data(response.json()?)
     }
@@ -1948,7 +1948,7 @@ impl GitLab {
                     return Ok(Fetched::NotModified);
                 }
                 if !response.success() {
-                    return Err(crate::http::classify(&ctx.endpoints, &response));
+                    return Err(ctx.response_error(&response));
                 }
                 return Ok(Fetched::Payload {
                     value: Payload::Repo(repo_payload(&response.json()?)),
@@ -2173,7 +2173,7 @@ impl GitLab {
                 let (text, truncated) = match ctx.send(&request, cancel) {
                     Ok(response) if response.success() => (response.text(), false),
                     Ok(response) => {
-                        return Err(crate::http::classify(&ctx.endpoints, &response));
+                        return Err(ctx.response_error(&response));
                     }
                     Err(ForgeError::BadResponse(message)) if message.contains("exceeds") => (
                         format!(
@@ -3103,7 +3103,7 @@ impl GitLab {
                 // 304 means "already so": not an error.
                 let response = ctx.send(&Self::write_requests(ctx, write)?.remove(0), cancel)?;
                 if !response.success() && response.status != 304 {
-                    return Err(crate::http::classify(&ctx.endpoints, &response));
+                    return Err(ctx.response_error(&response));
                 }
                 Ok(saved("Saved"))
             }

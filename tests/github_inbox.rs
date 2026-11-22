@@ -119,6 +119,7 @@ fn fixture_child_with_root(name: &str, host: &str, gh_host: &str, committed_dirt
         .env("DUSTY_INBOX_ROOT", &root)
         .env("DUSTY_INBOX_HOST", host)
         .env("DUSTY_INBOX_STATE", &state)
+        .env("DUSTY_FORGE_TOKEN", forge_fake::FAKE_TOKEN)
         .env(
             "PATH",
             format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
@@ -165,6 +166,173 @@ fn assert_local_source_unchanged() {
         "selecting a remote item must not create/switch a branch"
     );
     assert_eq!(repo.index().unwrap().len(), 0);
+}
+
+fn requested(method: &str, path: &str) -> Vec<Value> {
+    forge_fake::requests(&state_path())
+        .into_iter()
+        .filter(|request| request["method"] == method && request["path"] == path)
+        .collect()
+}
+
+fn release_gate(name: &str) {
+    std::fs::write(format!("{}.{name}", state_path().display()), "release").unwrap();
+}
+
+#[test]
+fn closing_comment_keeps_its_continuation_on_the_confirmed_inbox_issue() {
+    let name = "closing_comment_keeps_its_continuation_on_the_confirmed_inbox_issue";
+    if fixture_child(name, "github.com", "github.com") {
+        return;
+    }
+    let mut screen = open(json!({
+        "host": "github.com",
+        "gates": [{"path": "/issues/7/comments", "repo": "alpha/one", "name": "closing-comment"}]
+    }));
+    key(&mut screen, KeyCode::Char('>'));
+    key(&mut screen, KeyCode::Char('i'));
+    wait(&mut screen, |text| {
+        text.contains("Canonical source for alpha/one issue 7")
+    });
+    key(&mut screen, KeyCode::Char('x'));
+    let form = shown(&mut screen);
+    assert!(form.contains("Close issue #7"), "{form}");
+    if form.contains("Reason") {
+        key(&mut screen, KeyCode::Tab); // Reason → closing comment.
+    }
+    paste(&mut screen, "The work is complete.");
+    control(&mut screen, KeyCode::Enter);
+    wait(&mut screen, |_| {
+        !requested("POST", "repos/alpha/one/issues/7/comments").is_empty()
+    });
+
+    key(&mut screen, KeyCode::Char('j')); // beta/two also has an issue #7.
+    screen.poll();
+    release_gate("closing-comment");
+    wait(&mut screen, |text| text.contains("Closed alpha/one#7"));
+    let comments = requested("POST", "repos/alpha/one/issues/7/comments");
+    assert_eq!(comments.len(), 1);
+    assert_eq!(comments[0]["body"]["body"], "The work is complete.");
+    let closes = requested("PATCH", "repos/alpha/one/issues/7");
+    assert_eq!(closes.len(), 1);
+    assert_eq!(closes[0]["host"], "github.com");
+    assert_eq!(closes[0]["body"]["state"], "closed");
+    assert!(requested("PATCH", "repos/beta/two/issues/7").is_empty());
+}
+
+#[test]
+fn review_receipt_retires_only_sent_draft_ids_after_switching_inbox_prs() {
+    let name = "review_receipt_retires_only_sent_draft_ids_after_switching_inbox_prs";
+    if fixture_child(name, "github.com", "github.com") {
+        return;
+    }
+    use dusty::forge::transport::{AccountNamespace, HostKey};
+
+    let host_drafts =
+        PathBuf::from(std::env::var_os("DUSTY_FORGE_STATE_DIR").unwrap()).join("drafts/github.com");
+    let account = AccountNamespace::signed_in(HostKey::new("github.com"), "rowan").unwrap();
+    let drafts_root = dusty::forge::cache::account_directory(&host_drafts, &account);
+    let alpha = drafts_root.join("alpha%2Fone/7.json");
+    let beta = drafts_root.join("beta%2Ftwo/7.json");
+    let sent = json!({
+        "id": "sent", "path": "alpha.rs", "line": 1,
+        "side": "RIGHT", "body": "Alpha draft", "head": "a".repeat(40)
+    });
+    let mut just_added = sent.clone();
+    just_added["id"] = "new-duplicate".into();
+    let mut other_repo = sent.clone(); // IDs can coincide between repository scopes.
+    other_repo["path"] = "beta.rs".into();
+    other_repo["body"] = "Beta draft".into();
+    let mut screen = open(json!({
+        "host": "github.com",
+        "gates": [{"prefix": ["pr", "review", "7"], "repo": "alpha/one", "name": "review-write"}]
+    }));
+    for (file, draft) in [(&alpha, &sent), (&beta, &other_repo)] {
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(file, json!({"schema":1, "drafts":[draft]}).to_string()).unwrap();
+    }
+    let beta_before = std::fs::read(&beta).unwrap();
+
+    key(&mut screen, KeyCode::Char('i'));
+    wait(&mut screen, |text| {
+        // The inbox row already contains the body; only the loaded detail has the head.
+        text.contains("Canonical source for alpha/one pr 7")
+            && text.contains("wants to merge into main from topic")
+    });
+    key(&mut screen, KeyCode::Char('r'));
+    assert!(shown(&mut screen).contains("Alpha draft"));
+    control(&mut screen, KeyCode::Enter);
+    wait(&mut screen, |_| {
+        !requested("POST", "repos/alpha/one/pulls/7/reviews").is_empty()
+    });
+
+    key(&mut screen, KeyCode::Char('j'));
+    screen.poll(); // Load beta's saved drafts before releasing the review receipt.
+    key(&mut screen, KeyCode::Char('r'));
+    assert!(shown(&mut screen).contains("Beta draft"));
+    key(&mut screen, KeyCode::Escape);
+    std::fs::write(
+        &alpha,
+        json!({"schema":1, "drafts":[sent, just_added.clone()]}).to_string(),
+    )
+    .unwrap();
+
+    release_gate("review-write");
+    wait(&mut screen, |text| {
+        text.contains("Review sent with 1 inline comment")
+    });
+    let reviews = requested("POST", "repos/alpha/one/pulls/7/reviews");
+    assert_eq!(reviews.len(), 1);
+    assert_eq!(reviews[0]["host"], "github.com");
+    assert_eq!(reviews[0]["body"]["commit_id"], sent["head"]);
+    assert_eq!(reviews[0]["body"]["comments"].as_array().unwrap().len(), 1);
+    assert_eq!(reviews[0]["body"]["comments"][0]["body"], "Alpha draft");
+    assert_eq!(std::fs::read(&beta).unwrap(), beta_before);
+    let alpha_after: Value = serde_json::from_slice(&std::fs::read(&alpha).unwrap()).unwrap();
+    assert_eq!(alpha_after["drafts"][0]["id"], just_added["id"]);
+    assert_eq!(alpha_after["drafts"].as_array().unwrap().len(), 1);
+}
+
+#[test]
+fn leaving_a_foreign_notification_restores_the_local_list_comment_target() {
+    let name = "leaving_a_foreign_notification_restores_the_local_list_comment_target";
+    if fixture_child(name, "github.com", "github.com") {
+        return;
+    }
+    let mut screen = open(json!({
+        "host": "github.com",
+        "notifications": [{
+            "id": "1", "unread": true, "reason": "mention",
+            "updated_at": "2026-11-09T10:00:00Z",
+            "repository": {"full_name": "beta/two"},
+            "subject": {"title": "A foreign issue notification", "type": "Issue",
+                        "url": "https://api.github.com/repos/beta/two/issues/7"}
+        }]
+    }));
+    for _ in 0..3 {
+        key(&mut screen, KeyCode::Char('>')); // PRs → Issues → Actions → Notifications.
+    }
+    wait(&mut screen, |text| {
+        text.contains("A foreign issue notification")
+    });
+    key(&mut screen, KeyCode::Enter);
+    wait(&mut screen, |text| {
+        text.contains("Canonical source for beta/two issue 7")
+    });
+    key(&mut screen, KeyCode::Escape);
+    wait(&mut screen, |text| {
+        text.contains("Canonical source for local/root issue 7")
+    });
+
+    key(&mut screen, KeyCode::Char('C'));
+    paste(&mut screen, "Comment on the row I see.");
+    control(&mut screen, KeyCode::Enter);
+    wait(&mut screen, |text| text.contains("Saved on GitHub"));
+    let comments = requested("POST", "repos/local/root/issues/7/comments");
+    assert_eq!(comments.len(), 1);
+    assert_eq!(comments[0]["host"], "github.com");
+    assert_eq!(comments[0]["body"]["body"], "Comment on the row I see.");
+    assert!(requested("POST", "repos/beta/two/issues/7/comments").is_empty());
 }
 
 #[test]

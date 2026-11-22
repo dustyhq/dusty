@@ -584,10 +584,12 @@ pub fn issue_timeline_and_threads(harness: &Harness) {
 }
 
 pub fn diffs(harness: &Harness) {
-    let diff = expect!(
-        harness.read(Read::Diff(harness.family.pull())).unwrap(),
-        Payload::Text
-    );
+    let Payload::Diff { head, text: diff } =
+        harness.read(Read::Diff(harness.family.pull())).unwrap()
+    else {
+        panic!("expected a revision-bound pull request diff");
+    };
+    assert!(!head.is_empty());
     assert!(diff.starts_with("diff --git"), "{diff:.80}");
     let pull = *expect!(
         harness
@@ -1194,6 +1196,13 @@ fn ide_picker_lists_codeberg_pull_requests() {
             "[forge.hosts.\"codeberg.org\"]\nlogin = \"cb\"\n",
         )
         .unwrap();
+        let tea_config = home.join(".config/tea");
+        std::fs::create_dir_all(&tea_config).unwrap();
+        std::fs::write(
+            tea_config.join("config.yml"),
+            format!("logins:\n  - name: cb\n    url: {}\n", server.url()),
+        )
+        .unwrap();
         rerun_in_child("ide_picker_lists_codeberg_pull_requests", |command| {
             server.configure(command);
             command
@@ -1206,7 +1215,9 @@ fn ide_picker_lists_codeberg_pull_requests() {
                 .env("DUSTY_FORGE_TEA", &tea)
                 .env("DUSTY_FORGE_GH", directory.path().join("bin/no-gh"));
             if via == Via::Http {
-                command.env("FORGEJO_TOKEN", FAKE_TOKEN);
+                command
+                    .env("FORGEJO_TOKEN", FAKE_TOKEN)
+                    .env("FORGEJO_URL", server.url());
             }
         });
         let requests = forge_fake::requests(&path);

@@ -381,7 +381,7 @@ fn issue_detail(
         return Ok(Fetched::NotModified);
     }
     if !response.success() {
-        return Err(match crate::http::classify(&ctx.endpoints, &response) {
+        return Err(match ctx.response_error(&response) {
             ForgeError::NotFound(_) => ForgeError::NotFound(format!("issue #{number}")),
             error => error,
         });

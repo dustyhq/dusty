@@ -197,6 +197,9 @@ Task output and LSP logs update while their surfaces are open and follow the tai
 - `:test.list name=<task>`
 - `:lsp.server.logs`
 
+A task used as a formatter must declare both `kind = "formatter"` and
+`stdin = true`. Dusty sends the buffer text to the formatter on standard input.
+
 Task source locations are jumpable: select a `file:line[:column]` row and press
 Enter, or Escape then `gf` in picker Normal mode. Cargo arrows, TypeScript
 `file(line,column)` diagnostics, Go errors, and Python traceback frames are
@@ -454,22 +457,34 @@ Dusty never asks for a token. It uses the first sign-in it finds for the host:
 
 | Forge | Environment | Sign-in it reads |
 | --- | --- | --- |
-| GitHub | `DUSTY_FORGE_TOKEN`; `GH_TOKEN` or `GITHUB_TOKEN` for github.com and `*.ghe.com`; `GH_ENTERPRISE_TOKEN` or `GITHUB_ENTERPRISE_TOKEN` for other hosts | `gh auth token` (sign in with `gh auth login`) |
+| GitHub | `DUSTY_FORGE_TOKEN`; `GH_TOKEN` or `GITHUB_TOKEN`; `GH_ENTERPRISE_TOKEN` or `GITHUB_ENTERPRISE_TOKEN` with `GH_HOST` | `gh auth token` (sign in with `gh auth login`) |
 | GitLab | `DUSTY_FORGE_TOKEN`; `GITLAB_TOKEN` | glab's `config.yml`, then `glab auth status --show-token` (sign in with `glab auth login`) |
 | Gitea, Forgejo | `DUSTY_FORGE_TOKEN`; `GITEA_SERVER_TOKEN` with `GITEA_SERVER_URL`; `FORGEJO_TOKEN`; `GITEA_TOKEN` | fj's `keys.json` (`fj -H HOST auth login`), then tea's `config.yml` (`tea login add`) |
 
-Some variables apply to one host only. `DUSTY_FORGE_TOKEN` applies to
-`DUSTY_FORGE_HOST`, or to every host when that is unset. `GITLAB_TOKEN` applies to
-`GITLAB_HOST` or `GL_HOST` when one is set. `GITEA_SERVER_TOKEN` needs
-`GITEA_SERVER_URL`, and `FORGEJO_TOKEN` and `GITEA_TOKEN` follow `GITEA_SERVER_URL`
-or `FORGEJO_URL` when one is set. glab's file is `$GLAB_CONFIG_DIR/config.yml`, else
+Dusty sends a sign-in only to the API address it belongs to: the scheme, host
+and port must match. If you set a custom API address on another host or port,
+sign in for that address or use a token with that exact API URL as its selector.
+
+- `DUSTY_FORGE_TOKEN` follows `DUSTY_FORGE_HOST`. With no host selector, it is
+  used only for the public service named by `DUSTY_FORGE_PROVIDER`: github.com
+  (API at api.github.com), gitlab.com, gitea.com or codeberg.org. If neither
+  is set, it is used only for GitHub.
+- `GH_TOKEN` and `GITHUB_TOKEN` default to github.com. For a `*.ghe.com` host,
+  set `GH_HOST`. For other GitHub Enterprise hosts, set `GH_HOST` and use
+  `GH_ENTERPRISE_TOKEN` or `GITHUB_ENTERPRISE_TOKEN`.
+- `GITLAB_TOKEN` follows `GITLAB_HOST` or `GL_HOST`, defaulting to gitlab.com.
+- `GITEA_SERVER_TOKEN` requires `GITEA_SERVER_URL`. `FORGEJO_TOKEN` and
+  `GITEA_TOKEN` follow `GITEA_SERVER_URL` or `FORGEJO_URL`, defaulting to
+  codeberg.org and gitea.com respectively.
+
+glab's file is `$GLAB_CONFIG_DIR/config.yml`, else
 `$XDG_CONFIG_HOME/glab-cli/config.yml` (`~/.config` when unset); tea's is
 `$XDG_CONFIG_HOME/tea/config.yml`; fj's is `$XDG_DATA_HOME/forgejo-cli/keys.json`
 (`~/.local/share` when unset).
 
 With a token, Dusty talks to the forge's API directly after checking the token
-once. Without one it sends requests through the forge's CLI (`gh`, `glab` or `tea`)
-when that is installed. `DUSTY_FORGE_GH`, `DUSTY_FORGE_GLAB` and `DUSTY_FORGE_TEA`
+once. Without one it can use a saved sign-in from the forge's CLI (`gh`,
+`glab` or `tea`) for that host. Dusty does not pass environment tokens to the CLI. `DUSTY_FORGE_GH`, `DUSTY_FORGE_GLAB` and `DUSTY_FORGE_TEA`
 name the CLI to use instead of the one on `PATH`. `DUSTY_FORGE_TRANSPORT=http` uses
 only a token and `DUSTY_FORGE_TRANSPORT=cli` only the CLI. Tokens never appear in
 the screen, logs, notices or cache files.
@@ -502,9 +517,8 @@ api_base = "https://git.example.com/api/v1"  # only when the API lives elsewhere
 login = "work"                  # the tea login to use for this host
 ```
 
-For GitHub Enterprise Server use `GH_ENTERPRISE_TOKEN` or `gh auth login
---hostname HOST`; with `GH_HOST` set to that host, the token also tells Dusty the
-host is GitHub. Likewise `GITLAB_TOKEN` with `GITLAB_HOST`, and
+For GitHub Enterprise Server use `GH_ENTERPRISE_TOKEN` with `GH_HOST` set to
+that host, or sign in with `gh auth login --hostname HOST`. Likewise `GITLAB_TOKEN` with `GITLAB_HOST`, and
 `GITEA_SERVER_TOKEN` with `GITEA_SERVER_URL`, name their host's forge. What Dusty found out
 about a host is kept in `$XDG_STATE_HOME/dusty/forge/hosts.json`
 (`DUSTY_FORGE_STATE_DIR` changes the directory). The file never holds a token.

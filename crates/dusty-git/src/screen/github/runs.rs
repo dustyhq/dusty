@@ -237,7 +237,7 @@ fn job_seconds(job: &Value) -> Option<i64> {
 
 /// A read's error as UI copy: the provider's sentence, never an HTTP status echo.
 /// A failed read in plain words and its one next key (`states::explain`): `Rate limited by
-/// github.com · resets in 11m · R retry once it resets`, never the forge's raw `502 Bad
+/// github.com · resets in 11m · R retry after reset`, never the forge's raw `502 Bad
 /// Gateway` or `error sending request`.
 fn calm(ws: &Workspace, error: &str) -> String {
     ws.explain(error).line()
@@ -942,33 +942,41 @@ impl Workspace {
                 None => ("Loading…".into(), GitRole::Muted),
             },
             Some(Ok(_)) if self.runs().is_empty() => (format!("No {noun}s yet"), GitRole::Muted),
-            Some(Ok(_)) => match self.actions.section {
-                1 => ("Nothing is failing".into(), GitRole::Added),
-                2 => ("Nothing is running".into(), GitRole::Muted),
-                3 => (format!("None of these {noun}s are yours"), GitRole::Muted),
-                _ => (format!("No {noun}s match these filters"), GitRole::Muted),
-            },
+            Some(Ok(_)) => {
+                let login = self.viewer_login();
+                let section = self.actions.section;
+                if self
+                    .runs()
+                    .into_iter()
+                    .any(|run| self.in_section(run, section, login.as_deref()))
+                {
+                    return (format!("No {noun}s match these filters"), GitRole::Muted);
+                }
+                match section {
+                    1 => ("Nothing is failing".into(), GitRole::Added),
+                    2 => ("Nothing is running".into(), GitRole::Muted),
+                    3 => (format!("None of these {noun}s are yours"), GitRole::Muted),
+                    _ => (format!("No {noun}s match these filters"), GitRole::Muted),
+                }
+            }
         }
     }
 
-    fn actions_failure_hints(&self) -> Option<Vec<(&'static str, &'static str)>> {
-        let key = Key::Runs(self.workflow_id());
-        let hint = match self.cache.get(&key) {
-            Some(Ok(_)) => return None,
-            Some(Err(error)) => self.explain(error).hint,
-            None => match self.cache.get(&Key::Repository) {
-                Some(Err(error)) => self.explain(error).hint,
-                _ => return None,
-            },
+    fn actions_failure_hints(&self, key: &Key) -> Option<Vec<(&'static str, &'static str)>> {
+        let Some(Err(error)) = self.cache.get(key) else {
+            return None;
         };
-        let mut hints = vec![("R", "retry")];
+        let hint = self.explain(error).hint;
+        let retry = if hint == super::states::RETRY_AFTER_RESET {
+            "retry after reset"
+        } else {
+            "retry"
+        };
+        let mut hints = vec![("R", retry)];
         if hint.contains("sign in") {
             hints.push(("@", "sign in"));
         } else if hint.contains('@') {
             hints.push(("@", "accounts"));
-        }
-        if self.return_to.is_some() || self.notify.back {
-            hints.push(("Esc", "back"));
         }
         Some(hints)
     }
@@ -2319,6 +2327,39 @@ impl Workspace {
         }
     }
 
+    fn dispatch_verb(&self) -> &'static str {
+        if self.terms().run_noun == "pipeline" {
+            "run pipeline"
+        } else {
+            "run workflow"
+        }
+    }
+
+    fn dispatch_hint(&self) -> Option<(&'static str, &'static str)> {
+        let caps = self.capabilities();
+        if self.read_only() || !caps.dispatch.allowed() || self.dispatch_refusal().is_some() {
+            return None;
+        }
+        let id = self.dispatch_workflow()?;
+        let label = match self.cache.get(&Key::Workflow(id, String::new())) {
+            Some(Ok(reply)) => {
+                if !workflow::Definition::parse(&reply.text).ok()?.dispatch {
+                    return None;
+                }
+                self.dispatch_verb()
+            }
+            None if caps.dispatch_inputs_schema.allowed()
+                && !self.workflows().iter().any(|workflow| {
+                    number(workflow, "id") == id && workflow["dispatchable"] == Value::Bool(true)
+                }) =>
+            {
+                "check workflow"
+            }
+            _ => self.dispatch_verb(),
+        };
+        Some(("d", label))
+    }
+
     // --------------------------------------------------------------------------- keys
 
     /// Whether Actions types into its own input (a find or filter row), or Notifications
@@ -2491,9 +2532,7 @@ impl Workspace {
                 KeyCode::Char('r') => id.map(Action::Rerun),
                 KeyCode::Char('x') => id.map(Action::Cancel),
                 KeyCode::Char('A') => id.map(Action::Approve),
-                KeyCode::Char('d') if self.actions_failure_hints().is_none() => {
-                    Some(Action::Dispatch(0))
-                }
+                KeyCode::Char('d') => Some(Action::Dispatch(0)),
                 _ => None,
             };
             if matches!(sheet, Some(Action::Dispatch(_)))
@@ -2515,11 +2554,7 @@ impl Workspace {
                 let Some(id) = id else {
                     return Some(Err(format!("Select a {} first", self.actions_noun())));
                 };
-                let url = self
-                    .run_value(id)
-                    .map(|run| string(run, "url").to_owned())
-                    .unwrap_or_default();
-                if !url.starts_with("https://") && !url.starts_with("http://") {
+                let Some(url) = self.run_value(id).and_then(run_url).map(str::to_owned) else {
                     return Some(Err(format!("This {} has no web page", self.actions_noun())));
                 };
                 return Some(self.activate(Action::Web(3, id, url)));
@@ -3437,6 +3472,11 @@ impl Input {
     }
 }
 
+fn run_url(run: &Value) -> Option<&str> {
+    let url = string(run, "url");
+    (url.starts_with("https://") || url.starts_with("http://")).then_some(url)
+}
+
 fn run_number(run: &Value) -> u64 {
     run["number"]
         .as_u64()
@@ -3689,13 +3729,18 @@ pub(in crate::screen) fn frame(app: &mut GitScreen, width: u16, height: u16) -> 
             "",
             true,
         );
-        let (text, role) = match app.github.cache.get(&Key::Repository) {
-            Some(Err(error)) => (calm(&app.github, error), GitRole::Removed),
-            _ => ("Loading the repository…".to_owned(), GitRole::Muted),
-        };
-        frame
-            .grid
-            .put_text_clipped(2, 2, &text, st(role, PANE), width - 2);
+        let text = Rect::new(2, 2, body.w - 4, body.h - 2);
+        if let Some(Err(error)) = app.github.cache.get(&Key::Repository) {
+            paint_connection_error(&mut frame.grid, &app.github, text, error);
+        } else {
+            frame.grid.put_text_clipped(
+                text.x,
+                text.y,
+                "Loading the repository…",
+                st(GitRole::Muted, PANE),
+                text.right(),
+            );
+        }
     } else {
         page(&mut frame, &mut app.github, body, mode);
     }
@@ -3710,24 +3755,59 @@ pub(in crate::screen) fn frame(app: &mut GitScreen, width: u16, height: u16) -> 
     frame
 }
 
+/// Keep the configured-address remedy legible in both the full pane and the history column.
+fn paint_connection_error(grid: &mut CellGrid, ws: &Workspace, text: Rect, error: &str) {
+    if text.h == 0 || text.w == 0 {
+        return;
+    }
+    let words = ws.explain(error);
+    if words.headline != crate::forge::credential::API_PATH_NOT_FOUND {
+        grid.put_text_clipped(
+            text.x,
+            text.y,
+            &words.line(),
+            st(GitRole::Removed, PANE),
+            text.right(),
+        );
+        return;
+    }
+
+    let mut rows = text.y..text.bottom();
+    for (message, role) in [
+        (&words.headline, GitRole::Removed),
+        (&words.hint, GitRole::Muted),
+    ] {
+        for line in super::prose::wrap_words(message, usize::from(text.w)) {
+            let Some(row) = rows.next() else { return };
+            grid.put_text_clipped(text.x, row, line.trim(), st(role, PANE), text.right());
+        }
+    }
+}
+
 /// Workflows over their runs on the left, the run on the right; below 90 columns
 /// the left column or the run; `z` gives the run the whole width, and `toggle_sidebar`
 /// (`Space e`) hides the left column until it is toggled back.
 fn page(frame: &mut Frame, ws: &mut Workspace, body: Rect, mode: ExplorerIconMode) {
     let narrow = body.w < SPLIT;
     ws.actions.narrow = narrow;
-    if narrow && !ws.actions.open {
-        ws.actions.right = false;
-    }
     if narrow {
         if ws.actions.open && ws.run_id.is_some() {
             paint_run(frame, ws, body, true, mode);
         } else {
+            if ws.actions.right || ws.actions.pinned {
+                ws.leave_run();
+                ws.sync_actions();
+            }
             paint_left(frame, ws, body, mode);
         }
         return;
     }
-    if ws.sidebar_hidden() && ws.run_id.is_some() {
+    if ws.sidebar_hidden() {
+        if ws.run_id.is_none() || ws.actions.filter.editing || ws.actions.picker {
+            // There is no reader to fill this layout, or the list owns the input.
+            paint_left(frame, ws, body, mode);
+            return;
+        }
         // The left column is out of sight: the keys go to the run.
         ws.actions.right = true;
         ws.actions.workflows = false;
@@ -3925,12 +4005,22 @@ fn paint_list(
         let x = inner.x + 1;
         let room = inner.w.saturating_sub(2);
         let mut spans: Vec<Span> = Vec::new();
+        let mut cursor = None;
         if filter.active() {
-            spans.push((
-                format!("{} ", glyph(Glyph::Search, mode)),
-                st(GitRole::Modified, PANE),
-            ));
-            spans.push((filter.query.clone(), bold(GitRole::Modified, PANE)));
+            let prefix = format!("{} ", glyph(Glyph::Search, mode));
+            let prefix_width = chrome::width(&prefix);
+            let query = if filter.editing {
+                // The input appends at the end. Keep the tail and reserve its caret cell.
+                let query_room = room.saturating_sub(prefix_width + 1);
+                chrome::ellipsize_start(&filter.query, usize::from(query_room))
+            } else {
+                filter.query.clone()
+            };
+            if filter.editing && focused {
+                cursor = Some(x + prefix_width + chrome::width(&query));
+            }
+            spans.push((prefix, st(GitRole::Modified, PANE)));
+            spans.push((query, bold(GitRole::Modified, PANE)));
             if filter.editing {
                 spans.push(("▏".into(), st(GitRole::Modified, PANE)));
             }
@@ -3942,19 +4032,9 @@ fn paint_list(
             spans.push((word.clone(), st(GitRole::Ref, PANE)));
         }
         spans.push(("  Esc clears".into(), st(GitRole::Muted, PANE)));
-        chrome::put_spans(
-            &mut frame.grid,
-            inner.x + 1,
-            y,
-            &clip(spans, inner.w.saturating_sub(2)),
-            inner.right() - 1,
-        );
-        if filter.editing && focused {
-            frame.cursor = Some((
-                inner.x + 3 + chrome::width(&filter.query),
-                y,
-                SetCursorStyle::SteadyBar,
-            ));
+        chrome::put_spans(&mut frame.grid, x, y, &clip(spans, room), inner.right() - 1);
+        if let Some(x) = cursor {
+            frame.cursor = Some((x, y, SetCursorStyle::SteadyBar));
         }
         y += 1;
     }
@@ -3965,10 +4045,19 @@ fn paint_list(
     let list = Rect::new(inner.x, y, inner.w, inner.bottom().saturating_sub(y));
     let runs = ws.shown_runs();
     if runs.is_empty() {
-        let (text, role) = ws.empty_runs();
-        frame
-            .grid
-            .put_text_clipped(list.x + 1, list.y, &text, st(role, PANE), list.right() - 1);
+        if let Some(Err(error)) = ws.cache.get(&key) {
+            let text = Rect::new(list.x + 1, list.y, list.w.saturating_sub(2), list.h);
+            paint_connection_error(&mut frame.grid, ws, text, error);
+        } else {
+            let (text, role) = ws.empty_runs();
+            frame.grid.put_text_clipped(
+                list.x + 1,
+                list.y,
+                &text,
+                st(role, PANE),
+                list.right() - 1,
+            );
+        }
         if focused && frame.cursor.is_none() {
             frame.cursor = Some((list.x + 1, list.y, SetCursorStyle::SteadyBlock));
         }
@@ -4128,16 +4217,25 @@ fn paint_run(
         .and_then(|id| ws.run_value(id).map(|run| (id, run.clone())))
     else {
         let noun = ws.actions_noun();
-        let (text, role) = if ws.run_target().is_some() {
-            ("Loading…".to_owned(), GitRole::Muted)
-        } else if let Some(Ok(_)) = ws.cache.get(&Key::Runs(ws.workflow_id()))
-            && ws.runs().is_empty()
-        {
-            // Why `d` would refuse stays on screen here, not only in a toast that fades.
-            match ws.dispatch_refusal() {
-                None => (format!("No {noun} to show · d starts one"), GitRole::Muted),
-                Some(reason) => (format!("No {noun} to show · {reason}"), GitRole::Muted),
+        let history = ws.cache.get(&Key::Runs(ws.workflow_id()));
+        let (text, role) = if let Some(id) = ws.run_target() {
+            match ws.cache.get(&Key::Run(id, ws.attempt)) {
+                Some(Err(error)) => (calm(ws, error), GitRole::Removed),
+                _ => ("Loading…".to_owned(), GitRole::Muted),
             }
+        } else if history.is_some_and(Result::is_err) {
+            // The history pane already explains why the list could not be loaded.
+            return;
+        } else if history.is_some_and(Result::is_ok) && ws.runs().is_empty() {
+            // Why `d` would refuse stays on screen here, not only in a toast that fades.
+            let text = if let Some(reason) = ws.dispatch_refusal() {
+                format!("No {noun}s yet · {reason}")
+            } else if let Some((key, verb)) = ws.dispatch_hint() {
+                format!("No {noun}s yet · {key} {verb}")
+            } else {
+                format!("No {noun}s yet")
+            };
+            (text, GitRole::Muted)
         } else {
             ws.empty_runs()
         };
@@ -4924,13 +5022,17 @@ fn footer(app: &GitScreen, frame: &mut Frame, rect: Rect) {
             .collect::<Vec<_>>();
         hints.push(("Esc", "cancel"));
         hints
+    } else if let Some(mut hints) = ws.actions_failure_hints(&Key::Repository) {
+        if ws.notify.back || ws.return_to.is_some() {
+            hints.push(("Esc", "back"));
+        }
+        hints
     } else if !view.right && view.workflows {
-        let mut hints = vec![
-            ("j k", "choose"),
-            ("Enter", "runs"),
-            ("d", "dispatch"),
-            ("Tab", "panels"),
-        ];
+        let mut hints = ws
+            .actions_failure_hints(&Key::Runs(ws.workflow_id()))
+            .unwrap_or_default();
+        hints.extend(ws.dispatch_hint());
+        hints.extend([("j k", "choose"), ("Enter", "runs"), ("Tab", "panels")]);
         if !sidebar.is_empty() {
             hints.push((sidebar.as_str(), "sidebar"));
         }
@@ -4938,15 +5040,23 @@ fn footer(app: &GitScreen, frame: &mut Frame, rect: Rect) {
     } else if !view.right {
         // The run under the cursor still going: `x cancel`, not `r rerun`.
         let run = ws.run_target().and_then(|id| ws.run_value(id));
-        let mut hints = vec![("[ ]", "sections"), ("/", "filter"), ("F", "narrow")];
+        let mut hints = ws
+            .actions_failure_hints(&Key::Runs(ws.workflow_id()))
+            .unwrap_or_default();
+        hints.extend(ws.dispatch_hint());
         if let Some(run) = run {
             hints.insert(0, ("Enter", "open"));
-            hints.push(if State::of(run).finished() {
-                ("r", "re-run")
-            } else {
-                ("x", "cancel")
-            });
+            let caps = ws.capabilities();
+            if State::of(run).finished() {
+                if caps.rerun_all.allowed() || caps.rerun_failed.allowed() {
+                    hints.push(("r", "re-run"));
+                }
+            } else if caps.cancel_run.allowed() {
+                hints.push(("x", "cancel"));
+            }
         }
+        // Keep the selected run's write ahead of general navigation at narrow widths.
+        hints.extend([("[ ]", "sections"), ("/", "filter"), ("F", "narrow")]);
         // Opened from Notifications: the way back reads second, so a narrow row keeps it.
         if ws.notify.back {
             hints.insert(1, ("Esc", "back"));
@@ -4954,12 +5064,25 @@ fn footer(app: &GitScreen, frame: &mut Frame, rect: Rect) {
         if !sidebar.is_empty() {
             hints.push((sidebar.as_str(), "sidebar"));
         }
-        if ws.dispatch_refusal().is_none() {
-            hints.push(("d", "dispatch"));
-        }
-        if run.is_some() {
+        if run.is_some_and(|run| run_url(run).is_some()) {
             hints.push(("o", "browser"));
         }
+        hints
+    } else if let Some(id) = ws.run_target()
+        && ws.run_value(id).is_none()
+    {
+        let mut hints = ws
+            .actions_failure_hints(&Key::Run(id, ws.attempt))
+            .unwrap_or_default();
+        hints.push((
+            "Esc",
+            if view.zoom {
+                "unzoom"
+            } else {
+                back.as_deref().unwrap_or("list")
+            },
+        ));
+        hints.extend(ws.dispatch_hint());
         hints
     } else if view.visual.is_some() {
         vec![("j k", "extend"), ("y", "copy"), ("Esc", "cancel")]
@@ -5045,38 +5168,46 @@ fn footer(app: &GitScreen, frame: &mut Frame, rect: Rect) {
             Some(id) if ws.cursor_job(id).is_some() => "re-run job",
             _ => "re-run",
         };
-        // Signed out, a run can only be read: the key still says why when pressed.
-        if !ws.read_only() {
-            hints.push((4, if running { "x" } else { "r" }, rerun));
+        if running && caps.cancel_run.allowed() {
+            hints.push((4, "x", rerun));
+        } else if !running && (caps.rerun_all.allowed() || caps.rerun_failed.allowed()) {
+            hints.push((4, "r", rerun));
+        }
+        if rows.iter().any(|row| row.log.is_some()) {
+            hints.push((5, "/", "find"));
+        }
+        if run.is_some_and(|run| run_url(run).is_some()) {
+            hints.push((8, "o", "browser"));
         }
         hints.extend([
-            (5, "/", "find"),
-            (8, "o", "browser"),
             (8, "w", if view.nowrap { "wrap" } else { "no wrap" }),
             (0, "Esc", back.as_deref().unwrap_or("list")),
         ]);
         if !sidebar.is_empty() {
             hints.push((9, sidebar.as_str(), "sidebar"));
         }
+        if let Some((key, label)) = ws.dispatch_hint() {
+            hints.push((1, key, label));
+        }
         // The width the row has after a mode chip (NORMAL), or the last hints (`Esc`) are cut.
         fit_hints(&hints, chrome::footer_rect(rect).w, message)
     };
     let context = if view.right || ws.leader_pending() {
-        String::new()
+        ""
     } else {
-        view.filter.query.clone()
+        view.filter.query.as_str()
     };
     // Signed out: Actions' writes leave the footer, as the other tabs' do (pressing one
     // still says why).
     let mut hints = hints;
     if ws.read_only() {
-        hints
-            .retain(|hint| !matches!(*hint, ("x", "cancel") | ("r", "re-run") | ("d", "dispatch")));
+        hints.retain(|(key, _)| !matches!(*key, "x" | "r" | "d"));
     }
-    chrome::footer_with(&mut frame.grid, rect, &hints, &context, message, usize::MAX);
+    // The list already shows the query above the rows; its footer copy can yield to keys.
+    chrome::footer_keys_first_fill(&mut frame.grid, rect, &hints, context, message);
 }
 
-/// The hints `chrome::footer_with` will show whole (`? keys` after them), chosen by priority
+/// The hints `chrome::footer_keys_first_fill` will show whole (`? keys` after them), chosen by priority
 /// (0 first) until the width runs out, and kept in reading order.
 fn fit_hints<'a>(
     hints: &[(u8, &'a str, &'a str)],
@@ -5224,7 +5355,7 @@ mod tests {
             "{limited}"
         );
         assert!(
-            limited.ends_with(" · R retry once it resets") && !limited.contains("711s"),
+            limited.ends_with(" · R retry after reset") && !limited.contains("711s"),
             "{limited}"
         );
         let offline = calm(&ws, "Network error · error sending request");
@@ -5915,6 +6046,72 @@ mod tests {
         workspace.actions.rerun_job_run = Some(501);
         workspace.written(&Write::RerunJob(7.into()), Ok(Default::default()), &target);
         assert!(workspace.actions.pinned);
+    }
+
+    #[test]
+    fn rerun_follows_the_selected_row_after_resizing_before_the_history_reply() {
+        let (_root, mut app) = actions_screen();
+        app.github.choose_section(1);
+        app.github.toggle_sidebar();
+        frame(&mut app, 100, 30);
+        let rerun = Write::Rerun {
+            run: 501.into(),
+            scope: crate::forge::request::RerunScope::All,
+            debug: false,
+        };
+        app.github
+            .written(&rerun, Ok(Default::default()), &app.github.target());
+
+        frame(&mut app, 80, 30);
+        assert!(!app.github.actions.pinned);
+        assert_eq!(app.github.run_target(), Some(501));
+        let Ok(reply) = app.github.cache.get_mut(&Key::Runs(0)).unwrap() else {
+            unreachable!()
+        };
+        reply.value[0]["status"] = "in_progress".into();
+        reply.value[0]["conclusion"] = Value::Null;
+        frame(&mut app, 80, 30);
+        assert_eq!(app.github.actions.section, 2);
+        assert_eq!(app.github.run_target(), Some(501));
+    }
+
+    #[test]
+    fn resizing_to_the_visible_list_drops_an_off_list_rerun_pin() {
+        let (_root, mut app) = actions_screen();
+        app.github.choose_section(1);
+        app.github.toggle_sidebar();
+        let next = json!({
+            "databaseId": 502, "displayTitle": "Another failing run", "status": "completed",
+            "conclusion": "failure", "url": "https://github.com/octo/orbit/actions/runs/502"
+        });
+        let Ok(reply) = app.github.cache.get_mut(&Key::Runs(0)).unwrap() else {
+            unreachable!()
+        };
+        reply.value.as_array_mut().unwrap().push(next);
+        frame(&mut app, 100, 30);
+        assert!(app.github.actions.right && !app.github.actions.open);
+        let rerun = Write::Rerun {
+            run: 501.into(),
+            scope: crate::forge::request::RerunScope::All,
+            debug: false,
+        };
+        app.github
+            .written(&rerun, Ok(Default::default()), &app.github.target());
+        assert!(app.github.actions.pinned);
+        // After the refresh only B is listed, so no other tab can show A.
+        let Ok(reply) = app.github.cache.get_mut(&Key::Runs(0)).unwrap() else {
+            unreachable!()
+        };
+        reply.value.as_array_mut().unwrap().remove(0);
+        let narrow = frame(&mut app, 80, 30);
+        let (_, y, _) = narrow.cursor.expect("list cursor");
+        assert!(narrow.grid.row_text(y).contains("Another failing run"));
+        assert!(!app.github.actions.pinned);
+        let form = app.github.event(&KeyEvent::character('o'), None).unwrap();
+        assert!(matches!(
+            form.map(|form| form.action),
+            Some(FormAction::Github(Action::Web(3, 502, _)))
+        ));
     }
 
     #[test]

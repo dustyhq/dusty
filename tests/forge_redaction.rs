@@ -57,20 +57,12 @@ fn every_token_shape_is_redacted() {
             "0123456789abcdef0123456789abcdef01234567",
         ),
         (
-            "https://x/?token=0123456789abcdef0123456789abcdef01234567",
-            "0123456789abcdef0123456789abcdef01234567",
-        ),
-        (
             "    token: s3cr3t-config-value-0001",
             "s3cr3t-config-value-0001",
         ),
         (
             "{\"token\": \"s3cr3t-json-value-000002\"}",
             "s3cr3t-json-value-000002",
-        ),
-        (
-            "fatal: https://maya:hunter2hunter2@git.example/o/r.git",
-            "hunter2hunter2",
         ),
     ] {
         let redacted = redact(text);
@@ -80,6 +72,18 @@ fn every_token_shape_is_redacted() {
     // Commit hashes in ordinary text survive.
     let sha = "error: 0123456789abcdef0123456789abcdef01234567 is not a commit";
     assert_eq!(redact(sha), sha);
+}
+
+#[test]
+fn url_credentials_and_queries_are_removed_without_hiding_the_address() {
+    assert_eq!(
+        redact("https://x/?token=0123456789abcdef0123456789abcdef01234567"),
+        "https://x/"
+    );
+    assert_eq!(
+        redact("fatal: https://maya:hunter2hunter2@git.example/o/r.git"),
+        "fatal: https://git.example/o/r.git"
+    );
 }
 
 #[test]
@@ -261,7 +265,13 @@ fn cli_passthrough_never_puts_a_token_in_argv() {
         (ProviderKind::GitLab, "gl.redact.test"),
         (ProviderKind::Gitea, "tea.redact.test"),
     ] {
-        let chosen = transport::passthrough(&world.endpoints(kind, host), &options).unwrap();
+        let endpoints = detect::endpoints_for(
+            kind,
+            &HostKey::new(host),
+            None,
+            &Env::from_pairs([] as [(&str, &str); 0]),
+        );
+        let chosen = transport::passthrough(&endpoints, &options).unwrap();
         chosen
             .send(&HostKey::new(host), &request, &AtomicBool::new(false))
             .unwrap();

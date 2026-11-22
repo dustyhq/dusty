@@ -1777,29 +1777,49 @@ pub(super) fn record_rows(
             super::prose::muted("Anonymous visitors see nothing here,"),
             super::prose::muted("not even public repositories."),
             super::prose::blank(),
-            super::prose::Rich::new()
-                .push("Sign in with", super::prose::strong(GitRole::Text))
-                .line(),
         ];
-        for hint in &hints {
-            rows.push(
-                super::prose::Rich::new()
-                    .push("  $ ", super::prose::role(GitRole::Muted))
-                    .push(
-                        crate::forge::cli::redact(hint),
-                        super::prose::role(GitRole::Link),
-                    )
-                    .line(),
-            );
-        }
-        if let Some(
-            crate::forge::provider::ProviderKind::Gitea
-            | crate::forge::provider::ProviderKind::Forgejo,
-        ) = workspace.forge_kind()
-        {
-            rows.push(super::prose::muted(&format!(
-                "or make a token at https://{host}/user/settings/applications"
-            )));
+        let advice = hints
+            .iter()
+            .find(|hint| crate::forge::credential::is_sign_in_advice(hint));
+        if let Some(advice) = advice {
+            for line in crate::forge::cli::redact(advice).lines() {
+                rows.extend(
+                    super::prose::wrap_words(line, width)
+                        .iter()
+                        .map(|part| super::prose::muted(part.trim_start())),
+                );
+            }
+        } else {
+            rows.push(super::prose::heading("Sign in with", ""));
+            for hint in &hints {
+                let hint = crate::forge::cli::redact(hint);
+                if crate::forge::credential::is_token_example(&hint) {
+                    rows.extend(
+                        super::prose::wrap_words(&format!("  Set {hint}"), width)
+                            .iter()
+                            .map(|part| super::prose::muted(part.trim_end())),
+                    );
+                } else {
+                    rows.push(
+                        super::prose::Rich::new()
+                            .push("  $ ", super::prose::role(GitRole::Muted))
+                            .push(hint, super::prose::role(GitRole::Link))
+                            .line(),
+                    );
+                }
+            }
+            if let Some(
+                crate::forge::provider::ProviderKind::Gitea
+                | crate::forge::provider::ProviderKind::Forgejo,
+            ) = workspace.forge_kind()
+            {
+                let site = workspace
+                    .advertised_site_base()
+                    .unwrap_or_else(|| format!("https://{host}"));
+                rows.push(super::prose::muted(&format!(
+                    "or make a token at {site}/user/settings/applications"
+                )));
+            }
         }
         rows.push(super::prose::blank());
         rows.push(super::prose::muted("then R to retry · @ accounts"));

@@ -596,7 +596,7 @@ fn blocks(rows: &mut Vec<Line>, text: &str, width: usize, indent: &str) {
 /// the edge only when it has none. Plain prose may break after a
 /// `-` that joins two words. The fragments are contiguous byte ranges of `text`, as the
 /// reader's find offsets need.
-fn wrap_words(text: &str, width: usize) -> Vec<String> {
+pub(super) fn wrap_words(text: &str, width: usize) -> Vec<String> {
     use unicode_segmentation::UnicodeSegmentation;
     let width = width.max(1);
     let mut rows = Vec::new();

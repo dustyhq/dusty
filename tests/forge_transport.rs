@@ -99,15 +99,6 @@ impl World {
         endpoints
     }
 
-    fn options(&self) -> ConnectOptions {
-        ConnectOptions {
-            gh: Some(self.gh.clone()),
-            // Signed-out states, not anonymous reads (tests/forge_anonymous.rs).
-            no_anonymous: true,
-            ..ConnectOptions::default()
-        }
-    }
-
     fn transport(&self, via: Via, host: &str) -> Arc<dyn Transport> {
         match via {
             Via::Http => Arc::new(
@@ -130,7 +121,11 @@ impl World {
         ForgeContext::new(
             self.directory.path().to_path_buf(),
             self.endpoints(host),
-            self.options(),
+            ConnectOptions {
+                gh: Some(self.gh.clone()),
+                no_anonymous: true,
+                ..ConnectOptions::default()
+            },
             repo.and_then(RepoRef::parse),
             self.transport(via, host),
         )
@@ -138,7 +133,7 @@ impl World {
 }
 
 fn read(ctx: &ForgeContext, read: Read) -> Result<Payload, ForgeError> {
-    let provider = provider::build(ProviderKind::GitHub).unwrap();
+    let provider = provider::build(ctx.endpoints.kind).unwrap();
     match provider.read(ctx, &read, &Conditional::default(), &AtomicBool::new(false))? {
         Fetched::Payload { value, .. } => Ok(value),
         Fetched::NotModified => panic!("{read:?} was not modified"),
@@ -149,6 +144,46 @@ fn write(ctx: &ForgeContext, write: Write) -> Result<dusty::forge::request::Rece
     provider::build(ProviderKind::GitHub)
         .unwrap()
         .write(ctx, &write, &AtomicBool::new(false))
+}
+
+#[test]
+fn github_pr_diff_retries_when_the_head_moves_without_using_contents_permissions() {
+    let world = World::new(json!({"move_head_after_diff": ["b".repeat(40)]}));
+    let ctx = world.context(Via::Http, "github.com", Some("example/demo"));
+
+    let Payload::Diff { head, text } = read(&ctx, Read::Diff(9)).unwrap() else {
+        panic!("expected a PR patch");
+    };
+    assert_eq!(head, "b".repeat(40), "retry must use the new head");
+    assert!(text.starts_with("diff --git"));
+
+    let requests = world.requests();
+    assert_eq!(
+        requests
+            .iter()
+            .map(|request| request["path"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["repos/example/demo/pulls/9"; 6],
+    );
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request["accept"]
+                .as_str()
+                .is_some_and(|accept| accept.contains("diff")))
+            .count(),
+        2
+    );
+
+    world.update(|state| state["move_head_after_diff"] = json!(["c".repeat(40), "d".repeat(40)]));
+    let Payload::Diff { head, text } = read(&ctx, Read::Diff(9)).unwrap() else {
+        panic!("expected a visible but unanchored PR patch");
+    };
+    assert!(
+        head.is_empty(),
+        "two moving heads can't establish a revision"
+    );
+    assert!(text.starts_with("diff --git"));
 }
 
 /// The domain values every read of the contract produced, for comparing the two transports.
@@ -250,9 +285,10 @@ fn contract(world: &World, via: Via) -> Vec<String> {
     assert_eq!(viewed.len(), 2);
     seen.push(format!("{viewed:?}"));
 
-    let Payload::Text(diff) = read(&ctx, Read::Diff(9)).unwrap() else {
-        panic!()
+    let Payload::Diff { head, text: diff } = read(&ctx, Read::Diff(9)).unwrap() else {
+        panic!("expected a revision-bound pull request diff");
     };
+    assert_eq!(head, "a".repeat(40));
     assert!(diff.starts_with("diff --git a/example.rs"), "{diff}");
     seen.push(diff);
 
@@ -614,122 +650,326 @@ fn passthrough_output_parses_as_an_http_response() {
     assert!(String::from_utf8_lossy(&output.stderr).contains("(HTTP 404)"));
 }
 
+// glab permits a saved sign-in to name an explicit API origin, including the fixture's
+// loopback scheme and port. A saved gh sign-in can only name the host's normal HTTPS API.
+fn glab_fixture(world: &World, host: &str, signed_in: bool) -> (Endpoints, ConnectOptions) {
+    let glab = world
+        .server
+        .install_glab(&world.directory.path().join("bin"));
+    let endpoints = dusty::forge::detect::endpoints_for(
+        ProviderKind::GitLab,
+        &HostKey::new(host),
+        Some(&format!("{}/{host}/api/v4", world.server.url())),
+        &dusty::forge::credential::Env::from_pairs([] as [(&str, &str); 0]),
+    );
+    let config = world.directory.path().join("glab.yml");
+    let mut login = format!(
+        "hosts:\n  {host}:\n    api_host: {}/{host}\n",
+        world.server.url()
+    );
+    if signed_in {
+        login.push_str(&format!("    token: {FAKE_TOKEN}\n"));
+    }
+    std::fs::write(&config, login).unwrap();
+    let options = ConnectOptions {
+        glab: Some(glab),
+        stores: dusty::forge::credential::Stores {
+            glab_config: Some(config),
+            ..Default::default()
+        },
+        no_anonymous: true,
+        ..Default::default()
+    };
+    (endpoints, options)
+}
+
 #[test]
 fn a_rejected_token_falls_back_to_passthrough_once() {
-    let world = World::new(json!({}));
-    // A host of its own: the credential and transport caches are per host.
-    let host = "ghe.fallback.test";
-    let endpoints = world.endpoints(host);
-    let options = world.options();
+    let world = World::new(json!({ "world": "gitlab" }));
+    let (endpoints, options) = glab_fixture(&world, "git.fallback.test", true);
     let cancel = AtomicBool::new(false);
     let chosen = transport::for_host(&endpoints, &options, &cancel).unwrap();
-    assert!(
-        matches!(
-            chosen.kind(),
-            TransportKind::Http {
-                credential_source: CredentialSource::GhAuthToken
-            }
-        ),
-        "{:?}",
-        chosen.kind()
+    assert_eq!(
+        chosen.kind(),
+        TransportKind::Http {
+            credential_source: CredentialSource::GlabConfig,
+        },
     );
+    let other = World::new(json!({ "world": "gitlab" }));
+    let mut other_endpoints = endpoints.clone();
+    other_endpoints.override_api_base(&format!("{}/{}/api/v4", other.server.url(), endpoints.host));
+    let error = transport::for_host(&other_endpoints, &options, &cancel)
+        .err()
+        .unwrap();
+    assert!(
+        matches!(&error, ForgeError::NotAuthenticated { hint, .. }
+        if hint.contains(&format!("Set api_base to {}/{}/api/v4 ", world.server.url(), endpoints.host))),
+        "{error}"
+    );
+    assert!(
+        other.requests().is_empty(),
+        "sent a request to the other port"
+    );
+
+    // A token for the second address is revoked after connection. The live 401 should
+    // explain why the saved glab sign-in cannot take over.
+    let direct = HttpTransport::new(
+        other_endpoints.clone(),
+        Credential::new(FAKE_TOKEN, CredentialSource::Env("GITLAB_TOKEN"), None),
+    )
+    .unwrap();
+    let direct = Arc::new(direct);
+    let project = "projects/orbit%2Fteam%2Forbit";
+    let expected_base = format!("{}/{}/api/v4", world.server.url(), endpoints.host);
+    for (status, message, expected_kind) in [
+        (401, "Bad credentials", "NotAuthenticated"),
+        (401, "Only signed in user is allowed", "SignInRequired"),
+        (403, "Only signed in user is allowed", "SignInRequired"),
+        (403, "This project is forbidden", "Forbidden"),
+    ] {
+        other.update(|state| {
+            state["fail"] = json!([{"transport":"http","path":project,"status":status,
+                "message":message,"times":1}]);
+        });
+        let revoked = ForgeContext::new(
+            other.directory.path().to_path_buf(),
+            other_endpoints.clone(),
+            options.clone(),
+            RepoRef::parse("orbit/team/orbit"),
+            direct.clone(),
+        );
+        let error = read(&revoked, Read::Repository).unwrap_err();
+        let failure = dusty::forge::command::Failure::from(error);
+        assert_eq!(failure.kind, expected_kind, "{failure:?}");
+        if status == 401 {
+            assert!(failure.hint.contains(&expected_base), "{failure:?}");
+        }
+    }
+    assert!(
+        other
+            .requests()
+            .iter()
+            .all(|request| request["transport"] == "http")
+    );
+
+    // Reads that always require sign-in and preflight write refusals should use the
+    // anonymous transport's remedy without sending anything.
+    let options_for_public = ConnectOptions {
+        no_anonymous: false,
+        ..options.clone()
+    };
+    let anonymous = transport::for_host(&other_endpoints, &options_for_public, &cancel).unwrap();
+    assert_eq!(anonymous.kind(), TransportKind::Anonymous);
+    let public = ForgeContext::new(
+        other.directory.path().to_path_buf(),
+        other_endpoints,
+        options_for_public,
+        RepoRef::parse("orbit/team/orbit"),
+        anonymous,
+    );
+    other.clear_requests();
+    let error = read(&public, Read::JobLog(ItemId::new(42)))
+        .unwrap_err()
+        .to_string();
+    assert!(error.starts_with("Sign in to read logs · ") && error.contains(&expected_base));
+    let write = Write::CreateIssue {
+        title: "Fixture".into(),
+        body: String::new(),
+        labels: Vec::new(),
+        assignees: Vec::new(),
+    };
+    let error = provider::build(ProviderKind::GitLab)
+        .unwrap()
+        .write(&public, &write, &cancel)
+        .unwrap_err();
+    assert!(
+        matches!(error, ForgeError::NotAuthenticated { hint, .. } if hint.contains(&expected_base))
+    );
+    assert!(other.requests().is_empty());
+
     world.update(|state| {
-        state["fail"] = json!([{"transport":"http","path":"repos/example/demo","status":401,
+        state["fail"] = json!([{"transport":"http","path":project,"status":401,
             "message":"Bad credentials","times":1}]);
     });
     let ctx = ForgeContext::new(
         world.directory.path().to_path_buf(),
         endpoints.clone(),
         options.clone(),
-        RepoRef::parse("example/demo"),
-        chosen,
+        RepoRef::parse("orbit/team/orbit"),
+        chosen.clone(),
     );
-    let Payload::Repo(repo) = read(&ctx, Read::Repository).unwrap() else {
-        panic!()
-    };
-    assert_eq!(repo.full_name, "example/demo");
-    assert_eq!(ctx.transport_kind(), TransportKind::Cli(Cli::Gh));
+    let request = transport::ApiRequest::get(project);
+    let repo = ctx.json(&request, &cancel).unwrap();
+    assert_eq!(repo["path_with_namespace"], "orbit/team/orbit");
+    assert_eq!(ctx.transport_kind(), TransportKind::Cli(Cli::Glab));
     let repository_reads = world
         .requests()
         .into_iter()
-        .filter(|request| request["path"] == "repos/example/demo")
+        .filter(|request| request["path"] == project)
         .map(|request| request["transport"].as_str().unwrap().to_owned())
         .collect::<Vec<_>>();
-    assert_eq!(repository_reads, ["http", "gh"]);
-    // The fallback happens once per context: a second 401 surfaces instead of looping.
+    assert_eq!(repository_reads, ["http", "glab"]);
+
+    // Once the context switches, it won't try HTTP again.
     world.update(|state| {
         state["reject_http_auth"] = json!(true);
     });
     let ctx = ForgeContext::new(
         world.directory.path().to_path_buf(),
-        endpoints.clone(),
-        options.clone(),
-        RepoRef::parse("example/demo"),
-        world.transport(Via::Http, host),
+        endpoints,
+        options,
+        RepoRef::parse("orbit/team/orbit"),
+        chosen,
     );
     world.clear_requests();
-    read(&ctx, Read::Labels).unwrap();
-    let transports = world
-        .requests()
-        .into_iter()
+    ctx.json(&request, &cancel).unwrap();
+    ctx.json(&request, &cancel).unwrap();
+    let requests = world.requests();
+    let transports = requests
+        .iter()
+        .filter(|request| request["path"] == project)
         .map(|request| request["transport"].as_str().unwrap().to_owned())
         .collect::<Vec<_>>();
-    assert_eq!(transports, ["http", "gh"]);
-    let error = read(&ctx, Read::Repository);
-    assert!(error.is_ok(), "the context stays on passthrough: {error:?}");
+    assert_eq!(transports, ["http", "glab", "glab"]);
+    // The fallback checks glab's own sign-in once before using it; nothing else is sent.
+    let others = requests
+        .iter()
+        .filter(|request| request["path"] != project)
+        .map(|request| {
+            format!(
+                "{} {}",
+                request["transport"].as_str().unwrap(),
+                request["path"].as_str().unwrap()
+            )
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        others.len() <= 1 && others.iter().all(|request| request == "glab user"),
+        "{others:?}"
+    );
 }
 
 #[test]
-fn a_signed_out_host_without_gh_is_a_state_not_a_crash() {
-    let world = World::new(json!({"gh_auth": {"*": "missing"}}));
-    let host = "ghe.signedout.test";
-    let endpoints = world.endpoints(host);
+fn a_same_origin_viewer_404_suggests_the_saved_rest_path() {
+    let host = "git.prefix.test";
+    let world = World::new(json!({ "world": "gitlab" }));
+    let (saved, options) = glab_fixture(&world, host, true);
+    let options = ConnectOptions {
+        force: Some(transport::Force::Http),
+        ..options
+    };
+    let mut missing_prefix = saved.clone();
+    missing_prefix.override_api_base(&format!("{}/{host}/wrong/api/v4", world.server.url()));
+    world.update(|state| {
+        state["fail"] =
+            json!([{"transport":"http","path":"wrong/api/v4/user","status":404,"times":1}]);
+    });
+    let cancel = AtomicBool::new(false);
+    let error = transport::for_host(&missing_prefix, &options, &cancel)
+        .err()
+        .unwrap();
+    assert!(matches!(&error, ForgeError::NotFound(_)));
+    let failure = dusty::forge::command::Failure::from(error);
+    assert_eq!(failure.kind, "NotFound");
+    let json = failure.json();
+    assert_eq!(
+        json["error"]["message"],
+        "Not found · Dusty couldn't find the forge API at the configured address."
+    );
+    assert_eq!(
+        json["error"]["hint"],
+        format!("Set api_base to {}", saved.api_base)
+    );
+    let chosen = transport::for_host(&saved, &options, &cancel).unwrap();
+    assert!(matches!(chosen.kind(), TransportKind::Http { .. }));
+    let requests = world.requests();
+    assert_eq!(requests[0]["path"], "wrong/api/v4/user");
+    assert_eq!(requests[1]["path"], "user");
+}
+
+#[test]
+fn normal_github_dot_com_gh_sign_in_is_ready_without_a_notice() {
+    let world = World::new(json!({}));
+    let host = HostKey::new("github.com");
+    let mut endpoints = Endpoints::github(&host);
+    // Use the default origin for selection; the fake gh sends only to its loopback sidecar.
+    endpoints.override_api_base("https://api.github.com");
+    let options = ConnectOptions {
+        gh: Some(world.gh.clone()),
+        force: Some(transport::Force::Cli),
+        ..ConnectOptions::default()
+    };
+    let cancel = AtomicBool::new(false);
+    let chosen = transport::for_host(&endpoints, &options, &cancel).unwrap();
+    assert_eq!(chosen.kind(), TransportKind::Cli(Cli::Gh));
+    let ctx = ForgeContext::new(
+        world.directory.path().to_path_buf(),
+        endpoints,
+        options,
+        RepoRef::parse("example/demo"),
+        chosen,
+    );
+    assert!(matches!(
+        read(&ctx, Read::Repository).unwrap(),
+        Payload::Repo(_)
+    ));
+    assert!(
+        world
+            .requests()
+            .iter()
+            .any(|request| request["transport"] == "gh")
+    );
+    let account = dusty::forge::host_state::account(&host).unwrap();
+    assert!(matches!(
+        account.state,
+        dusty::forge::host_state::HostState::Ready { .. }
+    ));
+    assert!(account.state.notice("github.com", None).is_none());
+}
+
+#[test]
+fn a_signed_out_host_without_a_cli_is_a_state_not_a_crash() {
+    let world = World::new(json!({"glab_auth": {"*": "missing"}}));
+    let host = "git.signedout.test";
+    let (endpoints, options) = glab_fixture(&world, host, false);
     let forced = ConnectOptions {
         force: Some(transport::Force::Http),
-        ..world.options()
+        ..options.clone()
     };
-    let error = transport::for_host(&endpoints, &forced, &AtomicBool::new(false))
+    let cancel = AtomicBool::new(false);
+    let error = transport::for_host(&endpoints, &forced, &cancel)
         .err()
         .unwrap();
     assert!(
-        matches!(&error, ForgeError::NotAuthenticated { hint, .. } if hint == &format!("gh auth login --hostname {host}")),
+        matches!(&error, ForgeError::NotAuthenticated { hint, .. } if hint == &format!("glab auth login --hostname {host}")),
         "{error:?}"
     );
-    // Without forcing, a missing token means gh passthrough.
-    let chosen =
-        transport::for_host(&endpoints, &world.options(), &AtomicBool::new(false)).unwrap();
-    assert_eq!(chosen.kind(), TransportKind::Cli(Cli::Gh));
+    // Without forcing, a missing token means CLI passthrough.
+    let chosen = transport::for_host(&endpoints, &options, &cancel).unwrap();
+    assert_eq!(chosen.kind(), TransportKind::Cli(Cli::Glab));
     let missing = ConnectOptions {
         no_anonymous: true,
         ..ConnectOptions::default()
     };
-    let error = transport::for_host(
-        &world.endpoints("ghe.nogh.test"),
-        &missing,
-        &AtomicBool::new(false),
-    )
-    .err()
-    .unwrap();
+    let error = transport::for_host(&world.endpoints("ghe.nogh.test"), &missing, &cancel)
+        .err()
+        .unwrap();
     assert_eq!(error, ForgeError::CliMissing(Cli::Gh));
     // By default the same host is browsed anonymously instead.
     let anonymous = transport::for_host(
         &world.endpoints("ghe.anonymous.test"),
         &ConnectOptions::default(),
-        &AtomicBool::new(false),
+        &cancel,
     )
     .unwrap();
     assert_eq!(anonymous.kind(), TransportKind::Anonymous);
-    // So is a configured gh path that is not there (`DUSTY_FORGE_GH=/nowhere/gh`).
+    // So is a configured gh path that is not there.
     let nowhere = ConnectOptions {
         gh: Some(world.directory.path().join("nowhere/gh")),
         ..ConnectOptions::default()
     };
-    let anonymous = transport::for_host(
-        &world.endpoints("ghe.nowhere.test"),
-        &nowhere,
-        &AtomicBool::new(false),
-    )
-    .unwrap();
+    let anonymous =
+        transport::for_host(&world.endpoints("ghe.nowhere.test"), &nowhere, &cancel).unwrap();
     assert_eq!(anonymous.kind(), TransportKind::Anonymous);
 }
 

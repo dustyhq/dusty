@@ -910,7 +910,10 @@ pub fn threads(comments: &[Value]) -> Vec<ReviewThread> {
                 comments: vec![comment],
                 total_comments: None,
                 diff_hunk: optional(value, "diff_hunk"),
+                diff_head: None,
                 start_line: None,
+                original_start_line: None,
+                start_side: None,
             }),
         }
     }
@@ -1938,7 +1941,7 @@ impl Gitea {
             return Ok(None);
         }
         if !response.success() {
-            return Err(crate::http::classify(&ctx.endpoints, &response));
+            return Err(ctx.response_error(&response));
         }
         if !known {
             crate::detect::record_capability(ctx.host(), &ctx.endpoints, capability, true);
@@ -2198,7 +2201,7 @@ impl Gitea {
                 return Ok(Vec::new());
             }
             if !response.success() {
-                return Err(crate::http::classify(&ctx.endpoints, &response));
+                return Err(ctx.response_error(&response));
             }
             Ok(list_items(response.json()?, None))
         });
@@ -2260,7 +2263,7 @@ impl Gitea {
                     .flatten());
             }
             if response.status != 404 {
-                return Err(crate::http::classify(&ctx.endpoints, &response));
+                return Err(ctx.response_error(&response));
             }
         }
         // Old servers, or a PR into another base: scan the open ones (base-repo heads only,
@@ -2499,7 +2502,7 @@ impl Gitea {
             {
                 Ok(log(NEVER_RAN.into(), false))
             }
-            Ok(response) => Err(crate::http::classify(&ctx.endpoints, &response)),
+            Ok(response) => Err(ctx.response_error(&response)),
             Err(ForgeError::BadResponse(message)) if message.contains("exceeds") => Ok(log(
                 format!(
                     "log exceeds {} MiB · open it in the browser",
@@ -2591,7 +2594,7 @@ impl Gitea {
                 return Ok(response.text());
             }
             if response.status != 404 {
-                return Err(crate::http::classify(&ctx.endpoints, &response));
+                return Err(ctx.response_error(&response));
             }
         }
         Err(ForgeError::NotFound(format!("workflow {id}")))
@@ -2618,7 +2621,7 @@ impl Gitea {
                     return Ok(Fetched::NotModified);
                 }
                 if !response.success() {
-                    return Err(crate::http::classify(&ctx.endpoints, &response));
+                    return Err(ctx.response_error(&response));
                 }
                 return Ok(Fetched::Payload {
                     value: Payload::Repo(repo_payload(&response.json()?)),
@@ -2731,13 +2734,27 @@ impl Gitea {
             Read::Viewed(number) => {
                 Payload::Viewed(load_viewed(ctx, *number).into_iter().collect())
             }
-            Read::Diff(number) => Payload::Text(
-                ctx.ok(
-                    &rest(&format!("pulls/{number}.diff"))?.accept(Accept::Diff),
-                    cancel,
-                )?
-                .text(),
-            ),
+            Read::Diff(number) => {
+                // Gitea's pull diff endpoint takes no revision. Verify the refs around
+                // that read, not against the independently refreshed screen metadata.
+                let pull = rest(&format!("pulls/{number}"))?;
+                let revision =
+                    |item: &Value| (text(&item["base"], "sha"), text(&item["head"], "sha"));
+                let before = revision(&ctx.json(&pull, cancel)?);
+                let text = ctx
+                    .ok(
+                        &rest(&format!("pulls/{number}.diff"))?.accept(Accept::Diff),
+                        cancel,
+                    )?
+                    .text();
+                let after = revision(&ctx.json(&pull, cancel)?);
+                let head = if before == after && !before.0.is_empty() {
+                    before.1
+                } else {
+                    String::new()
+                };
+                Payload::Diff { head, text }
+            }
             Read::CommitDiff(sha) => Payload::Text(
                 ctx.ok(
                     &rest(&format!("git/commits/{sha}.diff"))?.accept(Accept::Diff),

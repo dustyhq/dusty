@@ -41,6 +41,9 @@ pub struct HttpTransport {
     credential: Option<Credential>,
     fingerprint: crate::ratelimit::Fingerprint,
     client: reqwest::blocking::Client,
+    api_origin: String,
+    sign_in_advice: Option<String>,
+    verified_login: std::sync::OnceLock<String>,
 }
 
 impl HttpTransport {
@@ -61,6 +64,8 @@ impl HttpTransport {
         credential: Option<Credential>,
         fingerprint: crate::ratelimit::Fingerprint,
     ) -> Result<Self, ForgeError> {
+        let api_origin = crate::transport::api_origin(&endpoints.api_base)
+            .ok_or_else(|| ForgeError::Failed(crate::transport::INVALID_API_ADDRESS.into()))?;
         Endpoints::check_scheme(&endpoints.api_base)?;
         if let Some(graphql) = &endpoints.graphql {
             Endpoints::check_scheme(graphql)?;
@@ -77,7 +82,15 @@ impl HttpTransport {
             endpoints,
             credential,
             client,
+            api_origin,
+            sign_in_advice: None,
+            verified_login: std::sync::OnceLock::new(),
         })
+    }
+
+    pub(crate) fn with_sign_in_advice(mut self, advice: Option<String>) -> Self {
+        self.sign_in_advice = advice;
+        self
     }
 
     pub fn credential(&self) -> Option<&Credential> {
@@ -95,6 +108,9 @@ impl HttpTransport {
             return Ok(());
         };
         let login = self.viewer(cancel)?;
+        if let Some(login) = &login {
+            let _ = self.verified_login.set(login.clone());
+        }
         crate::credential::accepted(&self.endpoints.host);
         crate::host_state::observe_account(&self.endpoints, &credential.source, login);
         Ok(())
@@ -114,8 +130,9 @@ impl HttpTransport {
         Ok(user["login"]
             .as_str()
             .or_else(|| user["username"].as_str())
-            .map(str::to_owned)
-            .or_else(|| self.credential.as_ref()?.user.clone()))
+            .map(str::trim)
+            .filter(|login| !login.is_empty())
+            .map(str::to_owned))
     }
 
     fn url(&self, request: &ApiRequest) -> Result<String, TransportError> {
@@ -127,8 +144,9 @@ impl HttpTransport {
                 })?,
                 Target::Absolute(url) => url.clone(),
             };
-        let mut url = reqwest::Url::parse(&base)
-            .map_err(|_| TransportError::Insecure(format!("invalid forge URL {base}")))?;
+        let mut url = reqwest::Url::parse(&base).map_err(|_| {
+            TransportError::Insecure("The forge request address is invalid.".into())
+        })?;
         if !request.query.is_empty() {
             url.query_pairs_mut().extend_pairs(request.query.iter());
         }
@@ -161,20 +179,22 @@ impl HttpTransport {
         };
         (!allowed).then(|| TransportError::NeedsSignIn {
             host: self.endpoints.host.to_string(),
-            hint: crate::credential::login_hint(self.endpoints.kind, &self.endpoints.host),
+            hint: self.sign_in_advice.clone().unwrap_or_else(|| {
+                crate::credential::login_hint(self.endpoints.kind, &self.endpoints.host)
+            }),
         })
     }
 }
 
-fn origin(url: &reqwest::Url) -> (String, Option<String>, Option<u16>) {
-    (
-        url.scheme().to_owned(),
-        url.host_str().map(str::to_ascii_lowercase),
-        url.port_or_known_default(),
-    )
-}
-
 impl Transport for HttpTransport {
+    fn verified_login(&self) -> Option<&str> {
+        self.verified_login.get().map(String::as_str)
+    }
+
+    fn sign_in_advice(&self) -> Option<&str> {
+        self.sign_in_advice.as_deref()
+    }
+
     fn kind(&self) -> TransportKind {
         match &self.credential {
             Some(credential) => TransportKind::Http {
@@ -209,12 +229,9 @@ impl Transport for HttpTransport {
         let _permit = HTTP_BOUND.acquire(cancel)?;
         let first = self.url(request)?;
         Endpoints::check_scheme(&first)?;
-        let api_origin = origin(
-            &reqwest::Url::parse(&self.endpoints.api_base)
-                .map_err(|_| TransportError::Insecure("invalid API base".into()))?,
-        );
-        let mut url = reqwest::Url::parse(&first)
-            .map_err(|_| TransportError::Insecure(format!("invalid forge URL {first}")))?;
+        let mut url = reqwest::Url::parse(&first).map_err(|_| {
+            TransportError::Insecure("The forge request address is invalid.".into())
+        })?;
         let mut method = request.method;
         let mut body = request.body.as_ref();
         for _ in 0..=MAX_REDIRECTS {
@@ -237,9 +254,8 @@ impl Transport for HttpTransport {
                 builder = builder.header("X-GitHub-Api-Version", "2022-11-28");
             }
             // Never across origins: blob storage gets the request without the token.
-            if origin(&url) == api_origin
-                && let Some((name, value)) = self.authorization()
-            {
+            let on_api_origin = url.origin().ascii_serialization() == self.api_origin;
+            if on_api_origin && let Some((name, value)) = self.authorization() {
                 builder = builder.header(name, value);
             }
             for (key, value) in &request.headers {
@@ -305,10 +321,14 @@ impl Transport for HttpTransport {
                 body: bytes,
             };
             // Only the API's own answers count against the credential, not a blob store's.
-            if anonymous && origin(&url) == api_origin {
-                crate::host_state::observe_quota(&self.endpoints, &response);
+            if anonymous && on_api_origin {
+                crate::host_state::observe_quota_with_advice(
+                    &self.endpoints,
+                    &response,
+                    self.sign_in_advice(),
+                );
             }
-            if origin(&url) == api_origin
+            if on_api_origin
                 && let Some(until) = limiter.observe(
                     self.fingerprint,
                     &response,
@@ -391,20 +411,15 @@ pub fn scopes_in(message: &str) -> Option<String> {
 /// One error per response; the copy shown to the user comes from `ForgeError`'s Display.
 pub fn classify(endpoints: &Endpoints, response: &ApiResponse) -> ForgeError {
     let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap_or_default();
-    let message = body["message"]
-        .as_str()
-        .or_else(|| body["error"].as_str())
-        .map(str::to_owned)
-        .unwrap_or_else(|| {
-            String::from_utf8_lossy(&response.body)
-                .lines()
-                .next()
-                .unwrap_or_default()
-                .chars()
-                .take(200)
-                .collect()
-        });
-    let message = crate::cli::redact(&message);
+    let raw_text = String::from_utf8_lossy(&response.body);
+    let json_message = body["message"].as_str().or_else(|| body["error"].as_str());
+    let raw_message = json_message.unwrap_or_else(|| raw_text.lines().next().unwrap_or_default());
+    let message = crate::cli::redact(raw_message);
+    let message = if json_message.is_none() {
+        message.chars().take(200).collect()
+    } else {
+        message
+    };
     if let Some(trigger) = crate::ratelimit::trigger(response, false) {
         return ForgeError::RateLimited {
             until: std::time::Instant::now()
@@ -413,7 +428,7 @@ pub fn classify(endpoints: &Endpoints, response: &ApiResponse) -> ForgeError {
     }
     // Forgejo/Gitea `REQUIRE_SIGNIN_VIEW`: every API call without a sign-in is refused.
     if matches!(response.status, 401 | 403)
-        && message
+        && raw_message
             .to_ascii_lowercase()
             .contains("only signed in user is allowed")
     {
@@ -427,8 +442,8 @@ pub fn classify(endpoints: &Endpoints, response: &ApiResponse) -> ForgeError {
             host: endpoints.host.to_string(),
             hint: crate::credential::login_hint(endpoints.kind, &endpoints.host),
         },
-        403 => ForgeError::Forbidden(match missing_scopes(response, &body, &message) {
-            Some(scopes) => format!("needs scope {scopes}"),
+        403 => ForgeError::Forbidden(match missing_scopes(response, &body, raw_message) {
+            Some(scopes) => format!("needs scope {}", crate::cli::redact(&scopes)),
             None => message,
         }),
         404 | 410 => ForgeError::NotFound(message),
@@ -457,6 +472,19 @@ mod scope_tests {
         let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap_or_default();
         let message = body["message"].as_str().unwrap_or_default().to_owned();
         missing_scopes(response, &body, &message)
+    }
+
+    #[test]
+    fn an_echoed_signed_url_after_a_key_is_safe_after_one_classification() {
+        let mut response = response(
+            &[],
+            r#"{"message":"download failed: url=https://fixture-user:fixture-password@blob.test:8443/log/42?sig=fixture-signature#fixture-fragment"}"#,
+        );
+        response.status = 400;
+        let endpoints = Endpoints::github(&HostKey::new("github.com"));
+        let error = classify(&endpoints, &response);
+        assert!(matches!(error, ForgeError::Failed(message)
+                if message == "400 download failed: url=https://blob.test:8443/log/42"));
     }
 
     #[test]

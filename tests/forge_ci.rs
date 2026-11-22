@@ -329,7 +329,7 @@ impl Harness {
             self.endpoints(),
             options,
             RepoRef::parse(self.forge.repo()),
-            self.transport(),
+            Arc::new(FixtureSignIn(self.transport())),
         )
     }
 
@@ -393,6 +393,33 @@ impl Harness {
                 assert_eq!(request["auth"], "valid", "{request}");
             }
         }
+    }
+}
+
+// This harness constructs transports directly instead of using the worker's sign-in check.
+// Its fixture has a single fixed account for each fake host.
+struct FixtureSignIn(Arc<dyn Transport>);
+
+impl Transport for FixtureSignIn {
+    fn kind(&self) -> dusty::forge::transport::TransportKind {
+        self.0.kind()
+    }
+
+    fn verified_login(&self) -> Option<&str> {
+        Some("fixture")
+    }
+
+    fn send(
+        &self,
+        host: &HostKey,
+        request: &dusty::forge::transport::ApiRequest,
+        cancel: &AtomicBool,
+    ) -> Result<dusty::forge::transport::ApiResponse, dusty::forge::transport::TransportError> {
+        self.0.send(host, request, cancel)
+    }
+
+    fn graphql_batching(&self) -> bool {
+        self.0.graphql_batching()
     }
 }
 
@@ -1190,7 +1217,7 @@ pub fn check_dedupe_and_rollup(harness: &Harness) {
 fn refresh(harness: &Harness, cache: &Cache, read: &Read) -> (Payload, Option<String>) {
     let ctx = harness.ctx();
     let provider = harness.provider();
-    let key = CacheKey::new(ctx.host(), ctx.repo.as_ref(), read);
+    let key = CacheKey::new(ctx.account().unwrap(), ctx.repo.as_ref(), read);
     let (cond, base) = dusty::forge::incremental::prepare(
         provider.as_ref(),
         &ctx,

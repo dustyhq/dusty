@@ -7,9 +7,8 @@
 //! | GitLab | `DUSTY_FORGE_TOKEN`, `GITLAB_TOKEN` | glab `config.yml` `hosts.H.token` | `glab auth status --hostname H --show-token` |
 //! | Gitea/Forgejo | `DUSTY_FORGE_TOKEN`, `GITEA_SERVER_TOKEN` (with `GITEA_SERVER_URL`), `FORGEJO_TOKEN`, `GITEA_TOKEN` | fj `keys.json`, tea `config.yml` | — |
 //!
-//! Scoped variables only apply to their host: `DUSTY_FORGE_TOKEN` to `DUSTY_FORGE_HOST` (any
-//! host when unset), `GITLAB_TOKEN` to `GITLAB_HOST`/`GL_HOST`, the Gitea ones to
-//! `GITEA_SERVER_URL`. A success is cached 5 min, a miss 10 s, a crash never. Tokens never
+//! Credentials must match the API origin. Unscoped environment tokens are for the public
+//! service only. A success is cached 5 min, a miss 10 s, a crash never. Tokens never
 //! enter argv, logs, notices, the cache or `hosts.json`; `Secret` prints `<redacted>` and every
 //! token read is registered with `cli::redact`, which strips it from any text verbatim.
 
@@ -19,6 +18,7 @@ use crate::request::ForgeError;
 use crate::transport::ConnectOptions;
 use crate::transport::Endpoints;
 use crate::transport::HostKey;
+use crate::transport::api_origin;
 use crate::yaml_lite;
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -147,6 +147,10 @@ impl Env {
         Self { vars: None }
     }
 
+    pub(crate) fn is_process(&self) -> bool {
+        self.vars.is_none()
+    }
+
     pub fn from_pairs<K: Into<String>, V: Into<String>>(
         pairs: impl IntoIterator<Item = (K, V)>,
     ) -> Self {
@@ -231,7 +235,7 @@ pub struct CredentialCache {
     entries: Mutex<HashMap<CacheKey, (CredentialState, Instant)>>,
 }
 
-type CacheKey = (HostKey, ProviderKind, ConnectOptions);
+type CacheKey = (Endpoints, ConnectOptions);
 
 impl CredentialCache {
     pub fn new() -> Self {
@@ -250,7 +254,7 @@ impl CredentialCache {
         options: &ConnectOptions,
         now: Instant,
     ) -> Option<CredentialState> {
-        let key = (endpoints.host.clone(), endpoints.kind, options.clone());
+        let key = (endpoints.clone(), options.clone());
         let entries = self.entries();
         let (state, at) = entries.get(&key)?;
         let ttl = match state {
@@ -271,15 +275,12 @@ impl CredentialCache {
         if matches!(state, CredentialState::Crashed(_)) {
             return;
         }
-        self.entries().insert(
-            (endpoints.host.clone(), endpoints.kind, options.clone()),
-            (state.clone(), now),
-        );
+        self.entries()
+            .insert((endpoints.clone(), options.clone()), (state.clone(), now));
     }
 
     pub fn evict(&self, endpoints: &Endpoints, options: &ConnectOptions) {
-        self.entries()
-            .remove(&(endpoints.host.clone(), endpoints.kind, options.clone()));
+        self.entries().remove(&(endpoints.clone(), options.clone()));
     }
 
     pub fn clear(&self) {
@@ -380,13 +381,24 @@ pub fn sign_in_hints(kind: ProviderKind, host: &HostKey) -> Vec<String> {
     let mut hints = vec![login_hint(kind, host)];
     match kind {
         ProviderKind::GitHub => {
-            hints.push(if host.host == "github.com" {
-                "GH_TOKEN=<token>".into()
-            } else {
-                "GH_ENTERPRISE_TOKEN=<token>".into()
-            });
+            let name = github_env_names(host)[0];
+            hints.push(
+                if host.host == "github.com" && host.port.is_none_or(|port| port == 443) {
+                    format!("{name}=<token>")
+                } else {
+                    format!("{name}=<token> GH_HOST={host}")
+                },
+            );
         }
-        ProviderKind::GitLab => hints.push("GITLAB_TOKEN=<token>".into()),
+        ProviderKind::GitLab => {
+            hints.push(
+                if host.host == "gitlab.com" && host.port.is_none_or(|port| port == 443) {
+                    "GITLAB_TOKEN=<token>".into()
+                } else {
+                    format!("GITLAB_TOKEN=<token> GITLAB_HOST={host}")
+                },
+            );
+        }
         ProviderKind::Gitea | ProviderKind::Forgejo => {
             hints.push(format!("fj -H {host} auth login"));
             hints.push(format!("FORGEJO_TOKEN=<token> FORGEJO_URL=https://{host}"));
@@ -415,51 +427,320 @@ pub fn lookup(
     env: &Env,
     cancel: &AtomicBool,
 ) -> CredentialState {
-    let host = &endpoints.host;
     let mut tried = Vec::new();
-    let hint = login_hint(endpoints.kind, host);
-    if let Some(token) = dusty_token(env, host) {
-        return CredentialState::Present(Credential::new(
+    let Some(scope) = Scope::new(endpoints) else {
+        return CredentialState::Missing {
+            tried,
+            hint: crate::transport::INVALID_API_ADDRESS.into(),
+        };
+    };
+    if let Some(credential) = environment_credential(&scope, env, &mut tried) {
+        return CredentialState::Present(credential);
+    }
+    let found = match endpoints.kind {
+        ProviderKind::GitHub => github(&scope, options, &mut tried, cancel),
+        ProviderKind::GitLab => gitlab(&scope, options, &mut tried, cancel),
+        ProviderKind::Gitea | ProviderKind::Forgejo => gitea(&scope, options, &mut tried),
+    };
+    match found {
+        Ok(Some(credential)) => CredentialState::Present(credential),
+        Ok(None) => CredentialState::Missing {
+            tried,
+            hint: saved_address_advice(endpoints, options, env)
+                .unwrap_or_else(|| login_hint(endpoints.kind, &endpoints.host)),
+        },
+        Err(crash) => CredentialState::Crashed(cli::redact(&crash)),
+    }
+}
+
+pub(crate) const DIRECT_TOKEN_ADVICE: &str =
+    "To use your environment token, switch to direct mode (DUSTY_FORGE_TRANSPORT=http).";
+
+pub(crate) fn direct_token_advice(endpoints: &Endpoints, env: &Env) -> Option<&'static str> {
+    environment_credential(&Scope::new(endpoints)?, env, &mut Vec::new())
+        .map(|_| DIRECT_TOKEN_ADVICE)
+}
+
+pub const API_PATH_NOT_FOUND: &str = "Dusty couldn't find the forge API at the configured address.";
+
+/// Whether a sign-in hint is an explanation rather than a command or token example.
+pub fn is_sign_in_advice(hint: &str) -> bool {
+    hint.starts_with("Your ")
+        || hint.starts_with("If you're signed in with ")
+        || hint.starts_with(API_PATH_NOT_FOUND)
+        || hint.starts_with("glab's saved API address")
+        || hint == DIRECT_TOKEN_ADVICE
+        || hint == crate::transport::INVALID_API_ADDRESS
+}
+
+/// A saved sign-in's routing origin and the REST base safe to show to a user.
+pub(crate) struct SignInAddress {
+    pub origin: String,
+    base: String,
+    saved: bool,
+}
+
+impl SignInAddress {
+    pub(crate) fn new(url: &str, kind: ProviderKind) -> Option<Self> {
+        let url = reqwest::Url::parse(url).ok()?;
+        if !matches!(url.scheme(), "http" | "https") {
+            return None;
+        }
+        let origin = url.origin().ascii_serialization();
+        let suffix = crate::detect::rest_api_suffix(kind);
+        let path = url.path().trim_end_matches('/');
+        // Construct from parsed parts: userinfo, query and fragment are not settings
+        // Dusty should show or copy. The installation prefix is independent of the origin gate.
+        let base = if kind != ProviderKind::GitHub && !path.ends_with(suffix) {
+            format!("{origin}{path}{suffix}")
+        } else {
+            format!("{origin}{path}")
+        };
+        Some(Self {
+            origin,
+            base,
+            saved: true,
+        })
+    }
+
+    pub(crate) fn default_for(endpoints: &Endpoints) -> Option<Self> {
+        let url = match endpoints.kind {
+            ProviderKind::GitHub => Endpoints::default_github_api_base(&endpoints.host),
+            _ => format!("https://{}", endpoints.host),
+        };
+        let mut address = Self::new(&url, endpoints.kind)?;
+        address.saved = false;
+        Some(address)
+    }
+}
+
+/// Whether a hint is an environment-token example, optionally introduced by prose.
+pub fn is_token_example(hint: &str) -> bool {
+    hint.contains("=<token>")
+}
+
+fn scoped_token_example(endpoints: &Endpoints) -> Option<String> {
+    let origin = api_origin(&endpoints.api_base)?;
+    Some(match endpoints.kind {
+        ProviderKind::GitHub => {
+            let name = github_env_names(&endpoints.host)[0];
+            format!("{name}=<token> GH_HOST={origin}")
+        }
+        ProviderKind::GitLab => format!("GITLAB_TOKEN=<token> GITLAB_HOST={origin}"),
+        ProviderKind::Gitea | ProviderKind::Forgejo => {
+            format!("GITEA_SERVER_TOKEN=<token> GITEA_SERVER_URL={origin}")
+        }
+    })
+}
+
+pub(crate) fn address_advice(
+    cli: crate::transport::Cli,
+    address: &SignInAddress,
+    endpoints: &Endpoints,
+    env: &Env,
+    pinned_login: bool,
+) -> String {
+    use crate::transport::Cli;
+    let base = &address.base;
+    let tool = cli.name();
+    let mut advice = if address.saved {
+        if cli == Cli::Glab {
+            "glab's saved API address and Dusty's API address don't match.".to_owned()
+        } else {
+            "Your saved sign-in and Dusty's API address don't match.".to_owned()
+        }
+    } else {
+        format!(
+            "If you're signed in with {tool}, Dusty's API address must match the address {tool} uses."
+        )
+    };
+    if crate::detect::github_api_base_override(endpoints.kind, env).is_some() {
+        advice.push_str(&format!(" Set DUSTY_FORGE_API_BASE to {base} or unset it."));
+    } else {
+        advice.push_str(&format!(
+            " Set api_base to {base} in Dusty's forge settings."
+        ));
+    }
+    if address.saved {
+        let field = if cli == Cli::Glab {
+            "glab's api_host (and api_protocol for a bare host)"
+        } else {
+            "the tea login's url"
+        };
+        let suffix = crate::detect::rest_api_suffix(endpoints.kind);
+        advice.push_str(&format!(
+            " Use {field}, keeping the installation path and adding {suffix} if absent."
+        ));
+    }
+    match cli {
+        Cli::Gh | Cli::Glab => {
+            let command = login_hint(endpoints.kind, &endpoints.host);
+            advice.push_str(&format!(" To sign in to the repository's host, run: {command}"));
+        }
+        Cli::Tea if pinned_login => advice.push_str(" To use a different tea login, change login in Dusty's forge settings to a matching tea login, or remove login to let Dusty pick one."),
+        Cli::Tea => advice.push_str(" To select a matching tea login, set login in Dusty's forge settings."),
+    }
+    if let Some(example) = scoped_token_example(endpoints) {
+        if cli == Cli::Tea {
+            advice.push_str(" To use a personal access token instead, create one in the forge's Applications settings.");
+        }
+        advice.push_str(&format!(
+            "\nOr set both variables and use direct mode (DUSTY_FORGE_TRANSPORT=http): {example}"
+        ));
+    }
+    advice
+}
+
+fn saved_address_advice(
+    endpoints: &Endpoints,
+    options: &ConnectOptions,
+    env: &Env,
+) -> Option<String> {
+    use crate::transport::Cli;
+    let expected = api_origin(&endpoints.api_base)?;
+    match endpoints.kind {
+        ProviderKind::GitHub => {
+            let address = SignInAddress::default_for(endpoints)?;
+            (address.origin != expected && options.gh.as_ref().is_some_and(|gh| gh.is_file()))
+                .then(|| address_advice(Cli::Gh, &address, endpoints, env, false))
+        }
+        ProviderKind::GitLab => {
+            let path = options.stores.glab_config.as_deref()?;
+            let address = glab_saved_api(path, endpoints).ok().flatten()?;
+            (address.origin != expected)
+                .then(|| address_advice(Cli::Glab, &address, endpoints, env, false))
+        }
+        ProviderKind::Gitea | ProviderKind::Forgejo => tea_cli_login(endpoints, options, env).err(),
+    }
+}
+
+fn environment_credential(
+    scope: &Scope<'_>,
+    env: &Env,
+    tried: &mut Vec<CredentialSource>,
+) -> Option<Credential> {
+    let endpoints = scope.endpoints;
+    let host = &endpoints.host;
+    let practice_token = || {
+        // The sealed tutor environment supplies both the server and a fake sign-in.
+        if env.vars.is_none() && scope.origin.starts_with("http://") {
+            crate::sandbox::practice_token(host, &scope.origin)
+        } else {
+            None
+        }
+    };
+    // The generic token has no provider in its name. Don't infer its provider from a repo.
+    let dusty_provider = match env.get("DUSTY_FORGE_PROVIDER") {
+        Some(kind) => crate::detect::parse_kind(&kind),
+        None => Some(ProviderKind::GitHub),
+    };
+    if let Some(token) = scope
+        .env_token(
+            env,
+            "DUSTY_FORGE_TOKEN",
+            &["DUSTY_FORGE_HOST"],
+            dusty_provider
+                .filter(|kind| *kind == endpoints.kind)
+                .map(public_host),
+        )
+        .or_else(practice_token)
+    {
+        return Some(Credential::new(
             token,
             CredentialSource::Env("DUSTY_FORGE_TOKEN"),
             None,
         ));
     }
     tried.push(CredentialSource::Env("DUSTY_FORGE_TOKEN"));
-    let found = match endpoints.kind {
-        ProviderKind::GitHub => github(host, options, env, &mut tried, cancel),
-        ProviderKind::GitLab => gitlab(host, options, env, &mut tried, cancel),
-        ProviderKind::Gitea | ProviderKind::Forgejo => gitea(host, options, env, &mut tried),
+    let mut token_for = |name, selectors: &[&str], public_host| {
+        tried.push(CredentialSource::Env(name));
+        scope
+            .env_token(env, name, selectors, public_host)
+            .map(|token| Credential::new(token, CredentialSource::Env(name), None))
     };
-    match found {
-        Ok(Some(credential)) => CredentialState::Present(credential),
-        Ok(None) => CredentialState::Missing { tried, hint },
-        Err(crash) => CredentialState::Crashed(cli::redact(&crash)),
+    match endpoints.kind {
+        ProviderKind::GitHub => github_env_names(host).iter().find_map(|&name| {
+            let public = matches!(name, "GH_TOKEN" | "GITHUB_TOKEN").then_some("github.com");
+            token_for(name, &["GH_HOST"], public)
+        }),
+        ProviderKind::GitLab => token_for(
+            "GITLAB_TOKEN",
+            &["GITLAB_HOST", "GL_HOST"],
+            Some("gitlab.com"),
+        ),
+        ProviderKind::Gitea | ProviderKind::Forgejo => {
+            token_for("GITEA_SERVER_TOKEN", &["GITEA_SERVER_URL"], None)
+                .or_else(|| {
+                    token_for(
+                        "FORGEJO_TOKEN",
+                        &["GITEA_SERVER_URL", "FORGEJO_URL"],
+                        Some("codeberg.org"),
+                    )
+                })
+                .or_else(|| {
+                    token_for(
+                        "GITEA_TOKEN",
+                        &["GITEA_SERVER_URL", "FORGEJO_URL"],
+                        Some("gitea.com"),
+                    )
+                })
+        }
     }
 }
 
-fn dusty_token(env: &Env, host: &HostKey) -> Option<String> {
-    let scoped = env.get("DUSTY_FORGE_HOST");
-    if scoped.is_some_and(|scope| HostKey::new(&scope) != *host) {
-        return None;
-    }
-    env.get("DUSTY_FORGE_TOKEN")
+struct Scope<'a> {
+    endpoints: &'a Endpoints,
+    origin: String,
 }
 
-/// A variable scoped to the host named by another variable (unset scope = any host).
-fn scoped_env(
-    env: &Env,
-    name: &'static str,
-    scopes: &[&str],
-    host: &HostKey,
-    scope_required: bool,
-) -> Option<String> {
-    let scope = scopes.iter().find_map(|scope| env.get(scope));
-    let matches = match scope {
-        Some(scope) => url_host(&scope).is_some_and(|scope| scope == *host),
-        None => !scope_required,
-    };
-    matches.then(|| env.get(name)).flatten()
+fn public_host(kind: ProviderKind) -> &'static str {
+    match kind {
+        ProviderKind::GitHub => "github.com",
+        ProviderKind::GitLab => "gitlab.com",
+        ProviderKind::Gitea => "gitea.com",
+        ProviderKind::Forgejo => "codeberg.org",
+    }
+}
+
+impl<'a> Scope<'a> {
+    fn new(endpoints: &'a Endpoints) -> Option<Self> {
+        Some(Self {
+            endpoints,
+            origin: api_origin(&endpoints.api_base)?,
+        })
+    }
+
+    fn default_origin(&self, host: &HostKey) -> bool {
+        Endpoints::default_api_origin(self.endpoints.kind, host).as_deref()
+            == Some(self.origin.as_str())
+    }
+
+    fn address_matches(&self, address: &str) -> bool {
+        if address.contains("://") {
+            api_origin(address).as_deref() == Some(self.origin.as_str())
+        } else {
+            self.default_origin(&HostKey::new(address))
+        }
+    }
+
+    fn env_token(
+        &self,
+        env: &Env,
+        name: &'static str,
+        selectors: &[&str],
+        public_host: Option<&str>,
+    ) -> Option<String> {
+        let matches = match selectors.iter().find_map(|selector| env.get(selector)) {
+            Some(address) => self.address_matches(&address),
+            None => public_host.is_some_and(|host| {
+                let public = HostKey::new(host);
+                Endpoints::default_api_origin(self.endpoints.kind, &self.endpoints.host)
+                    == Endpoints::default_api_origin(self.endpoints.kind, &public)
+                    && self.default_origin(&public)
+            }),
+        };
+        matches.then(|| env.get(name)).flatten()
+    }
 }
 
 /// `https://h:1/x` / `h:1` / `h` → the host key.
@@ -487,23 +768,13 @@ pub fn github_env_names(host: &HostKey) -> &'static [&'static str] {
 }
 
 fn github(
-    host: &HostKey,
+    scope: &Scope<'_>,
     options: &ConnectOptions,
-    env: &Env,
     tried: &mut Vec<CredentialSource>,
     cancel: &AtomicBool,
 ) -> Result<Option<Credential>, String> {
-    for name in github_env_names(host) {
-        tried.push(CredentialSource::Env(name));
-        if let Some(token) = env.get(name) {
-            return Ok(Some(Credential::new(
-                token,
-                CredentialSource::Env(name),
-                None,
-            )));
-        }
-    }
-    let Some(gh) = &options.gh else {
+    let host = &scope.endpoints.host;
+    let Some(gh) = options.gh.as_ref().filter(|_| scope.default_origin(host)) else {
         return Ok(None);
     };
     tried.push(CredentialSource::GhAuthToken);
@@ -573,7 +844,7 @@ fn run(
         program: program.to_path_buf(),
         args: args.iter().map(|arg| arg.to_string()).collect(),
         cwd: std::env::temp_dir(),
-        env: cli::child_env(),
+        env: cli::stored_sign_in_env(),
         stdin: None,
         timeout: AUTH_COMMAND_TIMEOUT,
         cap: 256 * 1024,
@@ -602,21 +873,64 @@ fn read_store(path: &Path) -> Option<String> {
 }
 
 /// glab's `config.yml`: `hosts.<H>.token` (matching the key or its `api_host`).
-pub fn glab_config(path: &Path, host: &HostKey) -> Option<(String, Option<String>)> {
+fn glab_config(path: &Path, scope: &Scope<'_>) -> Option<(String, Option<String>)> {
     let value = yaml_lite::parse(&read_store(path)?).ok()?;
     value
         .get("hosts")?
         .entries()
         .iter()
         .find_map(|(name, entry)| {
-            let matches = HostKey::new(name) == *host
-                || entry
-                    .text("api_host")
-                    .and_then(url_host)
-                    .is_some_and(|api| api == *host);
             let token = entry.text("token")?;
-            matches.then(|| (token.to_owned(), entry.text("user").map(str::to_owned)))
+            let address = glab_api(name, entry)?;
+            (address.origin == scope.origin
+                && (HostKey::new(name) == scope.endpoints.host
+                    || entry
+                        .text("api_host")
+                        .and_then(url_host)
+                        .is_some_and(|host| host == scope.endpoints.host)))
+            .then(|| (token.to_owned(), entry.text("user").map(str::to_owned)))
         })
+}
+
+fn glab_api(name: &str, entry: &yaml_lite::Yaml) -> Option<SignInAddress> {
+    let address = entry.text("api_host").unwrap_or(name);
+    if address.contains("://") {
+        SignInAddress::new(address, ProviderKind::GitLab)
+    } else {
+        let protocol = entry.text("api_protocol").unwrap_or("https");
+        SignInAddress::new(&format!("{protocol}://{address}"), ProviderKind::GitLab)
+    }
+}
+
+/// The API address glab would use for this host, taking saved settings into account.
+pub(crate) fn glab_cli_api(
+    endpoints: &Endpoints,
+    options: &ConnectOptions,
+) -> Option<SignInAddress> {
+    let configured = options
+        .stores
+        .glab_config
+        .as_deref()
+        .filter(|path| path.exists());
+    if let Some(path) = configured
+        && let Some(address) = glab_saved_api(path, endpoints).ok()?
+    {
+        return Some(address);
+    }
+    SignInAddress::default_for(endpoints)
+}
+
+fn glab_saved_api(path: &Path, endpoints: &Endpoints) -> Result<Option<SignInAddress>, ()> {
+    let config = yaml_lite::parse(&read_store(path).ok_or(())?).map_err(|_| ())?;
+    match config.get("hosts").and_then(|hosts| {
+        hosts
+            .entries()
+            .iter()
+            .find(|(name, _)| HostKey::new(name) == endpoints.host)
+    }) {
+        Some((name, entry)) => glab_api(name, entry).map(Some).ok_or(()),
+        None => Ok(None),
+    }
 }
 
 /// The hosts glab's config holds a token for (detection claims).
@@ -663,30 +977,28 @@ pub fn parse_glab_status(text: &str) -> (Option<String>, Option<String>) {
     (token, user)
 }
 
-fn gitlab(
-    host: &HostKey,
+/// The saved CLI token, deliberately ignoring direct-mode environment credentials.
+pub(crate) fn glab_saved_token(
+    endpoints: &Endpoints,
     options: &ConnectOptions,
-    env: &Env,
+    cancel: &AtomicBool,
+) -> Option<Secret> {
+    gitlab(&Scope::new(endpoints)?, options, &mut Vec::new(), cancel)
+        .ok()
+        .flatten()
+        .map(|credential| credential.token)
+}
+
+fn gitlab(
+    scope: &Scope<'_>,
+    options: &ConnectOptions,
     tried: &mut Vec<CredentialSource>,
     cancel: &AtomicBool,
 ) -> Result<Option<Credential>, String> {
-    tried.push(CredentialSource::Env("GITLAB_TOKEN"));
-    if let Some(token) = scoped_env(
-        env,
-        "GITLAB_TOKEN",
-        &["GITLAB_HOST", "GL_HOST"],
-        host,
-        false,
-    ) {
-        return Ok(Some(Credential::new(
-            token,
-            CredentialSource::Env("GITLAB_TOKEN"),
-            None,
-        )));
-    }
+    let host = &scope.endpoints.host;
     if let Some(path) = &options.stores.glab_config {
         tried.push(CredentialSource::GlabConfig);
-        if let Some((token, user)) = glab_config(path, host) {
+        if let Some((token, user)) = glab_config(path, scope) {
             return Ok(Some(Credential::new(
                 token,
                 CredentialSource::GlabConfig,
@@ -694,7 +1006,9 @@ fn gitlab(
             )));
         }
     }
-    let Some(glab) = &options.glab else {
+    let Some(glab) = options.glab.as_ref().filter(|_| {
+        glab_cli_api(scope.endpoints, options).is_some_and(|address| address.origin == scope.origin)
+    }) else {
         return Ok(None);
     };
     tried.push(CredentialSource::GlabAuthStatus);
@@ -715,7 +1029,7 @@ fn gitlab(
 }
 
 /// fj's `keys.json`: `{"hosts": {"codeberg.org": {"type": "Application", "name": "maya", "token": "…"}}}`.
-pub fn fj_keys(path: &Path, host: &HostKey) -> Option<(String, Option<String>)> {
+fn fj_keys(path: &Path, scope: &Scope<'_>) -> Option<(String, Option<String>)> {
     let value: serde_json::Value = serde_json::from_str(&read_store(path)?).ok()?;
     value["hosts"]
         .as_object()?
@@ -725,7 +1039,8 @@ pub fn fj_keys(path: &Path, host: &HostKey) -> Option<(String, Option<String>)> 
                 .as_str()
                 .map(str::trim)
                 .filter(|token| !token.is_empty())?;
-            (url_host(name)? == *host)
+            scope
+                .address_matches(name)
                 .then(|| (token.to_owned(), entry["name"].as_str().map(str::to_owned)))
         })
 }
@@ -803,53 +1118,155 @@ pub fn tea_login(path: &Path, host: &HostKey) -> Option<TeaLogin> {
         .cloned()
 }
 
-fn tea_token(path: &Path, host: &HostKey) -> Option<(String, String, Option<String>)> {
-    let login = tea_login(path, host)?;
+fn tea_token(path: &Path, scope: &Scope<'_>) -> Option<(String, String, Option<String>)> {
     let value = tea_entries(path)?;
-    let token = value
-        .get("logins")?
-        .as_list()
+    let mut matches = value.get("logins")?.as_list().iter().filter(|entry| {
+        entry
+            .text("url")
+            .is_some_and(|url| scope.address_matches(url))
+    });
+    let first = matches.next()?;
+    let entry = if first.text("default") == Some("true") {
+        first
+    } else {
+        matches
+            .find(|entry| entry.text("default") == Some("true"))
+            .unwrap_or(first)
+    };
+    Some((
+        entry.text("token")?.to_owned(),
+        entry.text("name")?.to_owned(),
+        entry.text("user").map(str::to_owned),
+    ))
+}
+
+/// Pick the configured name or a login for this API origin, then require a unique name for tea.
+pub(crate) fn tea_cli_login(
+    endpoints: &Endpoints,
+    options: &ConnectOptions,
+    env: &Env,
+) -> Result<Option<TeaLogin>, String> {
+    let Some((login, address)) = selected_tea_login(endpoints, options) else {
+        return Ok(None);
+    };
+    if api_origin(&endpoints.api_base).as_deref() != Some(address.origin.as_str()) {
+        if !address.saved {
+            return Ok(None);
+        }
+        return Err(address_advice(
+            crate::transport::Cli::Tea,
+            &address,
+            endpoints,
+            env,
+            options.logins.contains_key(&endpoints.host),
+        ));
+    }
+    Ok(Some(login))
+}
+
+fn selected_tea_login(
+    endpoints: &Endpoints,
+    options: &ConnectOptions,
+) -> Option<(TeaLogin, SignInAddress)> {
+    let scope = Scope::new(endpoints)?;
+    let value = tea_entries(options.stores.tea_config.as_deref()?)?;
+    let entries = value.get("logins")?.as_list();
+    let by_origin = |entry: &&yaml_lite::Yaml| {
+        entry
+            .text("url")
+            .is_some_and(|url| scope.address_matches(url))
+    };
+    let pinned = options.logins.get(&endpoints.host);
+    let candidate = match pinned {
+        Some(name) => entries
+            .iter()
+            .find(|entry| entry.text("name") == Some(name.as_str())),
+        None => preferred_tea_login(entries.iter().filter(by_origin)).or_else(|| {
+            preferred_tea_login(entries.iter().filter(|entry| {
+                entry.text("url").and_then(url_host).as_ref() == Some(&endpoints.host)
+            }))
+        }),
+    };
+    let entry = candidate?;
+    let name = entry.text("name")?;
+    let url = entry.text("url")?;
+    if entries
         .iter()
-        .find(|entry| entry.text("name") == Some(login.name.as_str()))?
-        .text("token")?
-        .to_owned();
-    Some((token, login.name, login.user))
+        .filter(|entry| entry.text("name") == Some(name))
+        .count()
+        != 1
+    {
+        return None;
+    }
+    let host = url_host(url)?;
+    let address = if url.contains("://") {
+        SignInAddress::new(url, endpoints.kind)?
+    } else {
+        let mut address = SignInAddress::new(&format!("https://{host}"), endpoints.kind)?;
+        address.saved = false;
+        address
+    };
+    Some((
+        TeaLogin {
+            name: name.to_owned(),
+            host,
+            user: entry.text("user").map(str::to_owned),
+            default: entry.text("default") == Some("true"),
+            has_token: entry.text("token").is_some(),
+        },
+        address,
+    ))
+}
+
+/// A viewer 404 can mean the API is mounted under the saved installation prefix. This
+/// diagnosis does not change which origins may receive credentials.
+pub(crate) fn rest_path_advice(endpoints: &Endpoints, options: &ConnectOptions) -> Option<String> {
+    let saved = match endpoints.kind {
+        ProviderKind::GitHub => return None,
+        ProviderKind::GitLab => {
+            glab_saved_api(options.stores.glab_config.as_deref()?, endpoints).ok()??
+        }
+        ProviderKind::Gitea | ProviderKind::Forgejo => selected_tea_login(endpoints, options)?.1,
+    };
+    let active = reqwest::Url::parse(&endpoints.api_base).ok()?;
+    if !saved.saved
+        || saved.origin != active.origin().ascii_serialization()
+        || saved.base == format!("{}{}", saved.origin, active.path().trim_end_matches('/'))
+    {
+        return None;
+    }
+    Some(format!(
+        "{API_PATH_NOT_FOUND} Set api_base to {}",
+        saved.base
+    ))
+}
+
+fn preferred_tea_login<'a>(
+    mut entries: impl Iterator<Item = &'a yaml_lite::Yaml>,
+) -> Option<&'a yaml_lite::Yaml> {
+    let first = entries.next()?;
+    if first.text("default") == Some("true") {
+        Some(first)
+    } else {
+        entries
+            .find(|entry| entry.text("default") == Some("true"))
+            .or(Some(first))
+    }
 }
 
 fn gitea(
-    host: &HostKey,
+    scope: &Scope<'_>,
     options: &ConnectOptions,
-    env: &Env,
     tried: &mut Vec<CredentialSource>,
 ) -> Result<Option<Credential>, String> {
-    tried.push(CredentialSource::Env("GITEA_SERVER_TOKEN"));
-    if let Some(token) = scoped_env(env, "GITEA_SERVER_TOKEN", &["GITEA_SERVER_URL"], host, true) {
-        return Ok(Some(Credential::new(
-            token,
-            CredentialSource::Env("GITEA_SERVER_TOKEN"),
-            None,
-        )));
-    }
-    for name in ["FORGEJO_TOKEN", "GITEA_TOKEN"] {
-        tried.push(CredentialSource::Env(name));
-        if let Some(token) =
-            scoped_env(env, name, &["GITEA_SERVER_URL", "FORGEJO_URL"], host, false)
-        {
-            return Ok(Some(Credential::new(
-                token,
-                CredentialSource::Env(name),
-                None,
-            )));
-        }
-    }
     for path in &options.stores.fj_keys {
         tried.push(CredentialSource::FjKeys);
-        if let Some((token, user)) = fj_keys(path, host) {
+        if let Some((token, user)) = fj_keys(path, scope) {
             return Ok(Some(Credential::new(token, CredentialSource::FjKeys, user)));
         }
     }
     if let Some(path) = &options.stores.tea_config {
-        if let Some((token, name, user)) = tea_token(path, host) {
+        if let Some((token, name, user)) = tea_token(path, scope) {
             return Ok(Some(Credential::new(
                 token,
                 CredentialSource::TeaConfig(name),
@@ -975,6 +1392,149 @@ mod tests {
         );
         let masked = "  ✓ Logged in to gitlab.com as maya\n  ✓ Token: **************************\n";
         assert_eq!(parse_glab_status(masked).0, None);
+    }
+
+    fn mismatch_hint(state: CredentialState) -> String {
+        match state {
+            CredentialState::Missing { hint, .. } => hint,
+            state => panic!("expected a missing sign-in, got {state:?}"),
+        }
+    }
+
+    #[test]
+    fn split_glab_api_hint_uses_the_saved_installation_prefix() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = directory.path().join("glab.yml");
+        std::fs::write(
+            &config,
+            "hosts:\n  git.example.test:\n    api_host: https://forge.example.test/tools/code\n",
+        )
+        .unwrap();
+        let env = Env::from_pairs([] as [(&str, &str); 0]);
+        let endpoints = crate::detect::endpoints_for(
+            ProviderKind::GitLab,
+            &HostKey::new("git.example.test"),
+            Some("https://git.example.test/stale/api/v4"),
+            &env,
+        );
+        let options = ConnectOptions {
+            stores: Stores {
+                glab_config: Some(config),
+                ..Stores::default()
+            },
+            ..ConnectOptions::default()
+        };
+        let hint = mismatch_hint(lookup(&endpoints, &options, &env, &AtomicBool::new(false)));
+        assert!(hint.contains("Set api_base to https://forge.example.test/tools/code/api/v4 "));
+        assert!(hint.contains("glab's api_host") && hint.contains("adding /api/v4"));
+        assert!(hint.contains("glab auth login --hostname git.example.test"));
+        assert!(!hint.contains("/stale/"));
+    }
+
+    #[test]
+    fn pinned_tea_mismatch_names_login_and_offers_a_token_for_the_current_api() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = directory.path().join("tea.yml");
+        std::fs::write(
+            &config,
+            "logins:\n  - name: work\n    url: https://old.example.test/tools/code\n  - name: other\n    url: https://api.example.test:8443\n",
+        )
+        .unwrap();
+        let env = Env::from_pairs([] as [(&str, &str); 0]);
+        let host = HostKey::new("git.example.test");
+        let endpoints = crate::detect::endpoints_for(
+            ProviderKind::Gitea,
+            &host,
+            Some("https://api.example.test:8443/api/v1"),
+            &env,
+        );
+        let mut options = ConnectOptions {
+            stores: Stores {
+                tea_config: Some(config),
+                ..Stores::default()
+            },
+            logins: BTreeMap::from([(host.clone(), "work".into())]),
+            ..ConnectOptions::default()
+        };
+        let hint = tea_cli_login(&endpoints, &options, &env).unwrap_err();
+        assert!(hint.contains("Set api_base to https://old.example.test/tools/code/api/v1 "));
+        assert!(hint.contains("change login") && hint.contains("or remove login"));
+        assert!(hint.contains("the tea login's url") && hint.contains("adding /api/v1"));
+        assert!(
+            hint.contains(
+                "GITEA_SERVER_TOKEN=<token> GITEA_SERVER_URL=https://api.example.test:8443"
+            )
+        );
+        options.logins.remove(&host);
+        let selected = tea_cli_login(&endpoints, &options, &env).unwrap().unwrap();
+        assert_eq!(selected.name, "other");
+    }
+
+    #[test]
+    fn advice_names_the_github_environment_override_without_echoing_its_value() {
+        let fake = tempfile::NamedTempFile::new().unwrap();
+        let env = Env::from_pairs([("DUSTY_FORGE_API_BASE", "https://api.example.test/opaque")]);
+        let endpoints = crate::detect::endpoints_for(
+            ProviderKind::GitHub,
+            &HostKey::new("github.com"),
+            Some("https://settings.example.test"),
+            &env,
+        );
+        let options = ConnectOptions {
+            gh: Some(fake.path().to_owned()),
+            ..ConnectOptions::default()
+        };
+        let hint = mismatch_hint(lookup(&endpoints, &options, &env, &AtomicBool::new(false)));
+        assert!(hint.contains("Set DUSTY_FORGE_API_BASE to https://api.github.com or unset it."));
+        assert!(hint.contains("gh auth login --hostname github.com"));
+        assert!(!hint.contains("Your saved sign-in"));
+        assert!(!hint.contains("Set api_base") && !hint.contains("/opaque"));
+    }
+
+    #[test]
+    fn rendered_advice_keeps_the_saved_path_but_omits_userinfo_query_and_fragment() {
+        let env = Env::from_pairs([] as [(&str, &str); 0]);
+        let endpoints = crate::detect::endpoints_for(
+            ProviderKind::GitLab,
+            &HostKey::new("git.example.test"),
+            Some("https://git.example.test:8443/api/v4"),
+            &env,
+        );
+        for path in ["/tools/code", "/tools/code/api/v4/"] {
+            let url = format!(
+                "https://secret-user:secret-password@forge.example.test:9443{path}?private_token=secret-query#secret-fragment"
+            );
+            let address = SignInAddress::new(&url, endpoints.kind).unwrap();
+            let hint = address_advice(
+                crate::transport::Cli::Glab,
+                &address,
+                &endpoints,
+                &env,
+                false,
+            );
+            let error = ForgeError::NotAuthenticated {
+                host: endpoints.host.to_string(),
+                hint,
+            };
+            let rendered = error.to_string();
+            let state =
+                crate::host_state::HostState::from_error(Some(endpoints.kind), &error).unwrap();
+            let account = crate::host_state::Account::new(
+                endpoints.host.clone(),
+                Some(endpoints.kind),
+                state,
+            );
+            for text in
+                std::iter::once(rendered).chain(account.lines().into_iter().map(|(text, _)| text))
+            {
+                assert!(!text.contains("secret-") && !text.contains("private_token"));
+            }
+            assert!(
+                error.to_string().contains(
+                    "Set api_base to https://forge.example.test:9443/tools/code/api/v4 in"
+                )
+            );
+        }
     }
 
     #[test]

@@ -16,6 +16,7 @@ use super::super::shell::layout::{self, Mode, Rect};
 use super::super::{FormAction, GitScreen};
 use super::*;
 use crate::config::ExplorerIconMode;
+use crate::forge::host_state::{self, LegacyAccess};
 use crate::forge::model::{ItemKind, Lifecycle, Notification, NotifyReason, NotifyTarget};
 use crate::forge::records;
 use crate::forge::request::{NotifyFilter, Page};
@@ -25,7 +26,7 @@ use std::collections::HashSet;
 pub(in crate::screen) const PAGE: usize = 4;
 const PANE: GitSurface = GitSurface::Pane;
 /// This repository's local Git config keeps the threads saved and marked done here, as
-/// `host/thread` words; the oldest go once a list holds this many.
+/// scoped `host/account/thread` words; the oldest go once one namespace holds this many.
 const SAVED_KEY: &str = "dusty-git.notifySaved";
 const DONE_KEY: &str = "dusty-git.notifyDone";
 const KEEP: usize = 500;
@@ -117,8 +118,9 @@ pub(super) struct Inbox {
     /// Local reads and confirmed writes, ahead of the forge's next list.
     read: HashSet<String>,
     gone: HashSet<String>,
-    /// Saved and done threads (`host/id`), read from the local Git config once.
+    /// Saved and done threads, partitioned by account in local Git config.
     marks: Option<Marks>,
+    marks_scope: Option<MarkScope>,
     /// A reader or run opened from here: its `Esc` comes back to Notifications.
     pub(super) back: bool,
     /// The thread that was opened, for the cursor to land on again.
@@ -131,6 +133,69 @@ pub(super) struct Inbox {
 struct Marks {
     saved: Vec<String>,
     done: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct MarkScope {
+    prefix: String,
+    adopted: Option<String>,
+    persistent: bool,
+}
+
+impl MarkScope {
+    fn new(host: &str, account: Option<&AccountNamespace>, access: LegacyAccess) -> Self {
+        let legacy = format!("{host}/");
+        match account {
+            Some(account) => {
+                let namespace = match account.login() {
+                    Some(login) => {
+                        let encoded: String =
+                            login.bytes().map(|byte| format!("{byte:02x}")).collect();
+                        format!("user-{encoded}")
+                    }
+                    None => "anonymous".into(),
+                };
+                Self {
+                    prefix: format!("{}/{namespace}/", account.host()),
+                    adopted: (access == LegacyAccess::Owner).then_some(legacy),
+                    persistent: true,
+                }
+            }
+            None if access == LegacyAccess::Unclaimed => Self {
+                prefix: legacy,
+                adopted: None,
+                persistent: true,
+            },
+            None => Self {
+                prefix: format!("{host}/unverified/"),
+                adopted: None,
+                persistent: false,
+            },
+        }
+    }
+
+    fn view(&self, list: Vec<String>) -> Vec<String> {
+        let matches = |entry: &str| mark_id(entry, &self.prefix).is_some();
+        let mut marks: Vec<_> = list
+            .iter()
+            .filter(|entry| matches(entry))
+            .cloned()
+            .collect();
+        if let Some(prefix) = &self.adopted {
+            for id in list.iter().filter_map(|entry| mark_id(entry, prefix)) {
+                let mark = format!("{}{id}", self.prefix);
+                if !marks.contains(&mark) {
+                    marks.push(mark);
+                }
+            }
+        }
+        marks
+    }
+}
+
+fn mark_id<'mark>(mark: &'mark str, prefix: &str) -> Option<&'mark str> {
+    mark.strip_prefix(prefix)
+        .filter(|id| !id.is_empty() && !id.contains('/'))
 }
 
 fn local_config(root: &std::path::Path) -> Option<git2::Config> {
@@ -146,20 +211,57 @@ fn load_marks(root: &std::path::Path) -> Marks {
     let Some(config) = local_config(root) else {
         return Marks::default();
     };
-    let list = |key: &str| {
-        config
-            .get_string(key)
-            .map(|text| text.split_whitespace().map(str::to_owned).collect())
-            .unwrap_or_default()
-    };
     Marks {
-        saved: list(SAVED_KEY),
-        done: list(DONE_KEY),
+        saved: read_marks(&config, SAVED_KEY),
+        done: read_marks(&config, DONE_KEY),
     }
 }
 
-fn store_marks(root: &std::path::Path, key: &str, list: &[String]) {
+fn read_marks(config: &git2::Config, key: &str) -> Vec<String> {
+    config
+        .get_string(key)
+        .map(|text| text.split_whitespace().map(str::to_owned).collect())
+        .unwrap_or_default()
+}
+
+fn set_mark(list: &mut Vec<String>, prefix: &str, mark: &str, present: bool) {
+    list.retain(|existing| existing != mark);
+    if present {
+        list.push(mark.to_owned());
+        let mut over = list
+            .iter()
+            .filter(|entry| mark_id(entry, prefix).is_some())
+            .count()
+            .saturating_sub(KEEP);
+        list.retain(|entry| {
+            if over > 0 && mark_id(entry, prefix).is_some() {
+                over -= 1;
+                false
+            } else {
+                true
+            }
+        });
+    }
+}
+
+fn store_mark(root: &std::path::Path, key: &str, scope: &MarkScope, id: &str, present: bool) {
+    if !scope.persistent {
+        return;
+    }
     if let Some(mut config) = local_config(root) {
+        // Replay just this edit against disk; other accounts' marks are not ours to replace.
+        let mut list = read_marks(&config, key);
+        if let Some(prefix) = &scope.adopted {
+            // Editing an adopted mark must also retire its old spelling, so removing it
+            // cannot make it reappear when the list is loaded again.
+            list.retain(|entry| mark_id(entry, prefix) != Some(id));
+        }
+        set_mark(
+            &mut list,
+            &scope.prefix,
+            &format!("{}{id}", scope.prefix),
+            present,
+        );
         let _ = if list.is_empty() {
             config.remove(key)
         } else {
@@ -242,29 +344,52 @@ impl Workspace {
         threads
     }
 
-    fn thread_mark(&self, thread: &Notification) -> String {
-        format!("{}/{}", self.host, thread.id.0)
+    fn thread_mark(&self, thread: &Notification) -> Option<String> {
+        self.notify
+            .marks_scope
+            .as_ref()
+            .map(|scope| format!("{}{}", scope.prefix, thread.id.0))
     }
 
     fn is_done(&self, thread: &Notification) -> bool {
-        let mark = self.thread_mark(thread);
-        self.notify
-            .marks
-            .as_ref()
-            .is_some_and(|marks| marks.done.contains(&mark))
+        self.thread_mark(thread).is_some_and(|mark| {
+            self.notify
+                .marks
+                .as_ref()
+                .is_some_and(|marks| marks.done.contains(&mark))
+        })
     }
 
     fn is_saved(&self, thread: &Notification) -> bool {
-        let mark = self.thread_mark(thread);
-        self.notify
-            .marks
-            .as_ref()
-            .is_some_and(|marks| marks.saved.contains(&mark))
+        self.thread_mark(thread).is_some_and(|mark| {
+            self.notify
+                .marks
+                .as_ref()
+                .is_some_and(|marks| marks.saved.contains(&mark))
+        })
     }
 
     fn ensure_marks(&mut self) {
-        if self.notify.marks.is_none() {
-            self.notify.marks = Some(load_marks(&self.root));
+        let access = host_state::legacy_access(&HostKey::new(&self.host), self.account.as_ref());
+        self.ensure_marks_with(access);
+    }
+
+    fn ensure_marks_with(&mut self, access: LegacyAccess) {
+        if self.host.is_empty() {
+            return;
+        }
+        let scope = MarkScope::new(&self.host, self.account.as_ref(), access);
+        if self.notify.marks_scope.as_ref() != Some(&scope) {
+            let marks = if scope.persistent {
+                load_marks(&self.root)
+            } else {
+                Marks::default()
+            };
+            self.notify.marks = Some(Marks {
+                saved: scope.view(marks.saved),
+                done: scope.view(marks.done),
+            });
+            self.notify.marks_scope = Some(scope);
         }
     }
 
@@ -513,7 +638,8 @@ impl Workspace {
                 {
                     return Err("Open it first (Enter), then o opens it on the forge".into());
                 }
-                let url = format!("https://{}/{}/{path}/{number}", self.host, thread.repo);
+                let base = self.repository_browser_base(&thread.repo);
+                let url = format!("{base}/{path}/{number}");
                 self.activate(Action::Web(page, *number, url))
             }
             NotifyTarget::Run(_) => {
@@ -539,11 +665,8 @@ impl Workspace {
         // GitHub's notification can name a REST release ID, not its tag. There is no
         // release reader: show the repository's Releases page instead of REST JSON.
         if host.eq_ignore_ascii_case("api.github.com") || path.starts_with("api/v3/repos/") {
-            Some(format!(
-                "https://{}/{}/releases",
-                self.host,
-                thread_repo(self, thread)
-            ))
+            let base = self.repository_browser_base(&thread_repo(self, thread));
+            Some(format!("{base}/releases"))
         } else {
             Some(url.clone())
         }
@@ -671,19 +794,8 @@ impl Workspace {
             }
             KeyCode::Char('s') => {
                 let thread = self.selected_thread().ok_or("No notification selected")?;
-                let mark = self.thread_mark(&thread);
-                let marks = self.notify.marks.get_or_insert_with(Marks::default);
-                let saved = if let Some(at) = marks.saved.iter().position(|kept| *kept == mark) {
-                    marks.saved.remove(at);
-                    false
-                } else {
-                    marks.saved.push(mark);
-                    let over = marks.saved.len().saturating_sub(KEEP);
-                    marks.saved.drain(..over);
-                    true
-                };
-                let list = marks.saved.clone();
-                store_marks(&self.root, SAVED_KEY, &list);
+                let saved = !self.is_saved(&thread);
+                self.edit_mark(SAVED_KEY, &thread, saved);
                 self.notice = if saved {
                     format!("✓ Saved {}", target_words(&thread))
                 } else {
@@ -760,25 +872,35 @@ impl Workspace {
             .unwrap_or(0);
     }
 
+    fn edit_mark(&mut self, key: &str, thread: &Notification, present: bool) {
+        self.ensure_marks();
+        self.edit_loaded_mark(key, thread, present);
+    }
+
+    fn edit_loaded_mark(&mut self, key: &str, thread: &Notification, present: bool) {
+        let Some(scope) = self.notify.marks_scope.as_ref() else {
+            return;
+        };
+        let mark = format!("{}{}", scope.prefix, thread.id.0);
+        let marks = self.notify.marks.get_or_insert_with(Marks::default);
+        let list = if key == SAVED_KEY {
+            &mut marks.saved
+        } else {
+            &mut marks.done
+        };
+        set_mark(list, &scope.prefix, &mark, present);
+        store_mark(&self.root, key, scope, &thread.id.0, present);
+    }
+
     /// `e`: Done, as on GitHub; in Done it moves the thread back to the inbox. Done is this
     /// repository's own mark; a thread still unread is also marked read on the forge.
     fn toggle_done(&mut self, thread: &Notification) -> Result<(), String> {
-        if !self.is_done(thread) && thread.unread && self.notifications_available() {
+        self.ensure_marks();
+        let done = !self.is_done(thread);
+        if done && thread.unread && self.notifications_available() {
             self.mark(Write::MarkRead(thread.id.clone()))?;
         }
-        let mark = self.thread_mark(thread);
-        let marks = self.notify.marks.get_or_insert_with(Marks::default);
-        let done = if let Some(at) = marks.done.iter().position(|kept| *kept == mark) {
-            marks.done.remove(at);
-            false
-        } else {
-            marks.done.push(mark);
-            let over = marks.done.len().saturating_sub(KEEP);
-            marks.done.drain(..over);
-            true
-        };
-        let list = marks.done.clone();
-        store_marks(&self.root, DONE_KEY, &list);
+        self.edit_mark(DONE_KEY, thread, done);
         self.notice_error = false;
         if !done {
             self.notice = format!("✓ Moved {} to the inbox", target_words(thread));
@@ -796,7 +918,7 @@ impl Workspace {
             return Err("Wait for the current action to finish".into());
         }
         self.cache.remove(&Key::Write);
-        self.enqueue(Key::Write, Op::Write(self.target(), write), false);
+        self.enqueue(Key::Write, self.write_op(self.target(), write), false);
         self.notice.clear();
         self.notice_error = false;
         Ok(())
@@ -805,7 +927,7 @@ impl Workspace {
     /// `Enter`: the thread's pull request or issue in its own tab (this repository), whose
     /// `Esc` comes back here; its run in Actions; or the browser for anything else.
     fn open_thread(&mut self, thread: &Notification) -> Result<Option<Form>, String> {
-        let here = thread.repo.is_empty() || thread.repo.eq_ignore_ascii_case(&self.repo);
+        let here = self.thread_here(thread);
         match &thread.target {
             NotifyTarget::Item { kind, number } if here => {
                 let page = if *kind == ItemKind::PullRequest { 2 } else { 1 };
@@ -915,7 +1037,11 @@ impl Workspace {
                 || head.starts_with("Sign in to ")
                 || head.ends_with("requires sign-in") =>
             {
-                format!("{action}: {}", self.explain(error).headline)
+                format!(
+                    "{action}: {}{}",
+                    self.explain(error).headline,
+                    sign_in_notice_suffix()
+                )
             }
             _ => action.into(),
         })
@@ -1096,6 +1222,12 @@ fn side_width(width: u16) -> u16 {
     (width / 5).clamp(26, 34)
 }
 
+const MARK_ALL_FAILURE: &str = "Couldn't mark all notifications read";
+
+fn sign_in_notice_suffix() -> String {
+    format!(" · {} sign in", super::states::SIGN_IN_KEY)
+}
+
 /// The Notifications page: top bar, sidebar, list and footer.
 pub(in crate::screen) fn frame(app: &mut GitScreen, width: u16, height: u16) -> Frame {
     let mut frame = Frame {
@@ -1157,7 +1289,32 @@ pub(in crate::screen) fn frame(app: &mut GitScreen, width: u16, height: u16) -> 
         let inner = list_rect.inner();
         let (left, right) = (inner.x + 1, inner.right().saturating_sub(1));
         let room = usize::from(right.saturating_sub(left));
-        let text = chrome::ellipsize(&format!("{mark}{}", workspace.notice), room);
+        let suffix = sign_in_notice_suffix();
+        let suffix_width = usize::from(chrome::width(&suffix));
+        let text = match workspace.notice.strip_suffix(&suffix) {
+            Some(notice) if workspace.notice_error && room > suffix_width => {
+                let room = room - suffix_width;
+                // Keep the action and signed-out reason together; the host can yield first.
+                let notice = match notice.strip_prefix(MARK_ALL_FAILURE) {
+                    // When the reason is longer than ": Not signed in", the
+                    // ellipsis takes one more cell.
+                    Some(reason)
+                        if reason.starts_with(": Not signed in")
+                            && usize::from(chrome::width(mark))
+                                + MARK_ALL_FAILURE.len()
+                                + ": Not signed in".len()
+                                + usize::from(reason.len() > ": Not signed in".len())
+                                > room =>
+                    {
+                        "Mark all failed: not signed in"
+                    }
+                    _ => notice,
+                };
+                let shortened = chrome::ellipsize(&format!("{mark}{notice}"), room);
+                format!("{shortened}{suffix}")
+            }
+            _ => chrome::ellipsize(&format!("{mark}{}", workspace.notice), room),
+        };
         let row = inner.bottom().saturating_sub(1);
         // Over `Showing N` when both do not fit: the notice is the news.
         let at = right.saturating_sub(chrome::width(&text)).max(left);
@@ -1709,6 +1866,84 @@ mod tests {
     use super::*;
     use crate::forge::model::{ItemId, Timestamp};
 
+    #[test]
+    fn legacy_marks_persist_unverified_then_belong_only_to_the_first_login() {
+        let root = tempfile::tempdir().unwrap();
+        git2::Repository::init(root.path()).unwrap();
+        let mut ws = Workspace::new(root.path().into());
+        ws.host = "forge.test:8443".into();
+        let host = HostKey::new(&ws.host);
+        let alice = AccountNamespace::signed_in(host.clone(), "alice").unwrap();
+        let bob = AccountNamespace::signed_in(host, "bob").unwrap();
+        let existing = thread(NotifyReason::Mentioned);
+        let mut added = existing.clone();
+        added.id = ItemId::new("2");
+        let mut bob_thread = existing.clone();
+        bob_thread.id = ItemId::new("3");
+
+        // Seed HEAD's exact spelling. An unverifiable session uses the same Git config.
+        let mut config = local_config(&ws.root).unwrap();
+        for key in [SAVED_KEY, DONE_KEY] {
+            config.set_str(key, "forge.test:8443/1").unwrap();
+        }
+        ws.ensure_marks_with(LegacyAccess::Unclaimed);
+        assert!(ws.is_saved(&existing) && ws.is_done(&existing));
+        ws.edit_loaded_mark(SAVED_KEY, &added, true);
+        ws.edit_loaded_mark(DONE_KEY, &added, true);
+        assert!(
+            load_marks(&ws.root)
+                .saved
+                .contains(&"forge.test:8443/2".to_owned())
+        );
+        assert!(
+            load_marks(&ws.root)
+                .done
+                .contains(&"forge.test:8443/2".to_owned())
+        );
+
+        ws.account = Some(alice.clone());
+        ws.ensure_marks_with(LegacyAccess::Owner);
+        for thread in [&existing, &added] {
+            assert!(ws.is_saved(thread) && ws.is_done(thread));
+        }
+        ws.edit_loaded_mark(SAVED_KEY, &added, false);
+        ws.edit_loaded_mark(DONE_KEY, &added, false);
+        ws.account = Some(bob);
+        ws.ensure_marks_with(LegacyAccess::Blocked);
+        assert!(!ws.is_saved(&existing) && !ws.is_done(&existing));
+        ws.edit_loaded_mark(SAVED_KEY, &bob_thread, true);
+        ws.edit_loaded_mark(DONE_KEY, &bob_thread, true);
+        let bob_mark = ws.thread_mark(&bob_thread).unwrap();
+
+        ws.account = Some(alice);
+        ws.ensure_marks_with(LegacyAccess::Owner);
+        assert!(ws.is_saved(&existing) && ws.is_done(&existing));
+        assert!(!ws.is_saved(&added) && !ws.is_done(&added));
+        assert!(!ws.is_saved(&bob_thread) && !ws.is_done(&bob_thread));
+        let marks = load_marks(&ws.root);
+        for list in [marks.saved, marks.done] {
+            assert!(
+                list.contains(&bob_mark),
+                "an edit must keep other accounts' marks"
+            );
+        }
+    }
+
+    #[test]
+    fn notification_errors_keep_account_confirmation_reasons() {
+        let ws = Workspace::new(PathBuf::new());
+        for reason in [
+            crate::forge::ACCOUNT_CHANGED,
+            crate::forge::UNVERIFIED_SIGN_IN,
+        ] {
+            assert_eq!(
+                ws.notification_write_error(&Write::MarkAllRead, reason)
+                    .as_deref(),
+                Some(reason)
+            );
+        }
+    }
+
     fn thread(reason: NotifyReason) -> Notification {
         Notification {
             id: ItemId::new("1"),
@@ -1722,6 +1957,60 @@ mod tests {
             },
             updated: Timestamp("2026-01-01T00:00:00Z".into()),
             comment: None,
+        }
+    }
+
+    #[test]
+    fn ctrl_l_opens_in_app_notifications_and_reports_browser_only_edges() {
+        let directory = tempfile::tempdir().unwrap();
+        let pr = || NotifyTarget::Item {
+            kind: ItemKind::PullRequest,
+            number: 7,
+        };
+        for (repo, target, expected_page, expected_item, expected_run, expected_edge) in [
+            ("o/r", pr(), 2, Some((2, 7)), None, None),
+            ("o/other", pr(), 2, Some((2, 7)), None, None),
+            (
+                "o/r",
+                NotifyTarget::Run(ItemId::new("42")),
+                3,
+                None,
+                Some(42),
+                None,
+            ),
+            (
+                "o/r",
+                NotifyTarget::Release("https://notifications.example/o/r/releases/tag/v1".into()),
+                PAGE,
+                None,
+                None,
+                Some(SpatialDirection::Right),
+            ),
+        ] {
+            let mut workspace = Workspace::new(directory.path().to_path_buf());
+            workspace.host = "notifications.example".into();
+            workspace.repo = "o/r".into();
+            workspace.active = lanes::Lanes::dry();
+            workspace.page = PAGE;
+            let mut notification = thread(NotifyReason::Subscribed);
+            notification.repo = repo.into();
+            notification.target = target;
+            let value = serde_json::json!({"Notifications": {"items": [notification]}});
+            workspace.cache.insert(
+                Key::Notifications,
+                Ok(Reply {
+                    text: value.to_string(),
+                    value,
+                }),
+            );
+
+            let key = "ctrl-l".parse().unwrap();
+            assert!(workspace.notification_key(&key).unwrap().is_none());
+            assert_eq!(workspace.page, expected_page);
+            assert_eq!(workspace.repo, repo);
+            assert_eq!(workspace.opened, expected_item);
+            assert_eq!(workspace.run_id, expected_run);
+            assert_eq!(workspace.focus_exit, expected_edge);
         }
     }
 
@@ -1772,10 +2061,18 @@ mod tests {
 
             // Let the fake forge reject the running request through the normal reply path.
             let request = workspace.active.finish(&Key::Write).unwrap();
-            let Op::Write(_, write) = &request.op else {
+            let Op::Write(_, write, _) = &request.op else {
                 panic!("expected a notification write");
             };
-            let reply = ForgeReply::Written(write.clone(), Err(ForgeError::Network("500".into())));
+            let error = if ch == 'm' {
+                ForgeError::NotAuthenticated {
+                    host: workspace.host.clone(),
+                    hint: "glab's saved API address and Dusty's API address don't match. Set api_base to https://api.example.test/tools/code/api/v4.".into(),
+                }
+            } else {
+                ForgeError::Network("500".into())
+            };
+            let reply = ForgeReply::Written(write.clone(), Err(error));
             let scope = (
                 workspace.host.clone(),
                 workspace.repo.clone(),
@@ -1787,11 +2084,71 @@ mod tests {
             assert_eq!(workspace.shown_threads(), [first.clone(), last.clone()]);
             assert_eq!(workspace.selected_thread().unwrap().id, last.id);
             assert!(workspace.notice_error);
-            assert_eq!(
-                workspace.notice,
-                format!("{action}: notifications.example is having problems")
-            );
+            let reason = if ch == 'm' {
+                "Not signed in to notifications.example · @ sign in"
+            } else {
+                "notifications.example is having problems"
+            };
+            assert_eq!(workspace.notice, format!("{action}: {reason}"));
         }
+    }
+
+    #[test]
+    fn rejected_mark_all_keeps_the_sign_in_reason_and_shortcut_at_100_and_80_columns() {
+        let root = tempfile::tempdir().unwrap();
+        git2::Repository::init(root.path()).unwrap();
+        let mut app = GitScreen::open(root.path()).unwrap();
+        app.page = PAGE;
+        app.github = Workspace::new(root.path().into());
+        app.github.host = "github.com".into();
+        app.github.repo = "o/r".into();
+        app.github.page = PAGE;
+        app.github.active = lanes::Lanes::dry();
+        app.github.notify.wanted = true;
+        assert!(!app.github.sidebar_hidden());
+        // Inject the queued write directly so the test doesn't depend on the global
+        // account registry's state for github.com before the write is sent.
+        let target = app.github.target();
+        app.github.enqueue(
+            Key::Write,
+            Op::Write(target, Write::MarkAllRead, None),
+            false,
+        );
+        assert!(app.github.start_reads());
+
+        let request = app.github.active.finish(&Key::Write).unwrap();
+        let error = crate::forge::request::ForgeError::NotAuthenticated {
+            host: "github.com".into(),
+            hint:
+                "If you're signed in with gh, Dusty's API address must match the address gh uses."
+                    .into(),
+        };
+        let scope = (
+            app.github.host.clone(),
+            app.github.repo.clone(),
+            app.github.scope_epoch,
+        );
+        let reply = ForgeReply::Written(Write::MarkAllRead, Err(error));
+        app.github.active.answer_for_test(request, scope, reply);
+        assert!(app.github.poll());
+
+        let shown = frame(&mut app, 100, 30);
+        let status = shown.grid.row_text(27);
+        assert!(
+            status.contains("Couldn't mark all notifications read"),
+            "{status}"
+        );
+        assert!(
+            status.contains("Not signed in") && status.contains("@ sign in"),
+            "{status}"
+        );
+
+        let shown = frame(&mut app, 80, 30);
+        let status = shown.grid.row_text(27);
+        assert!(
+            status.contains("Mark all failed: not signed in · @ sign in"),
+            "{status}"
+        );
     }
 
     #[test]
