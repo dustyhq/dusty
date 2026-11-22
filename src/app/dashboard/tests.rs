@@ -334,8 +334,9 @@ fn dashboard_start_moves_by_grid_cells_and_hands_off_at_edges() {
         ("h", DashboardPanel::Projects, 0),
         ("j", DashboardPanel::Projects, 1),
         ("l", DashboardPanel::Start, 2), // nearest row from Projects, in the left column
-        ("left", DashboardPanel::Projects, 0),
-        ("ctrl-l", DashboardPanel::Start, 0),
+        ("left", DashboardPanel::Projects, 1),
+        ("ctrl-l", DashboardPanel::Start, 2),
+        ("k", DashboardPanel::Start, 0),
         ("right", DashboardPanel::Start, 1),
         ("ctrl-l", DashboardPanel::Start, 1),
         ("ctrl-j", DashboardPanel::Start, 1), // Ctrl-j does not move within Start
@@ -380,17 +381,66 @@ fn dashboard_start_moves_by_grid_cells_and_hands_off_at_edges() {
 }
 
 #[test]
+fn sideways_dashboard_moves_keep_the_displayed_row_when_a_box_scrolls() {
+    use crate::app::tests::driver::TestSession;
+    use crate::ui::{DashboardPanel, DashboardProject};
+
+    let mut driver = TestSession::new(crate::config::load_bundled_config());
+    driver.resize(100, 19);
+    let app = driver.application_mut();
+    let root = &app.state.workspace_root;
+    app.ui.dashboard_workspace.projects = (1..=9)
+        .map(|number| {
+            let name = format!("project-{number}");
+            DashboardProject {
+                path: root.join(&name),
+                name,
+                branch: None,
+            }
+        })
+        .collect();
+
+    driver.key("h");
+    for _ in 0..8 {
+        driver.key("j");
+    }
+    let frame = driver.frame();
+    let row = (0..frame.grid.height())
+        .find(|&row| frame.grid.row_text(row).contains("project-9"))
+        .unwrap();
+    assert!(frame.grid.row_text(row).contains("tutor"));
+
+    driver.key("l");
+    let ui = &driver.application().ui;
+    assert_eq!(ui.dashboard_focus, Some(DashboardPanel::Start));
+    assert_eq!(ui.dashboard_actions[ui.dashboard_selected].label, "tutor");
+
+    driver.key("j");
+    driver.key("j");
+    let frame = driver.frame();
+    assert!(frame.grid.row_text(row).contains("quit"));
+    driver.key("h");
+    let ui = &driver.application().ui;
+    assert_eq!(ui.dashboard_focus, Some(DashboardPanel::Projects));
+    assert_eq!(
+        ui.dashboard_workspace.projects[ui.dashboard_row].name,
+        "project-3"
+    );
+    assert!(driver.frame().grid.row_text(row).contains("project-3"));
+}
+
+#[test]
 fn configured_text_and_dashboard_commands_are_schema_validated() {
     let (_app_dirs, app) = app();
     let mut loaded = crate::config::load_bundled_config();
-    assert!(validate_configured_commands(&app.commands, &loaded).is_ok());
+    assert!(validate_configured_commands(&app.commands, &loaded, false).is_ok());
     loaded
         .config
         .input
         .text_commands
         .insert("editor.insert".into(), "unknown.command".into());
     assert!(
-        validate_configured_commands(&app.commands, &loaded)
+        validate_configured_commands(&app.commands, &loaded, false)
             .expect_err("invalid command")
             .contains("editor.insert")
     );

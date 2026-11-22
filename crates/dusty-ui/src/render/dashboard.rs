@@ -10,6 +10,7 @@ use crate::config::BorderStyle;
 use crate::config::Config;
 use crate::config::DashboardConfig;
 use crate::config::ExplorerIconMode;
+use crate::geometry::cell_text_width;
 use crate::geometry::ellipsized;
 use crate::geometry::text_width;
 use crate::grid::CONTROL_CHARACTER_REPLACEMENT;
@@ -34,6 +35,8 @@ const HINTS_MIN_HEIGHT: u16 = 12;
 const MARGIN: u16 = 2;
 /// Columns between an action's key and its label.
 const KEY_GAP: u16 = 2;
+const HEADER_SEPARATOR: &str = " · ";
+const HEADER_TEXT_GAP: u16 = 2;
 const HINTS: &str = "h j k l move · Enter open · 1-9 recent file · space space find · F1 commands";
 const ALL_PANELS: [DashboardPanel; 4] = [
     DashboardPanel::RecentFiles,
@@ -139,7 +142,7 @@ pub(super) fn render_dashboard(
         );
         return Frame { grid, cursor: None };
     }
-    let layout = DashboardLayout::new(ui, configured, ambiguous, width, height);
+    let layout = DashboardLayout::new(root, ui, configured, editor_config, width, height);
     let mut screen = Screen {
         grid,
         ui,
@@ -176,6 +179,7 @@ pub(super) fn render_dashboard(
 
 /// The action area relative to the dashboard and the number of columns drawn in it.
 pub fn dashboard_start_grid(
+    root: &Path,
     ui: &UiState,
     configured: &DashboardConfig,
     config: &Config,
@@ -185,7 +189,7 @@ pub fn dashboard_start_grid(
     if width < configured.minimum_width || height < configured.minimum_height {
         return None;
     }
-    let layout = DashboardLayout::new(ui, configured, config.editor.ambiguous_width, width, height);
+    let layout = DashboardLayout::new(root, ui, configured, config, width, height);
     let (_, start) = layout
         .boxes
         .iter()
@@ -214,16 +218,17 @@ struct DashboardLayout {
 
 impl DashboardLayout {
     fn new(
+        root: &Path,
         ui: &UiState,
         configured: &DashboardConfig,
-        ambiguous: AmbiguousWidth,
+        config: &Config,
         width: u16,
         height: u16,
     ) -> Self {
         let shown = dashboard_panels(width, height);
         let block = configured.content_width.max(GRID_MIN_WIDTH).min(width);
         let left = (width - block) / 2;
-        let actions = ActionWidths::new(ui, ambiguous);
+        let actions = ActionWidths::new(ui, config.editor.ambiguous_width);
         // The boxes end above a blank row and the hints.
         let bottom = if height >= HINTS_MIN_HEIGHT {
             height - 2
@@ -231,7 +236,7 @@ impl DashboardLayout {
             height
         };
         let (logo, boxes) = if shown.len() == ALL_PANELS.len() {
-            let logo = HeaderLogo::fit(configured, ambiguous, block, height);
+            let logo = HeaderLogo::fit(root, ui, configured, config, block, height);
             let top = logo
                 .as_ref()
                 .map_or(5, |logo| logo.lines.len().max(5) as u16 + 2);
@@ -273,8 +278,10 @@ struct HeaderLogo {
 
 impl HeaderLogo {
     fn fit(
+        root: &Path,
+        ui: &UiState,
         configured: &DashboardConfig,
-        ambiguous: AmbiguousWidth,
+        config: &Config,
         block: u16,
         height: u16,
     ) -> Option<Self> {
@@ -286,21 +293,49 @@ impl HeaderLogo {
         } else {
             configured.logo.lines().map(str::to_owned).collect()
         };
-        let art_width = lines
-            .iter()
-            .map(|line| display_width(line, ambiguous))
-            .max()
-            .unwrap_or(0);
-        // Leave room for the repository and version, tightening the gap at 100 columns.
-        let gap = block
-            .saturating_sub(4 * MARGIN + 30)
-            .saturating_sub(art_width)
-            .min(8);
-        (lines.len() <= 6 && gap >= 4).then_some(Self {
+        let ambiguous = config.editor.ambiguous_width;
+        let width = |text: &str| cell_text_width(text, ambiguous);
+        let art_width = lines.iter().map(|line| width(line)).max().unwrap_or(0);
+        let room = usize::from(block - 4 * MARGIN).saturating_sub(art_width);
+        // Keep the wordmark's usual threshold before checking the text beside it.
+        let gap = room.saturating_sub(30).min(8);
+        if lines.len() > 6 || gap < 4 {
+            return None;
+        }
+
+        let icons = config.ui.explorer.icon_mode == ExplorerIconMode::NerdFont;
+        let mut info_width = workspace_line_width(root, ui.git_branch.as_deref(), icons, ambiguous);
+        if configured.show_version {
+            info_width += width(&dashboard_version(configured));
+        }
+        (info_width + gap + usize::from(HEADER_TEXT_GAP) <= room).then_some(Self {
             lines,
-            info_offset: art_width.saturating_add(gap),
+            info_offset: u16::try_from(art_width + gap).ok()?,
         })
     }
+}
+
+fn dashboard_version(configured: &DashboardConfig) -> String {
+    configured
+        .version_format
+        .replace("{version}", env!("CARGO_PKG_VERSION"))
+}
+
+fn branch_icon(icons: bool) -> &'static str {
+    if icons { "\u{e0a0} " } else { "" }
+}
+
+fn workspace_line_width(
+    root: &Path,
+    branch: Option<&str>,
+    icons: bool,
+    ambiguous: AmbiguousWidth,
+) -> usize {
+    let width = |text: &str| cell_text_width(text, ambiguous);
+    width(&directory_name(root))
+        + branch.map_or(0, |branch| {
+            width(HEADER_SEPARATOR) + width(branch_icon(icons)) + width(branch)
+        })
 }
 
 fn display_width(text: &str, ambiguous: AmbiguousWidth) -> u16 {
@@ -459,6 +494,10 @@ impl Screen<'_> {
         display_width(text, self.ambiguous)
     }
 
+    fn cell_width(&self, text: &str) -> u16 {
+        u16::try_from(cell_text_width(text, self.ambiguous)).unwrap_or(u16::MAX)
+    }
+
     fn put(&mut self, x: u16, y: u16, text: &str, style: Style, right: u16) -> u16 {
         self.grid.put_text_clipped(x, y, text, style, right)
     }
@@ -467,21 +506,20 @@ impl Screen<'_> {
     fn draw_header(&mut self, left: u16, block: u16, logo: Option<HeaderLogo>) {
         let x = left + 2 * MARGIN;
         let right = left + block - 2 * MARGIN;
-        let version = self
-            .configured
-            .version_format
-            .replace("{version}", env!("CARGO_PKG_VERSION"));
+        let version = dashboard_version(self.configured);
         if let Some(logo) = logo {
             let info_x = x + logo.info_offset;
             for (row, line) in (1..).zip(&logo.lines) {
                 self.put(x, row, line, Style::Accent, right);
             }
+            // The gap only separates the name from something drawn after it.
             let mut name_right = right;
             if self.configured.show_version {
-                name_right = right.saturating_sub(self.width(&version));
-                self.put(name_right, 2, &version, Style::Muted, right);
+                let version_x = right.saturating_sub(self.cell_width(&version));
+                self.put(version_x, 2, &version, Style::Muted, right);
+                name_right = version_x.saturating_sub(HEADER_TEXT_GAP);
             }
-            self.draw_workspace_line(info_x, 2, name_right.saturating_sub(2));
+            self.draw_workspace_line(info_x, 2, name_right);
             self.draw_path(info_x, 3, right);
             self.draw_last_commit(info_x, 5, right);
             return;
@@ -497,11 +535,28 @@ impl Screen<'_> {
             }
             identity.push_str(&version);
         }
+        let identity = if self.configured.show_identity
+            && let Some(branch) = self.ui.git_branch.as_deref()
+            && workspace_line_width(self.root, Some(branch), self.icons, self.ambiguous)
+                + usize::from(self.cell_width(&identity))
+                + usize::from(HEADER_TEXT_GAP)
+                > usize::from(right - x)
+        {
+            // Keep the optional label from taking cells the branch needs.
+            if self.configured.show_version {
+                version.as_str()
+            } else {
+                ""
+            }
+        } else {
+            identity.as_str()
+        };
         if !identity.is_empty() {
-            name_right = right.saturating_sub(self.width(&identity));
-            self.put(name_right, 1, &identity, Style::Muted, right);
+            let identity_x = right.saturating_sub(self.cell_width(identity));
+            self.put(identity_x, 1, identity, Style::Muted, right);
+            name_right = identity_x.saturating_sub(HEADER_TEXT_GAP);
         }
-        self.draw_workspace_line(x, 1, name_right.saturating_sub(2));
+        self.draw_workspace_line(x, 1, name_right);
         self.draw_path(x, 2, right);
         self.draw_last_commit(x, 3, right);
     }
@@ -510,8 +565,8 @@ impl Screen<'_> {
     fn draw_workspace_line(&mut self, x: u16, y: u16, right: u16) {
         let mut x = self.put(x, y, &directory_name(self.root), Style::Default, right);
         if let Some(branch) = &self.ui.git_branch {
-            let icon = if self.icons { "\u{e0a0} " } else { "" };
-            x = self.put(x, y, " · ", Style::Muted, right);
+            let icon = branch_icon(self.icons);
+            x = self.put(x, y, HEADER_SEPARATOR, Style::Muted, right);
             x = self.put(x, y, &format!("{icon}{branch}"), Style::Accent, right);
         }
         let ui = self.ui;
@@ -533,11 +588,12 @@ impl Screen<'_> {
             parts.push(("clean".to_owned(), Style::Muted));
         }
         // A summary that doesn't fit whole is left out; the changes box lists the same files.
+        let separator_width = self.cell_width(HEADER_SEPARATOR);
         for (summary, style) in parts {
-            if x.saturating_add(3).saturating_add(self.width(&summary)) > right {
-                break;
+            if separator_width.saturating_add(self.cell_width(&summary)) > right.saturating_sub(x) {
+                continue;
             }
-            x = self.put(x, y, " · ", Style::Muted, right);
+            x = self.put(x, y, HEADER_SEPARATOR, Style::Muted, right);
             x = self.put(x, y, &summary, style, right);
         }
     }
@@ -575,10 +631,7 @@ impl Screen<'_> {
             separator = " ";
         }
         if self.configured.show_version {
-            let version = self
-                .configured
-                .version_format
-                .replace("{version}", env!("CARGO_PKG_VERSION"));
+            let version = dashboard_version(self.configured);
             x = self.put(x, 0, separator, Style::Muted, right);
             x = self.put(x, 0, &version, Style::Muted, right);
         }

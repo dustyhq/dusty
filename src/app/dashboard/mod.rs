@@ -280,6 +280,7 @@ impl App {
     fn start_grid(&self) -> Option<(crate::windows::WindowRect, usize)> {
         let (width, height) = self.dashboard_size();
         crate::ui::render::dashboard_start_grid(
+            &self.state.workspace_root,
             &self.ui,
             self.configuration.dashboard(),
             self.configuration.settings(),

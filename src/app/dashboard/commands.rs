@@ -113,11 +113,23 @@ impl App {
                 return false;
             };
             if dashboard_rows(&self.ui, target) > 0 {
-                let across = match direction {
-                    SpatialDirection::Left | SpatialDirection::Right => {
-                        dashboard_selected_row(&self.ui, panel)
-                    }
-                    SpatialDirection::Up | SpatialDirection::Down => 0,
+                let sideways =
+                    matches!(direction, SpatialDirection::Left | SpatialDirection::Right);
+                let across = if sideways
+                    && (panel == DashboardPanel::Start || target == DashboardPanel::Start)
+                    && let Some((grid, columns)) = self.start_grid()
+                {
+                    let index = dashboard_selected_row(&self.ui, panel);
+                    let row = if panel == DashboardPanel::Start {
+                        index / columns
+                    } else {
+                        index
+                    };
+                    // Start and its horizontal neighbour share a height. The renderer
+                    // scrolls just enough to keep the selection on the last visible row.
+                    row.min(usize::from(grid.height.saturating_sub(1)))
+                } else {
+                    0
                 };
                 self.land_in_dashboard_box(target, direction, across);
                 return true;
@@ -200,10 +212,12 @@ impl App {
                     across.min((last - column) / columns) * columns + column
                 }
             }
-        } else if direction == SpatialDirection::Up {
-            last
         } else {
-            0
+            match direction {
+                SpatialDirection::Up => last,
+                SpatialDirection::Down => 0,
+                SpatialDirection::Left | SpatialDirection::Right => across.min(last),
+            }
         };
         self.ui.dashboard_focus = Some(panel);
         self.set_dashboard_row(panel, row);

@@ -214,7 +214,9 @@ fn dashboard_respects_top_docks_and_floating_window_order() {
 
 use crate::SelectedText;
 use crate::Style;
+use crate::config::Config;
 use crate::config::DashboardConfig;
+use crate::config::ExplorerIconMode;
 use crate::render::DashboardAction;
 use crate::render::DashboardChange;
 use crate::render::DashboardChanges;
@@ -286,15 +288,15 @@ fn workspace_ui() -> UiState {
 fn draw_with(
     ui: &UiState,
     configured: &DashboardConfig,
+    config: &Config,
     width: u16,
     height: u16,
 ) -> (crate::Frame, Vec<String>) {
-    let loaded = crate::config::load_bundled_config();
     let frame = crate::render::render_dashboard(
         Path::new("/work/tally"),
         ui,
         configured,
-        &loaded.config,
+        config,
         width,
         height,
     );
@@ -303,12 +305,8 @@ fn draw_with(
 }
 
 fn draw(ui: &UiState, width: u16, height: u16) -> (crate::Frame, Vec<String>) {
-    draw_with(
-        ui,
-        &crate::config::load_bundled_config().dashboard,
-        width,
-        height,
-    )
+    let loaded = crate::config::load_bundled_config();
+    draw_with(ui, &loaded.dashboard, &loaded.config, width, height)
 }
 
 /// The column `text` starts at in `row`.
@@ -445,46 +443,119 @@ fn an_80_by_24_dashboard_shows_one_header_line_recent_files_and_the_actions() {
 #[test]
 fn shorter_windows_drop_the_wordmark_before_the_boxes() {
     let ui = workspace_ui();
-    // At 100 columns the change summary doesn't fit whole, so it is left out, not cut.
-    for (width, height, info_x, summary) in [(120, 36, 70, true), (100, 30, 66, false)] {
-        let (_, rows) = draw(&ui, width, height);
+    let version_text = version();
+    let mut loaded = crate::config::load_bundled_config();
+    // With ASCII icons at 100 columns, only the shorter summary fits.
+    loaded.config.ui.explorer.icon_mode = ExplorerIconMode::Ascii;
+    for (width, height, info_x, summaries) in [
+        (120, 36, 70, " · 1 changed · 1 new"),
+        (100, 30, 66, " · 1 new"),
+    ] {
+        let (_, rows) = draw_with(&ui, &loaded.dashboard, &loaded.config, width, height);
         assert!(rows[1].trim_end().ends_with("██      ██"), "{rows:#?}");
         assert_eq!(column(&rows[2], "tally · "), info_x);
-        assert!(rows[2].contains("master"), "{}", rows[2]);
-        assert_eq!(
-            rows[2].contains("master · 1 changed"),
-            summary,
-            "{}",
-            rows[2]
-        );
-        assert_eq!(rows[2].contains(" · 1"), summary, "{}", rows[2]);
-        assert_eq!(column(&rows[3], "/work/tally"), info_x);
-        assert!(rows[2].trim_end().ends_with(&version()), "{rows:#?}");
-    }
-    let (_, rows) = draw(&ui, 120, 24);
-    assert!(!rows.iter().any(|row| row.contains("██")), "{rows:#?}");
-    assert!(rows[1].starts_with("    tally · "), "{}", rows[1]);
-    assert!(rows[1].contains("master · 1 changed"), "{}", rows[1]);
-    assert!(
-        rows[1]
+        let (_, after_branch) = rows[2].split_once("master").unwrap();
+        let actual = after_branch
             .trim_end()
-            .ends_with(&format!("dusty {}", version()))
+            .strip_suffix(version_text.as_str())
+            .unwrap();
+        assert_eq!(actual.trim_end(), summaries, "{}", rows[2]);
+        assert_eq!(column(&rows[3], "/work/tally"), info_x);
+    }
+    // The default Nerd Font branch icon takes cells too: the branch and version stay
+    // whole and the summary is shown whole or not at all.
+    let nerd = crate::config::load_bundled_config();
+    let (_, rows) = draw_with(&ui, &nerd.dashboard, &nerd.config, 100, 30);
+    assert!(rows[1].trim_end().ends_with("██      ██"), "{rows:#?}");
+    let (_, after_branch) = rows[2].split_once("master").unwrap();
+    let summary = after_branch
+        .trim_end()
+        .strip_suffix(version_text.as_str())
+        .unwrap_or_else(|| panic!("version clipped: {}", rows[2]));
+    assert!(
+        ["", " · 1 new", " · 1 changed · 1 new"].contains(&summary.trim_end()),
+        "{}",
+        rows[2]
     );
-    assert!(rows[3].contains("last commit Count characters too"));
-    for title in ["Recent files", "Changes", "Projects", "Start"] {
-        assert!(rows.iter().any(|row| row.contains(title)), "{rows:#?}");
+    for (width, height) in [(98, 27), (120, 24)] {
+        let (_, rows) = draw(&ui, width, height);
+        assert!(!rows.iter().any(|row| row.contains("██")), "{rows:#?}");
+        assert!(rows[1].starts_with("    tally · "), "{}", rows[1]);
+        assert!(
+            rows[1].contains("master · 1 changed · 1 new"),
+            "{}",
+            rows[1]
+        );
+        assert!(
+            rows[1]
+                .trim_end()
+                .ends_with(&format!("dusty {version_text}"))
+        );
+        assert!(rows[3].contains("last commit Count characters too"));
+        for title in ["Recent files", "Changes", "Projects", "Start"] {
+            assert!(rows.iter().any(|row| row.contains(title)), "{rows:#?}");
+        }
     }
     // Below the boxes' height only recent files and the actions are left.
     let (_, rows) = draw(&ui, 120, 18);
     assert!(rows.iter().any(|row| row.contains("Recent files")));
     assert!(!rows.iter().any(|row| row.contains("Changes")));
+
+    // The text-only four-box header has exactly 12 cells left: enough for the
+    // shorter summary, but not for " · 1 changed" with a wide middle dot. With nothing
+    // drawn on the right, the name keeps the gap's two cells.
+    loaded.config.editor.ambiguous_width = crate::config::AmbiguousWidth::Wide;
+    loaded.dashboard.show_identity = false;
+    loaded.dashboard.show_version = false;
+    let mut ui = ui;
+    let branch = "b".repeat(71);
+    ui.git_branch = Some(branch.clone());
+    let (_, rows) = draw_with(&ui, &loaded.dashboard, &loaded.config, 100, 24);
+    assert_eq!(rows[1].trim(), format!("tally · {branch} · 1 new"));
+}
+
+#[test]
+fn the_text_wordmark_keeps_the_full_branch_and_version() {
+    let mut ui = workspace_ui();
+    let mut loaded = crate::config::load_bundled_config();
+    loaded.config.ui.explorer.icon_mode = ExplorerIconMode::Ascii;
+    let long_version = "v0123456789012345678901234567890123456";
+    for (branch, version, label) in [
+        ("feature/start-grid".to_owned(), version(), "dusty "),
+        ("master".to_owned(), long_version.to_owned(), "dusty "),
+        ("b".repeat(73), version(), ""),
+    ] {
+        ui.git_branch = Some(branch.clone());
+        loaded.dashboard.version_format.clone_from(&version);
+        let (_, rows) = draw_with(&ui, &loaded.dashboard, &loaded.config, 100, 30);
+        assert!(!rows.iter().any(|row| row.contains("██")), "{rows:#?}");
+        assert!(
+            rows[1].starts_with(&format!("    tally · {branch}")),
+            "{}",
+            rows[1]
+        );
+        assert!(
+            rows[1].trim_end().ends_with(&format!("{label}{version}")),
+            "{}",
+            rows[1]
+        );
+        if label.is_empty() {
+            assert!(!rows[1].contains("dusty"), "{}", rows[1]);
+        }
+    }
+    // With nothing on the right, a branch that reaches the edge is not clipped.
+    loaded.dashboard.show_version = false;
+    let branch = "b".repeat(83);
+    ui.git_branch = Some(branch.clone());
+    let (_, rows) = draw_with(&ui, &loaded.dashboard, &loaded.config, 100, 30);
+    assert_eq!(rows[1].trim(), format!("tally · {branch}"), "{rows:#?}");
 }
 
 #[test]
 fn a_configured_logo_replaces_the_wordmark() {
-    let mut configured = crate::config::load_bundled_config().dashboard;
-    configured.logo = "TALLY\nworks".into();
-    let (_, rows) = draw_with(&workspace_ui(), &configured, 160, 39);
+    let mut loaded = crate::config::load_bundled_config();
+    loaded.dashboard.logo = "TALLY\nworks".into();
+    let (_, rows) = draw_with(&workspace_ui(), &loaded.dashboard, &loaded.config, 160, 39);
     assert!(rows[1].starts_with("    TALLY"), "{rows:#?}");
     assert!(rows[2].starts_with("    works"), "{rows:#?}");
     assert!(!rows.iter().any(|row| row.contains("██")));
