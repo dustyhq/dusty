@@ -2422,8 +2422,15 @@ fn typing_after_terminal_exit_keeps_the_editor_unchanged() {
     assert_eq!(driver.keyboard_terminal(), Some(id.0));
     assert!(app.terminal_session.contains(id));
 
+    for key in ["escape", "x", "escape"] {
+        driver.key(key);
+    }
+    assert_eq!(driver.context(), "terminal");
     driver.key("escape");
-    driver.key("escape");
+    assert_eq!(driver.context(), "terminal_normal");
+
+    driver.key("shift-enter");
+    assert_eq!(driver.keyboard_terminal(), Some(id.0));
     assert_eq!(driver.context(), "terminal_normal");
     for key in ["i", "a"] {
         driver.key(key);
@@ -2439,6 +2446,274 @@ fn typing_after_terminal_exit_keeps_the_editor_unchanged() {
 
     driver.key("q");
     assert!(!driver.application().terminal_session.contains(id));
+}
+
+#[test]
+fn exited_terminal_footer_keeps_the_normal_and_visual_cursor_visible() {
+    use crate::app::tests::driver::TestSession;
+    use crate::ui::{Style, TerminalPanelMode};
+
+    let mut driver = TestSession::new(crate::config::load_bundled_config());
+    driver.new_buffer();
+    driver.resize(100, 30);
+
+    let app = driver.application_mut();
+    for id in [PtyId(1), PtyId(2)] {
+        let mut screen = PtyScreen::new(39, 28, 100);
+        screen.feed_bytes(b"\x1b[2J\x1b[HERROR: failed\r\n");
+        app.terminal_session.fixture(
+            id,
+            TerminalFixture {
+                profile: "shell".into(),
+                screen,
+                running: id == PtyId(1),
+                exit_code: (id == PtyId(2)).then_some(7),
+                truncated: false,
+            },
+            app.workspace.version(),
+        );
+    }
+    let exited = PtyId(2);
+    app.terminal_session.select(exited);
+    app.set_terminal_focus(true);
+    app.sync_terminal_panel();
+    driver.reconcile_windows();
+    driver
+        .place_terminal(WindowPlacement::Docked {
+            edge: DockEdge::Right,
+            size: 40,
+        })
+        .unwrap();
+
+    let rect = driver.application().terminal_rect(exited).unwrap();
+    assert_eq!(rect.width, 40);
+    let footer_y = rect.y + rect.height - 1;
+    for key in ["escape", "escape", "G"] {
+        driver.key(key);
+    }
+    assert_eq!(driver.terminal_mode(), Some(TerminalPanelMode::Normal));
+    let history_rows = driver
+        .application()
+        .terminal_session
+        .fixture_lines(exited)
+        .len();
+    assert_eq!(driver.terminal_cursor(), Some((0, history_rows - 1)));
+    let frame = driver.frame();
+    let (x, y, _) = frame
+        .cursor
+        .expect("Normal cursor on the final blank PTY row");
+    assert_eq!((x, y), (rect.x + 1, footer_y - 1));
+    assert!(
+        frame
+            .grid
+            .row_text(footer_y)
+            .contains("Exited 7 · q closes")
+    );
+
+    driver.key("v");
+    assert_eq!(driver.terminal_mode(), Some(TerminalPanelMode::Visual));
+    let frame = driver.frame();
+    assert_eq!(frame.cursor.map(|(x, y, _)| (x, y)), Some((x, y)));
+    assert_eq!(frame.grid.get(x, y).unwrap().style, Style::Selection);
+    assert!(
+        frame
+            .grid
+            .row_text(footer_y)
+            .contains("Exited 7 · q closes")
+    );
+}
+
+fn close_exited_shell_over_insert_buffer(driver: &mut crate::app::tests::driver::TestSession) {
+    let app = driver.application_mut();
+    let id = PtyId(1);
+    app.terminal_session.fixture(
+        id,
+        TerminalFixture {
+            profile: "shell".into(),
+            screen: PtyScreen::new(80, 8, 100),
+            running: false,
+            exit_code: Some(7),
+            truncated: false,
+        },
+        app.workspace.version(),
+    );
+    app.terminal_session.select(id);
+    app.set_terminal_focus(true);
+    app.sync_terminal_panel();
+    driver.key("escape");
+    driver.key("escape");
+    assert_eq!(driver.context(), "terminal_normal");
+
+    driver.key("q");
+    assert!(!driver.application().terminal_session.contains(id));
+    assert_eq!(driver.context(), "editor.insert");
+}
+
+#[test]
+fn exited_terminal_close_key_distinguishes_repeat_cadence_and_fresh_presses() {
+    use crate::app::tests::driver::TestSession;
+    use crate::ui::KeyInputKind;
+
+    let mut driver = TestSession::new(crate::config::load_bundled_config());
+    driver.new_buffer();
+    driver.key("i");
+    let buffer = driver.application().state.active_buffer_id().unwrap();
+
+    close_exited_shell_over_insert_buffer(&mut driver);
+    for gap_ms in [650, 40, 30, 50] {
+        driver.advance_input(Duration::from_millis(gap_ms));
+        driver.key("q");
+    }
+    assert!(driver.application().state.buffers[buffer].text.is_empty());
+    driver.advance_input(Duration::from_millis(110));
+    driver.key("q");
+    assert_eq!(
+        driver.application().state.buffers[buffer].text.to_string(),
+        "q"
+    );
+
+    close_exited_shell_over_insert_buffer(&mut driver);
+    driver.advance_input(Duration::from_millis(700));
+    driver.key("q");
+    assert_eq!(
+        driver.application().state.buffers[buffer].text.to_string(),
+        "qq"
+    );
+
+    close_exited_shell_over_insert_buffer(&mut driver);
+    driver.advance_input(Duration::from_millis(700));
+    for kind in [KeyInputKind::Repeat, KeyInputKind::Release] {
+        driver.application_mut().handle_event(UiEvent::Key {
+            key: KeyEvent::character('q'),
+            kind,
+        });
+    }
+    assert_eq!(
+        driver.application().state.buffers[buffer].text.to_string(),
+        "qq"
+    );
+    driver.key("q");
+    assert_eq!(
+        driver.application().state.buffers[buffer].text.to_string(),
+        "qqq"
+    );
+
+    // Windows supplies a release even when its repeated key-downs look like Press.
+    close_exited_shell_over_insert_buffer(&mut driver);
+    driver.application_mut().handle_event(UiEvent::Key {
+        key: KeyEvent::character('q'),
+        kind: KeyInputKind::Release,
+    });
+    driver.key("q");
+    assert_eq!(
+        driver.application().state.buffers[buffer].text.to_string(),
+        "qqqq"
+    );
+}
+
+#[test]
+fn unrelated_key_up_does_not_release_the_exited_terminal_close_key() {
+    use crate::app::tests::driver::TestSession;
+    use crate::ui::KeyInputKind;
+
+    let mut driver = TestSession::new(crate::config::load_bundled_config());
+    driver.new_buffer();
+    driver.key("i");
+    let buffer = driver.application().state.active_buffer_id().unwrap();
+    close_exited_shell_over_insert_buffer(&mut driver);
+
+    driver.application_mut().handle_event(UiEvent::Key {
+        key: "escape".parse().unwrap(),
+        kind: KeyInputKind::Release,
+    });
+    // Windows supplies another Press for the still-held q.
+    driver.advance_input(Duration::from_millis(40));
+    driver.key("q");
+    assert!(driver.application().state.buffers[buffer].text.is_empty());
+
+    driver.application_mut().handle_event(UiEvent::Key {
+        key: KeyEvent::character('q'),
+        kind: KeyInputKind::Release,
+    });
+    driver.key("q");
+    assert_eq!(
+        driver.application().state.buffers[buffer].text.to_string(),
+        "q"
+    );
+}
+
+#[test]
+fn clicking_another_split_releases_the_exited_terminal_close_key() {
+    use crate::app::tests::driver::TestSession;
+
+    let mut driver = TestSession::new(crate::config::load_bundled_config());
+    driver.new_buffer();
+    driver.key("i");
+    let app = driver.application_mut();
+    let buffer = app.state.active_buffer_id().unwrap();
+    let first_view = app.state.active_view().unwrap();
+    let second_view = app
+        .state
+        .split_active(crate::windows::TileAxis::Horizontal, 500)
+        .unwrap();
+    driver.reconcile_windows();
+
+    close_exited_shell_over_insert_buffer(&mut driver);
+    assert_eq!(driver.application().state.active_view(), Some(second_view));
+    let _frame = driver.frame();
+    let app = driver.application();
+    let pane = crate::ui::view_pane_viewport(&app.state, &app.ui, first_view)
+        .expect("first split is visible");
+    driver.click(pane.x + 6, pane.y);
+    assert_eq!(driver.application().state.active_view(), Some(first_view));
+    assert_eq!(driver.context(), "editor.insert");
+
+    driver.key("q");
+    assert_eq!(
+        driver.application().state.buffers[buffer].text.to_string(),
+        "q"
+    );
+}
+
+#[test]
+fn missing_or_ended_terminal_stops_a_macro_before_its_next_step() {
+    use crate::app::command;
+
+    for ended in [false, true] {
+        let (_app_dirs, mut app) = app();
+        app.state
+            .open_text(TextBuffer::from_text("editor"), None)
+            .unwrap();
+        app.set_dashboard_visibility(false);
+        if ended {
+            let id = PtyId(1);
+            app.terminal_session.fixture(
+                id,
+                crate::app::terminal::TerminalFixture {
+                    profile: "shell".into(),
+                    screen: PtyScreen::new(80, 8, 100),
+                    running: false,
+                    exit_code: Some(0),
+                    truncated: false,
+                },
+                app.workspace.version(),
+            );
+            app.terminal_session.select(id);
+        }
+        let send = command("terminal.send")
+            .unwrap()
+            .with_argument("text", CommandValue::String("ignored".into()));
+        app.state
+            .registers
+            .set_macro('a', vec![send, command("mode.insert").unwrap()]);
+
+        assert!(!app.replay_macro('a', 1), "ended={ended}");
+        assert_eq!(
+            app.ui.notification.as_deref(),
+            Some("No terminal to send to.")
+        );
+        assert_eq!(app.active_input_context(), "editor.normal");
+    }
 }
 
 #[test]

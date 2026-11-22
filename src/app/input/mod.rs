@@ -20,6 +20,7 @@ use crate::editor::EditorMode;
 use crate::editor::input::GrammarInput;
 use crate::editor::input::InputAction;
 use crate::editor::input::InputError;
+use crate::editor::input::KeyCode;
 use crate::editor::input::KeyEvent;
 use crate::editor::input::KeymapSequence;
 use crate::editor::input::MappingResolution;
@@ -2669,10 +2670,17 @@ impl App {
 }
 
 impl App {
+    #[cfg(test)]
     pub(in crate::app) fn handle_configured_key(&mut self, key: KeyEvent) {
+        self.handle_configured_key_with_kind(key, KeyInputKind::Press);
+    }
+
+    fn handle_configured_key_with_kind(&mut self, key: KeyEvent, kind: KeyInputKind) {
         if self.input_replacement_pending() || self.select_replacement_pending() {
             if key.code == crate::editor::input::KeyCode::Escape {
-                if self.input_replacement_pending() {
+                if self.input_replacement_pending()
+                    && !self.is_repeated_confirmation_answer(kind, "command_line.cancel")
+                {
                     self.close_prompt();
                 }
                 if self.select_replacement_pending() {
@@ -2685,10 +2693,7 @@ impl App {
             self.input
                 .held_input
                 .push_back(crate::app::editing::clipboard::DeferredInput::Event(
-                    UiEvent::Key {
-                        key,
-                        kind: KeyInputKind::Press,
-                    },
+                    UiEvent::Key { key, kind },
                 ));
             return;
         }
@@ -2696,10 +2701,7 @@ impl App {
         if self.clipboard.waiting() {
             self.clipboard
                 .defer(crate::app::editing::clipboard::DeferredInput::Event(
-                    UiEvent::Key {
-                        key,
-                        kind: KeyInputKind::Press,
-                    },
+                    UiEvent::Key { key, kind },
                 ));
             return;
         }
@@ -2707,18 +2709,22 @@ impl App {
         if matches!(
             context.as_str(),
             "terminal" | "terminal_normal" | "terminal_visual"
-        ) && self.handle_ended_terminal_key(&key, context == "terminal")
+        ) && self.handle_ended_terminal_key(&key, kind, context == "terminal")
         {
             return;
         }
-        self.handle_key_in_context(&context, key);
+        self.handle_key_in_context_with_kind(&context, key, kind);
     }
 
-    /// A terminal whose program ended reads like a pager: `q` or Enter closes it, and in Input
-    /// mode other plain keys are swallowed without moving focus. Escape still enters Normal
-    /// mode when pressed twice, and navigation, copy, and Ctrl/Alt bindings work as usual.
-    fn handle_ended_terminal_key(&mut self, key: &KeyEvent, input_mode: bool) -> bool {
-        use crate::editor::input::KeyCode;
+    /// A terminal whose program ended reads like a pager: unmodified `q` or Enter closes it,
+    /// and in Input mode other plain keys are swallowed without moving focus. Two consecutive
+    /// Escapes still enter Normal mode; navigation, copy, and Ctrl/Alt bindings work as usual.
+    fn handle_ended_terminal_key(
+        &mut self,
+        key: &KeyEvent,
+        kind: KeyInputKind,
+        input_mode: bool,
+    ) -> bool {
         let Some(id) = self.keyboard_terminal() else {
             return false;
         };
@@ -2730,21 +2736,123 @@ impl App {
         {
             return false;
         }
-        if matches!(key.code, KeyCode::Char('q') | KeyCode::Enter) {
+        if !key.modifiers.shift && matches!(key.code, KeyCode::Char('q') | KeyCode::Enter) {
+            self.cancel_pending_mapping();
             self.close_terminal(id);
+            if self.keyboard_terminal() != Some(id) {
+                self.guard_handoff_key(key, kind);
+            }
             return true;
+        }
+        if input_mode {
+            self.cancel_pending_mapping();
         }
         input_mode
     }
 }
 
 impl App {
+    // Release bindings have their own sequence so a release cannot consume a press chord.
+    fn handle_key_release(&mut self, key: KeyEvent) {
+        let now = self.clock.monotonic();
+        self.flush_key_release_mapping(now);
+        let revision = self.configuration.binding_revision();
+        let resolution = self.configuration.keymaps().resolve(
+            &mut self.input.release_keymap.sequence,
+            "key_release",
+            key.clone(),
+        );
+        self.input.release_keymap.pending = matches!(
+            resolution,
+            MappingResolution::Pending | MappingResolution::Ambiguous
+        )
+        .then(|| PendingReleaseKeymap {
+            revision,
+            deadline: now
+                + Duration::from_millis(self.configuration.settings().input.mapping_timeout_ms),
+            focus: self.window_session.focus_stamp().clone(),
+            capture: self.input.capture_epoch(),
+        });
+        if matches!(resolution, MappingResolution::Missing) {
+            let context = "key_release";
+            if !self.type_unmapped(context, std::slice::from_ref(&key))
+                && let Some(command_id) = self
+                    .configuration
+                    .settings()
+                    .input
+                    .unmatched_commands
+                    .get(context)
+                    .cloned()
+            {
+                // A release neither consumes press modifiers nor replays into the new focus.
+                match command(&command_id) {
+                    Ok(invocation) => self.invoke(invocation),
+                    Err(error) => self.show_error(error),
+                }
+            }
+            self.ensure_cursor_visible();
+        } else {
+            self.dispatch_key_release_mapping(resolution);
+        }
+    }
+
+    fn flush_key_release_mapping(&mut self, now: Instant) {
+        let Some(pending) = &self.input.release_keymap.pending else {
+            return;
+        };
+        if pending.revision != self.configuration.binding_revision()
+            || !std::sync::Arc::ptr_eq(&pending.focus, self.window_session.focus_stamp())
+            || !self.input.capture_current(&pending.capture)
+        {
+            self.input.release_keymap.cancel();
+        } else if now >= pending.deadline {
+            self.input.release_keymap.pending = None;
+            let resolution = self.input.release_keymap.sequence.flush_timeout();
+            self.dispatch_key_release_mapping(resolution);
+        }
+    }
+
+    fn dispatch_key_release_mapping(&mut self, resolution: MappingResolution) {
+        let replay = match resolution {
+            // Release commands come from their own sequence, with no pending press count
+            // or register to attach to them.
+            MappingResolution::Ready(invocation) => {
+                self.invoke(invocation);
+                self.ensure_cursor_visible();
+                return;
+            }
+            MappingResolution::ReadyAndReplay(invocation, replay) => {
+                self.invoke(invocation);
+                self.ensure_cursor_visible();
+                replay
+            }
+            MappingResolution::DisabledAndReplay(replay) => replay,
+            MappingResolution::Replay(prefix, replay) => {
+                self.type_unmapped("key_release", &prefix);
+                self.ensure_cursor_visible();
+                replay
+            }
+            _ => return,
+        };
+        for key in replay {
+            self.handle_key_release(key);
+        }
+    }
+
     pub(in crate::app) fn handle_key_in_context(&mut self, context: &str, key: KeyEvent) {
+        self.handle_key_in_context_with_kind(context, key, KeyInputKind::Press);
+    }
+
+    fn handle_key_in_context_with_kind(
+        &mut self,
+        context: &str,
+        key: KeyEvent,
+        kind: KeyInputKind,
+    ) {
         let scrolls_completion_documentation = context == "completion"
             && key.modifiers.control
             && matches!(key.code, crate::editor::input::KeyCode::Char('d' | 'u'));
-        if !matches!(context, "documentation" | "key_release") && !scrolls_completion_documentation
-        {
+        if context != "documentation" && !scrolls_completion_documentation {
             self.close_documentation();
         }
         self.ui.lsp_loading = None;

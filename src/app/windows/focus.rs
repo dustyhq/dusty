@@ -31,6 +31,9 @@ impl Windows {
     pub(in crate::app) fn focus(&self) -> FocusTarget {
         self.focus
     }
+    pub(in crate::app) fn focus_stamp(&self) -> &std::sync::Arc<()> {
+        &self.focus_stamp
+    }
     pub(in crate::app) fn explorer_focused(&self) -> bool {
         matches!(self.focus(), FocusTarget::Explorer(_))
     }

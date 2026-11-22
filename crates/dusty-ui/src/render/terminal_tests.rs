@@ -338,6 +338,148 @@ fn terminal_tabs_keep_the_active_title_visible_and_hit_targets_match_borders() {
 }
 
 #[test]
+fn exited_terminal_keeps_tabs_clickable_and_the_last_output_line_visible() {
+    use crate::render::terminal::{dock_terminal_panel, terminal_tab_at_column};
+    use crate::render::{TerminalPanelMode, TerminalPanelState, TerminalPhase, TerminalTabState};
+    use crate::windows::{CompositorLayer, ProjectedCompositorWindow, WindowId, WindowRect};
+
+    const DIAGNOSTIC: &str = "ERROR: build failed at src/main.rs:42";
+    const FULL_NOTICE: &str = "Process exited with code 7 · q or Enter closes";
+    const COMPACT_NOTICE: &str = "Exited 7 · q closes";
+
+    let config = crate::config::load_bundled_config().config;
+    for (width, in_footer, notice) in [
+        (40, true, COMPACT_NOTICE),
+        (60, false, COMPACT_NOTICE),
+        (100, false, FULL_NOTICE),
+    ] {
+        let geometry = crate::render::terminal_window_geometry(ProjectedCompositorWindow {
+            window: WindowId(1),
+            rect: WindowRect {
+                x: 100 - width,
+                y: 0,
+                width,
+                height: 29,
+            },
+            layer: CompositorLayer::Docked,
+            z_index: 0,
+            focused: true,
+            focusable: true,
+        })
+        .unwrap();
+        const FIRST: &str = "ERROR: first line";
+        let mut screen = crate::PtyScreen::new(geometry.width + 1, geometry.body_height, 10);
+        screen.feed_bytes(FIRST.as_bytes());
+        screen.feed_bytes(format!("\x1b[{};1H{DIAGNOSTIC}", geometry.body_height).as_bytes());
+        screen.resize(geometry.width, geometry.body_height);
+        let mut terminal = TerminalPanelState {
+            id: 2,
+            profile: "shell".into(),
+            tabs: vec![
+                TerminalTabState {
+                    id: 1,
+                    profile: "shell".into(),
+                    phase: TerminalPhase::Running,
+                    running: true,
+                    exit_code: None,
+                },
+                TerminalTabState {
+                    id: 2,
+                    profile: "shell".into(),
+                    phase: TerminalPhase::Running,
+                    running: true,
+                    exit_code: None,
+                },
+            ],
+            mode: TerminalPanelMode::Input,
+            running: true,
+            exit_code: None,
+            truncated: false,
+            focused: true,
+            input_hint: None,
+            exit_notice: None,
+            columns: geometry.width,
+            rows: geometry.body_height,
+            cells: screen.history_window(0, usize::from(geometry.body_height)),
+            cells_start: 0,
+            cursor: None,
+            selection: None,
+            scrollback_lines: 0,
+            scroll_offset: 0,
+            requested_height: geometry.height,
+        };
+        let render = |terminal: &TerminalPanelState| {
+            dock_terminal_panel(
+                crate::grid::Frame {
+                    grid: crate::CellGrid::new(100, 30),
+                    cursor: None,
+                },
+                terminal,
+                geometry,
+                &config,
+                100,
+                30,
+            )
+        };
+
+        let last_row = geometry.top + geometry.height - 1;
+        let live = render(&terminal);
+        assert!(live.grid.row_text(geometry.body_top).contains(FIRST));
+        assert!(live.grid.row_text(last_row).contains(DIAGNOSTIC));
+
+        terminal.running = false;
+        terminal.exit_code = Some(7);
+        terminal.tabs[1].running = false;
+        terminal.tabs[1].exit_code = Some(7);
+        terminal.tabs[1].phase = TerminalPhase::Failed;
+        terminal.exit_notice = Some(FULL_NOTICE.into());
+        screen.resize(geometry.width + 1, geometry.body_height);
+        screen.resize(geometry.width, geometry.body_height);
+        terminal.cells = screen.history_window(0, usize::from(geometry.body_height));
+        let frame = render(&terminal);
+        let header = frame.grid.row_text(geometry.top);
+        for (title, id) in [("shell ", 1), ("shell 2 [failed]", 2)] {
+            let start = header
+                .find(title)
+                .unwrap_or_else(|| panic!("{width}: missing {title:?}: {header}"));
+            let column =
+                crate::geometry::text_width(&header[..start], config.editor.ambiguous_width);
+            assert_eq!(
+                terminal_tab_at_column(
+                    &terminal,
+                    &config,
+                    geometry,
+                    u16::try_from(column).unwrap()
+                ),
+                Some(id)
+            );
+        }
+        let output = frame.grid.row_text(last_row - u16::from(in_footer));
+        assert!(output.contains(DIAGNOSTIC), "{width}: {output}");
+        let notice_row = frame
+            .grid
+            .row_text(if in_footer { last_row } else { geometry.top });
+        assert!(notice_row.contains(notice), "{width}: {notice_row}");
+
+        if in_footer {
+            // An unused final row must not hide a diagnostic at the top.
+            screen.feed_bytes(format!("\x1b[{};1H\x1b[2K", geometry.body_height).as_bytes());
+            terminal.cells = screen.history_window(0, usize::from(geometry.body_height));
+            terminal.tabs[0].profile = "the first shell has a long title".into();
+            terminal.tabs[1].profile = "the second shell has a long title".into();
+            terminal.truncated = true;
+            let frame = render(&terminal);
+            assert!(frame.grid.row_text(geometry.body_top).contains(FIRST));
+            let footer = frame.grid.row_text(last_row);
+            assert!(footer.contains(COMPACT_NOTICE), "{footer}");
+            assert!(footer.contains("output truncated"), "{footer}");
+        } else {
+            assert!(frame.grid.row_text(geometry.body_top).contains(FIRST));
+        }
+    }
+}
+
+#[test]
 fn the_debug_console_and_the_terminal_panel_are_planned_together_rather_than_colliding() {
     let loaded = crate::config::load_bundled_config();
     let config = loaded.config.clone();

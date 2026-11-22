@@ -159,17 +159,20 @@ fn terminal_tab_start(terminal: &TerminalPanelState, config: &Config, width: u16
     first
 }
 
-fn terminal_header_hint(terminal: &TerminalPanelState) -> Option<&str> {
-    terminal.exit_notice.as_deref().or_else(|| {
-        terminal
-            .input_hint
-            .as_deref()
-            .filter(|_| terminal.focused && terminal.mode == TerminalPanelMode::Input)
-    })
+fn terminal_input_hint(terminal: &TerminalPanelState) -> Option<&str> {
+    terminal
+        .input_hint
+        .as_deref()
+        .filter(|_| terminal.focused && terminal.mode == TerminalPanelMode::Input)
 }
 
 fn terminal_title_width(terminal: &TerminalPanelState, config: &Config, width: u16) -> u16 {
-    let hint = terminal_header_hint(terminal);
+    // An exit notice can only use space left by the tabs. Drawing and hit testing fit the
+    // same titles whether the exit notice ends up in the header or in the footer.
+    if terminal.exit_notice.is_some() {
+        return width;
+    }
+    let hint = terminal_input_hint(terminal);
     let mode = match terminal.mode {
         TerminalPanelMode::Input => None,
         TerminalPanelMode::Normal => Some(TERMINAL_NORMAL_LABEL),
@@ -186,14 +189,10 @@ fn terminal_title_width(terminal: &TerminalPanelState, config: &Config, width: u
     let reserved = u16::try_from(reserved)
         .unwrap_or(u16::MAX)
         .saturating_add(2);
-    if width > reserved.saturating_add(8) {
-        width - reserved
-    } else if terminal.exit_notice.is_some() {
-        // In a narrow pane, show the close instruction before the tabs and mode label.
-        0
-    } else {
-        width
-    }
+    width
+        .checked_sub(reserved)
+        .filter(|&room| room > 8)
+        .unwrap_or(width)
 }
 
 #[must_use]
@@ -336,33 +335,104 @@ pub(super) fn dock_terminal_panel(
         TerminalPanelMode::Normal => Some(TERMINAL_NORMAL_LABEL),
         TerminalPanelMode::Visual => Some(TERMINAL_VISUAL_LABEL),
     };
-    let notice = if title_width == 0 {
-        terminal.exit_notice.clone().unwrap_or_default()
-    } else {
-        [
-            terminal_header_hint(terminal),
-            mode,
-            terminal.truncated.then_some("output truncated"),
-        ]
-        .into_iter()
-        .flatten()
-        .map(|text| format!(" {text} "))
-        .collect::<String>()
-    };
-    if title_width == 0 {
-        grid.put_text_clipped(title_x, geometry.top, &notice, Style::TerminalTitle, right);
-    } else if !notice.is_empty() {
+    let warning = terminal.truncated.then_some("output truncated");
+    let mut put_header_notice = |hint: Option<&str>, mode: Option<&str>, warning: Option<&str>| {
+        let notice = [hint, mode, warning]
+            .into_iter()
+            .flatten()
+            .map(|text| format!(" {text} "))
+            .collect::<String>();
         let notice_width =
             u16::try_from(text_width(&notice, config.editor.ambiguous_width)).unwrap_or(u16::MAX);
         let notice_x = right.saturating_sub(notice_width.saturating_add(1));
-        if notice_x > title_x {
-            grid.put_text_clipped(notice_x, geometry.top, &notice, Style::TerminalTitle, right);
+        if notice.is_empty() || notice_x <= title_x {
+            return false;
         }
+        grid.put_text_clipped(notice_x, geometry.top, &notice, Style::TerminalTitle, right);
+        true
+    };
+    let mut footer = Vec::new();
+    if let Some(exit_notice) = terminal.exit_notice.as_deref() {
+        if !put_header_notice(Some(exit_notice), mode, warning) {
+            let compact = match terminal.exit_code {
+                None | Some(0) => "Exited · q closes".to_owned(),
+                Some(code) => format!("Exited {code} · q closes"),
+            };
+            if !put_header_notice(Some(&compact), mode, warning) {
+                let header_fits = put_header_notice(None, mode, warning)
+                    || put_header_notice(None, None, warning);
+                let body_rows = bottom.saturating_sub(geometry.body_top);
+                // Leave a PTY row for the cursor even in a clipped dock.
+                if body_rows > 1 {
+                    if let Some(warning) = warning.filter(|_| !header_fits) {
+                        let combined = format!("{compact} · {warning}");
+                        if text_width(&combined, config.editor.ambiguous_width)
+                            <= usize::from(right.saturating_sub(geometry.x))
+                        {
+                            footer.push(combined);
+                        } else {
+                            footer.push(warning.to_owned());
+                            if body_rows > 2 {
+                                footer.push(compact);
+                            }
+                        }
+                    } else {
+                        footer.push(compact);
+                    }
+                }
+            }
+        }
+    } else {
+        put_header_notice(terminal_input_hint(terminal), mode, warning);
     }
 
-    let visible_rows = usize::from(geometry.body_height).min(terminal.cells.len());
-    let source_start = terminal.cells_start;
-    for (screen_row, row) in terminal.cells.iter().take(visible_rows).enumerate() {
+    let body_bottom = bottom - footer.len() as u16;
+    let visible_rows = usize::from(
+        geometry
+            .body_height
+            .min(body_bottom.saturating_sub(geometry.body_top)),
+    );
+    // Reuse empty trailing PTY rows before shifting the viewport. If it must shift, keep
+    // the end of the output in view and still let navigation reach the first projected row.
+    let skip = if footer.is_empty() {
+        0
+    } else {
+        let blank_rows = terminal
+            .cells
+            .iter()
+            .rev()
+            .take(footer.len())
+            .take_while(|row| {
+                row.iter().all(|cell| {
+                    cell.text == " " && !cell.continuation && cell.style == Default::default()
+                })
+            })
+            .count();
+        let tail = terminal
+            .cells
+            .len()
+            .saturating_sub(visible_rows + blank_rows);
+        match terminal.mode {
+            TerminalPanelMode::Input => tail,
+            TerminalPanelMode::Normal | TerminalPanelMode::Visual => {
+                terminal.cursor.map_or(0, |(_, row)| {
+                    let cursor = row.saturating_sub(terminal.cells_start);
+                    // A blank row is only spare space if the navigation cursor can still
+                    // be drawn. Scroll just enough to move the cursor above the footer.
+                    let first_visible = cursor.saturating_sub(visible_rows.saturating_sub(1));
+                    tail.clamp(first_visible, cursor)
+                })
+            }
+        }
+    };
+    let source_start = terminal.cells_start.saturating_add(skip);
+    for (screen_row, row) in terminal
+        .cells
+        .iter()
+        .skip(skip)
+        .take(visible_rows)
+        .enumerate()
+    {
         let source_row = source_start.saturating_add(screen_row);
         let y = geometry
             .body_top
@@ -412,13 +482,22 @@ pub(super) fn dock_terminal_panel(
         }
     }
 
+    for (row, notice) in (body_bottom..bottom).zip(footer) {
+        let notice_width =
+            u16::try_from(text_width(&notice, config.editor.ambiguous_width)).unwrap_or(u16::MAX);
+        let x = right
+            .saturating_sub(notice_width.saturating_add(1))
+            .max(geometry.x);
+        grid.put_text_clipped(x, row, &notice, Style::TerminalTitle, right);
+    }
+
     let cursor = if terminal.focused {
         terminal.cursor.and_then(|(column, source_row)| {
             let projected_row = source_row.checked_sub(source_start)?;
             let y = geometry
                 .body_top
                 .saturating_add(u16::try_from(projected_row).ok()?);
-            (column < usize::from(geometry.width) && y < bottom).then_some((
+            (column < usize::from(geometry.width) && y < body_bottom).then_some((
                 geometry.x.saturating_add(u16::try_from(column).ok()?),
                 y,
                 crossterm::cursor::SetCursorStyle::SteadyBlock,
@@ -549,29 +628,46 @@ pub fn render_key_hints(
         Style::KeyHintPrefix,
         inner_right,
     );
-    let body_top = top.saturating_add(2);
-    let gap_total =
-        KEY_HINT_COLUMN_GAP.saturating_mul(u16::try_from(columns.saturating_sub(1)).unwrap_or(0));
-    let column_width = inner_right
-        .saturating_sub(inner_left)
-        .saturating_sub(gap_total)
-        / u16::try_from(columns).unwrap_or(1);
-    if column_width < 3 {
+    let body_top = top.saturating_add(1 + title_rows);
+    let inner_width = usize::from(inner_right - inner_left);
+    let mut gap = usize::from(KEY_HINT_COLUMN_GAP);
+    let gap_count = columns - 1;
+    let column_width = inner_width.saturating_sub(gap * gap_count) / columns;
+    let mut widths = [column_width; KEY_HINT_MAX_COLUMNS as usize];
+    if compact_header && gap_count > 0 {
+        let mut preferred = [0; KEY_HINT_MAX_COLUMNS as usize];
+        for (width, rows) in preferred
+            .iter_mut()
+            .zip(hints.rows[..row_count].chunks(rows_per_column))
+        {
+            *width = rows
+                .iter()
+                .map(|row| entry_width(&frame.grid, row))
+                .max()
+                .unwrap_or(0);
+        }
+        let total = preferred.iter().sum::<usize>();
+        // Fit wider entries from the extra row by sharing the existing space.
+        if preferred.iter().any(|&width| width > column_width) && total + gap_count <= inner_width {
+            gap = gap.min((inner_width - total) / gap_count);
+            widths = preferred;
+        }
+    }
+    if widths[0] < 3 {
         return;
     }
     for (index, row) in hints.rows.iter().take(row_count).enumerate() {
         let column = index / rows_per_column;
         let row_index = index % rows_per_column;
-        let x = inner_left.saturating_add(
-            u16::try_from(column)
-                .unwrap_or(0)
-                .saturating_mul(column_width.saturating_add(KEY_HINT_COLUMN_GAP)),
-        );
+        let offset = widths[..column].iter().sum::<usize>() + column * gap;
+        let x = inner_left.saturating_add(u16::try_from(offset).unwrap_or(u16::MAX));
         let y = body_top.saturating_add(u16::try_from(row_index).unwrap_or(u16::MAX));
         if y >= bottom {
             continue;
         }
-        let column_right = x.saturating_add(column_width).min(inner_right);
+        let column_right = x
+            .saturating_add(u16::try_from(widths[column]).unwrap_or(u16::MAX))
+            .min(inner_right);
         let mut cursor = frame.grid.put_text_clipped(
             x,
             y,
