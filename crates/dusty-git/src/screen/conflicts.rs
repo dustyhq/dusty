@@ -704,6 +704,7 @@ impl GitScreen {
             action: FormAction::OperationMenu,
             fields: vec![field],
             selected: 0,
+            focus_moved: false,
         });
         Ok(())
     }

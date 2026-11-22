@@ -479,8 +479,19 @@ fn approve_and_cancel_sheets_check_the_run_first() {
         assert!(sheet.contains(needle), "{needle}:\n{sheet}");
     }
     key(&mut screen, KeyCode::Enter);
+    assert!(!screen.busy(), "Enter on Keep running queued a write");
     assert!(!text(&mut screen, 190, 48).contains("Cancel run #12"));
     assert!(!requested("POST", "actions/runs/503/cancel"));
+    key(&mut screen, KeyCode::Char('x'));
+    wait(&mut screen, "Cancel run #12 · Release v1.4?");
+    key(&mut screen, KeyCode::Tab);
+    key(&mut screen, KeyCode::Tab);
+    control(&mut screen, KeyCode::Enter);
+    assert!(!screen.busy(), "Ctrl+Enter on Keep running queued a write");
+    assert!(!text(&mut screen, 190, 48).contains("Cancel run #12"));
+    assert!(!requested("POST", "actions/runs/503/cancel"));
+
+    // A new sheet has no focus history: the untouched shortcut cancels the run.
     key(&mut screen, KeyCode::Char('x'));
     wait(&mut screen, "Cancel run #12 · Release v1.4?");
     control(&mut screen, KeyCode::Enter);
@@ -746,7 +757,7 @@ fn workflows_panel_filters_runs_and_panels_take_turns(shape: Shape) {
                 |frame| {
                     frame
                         .lines()
-                        .any(|line| line.contains(" to show · ") && line.contains("is turned off"))
+                        .any(|line| line.contains(" yet · ") && line.contains("is turned off"))
                 },
             );
         }

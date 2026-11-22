@@ -2,7 +2,7 @@
 //! pull stop in one place, label each hunk's sides, pick per hunk, count what is left and
 //! name the operation on continue, skip and abort. Temporary repositories and local bare
 //! remotes only.
-use dusty::config::{GitKeys, load_bundled_config};
+use dusty::config::{GitKeys, GitWindowConfig, load_bundled_config};
 use dusty::editor::input::{KeyCode, KeyEvent, Modifiers};
 use dusty::git::screen::{GitScreen, ScreenOutcome};
 use dusty::ui::{KeyInputKind, UiEvent};
@@ -292,6 +292,67 @@ fn a_merge_labels_each_side_and_picks_ours_theirs_or_both_per_hunk() {
     confirm(&mut screen);
     wait(&mut screen, |s| banner(s).is_empty());
     assert_eq!(git(root, &["rev-list", "--merges", "--count", "HEAD"]), "1");
+}
+
+#[test]
+fn replacing_a_conflicted_file_requires_focus_on_confirm() {
+    let dir = three_way();
+    let root = dir.path();
+    let index = unmerged(root);
+    assert!(!index.is_empty());
+
+    // Save a hand-edited resolution for the first hunk, leaving the others unresolved.
+    let conflicted = on_disk(root);
+    let (before, conflict) = conflicted.split_once("<<<<<<< ").unwrap();
+    let (_, end) = conflict.split_once(">>>>>>> ").unwrap();
+    let (_, after) = end.split_once('\n').unwrap();
+    let partial = format!("{before}saved partial resolution\n{after}");
+    std::fs::write(root.join(STORY), &partial).unwrap();
+
+    let mut screen = GitScreen::open(root).unwrap();
+    wait(&mut screen, |s| banner(s).contains('⟳'));
+    key(&mut screen, KeyCode::Char('2'));
+    shows(&mut screen, "<<<<<<< ours");
+    settle(&mut screen);
+
+    let sheet = "Replace story.txt with one side; stage separately";
+    key(&mut screen, KeyCode::Enter);
+    let shown = view(&mut screen);
+    assert!(
+        shown.contains(sheet) && shown.contains("↑/↓ choose"),
+        "{shown}"
+    );
+    let config = GitWindowConfig::default();
+    for columns in [100, 80] {
+        let (rect, frame) = screen.window_frame(columns, 30, &config);
+        let footer = (0..rect.height)
+            .map(|row| frame.grid.row_text(row))
+            .find(|row| row.contains("[ Confirm ]"))
+            .expect("replacement sheet should show Confirm");
+        assert!(
+            footer.contains("Tab to Confirm · Esc"),
+            "{columns}×30: {footer}"
+        );
+    }
+    confirm(&mut screen);
+    assert_eq!(
+        on_disk(root),
+        partial,
+        "Keep side must not confirm replacement"
+    );
+    assert_eq!(unmerged(root), index);
+    assert!(!view(&mut screen).contains(sheet));
+
+    key(&mut screen, KeyCode::Enter);
+    assert!(view(&mut screen).contains(sheet));
+    key(&mut screen, KeyCode::Tab);
+    confirm(&mut screen);
+    assert_eq!(
+        on_disk(root),
+        story(&[(3, "main 3"), (9, "main 9"), (15, "main 15")]),
+        "Ctrl+Enter on Confirm must replace the file with ours"
+    );
+    assert_eq!(unmerged(root), index, "replacement does not stage the file");
 }
 
 #[test]

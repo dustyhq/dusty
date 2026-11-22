@@ -417,6 +417,29 @@ struct Form {
     action: FormAction,
     fields: Vec<Field>,
     selected: usize,
+    focus_moved: bool,
+}
+
+impl Form {
+    fn move_focus(&mut self, selected: usize) {
+        self.focus_moved |= self.selected != selected;
+        self.selected = selected;
+    }
+
+    fn cancel_focused(&self) -> bool {
+        self.selected > self.fields.len()
+    }
+
+    fn requires_primary_focus(&self) -> bool {
+        matches!(
+            self.action,
+            FormAction::Conflict(_)
+                | FormAction::StageAnyway(_)
+                | FormAction::StageConflict { .. }
+                | FormAction::RemoveWorktree { .. }
+                | FormAction::Github(github::Action::ReplaceLog { .. })
+        )
+    }
 }
 
 /// One controller and renderer, used in the editor and the standalone executable.
@@ -425,6 +448,9 @@ pub struct GitScreen {
     project: String,
     pub(super) icon_mode: crate::config::ExplorerIconMode,
     page: usize,
+    /// The surface is too small or waiting for its first frame after a resize.
+    input_suspended: bool,
+    layout_mode: shell::layout::Mode,
     github: github::Workspace,
     status: GitStatusWorker,
     snapshot: Option<GitStatusSnapshot>,
@@ -585,6 +611,8 @@ impl GitScreen {
             github: github::Workspace::new(root.clone()),
             root,
             page: 0,
+            input_suspended: false,
+            layout_mode: shell::layout::Mode::Narrow,
             status: GitStatusWorker::default(),
             snapshot: None,
             operation_bar: None,
@@ -1958,8 +1986,43 @@ impl GitScreen {
                 .map(|(label, value)| Field::new(label, value))
                 .collect(),
             selected: 0,
+            focus_moved: false,
         });
     }
+    fn show_action_message(&mut self, title: &str, message: String) {
+        self.form(
+            title,
+            FormAction::ActionMessage {
+                message,
+                checking_removal: false,
+                note_top: std::cell::Cell::new(0),
+            },
+            Vec::new(),
+        );
+    }
+
+    fn show_removal_check(&mut self) {
+        self.busy = true;
+        self.branch_mutation = true;
+        self.form(
+            "Checking worktree",
+            FormAction::ActionMessage {
+                message: "Checking which files would be deleted…".into(),
+                checking_removal: true,
+                note_top: std::cell::Cell::new(0),
+            },
+            Vec::new(),
+        );
+    }
+
+    fn show_removing_worktree(&mut self) {
+        self.form(
+            "Removing worktree…",
+            FormAction::RemovingWorktree,
+            Vec::new(),
+        );
+    }
+
     fn operation_target(
         &self,
         operation: &str,
@@ -2138,6 +2201,7 @@ impl GitScreen {
                 rebase_identity,
             },
             selected: fields.len() + usize::from(blocked),
+            focus_moved: false,
             fields,
         });
         self.operation_bar = Some(bar);
@@ -2154,10 +2218,21 @@ impl GitScreen {
             action: FormAction::Conflict(path),
             fields: vec![choice],
             selected: 0,
+            focus_moved: false,
         });
     }
     fn submit(&mut self) -> Result<(), String> {
         let form = self.form.as_ref().ok_or("No open form")?;
+        if matches!(
+            &form.action,
+            FormAction::ActionMessage { .. } | FormAction::RemovingWorktree
+        ) {
+            return self.cancel_form();
+        }
+        // These confirmations require the primary button, even with Ctrl+Enter.
+        if form.requires_primary_focus() && form.selected != form.fields.len() {
+            return self.cancel_form();
+        }
         if !matches!(&form.action, FormAction::Command | FormAction::SourceSearch)
             && !matches!(&form.action, FormAction::Github(action) if !action.writes())
             && !matches!(&form.action, FormAction::Run(op) if !op.writes())
@@ -2374,7 +2449,21 @@ impl GitScreen {
                 self.notice.clear();
                 return Ok(());
             }
-            FormAction::Github(action) => self.github.submit(action.clone(), values)?,
+            FormAction::Github(
+                action @ (github::Action::SaveLog(_) | github::Action::ReplaceLog { .. }),
+            ) => {
+                self.form = self.github.submit_log(action, &values)?;
+                self.notice.clear();
+                return Ok(());
+            }
+            FormAction::Github(action) => {
+                if let Err(error) = self.github.submit(action.clone(), values) {
+                    if self.github.open_outdated_drafts(action, &error) {
+                        self.form = None;
+                    }
+                    return Err(error);
+                }
+            }
             FormAction::Command => {
                 self.tutor_command(values[0].trim())?;
                 return Ok(());
@@ -2478,7 +2567,7 @@ impl GitScreen {
                 || form.selected == form.fields.len()
                 || matches!(
                     form.action,
-                    FormAction::Github(github::Action::ConfirmPullRequest(_))
+                    FormAction::Command | FormAction::SourceSearch | FormAction::OperationMenu
                 )
                 || matches!(&form.action, FormAction::Run(op) if !op.writes())
             {
@@ -2549,33 +2638,36 @@ impl GitScreen {
         let form = self.form.as_mut().expect("checked form");
         let count = form.fields.len() + 2;
         if key.code == KeyCode::Tab && matches!(form.action, FormAction::Operation { .. }) {
-            form.selected = if form.selected == form.fields.len() {
+            let selected = if form.selected == form.fields.len() {
                 form.fields.len() + 1
             } else {
                 form.fields.len()
             };
+            form.move_focus(selected);
             return Ok(());
         }
         if key.code == KeyCode::Tab {
+            if matches!(
+                &form.action,
+                FormAction::ActionMessage { .. } | FormAction::RemovingWorktree
+            ) {
+                return Ok(());
+            }
+            let step = if key.modifiers.shift { count - 1 } else { 1 };
+            let mut selected = form.selected;
             loop {
-                form.selected =
-                    (form.selected + if key.modifiers.shift { count - 1 } else { 1 }) % count;
+                selected = (selected + step) % count;
                 if !matches!(form.action, FormAction::Rewrite(_))
-                    || form.selected >= form.fields.len()
-                    || !form.fields[form.selected].read_only
+                    || selected >= form.fields.len()
+                    || !form.fields[selected].read_only
                 {
                     break;
                 }
             }
+            form.move_focus(selected);
             return Ok(());
         }
         if form.selected >= form.fields.len() {
-            if key.code == KeyCode::Enter {
-                if form.selected == form.fields.len() {
-                    return self.submit();
-                }
-                return self.form_key(&KeyEvent::plain(KeyCode::Escape));
-            }
             return Ok(());
         }
         let field = &mut form.fields[form.selected];
@@ -2704,13 +2796,48 @@ impl GitScreen {
             KeyCode::End => input.cursor = input.input.len(),
             KeyCode::Enter if field.multiline => input.insert_text("\n"),
             KeyCode::Enter => {
-                form.selected = (form.selected + 1) % count;
+                form.move_focus((form.selected + 1) % count);
             }
             _ => {}
         }
         Ok(())
     }
     pub fn event(&mut self, event: UiEvent) -> ScreenOutcome {
+        if matches!(event, UiEvent::Resize(_, _)) {
+            // The next frame decides visibility from the actual Git viewport, including floats.
+            self.input_suspended = true;
+            return ScreenOutcome::Continue;
+        }
+        if self.input_suspended {
+            if !matches!(&event, UiEvent::Key { key, kind }
+                if *kind != KeyInputKind::Release && key.code == KeyCode::Escape)
+            {
+                return ScreenOutcome::Continue;
+            }
+            // Keys can still cover a hidden form. Esc closes the topmost sheet first.
+            if self.help {
+                self.help = false;
+                return ScreenOutcome::Continue;
+            }
+            if self.form.is_some() {
+                let result = self.cancel_form();
+                self.report(result);
+                self.sync_text_box();
+                return ScreenOutcome::Continue;
+            }
+            if self.tutor.is_some() {
+                let result = self.stop_tutor();
+                self.input_suspended = true;
+                self.report(result);
+                return ScreenOutcome::Continue;
+            }
+            // With nothing hidden to dismiss, Esc still backs out of the active pane.
+        }
+        match &event {
+            UiEvent::Key { kind, .. } if *kind != KeyInputKind::Release => self.write_footer = None,
+            UiEvent::Paste(_) | UiEvent::Mouse { .. } => self.write_footer = None,
+            _ => {}
+        }
         let outcome = self.handle_event(event);
         self.sync_text_box();
         // After every input, including keys a sheet, filter or overlay consumed early.
@@ -2784,9 +2911,18 @@ impl GitScreen {
                     self.help = true;
                     return ScreenOutcome::Continue;
                 }
-                if self.form.is_some() {
-                    let result = self.form_key(&key);
-                    self.report(result);
+                if let Some(form) = &self.form {
+                    // Don't let a held key confirm a sheet opened by its first press.
+                    if kind == KeyInputKind::Press
+                        || !matches!(
+                            form.action,
+                            FormAction::StageConflict { .. }
+                                | FormAction::Github(github::Action::ReplaceLog { .. })
+                        )
+                    {
+                        let result = self.form_key(&key);
+                        self.report(result);
+                    }
                     return ScreenOutcome::Continue;
                 }
                 if self.ops_key(&key) {
@@ -3442,6 +3578,38 @@ impl GitScreen {
         let result = self.reload_history();
         self.report(result);
     }
+    fn cancel_form(&mut self) -> Result<(), String> {
+        if self.reflog_submitting {
+            return Ok(());
+        }
+        if let Some(form) = &self.form {
+            match form.action {
+                FormAction::ActionMessage {
+                    checking_removal: true,
+                    ..
+                } => {
+                    if !self.branches.cancel_removal_check() && self.branches.removing_worktree() {
+                        self.show_removing_worktree();
+                        return Ok(());
+                    }
+                }
+                FormAction::RemovingWorktree => return Ok(()),
+                FormAction::Github(github::Action::ConfirmPullRequest(_)) => {
+                    self.form = self.github.activate(github::Action::CreatePullRequest)?;
+                    return Ok(());
+                }
+                FormAction::Rewrite(_) => {
+                    self.rewrite_diagnostic = None;
+                    self.notice.clear();
+                }
+                _ => {}
+            }
+        }
+        self.save_form_draft();
+        self.form = None;
+        Ok(())
+    }
+
     fn save_form_draft(&mut self) {
         if self.modal
             && let Some(form) = &self.form
@@ -3454,7 +3622,10 @@ impl GitScreen {
         }
         if let Some(form) = &self.form
             && let FormAction::Github(action) = &form.action
-            && !matches!(action, github::Action::ConfirmPullRequest(_))
+            && !matches!(
+                action,
+                github::Action::ConfirmPullRequest(_) | github::Action::ReplaceLog { .. }
+            )
         {
             let values = if matches!(action, github::Action::CreatePullRequest) {
                 self.github.pr_values(&form.fields)
@@ -3532,14 +3703,27 @@ impl GitScreen {
         shell::chrome::set_footer_inset(self.mode_chip_width(width));
         let mut frame = if self.page == 0 {
             shell::frame(self, width, height)
-        } else if let Some(banner) = self.tutor.as_ref().and_then(|tutor| tutor.banner(height)) {
-            // A forge lesson keeps its banner above the footer, as on the Git page.
-            let inner = github::frame(self, width, height - tutor::BANNER_ROWS);
-            let mut banner = banner;
-            banner.instruction = tutor::keyed(&banner.instruction, self.github.key_table());
-            tutor::with_banner(inner, banner, width, height)
         } else {
-            github::frame(self, width, height)
+            let inner = if self.input_suspended && forge_tutor {
+                shell::size_warning(
+                    width,
+                    content_height,
+                    &format!(
+                        "The Forge tutor needs {}×{}.",
+                        shell::layout::MIN_WIDTH,
+                        shell::layout::MIN_HEIGHT + tutor::BANNER_ROWS
+                    ),
+                )
+            } else {
+                github::frame(self, width, content_height)
+            };
+            if let Some(mut banner) = banner {
+                // A forge lesson keeps its banner above the footer, as on the Git page.
+                banner.instruction = tutor::keyed(&banner.instruction, self.github.key_table());
+                tutor::with_banner(inner, banner, width, height)
+            } else {
+                inner
+            }
         };
         if self.message_scroll.is_some() {
             commit::message(&mut frame, self, width, height);
@@ -3586,10 +3770,10 @@ impl GitScreen {
         } else {
             (
                 ((u32::from(width) * u32::from(config.width_percent) / 100) as u16)
-                    .max(64)
+                    .max(shell::layout::MIN_WIDTH)
                     .min(width),
                 ((u32::from(height) * u32::from(config.height_percent) / 100) as u16)
-                    .max(20)
+                    .max(shell::layout::MIN_HEIGHT)
                     .min(height),
             )
         };

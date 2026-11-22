@@ -435,7 +435,7 @@ pub(in crate::screen) fn button_pair(
 
 /// `Enter confirm · Esc cancel` after a button pair, keys in the accent.
 pub(in crate::screen) fn button_hints(frame: &mut Frame, at: u16, y: u16, right: u16, hints: &str) {
-    // Whole hints only, never cut mid-word. The first part is the confirm key and stays;
+    // Whole hints only, never cut mid-word. The first (primary) hint stays;
     // middle parts go first, then the words (the buttons beside them already say them),
     // then the last key.
     let room = usize::from(right.saturating_sub(at + 1));
@@ -809,9 +809,11 @@ fn generic(app: &GitScreen, frame: &mut Frame, form: &Form, lay: &Layout) {
         String::new()
     };
     let glyph_kind = match &form.action {
-        FormAction::Discard(_) | FormAction::DiscardFiles(_) | FormAction::StageAnyway(_) => {
-            Glyph::Warning
-        }
+        FormAction::Discard(_)
+        | FormAction::DiscardFiles(_)
+        | FormAction::StageAnyway(_)
+        | FormAction::StageConflict { .. }
+        | FormAction::ActionMessage { .. } => Glyph::Warning,
         FormAction::Stash => Glyph::Stash,
         FormAction::Branch(_) | FormAction::Reference(_) => Glyph::Branch,
         FormAction::SourceSearch => Glyph::Search,
@@ -1021,6 +1023,13 @@ fn generic(app: &GitScreen, frame: &mut Frame, form: &Form, lay: &Layout) {
     let hints = match &form.action {
         // The forge pages' footer carries a sheet's keys (one place for them).
         FormAction::Github(_) => "",
+        FormAction::ActionMessage {
+            checking_removal: true,
+            ..
+        } => "Enter / Esc cancel check",
+        FormAction::ActionMessage { .. } => "Enter / Esc close",
+        FormAction::Conflict(_) if form.selected < form.fields.len() => "Tab to Confirm · Esc",
+        _ if form.cancel_focused() => "Enter cancel · Tab next",
         FormAction::SourceSearch => "Enter find · Esc cancel",
         FormAction::Discard(_) | FormAction::DiscardFiles(_) => "Enter discard · Esc cancel",
         _ if form.fields.iter().any(|field| field.multiline) => {
@@ -1263,6 +1272,8 @@ fn commit(app: &GitScreen, frame: &mut Frame, form: &Form, lay: &Layout) {
         if amend { "Amend" } else { "Commit" },
         if visual {
             "y yank · d delete · c change · Esc normal"
+        } else if form.cancel_focused() {
+            "Enter cancel · Tab next"
         } else if amend && typing {
             "Ctrl+Enter amend HEAD · Tab next · Esc normal"
         } else if amend {

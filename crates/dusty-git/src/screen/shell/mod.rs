@@ -209,37 +209,44 @@ pub(super) fn top_bar(app: &GitScreen, grid: &mut CellGrid, width: u16) {
     );
 }
 
-fn too_small(frame: &mut Frame, width: u16, height: u16) {
+pub(super) fn size_warning(width: u16, height: u16, text: &str) -> Frame {
+    let mut frame = Frame {
+        grid: CellGrid::new(width, height),
+        cursor: None,
+    };
     chrome::fill(
         &mut frame.grid,
         Rect::new(0, 0, width, height),
         st(GitRole::Text, GitSurface::Canvas),
     );
-    let text = format!(
-        "Dusty Git needs {}×{}",
-        layout::MIN_WIDTH,
-        layout::MIN_HEIGHT
-    );
-    let x = width.saturating_sub(chrome::width(&text)) / 2;
+    let x = width.saturating_sub(chrome::width(text)) / 2;
     frame.grid.put_text_clipped(
         x,
         height / 2,
-        &text,
+        text,
         bold(GitRole::Modified, GitSurface::Canvas),
         width,
     );
+    frame
 }
 
 /// The Git tab.
 pub(super) fn frame(app: &mut GitScreen, width: u16, height: u16) -> Frame {
+    if layout::mode(width, height) == Mode::TooSmall {
+        return size_warning(
+            width,
+            height,
+            &format!(
+                "Dusty Git needs {}×{}",
+                layout::MIN_WIDTH,
+                layout::MIN_HEIGHT
+            ),
+        );
+    }
     let mut frame = Frame {
         grid: CellGrid::new(width, height),
         cursor: None,
     };
-    if layout::mode(width, height) == Mode::TooSmall {
-        too_small(&mut frame, width, height);
-        return frame;
-    }
     chrome::fill(
         &mut frame.grid,
         Rect::new(0, 0, width, height),

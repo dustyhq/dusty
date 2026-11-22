@@ -191,6 +191,7 @@ impl GitScreen {
             title: title.into(),
             action: FormAction::Reference(action),
             selected: if confirmation { fields.len() } else { 0 },
+            focus_moved: false,
             fields,
         });
         Ok(())

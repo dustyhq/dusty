@@ -614,7 +614,8 @@ fn every_git_lesson_advances_on_real_input_and_quit_restores_the_workspace() {
     at(s, "Merge · Resolve");
     select(s, '2', "greet.rs");
     char(s, 't');
-    ctrl(s, KeyCode::Enter);
+    key(s, KeyCode::Tab);
+    key(s, KeyCode::Enter);
     idle(s);
     char(s, 's');
     at(s, "Merge · Continue");
@@ -629,7 +630,8 @@ fn every_git_lesson_advances_on_real_input_and_quit_restores_the_workspace() {
     at(s, "Rebase · Continue");
     select(s, '2', "greet.txt");
     char(s, 't');
-    ctrl(s, KeyCode::Enter);
+    key(s, KeyCode::Tab);
+    key(s, KeyCode::Enter);
     idle(s);
     char(s, 's');
     idle(s);
@@ -664,6 +666,7 @@ fn every_git_lesson_advances_on_real_input_and_quit_restores_the_workspace() {
     keys(s, "2]");
     select(s, '2', "review");
     char(s, 'd');
+    wait(s, |s| view(s).contains("Remove clean, unlocked worktree"));
     key(s, KeyCode::Enter);
 
     // Rewrite history.

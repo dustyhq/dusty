@@ -349,6 +349,7 @@ fn stopped_merge_refreshes_conflicts_then_native_side_stage_and_continue_finish_
     );
     key(&mut screen, KeyCode::Char('t'));
     assert!(view(&mut screen).contains("stage separately"));
+    key(&mut screen, KeyCode::Tab);
     submit(&mut screen);
     finished(&mut screen);
     assert_eq!(
@@ -627,6 +628,7 @@ fn resolve_rebase_file(screen: &mut GitScreen, fixture: &Fixture) {
     });
     key(screen, KeyCode::Char('t'));
     assert!(view(screen).contains("stage separately"));
+    key(screen, KeyCode::Tab);
     submit(screen);
     finished(screen);
     assert_eq!(

@@ -543,7 +543,7 @@ fn render_operation_form(
     } else {
         label
     };
-    let cancel_selected = form.selected == form.fields.len() + 1;
+    let cancel_selected = form.cancel_focused();
     super::shell::sheet::button_pair(
         frame,
         x + 2,
@@ -678,7 +678,12 @@ fn render_changed_file_picker(
         ["Open file", "Cancel"],
         form.selected.checked_sub(1),
     );
-    super::shell::sheet::button_hints(frame, after, row, x + w - 2, "Ctrl+Enter open · Esc cancel");
+    let hints = if form.cancel_focused() {
+        "Enter cancel · Tab next"
+    } else {
+        "Ctrl+Enter open · Esc cancel"
+    };
+    super::shell::sheet::button_hints(frame, after, row, x + w - 2, hints);
     if form.selected == 0 {
         frame.cursor = Some((
             x + 4,
@@ -942,7 +947,9 @@ pub(super) fn render_form(frame: &mut Frame, form: &super::Form, width: u16, hei
         after,
         row,
         x + w - 2,
-        if matches!(form.action, super::FormAction::SourceSearch) {
+        if form.cancel_focused() {
+            "Enter cancel · Tab next"
+        } else if matches!(form.action, super::FormAction::SourceSearch) {
             "Enter find · Esc cancel"
         } else if matches!(
             form.action,
@@ -967,6 +974,7 @@ mod tests {
             action: super::super::FormAction::Github(super::super::github::Action::Files(3)),
             fields: vec![field],
             selected: 0,
+            focus_moved: false,
         }
     }
 

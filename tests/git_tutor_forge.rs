@@ -257,6 +257,10 @@ fn every_forge_lesson_advances_on_real_input_against_the_practice_forge() {
     // Pull requests: the tab, its sections, the filter and its menus, saved views.
     char(s, '>');
     lesson(s, "Pull requests · Sections");
+    let (rect, frame) = s.window_frame(100, 24, &dusty::config::GitWindowConfig::default());
+    assert_eq!((rect.width, rect.height), (85, 20));
+    let short = rendered(&frame);
+    assert!(short.contains("The Forge tutor needs 64×23."), "{short}");
     // The finished lesson is one check mark on the banner, never a footer notice.
     assert!(banner(s).contains("✓ Open the tab"), "{}", view(s));
     assert!(!view(s).contains("Open the tab done"), "{}", view(s));
@@ -460,7 +464,10 @@ fn every_forge_lesson_advances_on_real_input_against_the_practice_forge() {
     lesson(s, "Issues · Close");
     char(s, 'x');
     shows(s, "Close issue #");
-    ctrl_enter(s);
+    key(s, KeyCode::Tab);
+    key(s, KeyCode::Tab);
+    assert!(focused_row(s).contains("›[ Close ]"), "{}", view(s));
+    key(s, KeyCode::Enter);
     idle(s);
     char(s, 'X');
     shows(s, "Reopen issue #");

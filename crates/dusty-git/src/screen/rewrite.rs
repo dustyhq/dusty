@@ -1,5 +1,6 @@
 //! Native, immutable-target commit forms; hosts retain the usual write veto.
 use super::*;
+use crate::history;
 use crate::rewrite::{Kind, Plan};
 
 impl GitScreen {
@@ -105,6 +106,7 @@ impl GitScreen {
             action: FormAction::Rewrite(Box::new(plan)),
             fields,
             selected,
+            focus_moved: false,
         });
         self.notice.clear();
         Ok(())
@@ -217,6 +219,75 @@ mod tests {
             panic!("rewrite identity replaced")
         };
         assert_eq!(plan.head, head);
+    }
+
+    #[test]
+    fn default_history_rewords_the_detached_tip_but_not_a_selected_branch() {
+        let (directory, tip) = rewrite_repo();
+        let repo = git2::Repository::open(directory.path()).unwrap();
+        let branch = repo.head().unwrap().name().unwrap().to_owned();
+        repo.set_head_detached(tip).unwrap();
+
+        let mut screen = GitScreen::open(directory.path()).unwrap();
+        screen.focus = 2;
+        screen.last_list = 2;
+        let wait_for_history = |screen: &mut GitScreen| {
+            let deadline = std::time::Instant::now() + Duration::from_secs(20);
+            while screen.history_loading {
+                assert!(std::time::Instant::now() < deadline, "History did not load");
+                screen.poll();
+                std::thread::yield_now();
+            }
+            assert_eq!(
+                screen.selected_row().unwrap().value,
+                std::ffi::OsString::from(tip.to_string())
+            );
+        };
+        let reword = |screen: &mut GitScreen| {
+            screen.event(UiEvent::Key {
+                key: KeyEvent::plain(KeyCode::Char('W')),
+                kind: KeyInputKind::Press,
+            });
+        };
+
+        screen.history_target = Some((screen.root.clone(), branch.clone().into()));
+        screen.reload_history().unwrap();
+        wait_for_history(&mut screen);
+        reword(&mut screen);
+        assert!(screen.form.is_none());
+        let name = history::ref_label(&branch);
+        assert_eq!(
+            screen.notice,
+            format!("Check out {name} to change its history.")
+        );
+
+        screen.history_target = None;
+        screen.reload_history().unwrap();
+        wait_for_history(&mut screen);
+        reword(&mut screen);
+        let form = screen
+            .form
+            .as_mut()
+            .expect("detached History should offer Reword");
+        form.fields[0].input.input = "Reworded on detached HEAD".into();
+        screen.submit().unwrap();
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while screen.busy {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "reword did not finish"
+            );
+            screen.poll();
+            std::thread::yield_now();
+        }
+        assert!(screen.form.is_none(), "reword failed: {}", screen.notice);
+        assert!(repo.head_detached().unwrap());
+        assert_eq!(
+            repo.head().unwrap().peel_to_commit().unwrap().summary(),
+            Some("Reworded on detached HEAD")
+        );
+        assert_eq!(repo.find_reference(&branch).unwrap().target(), Some(tip));
     }
 
     #[test]

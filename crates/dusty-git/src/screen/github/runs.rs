@@ -4825,42 +4825,58 @@ fn footer(app: &GitScreen, frame: &mut Frame, rect: Rect) {
     if let Some(form) = &app.form {
         let several = form.fields.len() > 1;
         let multiline = form.fields.iter().any(|field| field.multiline);
-        let verb = match &form.action {
-            FormAction::Github(Action::Rerun(_)) => "re-run jobs",
-            FormAction::Github(Action::Cancel(_)) if ws.terms().run_noun == "pipeline" => {
-                "cancel pipeline"
-            }
-            FormAction::Github(Action::Cancel(_)) => "cancel run",
-            FormAction::Github(Action::Dispatch(_)) => "run workflow",
-            FormAction::Github(Action::Approve(_)) => "approve",
-            FormAction::Github(Action::Download(..)) => "download",
-            FormAction::Github(Action::SaveLog(_)) => "save",
+        let action = match &form.action {
+            FormAction::Github(action) => Some(action.unscoped()),
+            _ => None,
+        };
+        let verb = match action {
+            Some(Action::Rerun(_)) => "re-run jobs",
+            Some(Action::Cancel(_)) if ws.terms().run_noun == "pipeline" => "cancel pipeline",
+            Some(Action::Cancel(_)) => "cancel run",
+            Some(Action::Dispatch(_)) => ws.dispatch_verb(),
+            Some(Action::Approve(_)) => "approve",
+            Some(Action::Download(..)) => "download",
+            Some(Action::SaveLog(_)) => "save",
+            Some(Action::ReplaceLog { .. }) => "replace",
             _ => "confirm",
         };
         // The safe button (`Keep running`, `Cancel`) holds focus: Enter closes the sheet.
         let safe = form.selected == form.fields.len() + 1;
-        let keep = if matches!(&form.action, FormAction::Github(Action::Cancel(_))) {
+        let keep = if matches!(action, Some(Action::Cancel(_))) {
             "keep running"
         } else {
             "close"
         };
         // Esc says what it does: on the Cancel sheet it keeps the run, elsewhere it cancels
         // the sheet, as every other sheet's Esc does.
-        let esc = if matches!(&form.action, FormAction::Github(Action::Cancel(_))) {
+        let esc = if matches!(action, Some(Action::Cancel(_))) {
             "keep running"
         } else {
             "cancel"
         };
+        let rerun = matches!(action, Some(Action::Rerun(_)));
         let mut hints = if safe {
             vec![("Enter", keep), ("Tab", "switch"), ("Esc", esc)]
+        } else if rerun && form.selected < form.fields.len() {
+            vec![
+                ("Tab", "next field"),
+                ("Shift+Tab", "previous"),
+                ("Esc", esc),
+            ]
         } else {
             vec![
                 (if multiline { "Ctrl+Enter" } else { "Enter" }, verb),
                 ("Esc", esc),
             ]
         };
-        if several {
+        if several && !rerun {
             hints.extend([("Tab", "next field"), ("Shift+Tab", "previous")]);
+        } else if rerun && form.selected == form.fields.len() && !form.fields.is_empty() {
+            // Last in the footer: omit it rather than abbreviating the hint when space runs out.
+            hints.push(("Shift+Tab", "previous"));
+        }
+        if !safe && matches!(&form.action, FormAction::Github(Action::ReplaceLog { .. })) {
+            hints.insert(1, ("Tab", "switch"));
         }
         let message = (!app.notice.is_empty()).then_some((app.notice.as_str(), true));
         chrome::footer(&mut frame.grid, rect, &hints, "", message);
@@ -4935,7 +4951,6 @@ fn footer(app: &GitScreen, frame: &mut Frame, rect: Rect) {
         if ws.notify.back {
             hints.insert(1, ("Esc", "back"));
         }
-        // The sidebar toggle ahead of `d` and `o`, so 120 columns keep it.
         if !sidebar.is_empty() {
             hints.push((sidebar.as_str(), "sidebar"));
         }

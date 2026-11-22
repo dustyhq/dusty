@@ -427,7 +427,7 @@ pub(super) static FORGE: &[Chapter] = &[
             .teaching(&["Issue · Milestone"]),
             then(
                 "Close",
-                "x closes the issue: pick a reason, Ctrl+Enter. X reopens it: Ctrl+Enter.",
+                "x, pick a reason. Tab twice to Close, then Enter. Reopen: X, then Enter.",
                 Forge::new(ORBIT, SIGNED, "issues").item(19),
                 |p| {
                     let state = |to: &'static str| move |method: &str, path: &str, body: &Value| {
@@ -590,21 +590,21 @@ pub(super) static FORGE: &[Chapter] = &[
             .teaching(&["Navigate · Refresh"]),
             then(
                 "Cancel",
-                "The newest run is still running: x cancels it, Ctrl+Enter.",
+                "The newest run is still running. Press x, then Ctrl+Enter to cancel it.",
                 Forge::new(ACTIONS, SIGNED, "actions"),
                 |p| p.wrote(|method, path, _| method == "POST" && path.ends_with("/cancel")),
             )
             .teaching(&["Actions · Cancel"]),
             then(
                 "Approve",
-                "j to the fork's run that waits for approval; A approves it, Ctrl+Enter.",
+                "j to the fork's run that waits for approval. Press A, Tab to Approve, then Enter.",
                 Forge::new(ACTIONS, SIGNED, "actions"),
                 |p| p.wrote(|method, path, _| method == "POST" && path.ends_with("/approve")),
             )
             .teaching(&["Actions · Approve a waiting run"]),
             then(
                 "Rerun",
-                "] to Failing, then r reruns the run: pick all or failed jobs, then Ctrl+Enter.",
+                "] Failing, r; pick jobs. Tab past Debug logging to Re-run jobs, Enter. See Running.",
                 Forge::new(ACTIONS, SIGNED, "actions"),
                 |p| {
                     p.wrote(|method, path, _| {
@@ -615,7 +615,7 @@ pub(super) static FORGE: &[Chapter] = &[
             .teaching(&["Actions · Re-run jobs"]),
             then(
                 "Artifacts",
-                "In the run, Enter on an artifact lists its files; s downloads it, Ctrl+Enter.",
+                "Enter on run #7, then Artifacts, then an archive. Download: s, Ctrl+Enter.",
                 Forge::new(ACTIONS, SIGNED, "actions"),
                 |p| {
                     let runs = p.view().runs;

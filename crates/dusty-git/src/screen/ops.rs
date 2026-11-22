@@ -490,6 +490,7 @@ impl GitScreen {
             action: FormAction::Run(Box::new(op)),
             fields,
             selected,
+            focus_moved: false,
         });
         self.notice.clear();
     }

@@ -144,6 +144,7 @@ impl GitScreen {
                     action: FormAction::SourceSearch,
                     fields: vec![query],
                     selected: 0,
+                    focus_moved: false,
                 });
             }
             KeyCode::Char('n' | 'N') if self.preview.search.active() => {

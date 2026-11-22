@@ -263,6 +263,7 @@ impl Workspace {
                 action: FormAction::SourceSearch,
                 fields: vec![field],
                 selected: 0,
+                focus_moved: false,
             });
         }
         None

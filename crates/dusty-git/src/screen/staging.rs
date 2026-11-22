@@ -801,6 +801,7 @@ impl GitScreen {
             title: "Discard unstaged change?".into(),
             action: FormAction::Discard(Box::new(request)),
             selected: fields.len(),
+            focus_moved: false,
             fields,
         });
         self.notice.clear();
@@ -1118,6 +1119,7 @@ impl GitScreen {
             })),
             // The cursor rests on the primary Discard button.
             selected: fields.len(),
+            focus_moved: false,
             fields,
         });
         self.notice.clear();

@@ -77,6 +77,7 @@ impl GitScreen {
             } else {
                 0
             },
+            focus_moved: false,
             // Target and event are visible but cannot retarget an open recovery form.
             fields,
         });

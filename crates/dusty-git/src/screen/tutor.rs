@@ -529,7 +529,7 @@ static GIT: &[Chapter] = &[
             ).teaching(&["Branches · Merge into current"]),
             carried(
                 "Resolve",
-                "2, select src/greet.rs; o or t keeps a side, Ctrl+Enter; s stages.",
+                "2, src/greet.rs: o/t picks a side. Tab, Enter; s stages.",
                 merging,
                 |p| p.repo.state() == RepositoryState::Merge && !p.conflicted(),
             ).teaching(&["Operation · Take ours · theirs"]),
@@ -552,7 +552,7 @@ static GIT: &[Chapter] = &[
             ).teaching(&["Branches · Rebase current onto"]),
             carried(
                 "Continue",
-                "2, greet.txt: t keeps the commit, Ctrl+Enter, s, then C, Enter.",
+                "2, greet.txt: t, Tab, Enter, s, then C, Enter.",
                 rebase_stopped,
                 |p| {
                     let subjects = p.subjects();
@@ -601,7 +601,7 @@ static GIT: &[Chapter] = &[
             ),
             carried(
                 "Remove",
-                "2, ] Worktrees: {Worktrees:Enter} on practice, then d on review, Enter.",
+                "2, ] Worktrees: {Worktrees:Enter} on practice, d on review, then Enter when asked to confirm.",
                 review,
                 |p| !p.repo.is_worktree() && p.worktrees() == 0,
             ).teaching(&["Worktrees · Remove a clean worktree"]),
@@ -2232,6 +2232,14 @@ mod coverage {
         let mut out = Vec::new();
         for preset in ["default", "vim", "lazygit"] {
             let mut screen = GitScreen::open(&fixture.root).unwrap();
+            // Rewrite actions are available only after the checked-out history loads.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            while screen.history_loading {
+                assert!(std::time::Instant::now() < deadline, "History did not load");
+                screen.poll();
+                std::thread::yield_now();
+            }
+            assert!(screen.history_rewrite_hints());
             if preset != "default" {
                 let mut config = crate::config::load_bundled_config().config;
                 if preset == "lazygit" {

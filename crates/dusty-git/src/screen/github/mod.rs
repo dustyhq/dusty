@@ -1785,6 +1785,7 @@ impl Workspace {
             action: FormAction::Github(action),
             fields,
             selected: 0,
+            focus_moved: false,
         }
     }
     pub fn event(
