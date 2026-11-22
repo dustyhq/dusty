@@ -343,8 +343,141 @@ mod tests {
         let hunk = "@@ -1,3 +1,4 @@\n keep\n-old\n+one\n+two\n\\ No newline at end of file";
         assert_eq!(original(hunk, 2), vec!["one".to_owned(), "two".to_owned()]);
         assert_eq!(
-            original(hunk, 9),
-            vec!["keep".to_owned(), "one".to_owned(), "two".to_owned()]
+            original(hunk, 5, 6),
+            Some(vec!["keep".into(), "one".into()])
+        );
+        assert_eq!(original(hunk, 6, 8), None);
+        assert_eq!(original(hunk, 1, 2), None);
+    }
+
+    #[test]
+    fn a_suggestion_requires_a_complete_right_side_hunk_on_the_current_head() {
+        let mut workspace = Workspace::new(PathBuf::new());
+        let number = 7;
+        let key = Key::Threads(number);
+        let head = "a".repeat(40);
+        workspace.cache.insert(
+            Key::Item(2, number),
+            Ok(Reply {
+                text: String::new(),
+                value: serde_json::json!({"headRefOid": head, "headRefName": "feature"}),
+            }),
+        );
+        const PATCH: &str = "diff --git a/file.rs b/file.rs\n--- a/file.rs\n+++ b/file.rs\n@@ -1,4 +1,4 @@\n keep\n\n one\n-old\n+two\n";
+        workspace.cache.insert(
+            Key::Diff(number),
+            Ok(Reply {
+                text: PATCH.into(),
+                value: serde_json::json!({"headRefOid": head}),
+            }),
+        );
+        let mut thread = serde_json::json!({
+            "id": "THREAD", "isResolved": false, "path": "file.rs", "line": 4,
+            "startLine": 3, "originalLine": 4, "originalStartLine": 3,
+            "diffSide": "RIGHT", "startDiffSide": "RIGHT", "diffHeadOid": head,
+            "comments": { "nodes": [{
+                "id": "COMMENT", "body": "```suggestion\nnew\n```"
+            }]}
+        });
+        let wrap = |thread| Reply {
+            text: String::new(),
+            value: serde_json::json!({"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[thread]}}}}}),
+        };
+        workspace
+            .cache
+            .insert(key.clone(), Ok(wrap(thread.clone())));
+        assert!(!workspace.offers_commit(number, "THREAD"), "missing hunk");
+
+        thread["comments"]["nodes"][0]["diffHunk"] = "@@ -1,4 +1,4 @@\n keep\n\n one".into();
+        workspace
+            .cache
+            .insert(key.clone(), Ok(wrap(thread.clone())));
+        assert!(!workspace.offers_commit(number, "THREAD"), "short hunk");
+
+        thread["comments"]["nodes"][0]["diffHunk"] = "@@ -1,4 +1,4 @@\n keep\n\n one\n two".into();
+        thread["diffSide"] = "LEFT".into();
+        workspace
+            .cache
+            .insert(key.clone(), Ok(wrap(thread.clone())));
+        assert!(!workspace.offers_commit(number, "THREAD"), "left side");
+
+        thread["diffSide"] = "RIGHT".into();
+        workspace.cache.insert(key, Ok(wrap(thread)));
+        assert!(
+            workspace.offers_commit(number, "THREAD"),
+            "both hunks count the blank context line before the suggestion"
+        );
+        let snapshot = workspace.suggestion(number, "THREAD").unwrap();
+        let Write::CommitSuggestion {
+            head: confirmed,
+            original,
+            ..
+        } = workspace.suggestion_write(&snapshot, &[]).unwrap()
+        else {
+            panic!("expected suggestion write")
+        };
+        assert_eq!(confirmed, head);
+        assert_eq!(original, ["one", "two"]);
+        let patch = workspace
+            .cache
+            .get_mut(&Key::Diff(number))
+            .unwrap()
+            .as_mut()
+            .unwrap();
+        patch.text = PATCH.replace("+two", "+different");
+        assert!(
+            !workspace.offers_commit(number, "THREAD"),
+            "the current text differs"
+        );
+
+        let new_head = "b".repeat(40);
+        let patch = workspace
+            .cache
+            .get_mut(&Key::Diff(number))
+            .unwrap()
+            .as_mut()
+            .unwrap();
+        patch.text = PATCH.into();
+        patch.value["headRefOid"] = serde_json::json!(new_head);
+        workspace
+            .cache
+            .get_mut(&Key::Item(2, number))
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .value["headRefOid"] = serde_json::json!(new_head);
+        let refreshed = workspace
+            .suggestion(number, "THREAD")
+            .expect("the unchanged text is still available after both heads advance");
+        assert_eq!(refreshed.head, new_head);
+        assert_eq!(refreshed.original, snapshot.original);
+        assert_eq!(
+            workspace.suggestion_write(&snapshot, &[]).unwrap_err(),
+            "The suggestion changed. Refresh and open it again."
+        );
+    }
+
+    #[test]
+    fn gitea_and_forgejo_preview_the_hunk_without_an_original_line() {
+        let mut workspace = Workspace::new(PathBuf::new());
+        let thread = serde_json::json!({
+            "line": 9, "diffSide": "RIGHT", "comments": { "nodes": [{
+                "line": 9, "diffHunk": "@@ -7,2 +7,3 @@\n keep\n-old\n+inserted\n+replace me"
+            }]}
+        });
+        for host in ["gitea.com", "codeberg.org"] {
+            workspace.host = host.into();
+            assert_eq!(
+                workspace.suggestion_preview(&thread),
+                ["replace me"],
+                "{host}"
+            );
+        }
+        workspace.host = "github.com".into();
+        assert!(workspace.suggestion_preview(&thread).is_empty());
+        assert!(
+            original_lines(&thread).is_none(),
+            "writes require original coordinates"
         );
         assert_eq!(span(Some(2), Some(4)), 3);
         assert_eq!(span(None, Some(4)), 1);

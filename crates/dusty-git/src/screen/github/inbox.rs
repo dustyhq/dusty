@@ -43,13 +43,28 @@ impl Target {
             number,
         })
     }
-    pub(super) fn from_row(value: &Value, host: &str, page: usize) -> Result<Self, String> {
-        let target = Self::from_url(string(value, "url"), host, page, number(value, "number"))?;
+    pub(super) fn from_row(
+        value: &Value,
+        host: &str,
+        web_alias: Option<&HostKey>,
+        page: usize,
+    ) -> Result<Self, String> {
+        let target = Self::from_url(
+            string(value, "url"),
+            host,
+            web_alias,
+            page,
+            number(value, "number"),
+        )?;
         if !string(&value["repository"], "nameWithOwner").eq_ignore_ascii_case(&target.repo) {
             return Err("Search item URL and repository disagree".into());
         }
         Ok(target)
     }
+    pub(super) fn repository(&self) -> ForgeTarget {
+        ForgeTarget::repository(&self.host, &self.repo)
+    }
+
     fn identity(&self) -> String {
         format!("{}/{}/{}/{}", self.host, self.repo, self.page, self.number)
     }
@@ -132,6 +147,9 @@ impl Workspace {
         }
         if !self.inbox.enabled {
             self.view_scope()?;
+            if self.inbox.local_link_origin.is_some() {
+                self.return_to_list();
+            }
         }
         self.remember_list_selection();
         if self.inbox.enabled {
@@ -166,6 +184,7 @@ impl Workspace {
     }
     pub(super) fn reset_remote_detail(&mut self) {
         self.opened = None;
+        self.reader_row = None;
         self.selected_commit = None;
         self.detail_rows.clear();
         self.detail_cursor = 0;
@@ -177,8 +196,22 @@ impl Workspace {
         self.collapsed.clear();
         self.reveal_file = self.page == 2 && self.pr_tab == 3;
         self.pending_pr = false;
+        self.compose = super::create::Compose::default();
         self.ready_form = None;
+        self.reset_run_write_scope();
     }
+    /// Keep the known spelling for drafts and storage; a search row lowercases the repo.
+    pub(super) fn known_repository_spelling(&self, repo: &str) -> Option<&str> {
+        let local = if self.inbox.enabled {
+            self.inbox.home.as_str()
+        } else {
+            self.list_repository()
+        };
+        [&*self.repo, local]
+            .into_iter()
+            .find(|known| known.eq_ignore_ascii_case(repo))
+    }
+
     pub(super) fn switch_detail_repository(&mut self, repo: String) {
         if self.repo.eq_ignore_ascii_case(&repo) {
             return;
@@ -187,7 +220,11 @@ impl Workspace {
             .scope_epoch
             .checked_add(1)
             .expect("GitHub scope generation exhausted");
-        self.repo = repo;
+        self.repo = self
+            .known_repository_spelling(&repo)
+            .map_or(repo, str::to_owned);
+        self.again
+            .retain(|key, _| matches!(key, Key::List(..) | Key::Inbox(..)));
         // Repository metadata belongs to home; inbox creation/develop are disabled.
         // Lists have independent identities; only number-keyed detail state is evicted.
         self.cache
@@ -207,91 +244,190 @@ impl Workspace {
         let target = self
             .items()
             .get(self.selected[self.page - 1])
-            .and_then(|row| Target::from_row(row, &self.host, self.page).ok());
+            .and_then(|row| self.inbox_row_target(row, self.page).ok());
         if let Some(target) = target {
             self.switch_detail_repository(target.repo);
         }
     }
-    pub(super) fn return_inbox_list(&mut self) {
-        if self.inbox.enabled && self.opened.is_some() {
-            if let Some(page) = self.inbox.origin_page.take() {
-                self.page = page;
-            }
-            self.opened = None;
-            self.reset_remote_detail();
-            self.restore_list_selection();
-            self.ensure(false);
+    pub(super) fn remember_remote_link(&mut self, item_page: usize) {
+        if self.inbox.local_link_origin.is_none() && self.inbox.origin_page.is_none() {
+            self.remember_list_selection();
+        }
+        if self.inbox.enabled {
+            self.inbox.origin_page.get_or_insert(self.page);
+        } else {
+            // A foreign notification opens its item over the checkout's corresponding list.
+            let page = if self.page == notifications::PAGE {
+                item_page
+            } else {
+                self.page
+            };
+            self.inbox
+                .local_link_origin
+                .get_or_insert_with(|| (page, self.repo.clone()));
         }
     }
+    pub(super) fn list_repository(&self) -> &str {
+        self.inbox
+            .local_link_origin
+            .as_ref()
+            .map_or(&self.repo, |(_, repo)| repo)
+    }
+    /// Account reset discards the inbox's return paths, so restore the checkout first.
+    pub(super) fn restore_checkout_for_account_reset(&mut self) {
+        let home = if self.inbox.enabled && !self.inbox.home.is_empty() {
+            Some(std::mem::take(&mut self.inbox.home))
+        } else {
+            self.inbox.local_link_origin.take().map(|(_, repo)| repo)
+        };
+        if let Some(repo) = home {
+            self.repo = repo;
+            self.focus = 0;
+        }
+    }
+
+    pub(super) fn restore_local_list_repository(&mut self) -> Option<usize> {
+        let (page, repo) = self.inbox.local_link_origin.take()?;
+        self.switch_detail_repository(repo);
+        Some(page)
+    }
+    pub(super) fn return_to_list(&mut self) {
+        let origin = self
+            .restore_local_list_repository()
+            .or_else(|| self.inbox.origin_page.take());
+        if let Some(page) = origin {
+            self.page = page;
+        }
+        if origin.is_some() || self.inbox.enabled {
+            self.reset_remote_detail();
+            // Only a link can leave the current list. Moving focus out of its own
+            // reader keeps the list cursor where it already is.
+            if origin.is_some() && matches!(self.page, 1 | 2) {
+                self.restore_list_selection();
+            }
+        } else {
+            // Moving focus to the same item's list row keeps its reading position.
+            // Clear the old action rows only if leaving a different item.
+            let list_number = self.list_row().map(|row| number(row, "number"));
+            if self.opened_number() != list_number {
+                self.detail_rows.clear();
+            }
+            self.opened = None;
+            self.reader_row = None;
+        }
+        self.ensure(false);
+    }
+    pub(super) fn inbox_row_target(&self, row: &Value, page: usize) -> Result<Target, String> {
+        Target::from_row(row, &self.host, self.advertised_web_host().as_ref(), page)
+    }
+
     pub(super) fn row_identity(&self, item: &Value) -> String {
         if self.inbox.enabled {
-            return Target::from_row(item, &self.host, self.page)
+            return self
+                .inbox_row_target(item, self.page)
                 .map(|target| target.identity())
                 .unwrap_or_default();
         }
         format!(
             "{}/{}/{}/{}",
             self.host,
-            self.repo,
+            self.list_repository(),
             self.page,
             number(item, "number")
         )
+    }
+    pub(super) fn cache_scope(&self, key: &Key) -> CacheScope {
+        match key {
+            Key::List(..) => CacheScope::List(ForgeTarget::repository(
+                &self.host,
+                &self.list_repository().to_ascii_lowercase(),
+            )),
+            Key::Inbox(..) => CacheScope::Inbox(self.host.clone()),
+            _ => CacheScope::Detail((
+                self.host.clone(),
+                self.repo.to_ascii_lowercase(),
+                self.scope_epoch,
+            )),
+        }
     }
     /// Whether a reply started under `scope` still belongs on screen.
     pub(super) fn accept_scope(&self, key: &Key, scope: &super::lanes::Scope) -> bool {
         match key {
             Key::Write | Key::WorktreeWrite(_) => true,
-            Key::Inbox(host, ..) => host == &self.host,
-            _ => scope == &(self.host.clone(), self.repo.clone(), self.scope_epoch),
+            Key::Inbox(host, ..) => host == &self.host && scope.2 == self.scope_epoch,
+            _ => {
+                scope.0 == self.host
+                    && scope.1.eq_ignore_ascii_case(&self.repo)
+                    && scope.2 == self.scope_epoch
+            }
         }
     }
-    /// A remote inbox item of another repository: this checkout does not hold its files.
-    pub(super) fn foreign_inbox_item(&self) -> bool {
-        self.inbox.enabled && !self.repo.eq_ignore_ascii_case(&self.inbox.home)
+    /// The current item's repository is not the local checkout.
+    pub(super) fn foreign_item(&self) -> bool {
+        let checkout = if self.inbox.enabled {
+            &self.inbox.home
+        } else {
+            self.list_repository()
+        };
+        !self.repo.eq_ignore_ascii_case(checkout)
     }
     pub(super) fn check_inbox_action(&self, action: &Action) -> Result<(), String> {
-        if self.inbox.enabled {
-            if matches!(
+        if self.inbox.enabled
+            && matches!(
                 action,
                 Action::CreateIssue
                     | Action::CreatePullRequest
                     | Action::Develop(_)
                     | Action::Run(_)
-            ) {
-                return Err("Press i to go back to this repository first".into());
-            }
-            if matches!(action, Action::Checkout(_) | Action::Worktree(_))
-                && !self.repo.eq_ignore_ascii_case(&self.inbox.home)
-            {
-                return Err("Remote inbox item: open its local repository before checkout".into());
-            }
-            if action.item_scoped() && self.number() == 0 {
-                return Err("Select an inbox item first".into());
-            }
-            let target = match action {
-                Action::Browser(page, id)
-                | Action::Web(page, id, _)
-                | Action::Edit(page, id)
-                | Action::Comment(page, id)
-                | Action::State(page, id, _)
-                | Action::Metadata(page, id, _) => Some((*page, *id)),
-                Action::Review(id)
-                | Action::Merge(id, _)
-                | Action::Checkout(id)
-                | Action::Worktree(id)
-                | Action::Files(id)
-                | Action::Viewed(id, _)
-                | Action::Inline { number: id, .. }
-                | Action::Reply { number: id, .. } => Some((2, *id)),
-                _ => None,
-            };
-            if target.is_some_and(|target| target != (self.page, self.number())) {
-                return Err(
-                    "Selected item changed; reopen the original action (draft preserved)".into(),
-                );
-            }
+            )
+        {
+            return Err("Press i to go back to this repository first".into());
         }
-        Ok(())
+        if self.foreign_item()
+            && matches!(
+                action,
+                Action::Checkout(_) | Action::Worktree(_) | Action::Develop(_)
+            )
+        {
+            return Err("Open the item's local repository first.".into());
+        }
+        if !action.item_scoped()
+            || !matches!(self.page, 1 | 2)
+                && matches!(action, Action::Browser(..) | Action::Web(..))
+        {
+            return Ok(());
+        }
+        let expected = match action {
+            Action::Browser(page, id)
+            | Action::Web(page, id, _)
+            | Action::Edit(page, id)
+            | Action::Comment(page, id)
+            | Action::State(page, id, _)
+            | Action::Metadata(page, id, _) => (*page, *id),
+            Action::Develop(id) => (1, *id),
+            Action::ConfirmSuggestion(snapshot) => (2, snapshot.number),
+            Action::Review(id)
+            | Action::Merge(id, _)
+            | Action::Checkout(id)
+            | Action::Worktree(id)
+            | Action::Files(id)
+            | Action::Viewed(id, _)
+            | Action::CommitSuggestion(id, _)
+            | Action::Draft(id, _)
+            | Action::Inline { number: id, .. }
+            | Action::InlineRange { number: id, .. }
+            | Action::Reply { number: id, .. } => (2, *id),
+            _ => (self.page, self.number()),
+        };
+        if self.selected_item_target().is_some_and(|item| {
+            item.host == self.host
+                && item.repo.eq_ignore_ascii_case(&self.repo)
+                && (item.page, item.number) == expected
+        }) {
+            Ok(())
+        } else {
+            Err("Selected item changed; reopen the original action (draft preserved)".into())
+        }
     }
 }
 
@@ -299,6 +435,28 @@ impl Workspace {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn account_recheck_from_a_foreign_inbox_item_restores_the_checkout() {
+        let mut ws = Workspace::new(PathBuf::new());
+        ws.host = "github.com".into();
+        ws.repo = "home/checkout".into();
+        ws.page = 1;
+        ws.toggle_inbox().unwrap();
+        ws.switch_detail_repository("foreign/item".into());
+        ws.opened = Some((1, 7));
+        ws.accounts.open = true;
+        assert!(matches!(
+            ws.accounts_key(&KeyEvent::character('r')),
+            Some(Ok(None))
+        ));
+        assert_eq!(
+            ws.target(),
+            ForgeTarget::repository("github.com", "home/checkout")
+        );
+        assert!(!ws.inbox.enabled);
+        assert!(ws.opened.is_none());
+    }
 
     fn row(repo: &str, page: usize) -> Value {
         json!({"number":7,"repository":{"nameWithOwner":repo},
@@ -385,7 +543,7 @@ mod tests {
             .iter()
             .find(|request| request.key == Key::Write)
             .unwrap();
-        let Op::Write(target, comment) = &write.op else {
+        let Op::Write(target, comment, _) = &write.op else {
             panic!("a comment is a write")
         };
         assert_eq!(target, &ForgeTarget::repository("github.com", "beta/two"));
@@ -441,9 +599,11 @@ mod tests {
             scope,
             ForgeReply::Fetched(
                 Read::PullRequest(7),
+                None,
                 Ok(crate::forge::provider::Fetched::payload(
                     crate::forge::request::Payload::Text("stale alpha".into()),
                 )),
+                None,
             ),
         );
         assert!(workspace.poll());
@@ -455,17 +615,307 @@ mod tests {
     }
 
     #[test]
+    fn a_link_uses_its_repository_for_preview_and_returns_to_the_original_list() {
+        let mut workspace = workspace(PathBuf::new());
+        workspace.follow(open::parse("https://github.com/Beta/Two/pull/7").unwrap());
+        assert_eq!(
+            string(workspace.list_item().expect("Inbox fallback"), "title"),
+            "beta/two seven"
+        );
+
+        workspace.toggle_inbox().unwrap();
+        workspace.page(1);
+        let origin = workspace.target();
+        let mut alpha = row("local/root", 1);
+        alpha["number"] = 16.into();
+        let mut beta = row("beta/two", 1);
+        beta["number"] = 16.into();
+        let rows = json!([row("local/root", 1), alpha]);
+        workspace.cache.insert(
+            workspace.list_key(),
+            Ok(Reply {
+                text: rows.to_string(),
+                value: rows,
+            }),
+        );
+        workspace.selected[0] = 1;
+        let target = Target {
+            host: "github.com".into(),
+            repo: "beta/two".into(),
+            page: 1,
+            number: number(&beta, "number"),
+        };
+        workspace.activate(Action::OpenRemote(target)).unwrap();
+        assert!(
+            workspace.list_item().is_none(),
+            "same number, wrong repository"
+        );
+        assert!(matches!(workspace.list_read(LIST_BATCH), Op::Read(target, _) if target == origin));
+        workspace
+            .event(&KeyEvent::plain(KeyCode::Escape), None)
+            .unwrap();
+        assert_eq!(workspace.selected[0], 1);
+        let form = workspace
+            .event(&KeyEvent::character('x'), None)
+            .unwrap()
+            .expect("close the highlighted issue");
+        let action = form_action(form);
+        workspace.selected[0] = 0;
+        assert!(
+            workspace
+                .submit(action.clone(), vec!["Completed".into(), String::new()])
+                .unwrap_err()
+                .contains("source changed")
+        );
+        assert!(!workspace.writing());
+        workspace.selected[0] = 1;
+        workspace
+            .submit(action, vec!["Completed".into(), String::new()])
+            .unwrap();
+        assert!(workspace.queue.iter().any(|request| matches!(
+            &request.op,
+            Op::Write(target, Write::SetState { number: 16, open: false, .. }, _) if *target == origin
+        )));
+    }
+
+    fn linked_issue_workspace(root: PathBuf) -> Workspace {
+        let mut ws = workspace(root);
+        ws.fresh = fresh::Fresh::with(None);
+        ws.active = lanes::Lanes::dry();
+        ws.toggle_inbox().unwrap();
+        ws.page(1);
+        let rows = json!([row("local/root", 1)]);
+        ws.cache.insert(
+            ws.list_key(),
+            Ok(Reply {
+                text: rows.to_string(),
+                value: rows,
+            }),
+        );
+        ws.follow(open::parse("https://github.com/beta/two/issues/7").unwrap());
+        let detail = row("beta/two", 1);
+        ws.cache.insert(
+            Key::Item(1, 7),
+            Ok(Reply {
+                text: detail.to_string(),
+                value: detail,
+            }),
+        );
+        ws
+    }
+
+    fn close_issue(ws: &mut Workspace, comment: &str) -> Request {
+        let form = ws
+            .event(&KeyEvent::character('x'), None)
+            .unwrap()
+            .expect("close the linked issue");
+        ws.submit(form_action(form), vec!["Completed".into(), comment.into()])
+            .unwrap();
+        let index = ws
+            .queue
+            .iter()
+            .position(|request| request.key == Key::Write)
+            .expect("queued issue write");
+        ws.queue.remove(index).unwrap()
+    }
+
+    #[test]
+    fn closing_comment_receipt_keeps_its_follow_up_on_the_linked_issue() {
+        let mut ws = linked_issue_workspace(PathBuf::new());
+        let target = ws.target();
+        let scope = (ws.host.clone(), ws.repo.clone(), ws.scope_epoch);
+        let request = close_issue(&mut ws, "Fixed in the linked change");
+        let Op::Write(sent_to, write @ Write::Comment { number: 7, .. }, _) = &request.op else {
+            panic!("closing comment is sent first");
+        };
+        assert_eq!(*sent_to, target);
+        let receipt = ForgeReply::Written(write.clone(), Ok(Default::default()));
+        ws.active.answer_for_test(request, scope, receipt);
+
+        ws.event(&KeyEvent::plain(KeyCode::Escape), None).unwrap();
+        assert_eq!(ws.repo, "local/root");
+        assert!(ws.poll());
+        assert!(ws.queue.iter().chain(ws.active.requests()).any(|request| {
+            matches!(
+                &request.op,
+                Op::Write(sent_to, Write::SetState { number: 7, open: false, .. }, _)
+                    if *sent_to == target
+            )
+        }));
+        assert_eq!(string(ws.list_item().unwrap(), "state"), "open");
+    }
+
+    #[test]
+    fn off_screen_close_and_reopen_receipts_name_the_linked_repository() {
+        for (key, open, notice) in [
+            ('x', false, "Closed beta/two#7"),
+            ('X', true, "Reopened beta/two#7"),
+        ] {
+            let mut ws = linked_issue_workspace(PathBuf::new());
+            if open {
+                ws.cache
+                    .get_mut(&Key::Item(1, 7))
+                    .unwrap()
+                    .as_mut()
+                    .unwrap()
+                    .value["state"] = "CLOSED".into();
+            }
+            let scope = (ws.host.clone(), ws.repo.clone(), ws.scope_epoch);
+            let request = if open {
+                let form = ws.event(&KeyEvent::character(key), None).unwrap().unwrap();
+                ws.submit(form_action(form), vec![]).unwrap();
+                let index = ws
+                    .queue
+                    .iter()
+                    .position(|request| request.key == Key::Write)
+                    .unwrap();
+                ws.queue.remove(index).unwrap()
+            } else {
+                close_issue(&mut ws, "")
+            };
+            let Op::Write(
+                target,
+                write @ Write::SetState {
+                    number: 7,
+                    open: sent_open,
+                    ..
+                },
+                _,
+            ) = &request.op
+            else {
+                panic!("expected a state change");
+            };
+            assert_eq!(*target, ws.target());
+            assert_eq!(*sent_open, open);
+            let reply = ForgeReply::Written(write.clone(), Ok(Default::default()));
+            ws.active.answer_for_test(request, scope, reply);
+            ws.event(&KeyEvent::plain(KeyCode::Escape), None).unwrap();
+            assert_eq!(ws.repo, "local/root");
+            ws.poll();
+            assert_eq!(ws.notice, notice);
+            assert_eq!(string(ws.list_item().unwrap(), "state"), "open");
+        }
+    }
+
+    #[test]
+    fn leaving_a_link_drops_its_detail_rollback_and_deferred_refresh() {
+        let root = tempfile::tempdir().unwrap();
+        let mut ws = linked_issue_workspace(root.path().into());
+        ws.fresh = fresh::Fresh::with(Some(std::sync::Arc::new(crate::forge::cache::Cache::at(
+            root.path().join("forge-cache"),
+        ))));
+        let key = Key::Item(1, 7);
+        let request = close_issue(&mut ws, "");
+        let Op::Write(target, write @ Write::SetState { number: 7, .. }, _) = request.op else {
+            panic!("plain close");
+        };
+        assert_eq!(string(ws.value(&key).unwrap(), "state"), "CLOSED");
+
+        let scope = (ws.host.clone(), ws.repo.clone(), ws.scope_epoch);
+        let op = ws.read(Read::Issue(7));
+        ws.active.answer_for_test(
+            Request {
+                key: key.clone(),
+                op,
+            },
+            scope,
+            ForgeReply::Fetched(
+                Read::Issue(7),
+                None,
+                Ok(crate::forge::provider::Fetched::payload(
+                    crate::forge::request::Payload::Text(String::new()),
+                )),
+                None,
+            ),
+        );
+        ws.enqueue(key.clone(), ws.read(Read::Issue(7)), true);
+        assert!(ws.again.contains_key(&key));
+
+        ws.event(&KeyEvent::plain(KeyCode::Escape), None).unwrap();
+        assert_eq!(ws.repo, "local/root");
+        ws.written(&write, Err("Network error".into()), &target);
+        assert!(
+            ws.value(&key).is_none(),
+            "the linked issue's detail was evicted"
+        );
+        assert_eq!(string(ws.list_item().unwrap(), "title"), "local/root seven");
+        // A later completion for the local reader must not restart the linked read.
+        assert!(ws.active.finish(&key).is_some());
+        ws.queue.clear();
+        ws.ask_again(&key);
+        assert!(!ws.pending(&key));
+    }
+
+    #[test]
+    fn inbox_accepts_the_advertised_host_without_using_it_as_a_target() {
+        let host = "git.internal.example:8443";
+        let alias = HostKey::new("forge.example");
+        let target = Target::from_url(
+            "https://forge.example/o/r/issues/7",
+            host,
+            Some(&alias),
+            1,
+            7,
+        )
+        .unwrap();
+        assert_eq!(target.repository(), ForgeTarget::repository(host, "o/r"));
+        assert!(
+            Target::from_url(
+                "https://forge.example:8443/o/r/issues/7",
+                host,
+                Some(&alias),
+                1,
+                7
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn inbox_links_must_match_the_requested_port() {
+        let host = "git.example.test:8443";
+        let target = Target::from_url(
+            "https://git.example.test:8443/o/r/issues/7",
+            host,
+            None,
+            1,
+            7,
+        )
+        .unwrap();
+        assert_eq!(target.host, host);
+        assert!(
+            Target::from_url(
+                "https://git.example.test:8444/o/r/issues/7",
+                host,
+                None,
+                1,
+                7
+            )
+            .is_err()
+        );
+        assert!(
+            Target::from_url("https://git.example.test/o/r/issues/7", host, None, 1, 7).is_err()
+        );
+    }
+
+    #[test]
     fn section_and_link_return_restore_repository_qualified_cursor_not_number() {
         let mut workspace = workspace(PathBuf::new());
         workspace.selected[1] = 1;
         workspace.ensure(false);
         workspace.remember_list_selection();
         let origin = workspace.list_key();
-        let target =
-            Target::from_url("https://github.com/alpha/one/issues/7", "github.com", 1, 7).unwrap();
+        let target = Target::from_url(
+            "https://github.com/alpha/one/issues/7",
+            "github.com",
+            None,
+            1,
+            7,
+        )
+        .unwrap();
         workspace.activate(Action::OpenRemote(target)).unwrap();
         assert_eq!((workspace.page, workspace.repo.as_str()), (1, "alpha/one"));
-        workspace.return_inbox_list();
+        workspace.return_to_list();
         assert_eq!(workspace.page, 2);
         assert_eq!(workspace.list_key(), origin);
         assert_eq!(workspace.selected[1], 1);
@@ -631,7 +1081,7 @@ mod tests {
             assert!(
                 screen
                     .notice
-                    .contains("open its local repository before checkout")
+                    .contains("Open the item's local repository first")
             );
             assert!(screen.form.is_none());
             assert!(!screen.github.writing());

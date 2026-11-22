@@ -1257,7 +1257,7 @@ mod tests {
             panic!("native reply form required")
         };
         assert!(
-            matches!(&action, Action::Reply { number: 7, thread, repo, host } if thread == "THREAD_B" && repo == "example/demo" && host == "github.com")
+            matches!(action.unscoped(), Action::Reply { number: 7, thread, repo, host } if thread == "THREAD_B" && repo == "example/demo" && host == "github.com")
         );
         assert!(
             action.writes(),
@@ -1268,7 +1268,7 @@ mod tests {
             .unwrap();
         let request = workspace.queue.back().unwrap();
         assert_eq!(request.key, Key::Write);
-        let Op::Write(target, write) = &request.op else {
+        let Op::Write(target, write, _) = &request.op else {
             panic!("a reply is a write")
         };
         assert_eq!(
@@ -1772,7 +1772,7 @@ mod tests {
 
     #[test]
     fn comment_key_uses_the_real_selected_diff_line_and_its_draft() {
-        let mut workspace = workspace(2);
+        let mut workspace = files_workspace();
         let action = Action::Inline {
             number: 7,
             path: "src/deep/file.rs".into(),
@@ -1787,7 +1787,9 @@ mod tests {
             .event(&KeyEvent::plain(KeyCode::Char('c')), None)
             .unwrap()
             .unwrap();
-        assert!(matches!(form.action, FormAction::Github(ref actual) if actual == &action));
+        assert!(
+            matches!(form.action, FormAction::Github(ref actual) if actual.unscoped() == &action)
+        );
         assert_eq!(form.fields[0].input.input, "Keep my inline draft");
         // In the list `c` checks out; `C` comments on the item.
         workspace.focus = 0;
@@ -1797,8 +1799,198 @@ mod tests {
             .unwrap();
         assert!(matches!(
             form.action,
-            FormAction::Github(Action::Comment(2, 7))
+            FormAction::Github(action) if matches!(action.unscoped(), Action::Comment(2, 7))
         ));
+    }
+
+    #[test]
+    fn a_stale_patch_keeps_its_head_and_refuses_a_single_comment() {
+        let mut workspace = files_workspace();
+        workspace.focus = 2;
+        workspace
+            .cache
+            .get_mut(&Key::Item(2, 7))
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .value["headRefOid"] = json!("b".repeat(40));
+        let rows = super::super::paint::record_rows(&workspace, 120, workspace.icons);
+        assert!(
+            rows.iter()
+                .any(|row| row.text == super::super::files::OUTDATED_DIFF)
+        );
+        let row = rows
+            .iter()
+            .find(|row| row.text.contains("fn after()"))
+            .unwrap();
+        let action = row.action.clone().unwrap();
+        assert!(matches!(&action, Action::Inline { head, .. } if head == &"a".repeat(40)));
+        assert_eq!(
+            workspace.activate(action.clone()).err().as_deref(),
+            Some(super::super::files::OUTDATED_DIFF)
+        );
+        assert_eq!(
+            workspace
+                .submit(action, vec!["Single comment".into()])
+                .unwrap_err(),
+            super::super::files::OUTDATED_DIFF
+        );
+        assert!(workspace.queue.is_empty());
+    }
+
+    #[test]
+    fn the_end_of_a_range_cannot_use_a_new_heads_line_numbers() {
+        let mut workspace = files_workspace();
+        workspace.focus = 2;
+        let row = |line, head: &str| {
+            Line::button(
+                "code",
+                Action::Inline {
+                    number: 7,
+                    path: "example.rs".into(),
+                    line,
+                    side: "RIGHT",
+                    head: head.repeat(40),
+                },
+            )
+        };
+        workspace.detail_rows = vec![row(1, "a")];
+        workspace
+            .review_key(&KeyEvent::plain(KeyCode::Char('V')))
+            .unwrap()
+            .unwrap();
+        for key in [Key::Item(2, 7), Key::Diff(7)] {
+            workspace
+                .cache
+                .get_mut(&key)
+                .unwrap()
+                .as_mut()
+                .unwrap()
+                .value["headRefOid"] = json!("b".repeat(40));
+        }
+        workspace.detail_rows = vec![row(2, "b")];
+        let result = workspace
+            .review_key(&KeyEvent::plain(KeyCode::Char('C')))
+            .unwrap();
+        assert_eq!(
+            result.err().as_deref(),
+            Some("The range is on an older commit. Press Esc and start it again.")
+        );
+        assert!(workspace.review_drafts(7).is_empty() && workspace.queue.is_empty());
+    }
+
+    #[test]
+    fn removed_file_draft_is_copyable_and_deletable_after_a_refused_review() {
+        use crate::forge::model::Side;
+        use crate::forge::request::{InlineDraft, Write};
+        use crate::screen::{GitScreen, ScreenOutcome};
+        use crate::ui::{KeyInputKind, UiEvent};
+
+        let mut workspace = files_workspace();
+        // Keep persistence off the test's shared state directory.
+        workspace.host.clear();
+        let first = InlineDraft {
+            path: "example.rs".into(),
+            line: 1,
+            start_line: None,
+            side: Side::Left,
+            body: "First".into(),
+        };
+        let second = InlineDraft {
+            path: "removed.rs".into(),
+            line: 3,
+            start_line: Some(2),
+            side: Side::Right,
+            body: "Keep this text from the removed file".into(),
+        };
+        let pending =
+            |comment, head: &str| super::super::drafts::PendingDraft::new(comment, head.repeat(40));
+        workspace.inline_drafts.insert(
+            7,
+            vec![pending(first.clone(), "a"), pending(second.clone(), "b")],
+        );
+        let root = tempfile::tempdir().unwrap();
+        git2::Repository::init(root.path()).unwrap();
+        let mut app = GitScreen::open(root.path()).unwrap();
+        app.page = 2;
+        app.github = workspace;
+        let press = |app: &mut GitScreen, code, control| {
+            let mut key = KeyEvent::plain(code);
+            key.modifiers.control = control;
+            app.event(UiEvent::Key {
+                key,
+                kind: KeyInputKind::Press,
+            })
+        };
+        press(&mut app, KeyCode::Char('r'), false);
+        assert!(app.form.is_some(), "opens the review sheet");
+        press(&mut app, KeyCode::Enter, true);
+        assert!(app.form.is_none(), "refusal closes the sheet");
+        assert!(
+            app.notice
+                .starts_with("1 draft doesn't match this version of the pull request.")
+        );
+        assert!(
+            !app.github
+                .queue
+                .iter()
+                .any(|request| request.key == Key::Write)
+        );
+        assert_eq!(app.github.review_drafts(7).len(), 2);
+
+        app.frame(120, 40);
+        let rows = &app.github.detail_rows;
+        assert!(rows.iter().any(|row| row.text.contains("Outdated drafts")));
+        assert!(
+            rows.iter()
+                .any(|row| row.text.contains("Keep this text from the removed file"))
+        );
+        let draft = rows
+            .iter()
+            .position(|row| row.text.contains("removed.rs:2–3"))
+            .unwrap();
+        assert!(
+            app.github.detail_cursor < draft,
+            "the list opens above the draft"
+        );
+        for _ in 0..=draft {
+            press(&mut app, KeyCode::Down, false);
+            if app.github.detail_cursor >= draft {
+                break;
+            }
+        }
+        assert_eq!(
+            app.github.detail_cursor, draft,
+            "Down stops on the draft header"
+        );
+        assert_eq!(
+            press(&mut app, KeyCode::Char('y'), false),
+            ScreenOutcome::Copy(second.body.clone())
+        );
+        press(&mut app, KeyCode::Enter, false);
+        let form = app.form.as_ref().expect("Enter opens the draft editor");
+        assert!(form.title.starts_with("Pending comment on removed.rs:2–3"));
+        assert_eq!(form.fields[0].input.input, second.body);
+        assert_eq!(form.fields[1].input.input, "Keep");
+        press(&mut app, KeyCode::Tab, false);
+        press(&mut app, KeyCode::Down, false);
+        assert_eq!(app.form.as_ref().unwrap().fields[1].input.input, "Delete");
+        assert_eq!(
+            app.github.review_drafts(7).len(),
+            2,
+            "selecting Delete doesn't confirm it"
+        );
+        press(&mut app, KeyCode::Enter, true);
+        assert!(app.form.is_none());
+        assert_eq!(app.github.review_drafts(7).len(), 1);
+
+        press(&mut app, KeyCode::Char('r'), false);
+        press(&mut app, KeyCode::Enter, true);
+        assert!(app.github.queue.iter().any(|request| matches!(
+            &request.op,
+            Op::Write(_, Write::SubmitReview { number: 7, drafts, head: Some(head), .. }, _)
+                if drafts.as_slice() == std::slice::from_ref(&first) && head == &"a".repeat(40)
+        )));
     }
 
     #[test]

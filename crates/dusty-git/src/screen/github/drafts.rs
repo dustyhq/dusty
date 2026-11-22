@@ -317,13 +317,29 @@ impl Workspace {
     /// Files reader keys for pending comments: `V` marks a range, Esc drops it, `c` (or `C`)
     /// on a pending comment edits it and on the range's last line comments on the range.
     pub(super) fn review_key(&mut self, key: &KeyEvent) -> Option<Result<Option<Form>, String>> {
-        if !self.files_reader() || key.modifiers.control || key.modifiers.alt {
+        if self.page != 2 || self.focus != 2 || key.modifiers.control || key.modifiers.alt {
             return None;
         }
         let row = self
             .detail_rows
             .get(self.detail_cursor)
             .and_then(|row| row.action.clone());
+        if let Some(Action::Draft(number, index)) = &row {
+            match key.code {
+                KeyCode::Char('c' | 'C') => {
+                    return Some(self.activate(Action::Draft(*number, *index)));
+                }
+                KeyCode::Char('y') => {
+                    let draft = self.review_drafts(*number).get(*index)?;
+                    self.copied = Some(draft.comment.body.clone());
+                    return Some(Ok(None));
+                }
+                _ => {}
+            }
+        }
+        if !self.files_reader() {
+            return None;
+        }
         match key.code {
             KeyCode::Escape if self.review.anchor.is_some() => {
                 self.review.anchor = None;
@@ -360,7 +376,6 @@ impl Workspace {
                 Some(Ok(None))
             }
             KeyCode::Char('c' | 'C') => match row {
-                Some(action @ Action::Draft(..)) => Some(self.activate(action)),
                 Some(Action::Inline {
                     number,
                     path,
@@ -432,8 +447,9 @@ impl Workspace {
                 let (draft, _) = self
                     .review_drafts(*number)
                     .get(*index)
-                    .cloned()
-                    .ok_or("That draft was already sent or deleted")?;
+                    .ok_or("That draft was already sent or deleted")?
+                    .comment
+                    .clone();
                 // The saved text, not an older typed value for the same slot.
                 self.drafts.remove(&self.draft_key(action));
                 let fields = vec![
@@ -469,20 +485,23 @@ impl Workspace {
                 if body.is_empty() {
                     return Some(Err("Comment is required".into()));
                 }
-                self.inline_drafts.entry(*number).or_default().push((
-                    InlineDraft {
-                        path: path.clone(),
-                        line: u64::from(*line),
-                        start_line: Some(u64::from(*start)),
-                        side: if *side == "LEFT" {
-                            Side::Left
-                        } else {
-                            Side::Right
+                self.inline_drafts
+                    .entry(*number)
+                    .or_default()
+                    .push(PendingDraft::new(
+                        InlineDraft {
+                            path: path.clone(),
+                            line: u64::from(*line),
+                            start_line: Some(u64::from(*start)),
+                            side: if *side == "LEFT" {
+                                Side::Left
+                            } else {
+                                Side::Right
+                            },
+                            body: body.to_owned(),
                         },
-                        body: body.to_owned(),
-                    },
-                    head.clone(),
-                ));
+                        head.clone(),
+                    ));
                 self.review.anchor = None;
                 self.notice = format!(
                     "Added to your review · {}",
@@ -504,7 +523,7 @@ impl Workspace {
                 if delete {
                     drafts.remove(*index);
                 } else {
-                    drafts[*index].0.body = values[0].trim().to_owned();
+                    drafts[*index].comment.body = values[0].trim().to_owned();
                 }
                 let left = drafts.len();
                 self.notice = match (delete, left) {
@@ -561,7 +580,7 @@ pub(super) fn file_count(workspace: &Workspace, id: u64, path: &str) -> usize {
     workspace
         .review_drafts(id)
         .iter()
-        .filter(|(draft, _)| draft.path == path)
+        .filter(|draft| draft.comment.path == path)
         .count()
 }
 
@@ -832,6 +851,85 @@ mod tests {
         );
         assert_eq!(wrap("first\n\nsecond", 20), vec!["first", "", "second"]);
         assert_eq!(wrap("abcdefghijkl", 8), vec!["abcdefgh", "ijkl"]);
+    }
+
+    #[test]
+    fn first_login_adopts_head_drafts_under_both_checkout_spellings() {
+        let scratch = tempfile::tempdir().unwrap();
+        let state = scratch.path();
+        let host = "forge.test:8443";
+        let h = HostKey::new(host);
+        let alice = AccountNamespace::signed_in(h.clone(), "alice").unwrap();
+        let bob = AccountNamespace::signed_in(h, "bob").unwrap();
+        // HEAD placed escaped REPO/PR.json directly under drafts/escaped-host. It
+        // did not write a draft ID or an _accounts path.
+        let legacy_host = state.join("drafts/forge.test%3A8443");
+        let lower = legacy_host.join("acme%2Fwidget");
+        let mixed = legacy_host.join("Acme%2FWidget");
+        let seed = |directory: &std::path::Path, body: &str| {
+            std::fs::create_dir_all(directory).unwrap();
+            std::fs::write(
+                directory.join("7.json"),
+                serde_json::json!({
+                    "schema": 1,
+                    "drafts": [{
+                        "path": "src/lib.rs", "line": 14, "side": "RIGHT", "body": body,
+                        "head": "a".repeat(40)
+                    }]
+                })
+                .to_string(),
+            )
+            .unwrap();
+        };
+        seed(&lower, "lowercase HEAD draft");
+        let distinct_spellings = !mixed.exists();
+
+        let load_as = |account: Option<&AccountNamespace>, access, repo: &str| {
+            let mut ws = Workspace::new(PathBuf::new());
+            ws.host = host.into();
+            ws.repo = repo.into();
+            ws.account = account.cloned();
+            ws.sync_drafts_with(&|account, host, repo| {
+                directories_in(state, account, host, repo, access)
+            });
+            let mut bodies: Vec<_> = ws
+                .review_drafts(7)
+                .iter()
+                .map(|draft| draft.comment.body.clone())
+                .collect();
+            bodies.sort();
+            bodies
+        };
+        let lower_only = vec!["lowercase HEAD draft".to_owned()];
+        assert_eq!(
+            load_as(Some(&alice), LegacyAccess::Owner, "Acme/Widget"),
+            lower_only
+        );
+        assert_eq!(
+            load_as(None, LegacyAccess::Unclaimed, "Acme/Widget"),
+            lower_only
+        );
+
+        // Write the mixed-case HEAD layout too. On an insensitive filesystem the first
+        // directory has to go before we can create an entry with the other spelling.
+        if !distinct_spellings {
+            std::fs::remove_dir_all(&lower).unwrap();
+        }
+        seed(&mixed, "mixed-case HEAD draft");
+        let mut expected = if distinct_spellings {
+            lower_only
+        } else {
+            Vec::new()
+        };
+        expected.push("mixed-case HEAD draft".to_owned());
+        for spelling in ["Acme/Widget", "acme/widget"] {
+            assert_eq!(
+                load_as(Some(&alice), LegacyAccess::Owner, spelling),
+                expected
+            );
+            assert!(load_as(Some(&bob), LegacyAccess::Blocked, spelling).is_empty());
+            assert!(load_as(None, LegacyAccess::Blocked, spelling).is_empty());
+        }
     }
 
     #[test]

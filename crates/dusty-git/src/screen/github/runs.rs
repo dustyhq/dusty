@@ -78,6 +78,8 @@ pub(super) struct View {
     /// A run opened from elsewhere (a pull request's check), or one just re-run, stays shown
     /// though not listed, until the cursor moves.
     pinned: bool,
+    /// The selected run whose successful rerun can move it to another history tab.
+    follow_rerun: Option<u64>,
     /// The run attempt the tree below belongs to; another one starts from the defaults.
     tree_for: String,
     opened: BTreeSet<Node>,
@@ -101,7 +103,7 @@ pub(super) struct View {
     find_current: usize,
     /// The last download's receipt and the run it came from: shown under that run only.
     receipt: Option<(u64, String)>,
-    pending_dispatch: Option<u64>,
+    pending_dispatch: Option<(ForgeTarget, u64)>,
     /// The run whose `r` waits for its jobs: the sheet opens when they arrive.
     pub(super) pending_rerun: Option<u64>,
     dispatched: Option<(u64, String, BTreeSet<u64>)>,
@@ -923,7 +925,7 @@ impl Workspace {
     }
 
     fn run_target(&self) -> Option<u64> {
-        if self.actions.pinned {
+        if self.actions.right && self.actions.pinned {
             return self.run_id;
         }
         let runs = self.shown_runs();
@@ -1145,6 +1147,7 @@ impl Workspace {
     /// Opens a run from elsewhere (Enter on a check that links to its run).
     pub(super) fn open_run(&mut self, id: u64) {
         self.run_id = Some(id);
+        self.actions.follow_rerun = None;
         self.actions.pinned = true;
         self.actions.workflows = false;
         self.actions.right = true;
@@ -1159,7 +1162,11 @@ impl Workspace {
         }
         let id = self.run_id?;
         let run = self.run_value(id)?;
-        (State::of(run).finished() || self.actions.opened.contains(&Node::Artifacts)).then_some(id)
+        // A rerun can still have artifacts from its previous attempt.
+        (State::of(run).finished()
+            || self.actions.follow_rerun == Some(id)
+            || self.actions.opened.contains(&Node::Artifacts))
+        .then_some(id)
     }
 
     fn artifacts(&self) -> Vec<&Value> {
@@ -1853,12 +1860,14 @@ impl Workspace {
         if self.page != 3 {
             return;
         }
+        self.follow_rerun_section();
         if !self.actions.pinned {
             let runs = self.shown_runs();
             let selected = self.run_cursor(&runs);
             let id = selected.map(|at| number(runs[at], "databaseId"));
             self.run_selected = selected.unwrap_or(0);
             if id != self.run_id {
+                self.actions.follow_rerun = None;
                 self.run_id = id;
                 self.attempt = 0;
             }
@@ -1886,6 +1895,37 @@ impl Workspace {
         }
     }
 
+    fn clear_run_pin(&mut self) {
+        self.actions.follow_rerun = None;
+        self.actions.pinned = false;
+    }
+
+    fn follow_rerun_section(&mut self) {
+        let Some(id) = self
+            .actions
+            .follow_rerun
+            .filter(|id| Some(*id) == self.run_id)
+        else {
+            return;
+        };
+        let login = self.viewer_login();
+        let section = self.actions.section;
+        let Some(run) = self
+            .filtered_runs()
+            .into_iter()
+            .find(|run| number(run, "databaseId") == id)
+        else {
+            return;
+        };
+        if self.in_section(run, section, login.as_deref()) {
+            return;
+        }
+        self.actions.section = [2, 3, 0]
+            .into_iter()
+            .find(|section| self.in_section(run, *section, login.as_deref()))
+            .unwrap_or(0);
+    }
+
     fn select_run(&mut self, delta: isize) {
         let runs = self.shown_runs();
         let Some(cursor) = self.run_cursor(&runs) else {
@@ -1894,7 +1934,7 @@ impl Workspace {
         let at = cursor.saturating_add_signed(delta).min(runs.len() - 1);
         let id = number(runs[at], "databaseId");
         self.run_selected = at;
-        self.actions.pinned = false;
+        self.clear_run_pin();
         if self.run_id != Some(id) {
             self.run_id = Some(id);
             self.attempt = 0;
@@ -1907,7 +1947,7 @@ impl Workspace {
         self.actions.section = section;
         // The run opens afresh at its first error, even when it was the one shown.
         self.actions.tree_for.clear();
-        self.actions.pinned = false;
+        self.clear_run_pin();
         self.run_selected = 0;
         self.run_id = None;
         self.attempt = 0;
@@ -2072,7 +2112,7 @@ impl Workspace {
             _ => self.actions.event = value,
         }
         self.actions.picker = false;
-        self.actions.pinned = false;
+        self.clear_run_pin();
         self.actions.tree_for.clear();
         self.run_selected = 0;
         self.run_id = None;
@@ -2180,7 +2220,7 @@ impl Workspace {
                 self.actions.workflow = Some(name);
             }
         }
-        self.actions.pinned = false;
+        self.clear_run_pin();
         self.actions.tree_for.clear();
         self.run_selected = 0;
         self.run_id = None;
@@ -2332,7 +2372,7 @@ impl Workspace {
             self.reveal_match(None);
         } else {
             self.run_selected = 0;
-            self.actions.pinned = false;
+            self.clear_run_pin();
             self.sync_actions();
         }
         true
@@ -2481,7 +2521,7 @@ impl Workspace {
                     .unwrap_or_default();
                 if !url.starts_with("https://") && !url.starts_with("http://") {
                     return Some(Err(format!("This {} has no web page", self.actions_noun())));
-                }
+                };
                 return Some(self.activate(Action::Web(3, id, url)));
             }
             if key.code == KeyCode::Char('R') {
@@ -2786,7 +2826,7 @@ impl Workspace {
                     self.back_to_notifications();
                 } else if !self.go_back() {
                     // Opened from a pull request's check, Esc went back to it (R9-05).
-                    self.leave_run();
+                    self.focus_panel(1);
                 }
             }
             // Tab goes round the panels; Shift+Tab, h and ← back to the runs.
@@ -2878,6 +2918,7 @@ impl Workspace {
         self.return_to = None;
         self.notify.back = false;
         self.actions.visual = None;
+        // Leaving the reader clears its pin; the list can still follow its selected rerun.
         self.actions.pinned = false;
         self.actions.right = false;
         self.actions.workflows = false;
@@ -2916,17 +2957,24 @@ impl Workspace {
     // --------------------------------------------------------------------------- writes
 
     /// A finished write the Actions tab reports itself.
-    pub(super) fn actions_written(&mut self, write: &Write, summary: &str) {
+    pub(super) fn actions_written(&mut self, write: &Write, summary: &str, same_target: bool) {
         match write {
             Write::DownloadArtifact {
-                name, directory, ..
-            } => {
-                let size = self
+                artifact,
+                name,
+                directory,
+            } if same_target => {
+                let Ok(id) = artifact.0.parse::<u64>() else {
+                    return;
+                };
+                let Some(item) = self
                     .artifacts()
-                    .iter()
-                    .find(|artifact| string(artifact, "name") == name)
-                    .map(|artifact| size(number(artifact, "size")))
-                    .unwrap_or_default();
+                    .into_iter()
+                    .find(|item| artifact_id(item) == id)
+                else {
+                    return;
+                };
+                let size = size(number(item, "size"));
                 let shown = directory
                     .strip_prefix(&self.root)
                     .map(|path| format!("./{}", path.join(format!("{name}.zip")).display()))
@@ -2941,26 +2989,29 @@ impl Workspace {
                 self.actions.receipt = self.run_id.map(|run| (run, text));
                 let _ = summary;
             }
-            Write::CancelRun(run) => {
+            Write::CancelRun(run) if same_target => {
                 if let Ok(id) = run.0.parse::<u64>() {
                     self.actions.cancelling.insert(id);
                 }
             }
-            Write::Rerun { run, .. } => self.pin_rerun(run.0.parse::<u64>().ok()),
+            Write::Rerun { run, .. } if same_target => {
+                self.follow_rerun(run.0.parse::<u64>().ok());
+            }
             Write::RerunJob(_) => {
                 let run = self.actions.rerun_job_run.take();
-                self.pin_rerun(run);
+                if same_target {
+                    self.follow_rerun(run);
+                }
             }
             _ => {}
         }
     }
 
-    /// A re-run run may leave the list it was picked from (no longer failing); like a closed
-    /// issue in the reader, it stays shown there until the cursor moves. From the list itself
-    /// the cursor moves on with the list instead.
-    fn pin_rerun(&mut self, run: Option<u64>) {
-        if self.actions.right && run.is_some() && run == self.run_target() {
-            self.actions.pinned = true;
+    /// Follow the selected run when refreshed history moves it out of the current tab.
+    fn follow_rerun(&mut self, run: Option<u64>) {
+        if self.page == 3 && run.is_some() && run == self.run_target() {
+            self.actions.follow_rerun = run;
+            self.actions.pinned = self.actions.right;
         }
     }
 
@@ -2974,11 +3025,25 @@ impl Workspace {
     }
 
     pub(super) fn begin_dispatch(&mut self, workflow: u64) {
-        self.actions.pending_dispatch = Some(workflow);
+        self.actions.pending_dispatch = Some((self.target(), workflow));
     }
 
     pub(super) fn pending_dispatch(&self) -> Option<u64> {
-        self.actions.pending_dispatch
+        let (target, workflow) = self.actions.pending_dispatch.as_ref()?;
+        (self.page == 3 && *target == self.target()).then_some(*workflow)
+    }
+
+    pub(super) fn cancel_pending_run_forms(&mut self) {
+        self.actions.pending_dispatch = None;
+        self.actions.pending_rerun = None;
+    }
+
+    pub(super) fn reset_run_write_scope(&mut self) {
+        self.cancel_pending_run_forms();
+        self.actions.dispatched = None;
+        self.actions.follow_rerun = None;
+        self.actions.cancelling.clear();
+        self.actions.receipt = None;
     }
 
     /// Opens pending sheets when their details arrive, and correlates a dispatched run
@@ -3004,7 +3069,11 @@ impl Workspace {
                 self.enqueue(Key::Run(id, self.attempt), self.run_read(id), false);
             }
         }
-        if let Some(workflow) = self.actions.pending_dispatch
+        let dispatch = self.pending_dispatch();
+        if dispatch.is_none() {
+            self.actions.pending_dispatch = None;
+        }
+        if let Some(workflow) = dispatch
             && self.ready_form.is_none()
             && self
                 .cache
@@ -3212,7 +3281,7 @@ impl Workspace {
                 .map(|field| field.input.input.trim().to_owned())
                 .unwrap_or_default()
         };
-        match action {
+        match action.unscoped() {
             Action::Cancel(_) => Some("Running jobs stop. Finished jobs keep their logs.".into()),
             Action::Approve(_) => {
                 Some("Its jobs start on this repository's runners, with its secrets.".into())
@@ -3277,7 +3346,7 @@ impl Workspace {
                     format!("Starts {what}{on}.")
                 })
             }
-            _ => self.feature_note(action, fields),
+            action => self.feature_note(action, fields),
         }
     }
 
@@ -3853,6 +3922,8 @@ fn paint_list(
     let words = ws.filter_words();
     let filter = &ws.actions.filter;
     if filter.active() || !words.is_empty() {
+        let x = inner.x + 1;
+        let room = inner.w.saturating_sub(2);
         let mut spans: Vec<Span> = Vec::new();
         if filter.active() {
             spans.push((
@@ -4805,7 +4876,14 @@ fn footer(app: &GitScreen, frame: &mut Frame, rect: Rect) {
         None
     };
     let view = &ws.actions;
-    let back: Option<String>;
+    // The reader can return to the PR check or notification that opened it.
+    let back = if ws.notify.back {
+        Some("back".into())
+    } else {
+        ws.return_to
+            .as_ref()
+            .map(|target| format!("back to {}", target.label))
+    };
     let keys = ws.key_table();
     let sidebar = keys.keys(Named::ToggleSidebar).unwrap_or_default();
     // Each chord whole (`Space e sidebar`), not its tail beside a lone `Space …` at the far
@@ -4815,9 +4893,7 @@ fn footer(app: &GitScreen, frame: &mut Frame, rect: Rect) {
         .into_iter()
         .map(|(key, label)| (format!("{} {key}", keys.leader_name()), label))
         .collect::<Vec<_>>();
-    let hints: Vec<(&str, &str)> = if let Some(hints) = ws.actions_failure_hints() {
-        hints
-    } else if view.find.editing || view.filter.editing {
+    let hints: Vec<(&str, &str)> = if view.find.editing || view.filter.editing {
         vec![
             ("Enter", if view.find.editing { "find" } else { "filter" }),
             ("Esc", "cancel"),
@@ -4907,28 +4983,31 @@ fn footer(app: &GitScreen, frame: &mut Frame, rect: Rect) {
             }
             _ => {}
         }
-        let full = row
-            .and_then(|row| job_of(&row.node))
-            .is_some_and(|job| view.full.contains(&job));
-        // Opened from a pull request's check, Esc goes back to it (R9-05).
-        // Opened from Notifications, Esc goes back there.
-        back = if ws.notify.back {
-            Some("back".into())
+        let job = row.and_then(|row| job_of(&row.node)).or_else(|| {
+            rows.iter()
+                .find(|row| row.state == Some(State::Failed))
+                .and_then(|row| job_of(&row.node))
+        });
+        if let Some(job) = job {
+            hints.push((
+                2,
+                "f",
+                if view.full.contains(&job) {
+                    "steps"
+                } else {
+                    "full log"
+                },
+            ));
+        }
+        // Zoomed, the way back is as needed as `Esc list` (A2-02).
+        hints.push(if view.zoom {
+            (0, "z", "unzoom")
         } else {
-            ws.return_to
-                .as_ref()
-                .map(|target| format!("back to {}", target.label))
-        };
-        hints.extend([
-            (2, "f", if full { "steps" } else { "full log" }),
-            // Zoomed, the way back is as needed as `Esc list` (A2-02).
-            if view.zoom {
-                (0, "z", "unzoom")
-            } else {
-                (7, "z", "zoom")
-            },
-            (3, "n", "next error"),
-        ]);
+            (7, "z", "zoom")
+        });
+        if rows.iter().any(Row::error) {
+            hints.push((3, "n", "next error"));
+        }
         // Offered where the forge is known to keep attempts, or this run has had several
         // (an unprobed Gitea may predate 1.27's attempts API).
         if matches!(
@@ -4942,10 +5021,9 @@ fn footer(app: &GitScreen, frame: &mut Frame, rect: Rect) {
         // Re-run what the cursor is on: its job, else the failed jobs (the sheet offers all).
         // A run still going cannot be re-run (`r` says so); its key is `x cancel` (r15
         // narrow pass: the footer offered `r rerun` on #215 while it ran).
-        let running = ws
-            .run_id
-            .and_then(|id| ws.run_value(id))
-            .is_some_and(|run| !State::of(run).finished());
+        let run = ws.run_target().and_then(|id| ws.run_value(id));
+        let running = run.is_some_and(|run| !State::of(run).finished());
+        let caps = ws.capabilities();
         let rerun = match ws.run_id {
             _ if running => "cancel",
             Some(id) if ws.run_jobs(id).0 > 0 => "re-run failed",
@@ -5367,26 +5445,337 @@ mod tests {
     }
 
     #[test]
-    fn actions_load_failure_footer_only_offers_recovery() {
+    fn editing_a_long_history_filter_keeps_the_tail_and_caret_visible_at_100_columns() {
         let (_root, mut app) = actions_screen();
+        let query = "Exercise the retry-limit regression check";
+        for ch in "/".chars().chain(query.chars()) {
+            assert!(
+                app.github
+                    .event(&KeyEvent::character(ch), None)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        assert_eq!(app.github.actions.filter.query, query);
+        let shown = frame(&mut app, 100, 30);
+        let (x, y, style) = shown.cursor.expect("the filter owns the cursor");
+        let row = shown.grid.row_text(y);
+        assert!(
+            row.contains("…") && row.contains("regression check▏"),
+            "{row}"
+        );
+        assert_eq!(style, SetCursorStyle::SteadyBar);
+        assert_eq!(shown.grid.get(x, y).unwrap().symbol, "▏");
+        assert!(shown.grid.row_text(29).contains("Enter filter"));
+    }
+
+    #[test]
+    fn filtered_history_keeps_dispatch_and_the_selected_run_action_at_100_columns() {
+        let (_root, mut app) = actions_screen();
+        let ws = &mut app.github;
+        ws.workflow_selected = 1;
+        ws.cache.extend([
+            (
+                Key::Workflows,
+                Ok(Reply {
+                    text: String::new(),
+                    value: json!({"workflows":[{"id":31,"name":"CI","state":"active"}]}),
+                }),
+            ),
+            (
+                Key::Workflow(31, String::new()),
+                Ok(Reply {
+                    text: "on: workflow_dispatch".into(),
+                    value: Value::Null,
+                }),
+            ),
+        ]);
+        let mut runs = ws.cache.remove(&Key::Runs(0)).unwrap().unwrap();
+        runs.value[0]["displayTitle"] = json!("Exercise the retry-limit regression check");
+        ws.cache.insert(Key::Runs(31), Ok(runs));
+        ws.actions.filter.query = "limit regression".into();
+
+        let finished = frame(&mut app, 100, 30);
+        assert_eq!(app.github.run_target(), Some(501));
+        assert!((1..29).any(|y| finished.grid.row_text(y).contains("limit regression")));
+        let footer = finished.grid.row_text(29);
+        assert!(
+            footer.contains("d run workflow") && footer.contains("r re-run"),
+            "{footer}"
+        );
+        assert!(footer.contains("F narrow"), "{footer}");
+
+        for key in [Key::Runs(31), Key::Run(501, 0)] {
+            let value = &mut app
+                .github
+                .cache
+                .get_mut(&key)
+                .unwrap()
+                .as_mut()
+                .unwrap()
+                .value;
+            let run = if value.is_array() {
+                &mut value[0]
+            } else {
+                value
+            };
+            run["status"] = json!("in_progress");
+            run["conclusion"] = Value::Null;
+        }
+        let footer = frame(&mut app, 100, 30).grid.row_text(29);
+        assert!(
+            footer.contains("d run workflow") && footer.contains("x cancel"),
+            "{footer}"
+        );
+        assert!(!footer.contains("r re-run"), "{footer}");
+    }
+
+    #[test]
+    fn rerun_sheet_footer_only_offers_enter_to_submit_on_the_primary_button() {
+        let (_root, mut app) = actions_screen();
+        app.form = app.github.activate(Action::Rerun(501)).unwrap();
+        for field in ["Jobs", "Debug logging"] {
+            let form = app.form.as_ref().unwrap();
+            assert_eq!(form.fields[form.selected].label, field);
+            let footer = frame(&mut app, 100, 30).grid.row_text(29);
+            assert!(footer.contains("Tab next field"), "{footer}");
+            assert!(!footer.contains("Enter re-run jobs"), "{footer}");
+            app.form_key(&KeyEvent::plain(KeyCode::Tab)).unwrap();
+        }
+        let form = app.form.as_ref().unwrap();
+        assert_eq!(form.selected, form.fields.len());
+        let footer = frame(&mut app, 100, 30).grid.row_text(29);
+        assert!(footer.contains("Enter re-run jobs"), "{footer}");
+        assert!(footer.contains("Shift+Tab previous"), "{footer}");
+        assert!(!footer.contains("Tab next field"), "{footer}");
+    }
+
+    #[test]
+    fn actions_history_failure_keeps_controls_for_available_data() {
+        let (_root, mut app) = actions_screen();
+        app.github.workflow_selected = 1;
+        app.github.cache.extend([
+            (
+                Key::Workflows,
+                Ok(Reply {
+                    text: String::new(),
+                    value: json!({"workflows":[{"id":31,"name":"CI","state":"active"}]}),
+                }),
+            ),
+            (
+                Key::Workflow(31, String::new()),
+                Ok(Reply {
+                    text: "on: workflow_dispatch".into(),
+                    value: Value::Null,
+                }),
+            ),
+            (Key::Runs(31), Err("Rate limited · retry in 711s".into())),
+        ]);
+        let footer = frame(&mut app, 100, 30).grid.row_text(29);
+        for hint in [
+            "R retry after reset",
+            "/ filter",
+            "F narrow",
+            "d run workflow",
+        ] {
+            assert!(footer.contains(hint), "{footer}");
+        }
+        assert!(!footer.contains("Enter open"), "{footer}");
+        for (key, hint) in [('/', "Enter filter"), ('F', "Enter choose")] {
+            app.github.event(&KeyEvent::character(key), None).unwrap();
+            let footer = frame(&mut app, 150, 30).grid.row_text(29);
+            assert!(
+                footer.contains(hint) && !footer.contains("R retry"),
+                "{footer}"
+            );
+            app.github
+                .event(&KeyEvent::plain(KeyCode::Escape), None)
+                .unwrap();
+        }
+        let form = app
+            .github
+            .event(&KeyEvent::character('d'), None)
+            .unwrap()
+            .unwrap();
+        let FormAction::Github(action) = form.action else {
+            panic!("expected a forge sheet");
+        };
+        assert!(matches!(action.unscoped(), Action::Dispatch(31)));
+
+        app.github.cache.remove(&Key::Workflow(31, String::new()));
+        let footer = frame(&mut app, 100, 30).grid.row_text(29);
+        assert!(footer.contains("d check workflow"), "{footer}");
+
+        app.github.open_run(900);
         app.github.cache.insert(
-            Key::Runs(0),
-            Err("Network error · error sending request".into()),
+            Key::Run(900, 0),
+            Err("Network error · 502 Bad Gateway".into()),
         );
         let shown = frame(&mut app, 150, 30);
+        let reader = shown.grid.row_text(2);
+        assert!(reader.contains("github.com is having problems"), "{reader}");
+        assert!(!reader.contains("Loading…"), "{reader}");
         let footer = shown.grid.row_text(29);
-        assert!(footer.contains("R retry"), "{footer}");
-        for hint in [
-            "Enter open",
-            "sections",
-            "filter",
-            "narrow",
-            "re-run",
-            "dispatch",
-            "browser",
-        ] {
-            assert!(!footer.contains(hint), "{footer}");
+        assert!(
+            footer.contains("R retry") && footer.contains("Esc list"),
+            "{footer}"
+        );
+        for unavailable in ["full log", "next error", "re-run", "browser"] {
+            assert!(!footer.contains(unavailable), "{footer}");
         }
+    }
+
+    #[test]
+    fn leaving_a_linked_check_discards_its_dispatch_intent_and_form() {
+        let mut ws = workspace();
+        ws.active = lanes::Lanes::dry();
+        ws.fresh = fresh::Fresh::with(None);
+        ws.page(2);
+        ws.follow(super::super::open::parse("https://github.com/beta/two/pull/18").unwrap());
+        assert_eq!(ws.repo, "beta/two");
+        ws.activate(Action::Run(501)).unwrap();
+        ws.cache.insert(
+            Key::Workflows,
+            Ok(Reply {
+                text: String::new(),
+                value: json!({"workflows":[{"id":31,"name":"CI","state":"active"}]}),
+            }),
+        );
+        ws.choose_flow(1);
+        let key = Key::Workflow(31, String::new());
+        // Capture a form first, then make its definition cold for the deferred-key path.
+        ws.cache.insert(key.clone(), Err("No inputs schema".into()));
+        let form = ws.activate(Action::Dispatch(31)).unwrap().unwrap();
+        let FormAction::Github(action) = form.action else {
+            panic!("expected a forge sheet");
+        };
+        ws.cache.remove(&key);
+        assert!(ws.event(&KeyEvent::character('d'), None).unwrap().is_none());
+        assert_eq!(ws.pending_dispatch(), Some(31));
+        let target = ws.target();
+        let index = ws
+            .queue
+            .iter()
+            .position(|request| request.key == key)
+            .unwrap();
+        let request = ws.queue.remove(index).unwrap();
+        let Op::Read(source, read) = &request.op else {
+            panic!("expected the linked workflow definition");
+        };
+        assert_eq!(source, &target);
+        let result = ForgeReply::Fetched(
+            read.clone(),
+            None,
+            Ok(crate::forge::provider::Fetched::payload(
+                crate::forge::request::Payload::Text("on: workflow_dispatch".into()),
+            )),
+            None,
+        );
+        ws.active.answer_for_test(
+            request,
+            (ws.host.clone(), ws.repo.clone(), ws.scope_epoch),
+            result,
+        );
+
+        ws.page(1);
+        ws.page(3);
+        assert_eq!(ws.repo, "octo/orbit");
+        assert_eq!(ws.pending_dispatch(), None);
+        assert!(!ws.queue.iter().any(|request| request.key == key));
+        // A's workflow can share B's ID, and a failed lookup would also open a ref-only sheet.
+        ws.cache.insert(key, Err("No inputs schema".into()));
+        ws.poll();
+        assert!(ws.take_form().is_none());
+        assert!(ws.submit(action, vec!["main".into()]).is_err());
+        assert!(
+            !ws.queue
+                .iter()
+                .chain(ws.active.requests())
+                .any(|request| { matches!(request.op, Op::Write(_, Write::Dispatch { .. }, _)) })
+        );
+    }
+
+    #[test]
+    fn actions_wraps_the_api_path_remedy_below_the_heading() {
+        let (_root, mut app) = actions_screen();
+        let heading = crate::forge::credential::API_PATH_NOT_FOUND;
+        let address = "https://git.acme.example/tools/code/engineering/teams/infrastructure/production/forge-instance/api/v4";
+        app.github.repo.clear();
+        app.github.cache.insert(
+            Key::Repository,
+            Err(format!("Not found · {heading} Set api_base to {address}")),
+        );
+
+        let shown = frame(&mut app, 100, 30);
+        assert!(shown.grid.row_text(2).contains(heading));
+        assert!(!shown.grid.row_text(2).contains("Set api_base"));
+        let hint = (3..29)
+            .map(|y| {
+                let content: String = shown.grid.row_text(y).chars().skip(2).take(96).collect();
+                content.trim().to_owned()
+            })
+            .collect::<String>();
+        assert!(
+            hint.contains(&format!("Set api_base to {address}")),
+            "{hint}"
+        );
+    }
+
+    #[test]
+    fn history_wraps_the_api_path_remedy_with_cached_gitlab_repository_metadata() {
+        let (_root, mut app) = actions_screen();
+        let heading = crate::forge::credential::API_PATH_NOT_FOUND;
+        let address = "https://git.acme.example/tools/code/api/v4";
+        let remedy = "Set api_base to";
+        app.github.host = "gitlab.com".into();
+        app.github.cache.retain(|key, _| *key == Key::Repository);
+        app.github.cache.insert(
+            Key::Runs(0),
+            Err(format!("Not found · {heading} {remedy} {address}")),
+        );
+
+        let shown = frame(&mut app, 100, 30);
+        assert!(app.github.value(&Key::Repository).is_some());
+        let history: Vec<String> = (2..28)
+            .map(|y| {
+                let cells: String = shown.grid.row_text(y).chars().skip(2).take(36).collect();
+                cells.trim().to_owned()
+            })
+            .collect();
+        let remedy_at = history
+            .iter()
+            .position(|row| row.starts_with(remedy))
+            .expect("the left history pane shows the path remedy");
+        assert!(history[..remedy_at].join(" ").contains(heading));
+        let full_address = history[remedy_at..]
+            .iter()
+            .take_while(|row| !row.is_empty())
+            .map(|row| row.strip_prefix(remedy).unwrap_or(row).trim())
+            .collect::<String>();
+        assert_eq!(full_address, address);
+    }
+
+    #[test]
+    fn history_failure_is_visible_with_the_sidebar_hidden() {
+        let (_root, mut app) = actions_screen();
+        app.github.toggle_sidebar();
+        app.github
+            .cache
+            .insert(Key::Runs(0), Err("Network error · 502 Bad Gateway".into()));
+
+        let shown = frame(&mut app, 100, 30);
+        assert!((1..29).any(|row| {
+            shown
+                .grid
+                .row_text(row)
+                .contains("github.com is having problems")
+        }));
+        assert!(!shown.grid.row_text(29).contains("d run workflow"));
+
+        app.github.event(&KeyEvent::character('/'), None).unwrap();
+        let editing = frame(&mut app, 100, 30);
+        assert!(editing.cursor.is_some(), "the filter has a visible input");
+        assert!(editing.grid.row_text(29).contains("Enter filter"));
     }
 
     /// A run sheet names the run as the header does, says what it does, and a destructive one
@@ -5487,30 +5876,29 @@ mod tests {
                 reply.value[0]["conclusion"] = Value::Null;
             }
             workspace.sync_actions();
-            assert!(workspace.shown_runs().is_empty());
+            assert_eq!(workspace.actions.section, 2);
+            assert_eq!(workspace.run_target(), Some(501));
+            assert_eq!(workspace.run_cursor(&workspace.shown_runs()), Some(0));
         };
 
-        // Re-run from the reader: the run stays open there until the cursor moves.
-        let mut workspace = start(true);
-        workspace.written(&rerun, Ok(Default::default()), true);
-        leave_failing(&mut workspace);
-        assert_eq!(workspace.run_target(), Some(501));
-        workspace.choose_section(1);
-        assert_eq!(workspace.run_target(), None);
-
-        // Re-run from the list: the cursor moves on with the list.
-        let mut workspace = start(false);
-        workspace.written(&rerun, Ok(Default::default()), true);
-        leave_failing(&mut workspace);
-        assert_eq!(workspace.run_target(), None);
+        // Re-run in either pane: Running now highlights the run and the reader stays on it.
+        for reading in [true, false] {
+            let mut workspace = start(reading);
+            workspace.written(&rerun, Ok(Default::default()), &workspace.target());
+            leave_failing(&mut workspace);
+            assert_eq!(workspace.actions.right, reading);
+            assert_eq!(workspace.wanted_artifacts(), Some(501));
+            workspace.choose_section(1);
+            assert_eq!(workspace.run_target(), None);
+        }
 
         // One job's reply names only the job: it pins the run it was sent for, not another.
         let mut workspace = start(true);
         workspace.actions.rerun_job_run = Some(502);
-        workspace.written(&Write::RerunJob(7.into()), Ok(Default::default()), true);
+        workspace.written(&Write::RerunJob(7.into()), Ok(Default::default()), &target);
         assert!(!workspace.actions.pinned);
         workspace.actions.rerun_job_run = Some(501);
-        workspace.written(&Write::RerunJob(7.into()), Ok(Default::default()), true);
+        workspace.written(&Write::RerunJob(7.into()), Ok(Default::default()), &target);
         assert!(workspace.actions.pinned);
     }
 

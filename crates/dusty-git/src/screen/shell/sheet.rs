@@ -19,8 +19,12 @@ pub(in crate::screen) fn paint(app: &GitScreen, frame: &mut Frame, lay: &Layout)
         return true;
     };
     match &form.action {
-        FormAction::Operation { .. }
-        | FormAction::Github(super::super::github::Action::Files(_)) => false,
+        FormAction::Operation { .. } => false,
+        FormAction::Github(action)
+            if matches!(action.unscoped(), super::super::github::Action::Files(_)) =>
+        {
+            false
+        }
         FormAction::Commit => {
             commit(app, frame, form, lay);
             true
@@ -455,28 +459,29 @@ fn primary_label(app: &GitScreen, form: &Form) -> &'static str {
     use super::super::refs::Action as Ref;
     let pipeline = app.github.terms().run_noun == "pipeline";
     match &form.action {
-        // The button says the verb the footer says.
-        FormAction::Github(Action::Cancel(_)) if pipeline => "Cancel pipeline",
-        FormAction::Github(Action::Cancel(_)) => "Cancel run",
-        FormAction::Github(Action::Rerun(_)) => "Re-run jobs",
-        FormAction::Github(Action::Dispatch(_)) => "Run workflow",
-        FormAction::Github(Action::Approve(_)) => "Approve",
-        FormAction::Github(Action::Download(..)) => "Download",
-        FormAction::Github(Action::SaveLog(_)) => "Save",
-        FormAction::Github(Action::CreatePullRequest) => "Review →",
-        FormAction::Github(
-            Action::CreatePullRequestWeb | Action::Browser(..) | Action::Web(..),
-        ) => "Open in browser",
-        FormAction::Github(Action::InlineRange { .. }) => "Add review comment",
-        FormAction::Github(Action::Draft(..)) => "Save",
-        FormAction::Github(Action::ConfirmPullRequest(request)) if request.push.is_some() => {
-            "Push + create PR"
-        }
-        FormAction::Github(Action::ConfirmPullRequest(_)) => "Create PR",
-        FormAction::Github(Action::SaveView(..)) => "Save view",
-        // The verb the title asks about, not a bare `Confirm`.
-        FormAction::Github(Action::State(_, _, true)) => "Close",
-        FormAction::Github(Action::State(_, _, false)) => "Reopen",
+        FormAction::Github(action) => match action.unscoped() {
+            // The button says the verb the footer says.
+            Action::Cancel(_) if pipeline => "Cancel pipeline",
+            Action::Cancel(_) => "Cancel run",
+            Action::Rerun(_) => "Re-run jobs",
+            Action::Dispatch(_) if pipeline => "Run pipeline",
+            Action::Dispatch(_) => "Run workflow",
+            Action::Approve(_) => "Approve",
+            Action::Download(..) => "Download",
+            Action::SaveLog(_) | Action::Draft(..) => "Save",
+            Action::ReplaceLog { .. } => "Replace",
+            Action::CreatePullRequest => "Review →",
+            Action::CreatePullRequestWeb | Action::Browser(..) | Action::Web(..) => {
+                "Open in browser"
+            }
+            Action::InlineRange { .. } => "Add review comment",
+            Action::ConfirmPullRequest(request) if request.push.is_some() => "Push + create PR",
+            Action::ConfirmPullRequest(_) => "Create PR",
+            Action::SaveView(..) => "Save view",
+            Action::State(_, _, true) => "Close",
+            Action::State(_, _, false) => "Reopen",
+            _ => "Confirm",
+        },
         FormAction::Rewrite(plan) => match plan.kind {
             crate::rewrite::Kind::Amend => "Amend",
             crate::rewrite::Kind::Reword => "Reword",
@@ -660,7 +665,7 @@ fn generic(app: &GitScreen, frame: &mut Frame, form: &Form, lay: &Layout) {
     // Closing an issue adds an optional comment; the dialog stays a short question.
     let short = matches!(
         &form.action,
-        FormAction::Github(super::super::github::Action::State(..))
+        FormAction::Github(action) if matches!(action.unscoped(), super::super::github::Action::State(..))
     );
     let w = if short { w.min(72) } else { w };
     // The note wraps in the interior less its one-column pad (a rerun's second line says why
@@ -682,7 +687,9 @@ fn generic(app: &GitScreen, frame: &mut Frame, form: &Form, lay: &Layout) {
     let rect = Rect::new(x, body.y + body.h.saturating_sub(h) / 2, w, h);
     // The `Field 1/2` pager shows only when some field is out of view: a sheet whose
     // fields all show reads as GitHub's dialogs do, without a counter (R16-issues-06).
-    let position = if form.fields.len() > 1 && note.is_empty() && wanted > h {
+    let position = if path_top.is_some() && wanted > h {
+        "↑/↓ scroll".to_owned()
+    } else if form.fields.len() > 1 && note.is_empty() && wanted > h {
         format!(
             "Field {}/{}",
             (form.selected + 1).min(form.fields.len()),
@@ -731,21 +738,26 @@ fn generic(app: &GitScreen, frame: &mut Frame, form: &Form, lay: &Layout) {
     } else {
         usize::from(chrome::width(&position)) + 3
     };
-    let title = cut_title(
-        &form.title,
-        usize::from(w.saturating_sub(6)).saturating_sub(glyph_cells + position_cells),
-    );
+    let title = cut_title(title, cells.saturating_sub(glyph_cells + position_cells));
     let spans = if run_sheet {
         vec![(title, bold(GitRole::Text, SURFACE))]
     } else {
         title_spans(app, glyph_kind, &title)
     };
     let inner = frame_box(frame, rect, &spans, &position);
-    let fields_bottom = inner
-        .bottom()
-        .saturating_sub(1 + u16::from(status.is_some()));
+    let fields_bottom = inner.bottom().saturating_sub(1 + status_rows);
 
-    for (row, (line, first)) in note.iter().enumerate() {
+    let note_room = if path_top.is_some() {
+        usize::from(fields_bottom.saturating_sub(inner.y + 1))
+    } else {
+        note.len()
+    };
+    let note_start = path_top.map_or(0, |top| {
+        let first = top.get().min(note.len().saturating_sub(note_room));
+        top.set(first);
+        first
+    });
+    for (row, (line, first)) in note.iter().skip(note_start).take(note_room).enumerate() {
         frame.grid.put_text_clipped(
             inner.x + 1,
             inner.y + 1 + row as u16,
@@ -858,21 +870,24 @@ fn generic(app: &GitScreen, frame: &mut Frame, form: &Form, lay: &Layout) {
             focused,
         );
     }
-    if let Some((text, error)) = status {
-        frame.grid.put_text_clipped(
-            inner.x + 1,
-            inner.bottom() - 2,
-            &chrome::ellipsize(&text, usize::from(inner.w.saturating_sub(1))),
-            st(
-                if error {
-                    GitRole::Removed
-                } else {
-                    GitRole::Modified
-                },
-                SURFACE,
-            ),
-            inner.right(),
+    if let Some((rows, error)) = status {
+        let style = st(
+            if error {
+                GitRole::Removed
+            } else {
+                GitRole::Modified
+            },
+            SURFACE,
         );
+        for (offset, line) in rows.iter().enumerate() {
+            frame.grid.put_text_clipped(
+                inner.x + 1,
+                fields_bottom + offset as u16,
+                &chrome::ellipsize(line, usize::from(inner.w.saturating_sub(1))),
+                style,
+                inner.right(),
+            );
+        }
     }
     let hints = match &form.action {
         // The forge pages' footer carries a sheet's keys (one place for them).

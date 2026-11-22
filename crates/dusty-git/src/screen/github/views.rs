@@ -11,46 +11,30 @@ const MAX_VIEWS: usize = 512;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(in crate::screen) struct Scope {
     host: String,
+    web_alias: Option<String>,
     repo: String,
     page: usize,
 }
 impl Scope {
     fn new(host: &str, repo: &str, page: usize) -> Result<Self, String> {
-        if host.is_empty()
-            || host.chars().any(|c| c.is_whitespace() || c.is_control())
-            || host.contains(['/', '\\', '@', '?', '#'])
-        {
-            return Err("Choose a valid GitHub host for saved views".into());
-        }
-        let url = reqwest::Url::parse(&format!("https://{host}"))
-            .map_err(|_| "Choose a valid GitHub host for saved views")?;
+        let host =
+            HostKey::parse_authority(host).ok_or("Choose a valid GitHub host for saved views")?;
         if !matches!(page, 1 | 2)
             || (repo != "*" && !crate::forge::pull_request::valid_repository(repo))
-            || !url.username().is_empty()
-            || url.password().is_some()
-            || url.port().is_some()
-            || url.path() != "/"
-            || url.query().is_some()
-            || url.fragment().is_some()
         {
             return Err("Saved views require a GitHub host, OWNER/REPO and Issues or PRs".into());
         }
-        let host = url
-            .host_str()
-            .ok_or("Saved views require a GitHub host")?
-            .trim_end_matches('.')
-            .to_ascii_lowercase();
-        if host.is_empty() {
-            return Err("Saved views require a GitHub host".into());
-        }
         Ok(Self {
-            host,
+            host: host.to_string(),
+            web_alias: None,
             repo: repo.to_ascii_lowercase(),
             page,
         })
     }
     fn contains(&self, view: &SavedView) -> bool {
-        self.host == view.host && self.repo == view.repo && self.page == view.page
+        (self.host == view.host || self.web_alias.as_ref() == Some(&view.host))
+            && self.repo == view.repo
+            && self.page == view.page
     }
 }
 
@@ -187,7 +171,10 @@ fn store(
     let mut views = read_config(&config)?;
     let at = views
         .iter()
-        .position(|view| scope.contains(view) && view.name == name);
+        .enumerate()
+        .filter(|(_, view)| scope.contains(view) && view.name == name)
+        .min_by_key(|(_, view)| view.host != scope.host)
+        .map(|(at, _)| at);
     match (at, replacement) {
         (Some(at), Some(view)) => views[at] = view,
         (None, Some(view)) => views.push(view),
@@ -220,18 +207,35 @@ impl Workspace {
         }
     }
     pub(super) fn view_scope(&self) -> Result<Scope, String> {
-        Scope::new(
+        let mut scope = Scope::new(
             &self.host,
-            if self.inbox.enabled { "*" } else { &self.repo },
+            if self.inbox.enabled {
+                "*"
+            } else {
+                self.list_repository()
+            },
             self.page,
-        )
+        )?;
+        scope.web_alias = self
+            .advertised_web_host()
+            .map(|host| host.to_string())
+            .filter(|host| host != &scope.host);
+        Ok(scope)
     }
     pub(super) fn scoped_views(&self) -> Result<Vec<SavedView>, String> {
         let scope = self.view_scope()?;
-        Ok(load(&self.root)?
-            .into_iter()
-            .filter(|view| scope.contains(view))
-            .collect())
+        let mut views = load(&self.root)?;
+        // An old view under the web address may share a name with a routing-scoped view.
+        // The picker, save and delete all prefer the routing-scoped one in that case.
+        let primary_names: BTreeSet<_> = views
+            .iter()
+            .filter(|view| scope.contains(view) && view.host == scope.host)
+            .map(|view| view.name.clone())
+            .collect();
+        views.retain(|view| {
+            scope.contains(view) && (view.host == scope.host || !primary_names.contains(&view.name))
+        });
+        Ok(views)
     }
     fn check_view_scope(&self, scope: &Scope) -> Result<(), String> {
         if &self.view_scope()? != scope {
@@ -449,13 +453,16 @@ impl Workspace {
         view: Option<SavedView>,
     ) -> Result<(), String> {
         validate_filter(self.page, &query, &state)?;
-        self.remember_list_selection();
+        if self.restore_local_list_repository().is_none() {
+            self.remember_list_selection();
+        }
         let at = self.page - 1;
         self.queries[at] = query;
         self.states[at] = state;
         self.active_views[at] = view;
         self.restore_list_selection();
         self.opened = None;
+        self.reader_row = None;
         self.inbox.origin_page = None;
         self.selected_commit = None;
         self.focus = 0;
@@ -475,6 +482,69 @@ impl Workspace {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn saved_views_distinguish_ports_on_the_same_host() {
+        let scope = Scope::new("Git.Example.Test.:8443", "*", 1).unwrap();
+        let view = SavedView::new(&scope, "Triage", "", "open").unwrap();
+        assert_eq!(view.host, "git.example.test:8443");
+        assert!(scope.contains(&view));
+        assert!(
+            !Scope::new("git.example.test:8444", "*", 1)
+                .unwrap()
+                .contains(&view)
+        );
+        assert!(
+            !Scope::new("git.example.test", "*", 1)
+                .unwrap()
+                .contains(&view)
+        );
+    }
+
+    #[test]
+    fn old_views_under_the_advertised_host_are_in_the_picker() {
+        let root = tempfile::tempdir().unwrap();
+        git2::Repository::init(root.path()).unwrap();
+        let mut workspace = Workspace::new(root.path().into());
+        workspace.fresh = fresh::Fresh::with(None);
+        workspace.host = "git.internal.example".into();
+        workspace.repo = "o/r".into();
+        workspace.page = 1;
+        workspace.cache.insert(Key::Repository, Ok(Reply {
+            value: serde_json::json!({"nameWithOwner": "o/r", "url": "https://forge.example/o/r"}),
+            text: String::new(),
+        }));
+        for (host, name) in [
+            ("forge.example", "Old view"),
+            ("forge.example:8443", "Other port"),
+            ("elsewhere.example", "Other host"),
+        ] {
+            let scope = Scope::new(host, "o/r", 1).unwrap();
+            let view = SavedView::new(&scope, name, "label:triage", "open").unwrap();
+            store(root.path(), &scope, name, Some(view)).unwrap();
+        }
+        let form = workspace.views_form().unwrap();
+        assert!(
+            form.fields[0]
+                .choices
+                .iter()
+                .any(|label| label == "Saved: Old view")
+        );
+        assert!(
+            !form.fields[0]
+                .choices
+                .iter()
+                .any(|label| label.starts_with("Saved: Other"))
+        );
+        workspace.choose_view("Saved: Old view").unwrap();
+        assert_eq!(workspace.queries[0], "label:triage");
+        let scope = workspace.view_scope().unwrap();
+        workspace
+            .delete_view(&scope, &["Old view".into(), "Delete locally".into()])
+            .unwrap();
+        assert!(workspace.scoped_views().unwrap().is_empty());
+        assert_eq!(load(root.path()).unwrap().len(), 2);
+    }
 
     #[test]
     fn local_views_validate_canonical_scope_and_preserve_every_other_scope() {
@@ -517,6 +587,30 @@ mod tests {
                 .contains("Couldn't read saved views · your saved views are unchanged")
         );
         assert_eq!(local.get_string(CONFIG_KEY).unwrap(), "not valid JSON");
+    }
+
+    #[test]
+    fn saved_views_from_a_linked_reader_belong_to_the_list() {
+        let root = tempfile::tempdir().unwrap();
+        git2::Repository::init(root.path()).unwrap();
+        let mut ws = Workspace::new(root.path().into());
+        ws.fresh = fresh::Fresh::with(None);
+        ws.change_repository("example/home".into(), "github.com".into());
+        ws.page(1);
+
+        let home = ws.view_scope().unwrap();
+        let foreign = Scope::new("github.com", "example/linked", 1).unwrap();
+        for (scope, query) in [(&home, "label:home"), (&foreign, "label:foreign")] {
+            let view = SavedView::new(scope, "Triage", query, "open").unwrap();
+            store(root.path(), scope, &view.name, Some(view.clone())).unwrap();
+        }
+        ws.follow(open::parse("https://github.com/example/linked/issues/7").unwrap());
+        assert_eq!(ws.repo, "example/linked");
+        assert_eq!(ws.scoped_views().unwrap()[0].query, "label:home");
+
+        ws.choose_view("Saved: Triage").unwrap();
+        assert_eq!(ws.repo, "example/home");
+        assert_eq!(ws.queries[0], "label:home");
     }
 
     #[test]

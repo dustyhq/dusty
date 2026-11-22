@@ -12,6 +12,7 @@ use std::time::Duration;
 /// Opens the accounts popover, which says how to sign in to each host. Free on every forge
 /// screen and in every preset (`a` is assignees in a reader and attempts in a run).
 pub(super) const SIGN_IN_KEY: char = '@';
+pub(super) const RETRY_AFTER_RESET: &str = "R retry after reset";
 
 /// One failure in words: the headline (what happened) and the hint (the next key).
 #[derive(Clone, Debug, PartialEq, Eq)]

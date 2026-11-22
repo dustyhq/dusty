@@ -2126,6 +2126,66 @@ impl GitScreen {
 mod coverage {
     use super::*;
 
+    #[test]
+    fn forge_banner_fits_the_confirmation_steps_at_narrow_widths() {
+        let height = 30;
+        for (chapter, title, width, confirmations) in [
+            (
+                "Issues",
+                "Close",
+                80,
+                ["Close, then Enter", "X, then Enter"],
+            ),
+            (
+                "Actions",
+                "Rerun",
+                100,
+                ["Debug logging", "Re-run jobs, Enter"],
+            ),
+            (
+                "Actions",
+                "Artifacts",
+                80,
+                ["Enter on run #7", "s, Ctrl+Enter"],
+            ),
+            (
+                "Actions",
+                "Artifacts",
+                100,
+                ["Enter on run #7", "s, Ctrl+Enter"],
+            ),
+        ] {
+            let (_, lesson) = Track::Forge
+                .lessons(false)
+                .find(|(section, lesson)| section.name == chapter && lesson.title == title)
+                .unwrap();
+            let instruction = keyed(lesson.instruction, github::keymap::Keys::default());
+            let frame = with_banner(
+                Frame {
+                    grid: CellGrid::new(width, height - BANNER_ROWS),
+                    cursor: None,
+                },
+                Banner {
+                    title: title.into(),
+                    completed: None,
+                    instruction: instruction.clone(),
+                    hint: "",
+                },
+                width,
+                height,
+            );
+            let row = frame.grid.row_text(height - BANNER_ROWS);
+            assert_eq!(
+                row.trim(),
+                instruction,
+                "{chapter} · {title} at {width} columns"
+            );
+            for keys in confirmations {
+                assert!(row.contains(keys), "{chapter} · {title}: {row}");
+            }
+        }
+    }
+
     /// Moving about, which every lesson does on the way: the only items without a lesson.
     const TRIVIAL: &[&str] = &[
         "Navigate · Move",

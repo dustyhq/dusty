@@ -281,7 +281,7 @@ impl Workspace {
         self.cache.remove(&Key::Write);
         self.enqueue(
             Key::Write,
-            Op::Write(
+            self.write_op(
                 self.target(),
                 Write::OpenInBrowser {
                     kind: ItemKind::PullRequest,

@@ -577,8 +577,8 @@ fn render_changed_file_picker(
     height: u16,
 ) -> bool {
     if !matches!(
-        form.action,
-        super::FormAction::Github(super::github::Action::Files(_))
+        &form.action,
+        super::FormAction::Github(action) if matches!(action.unscoped(), super::github::Action::Files(_))
     ) || width < 24
         || height < 8
     {

@@ -345,7 +345,7 @@ pub(in crate::screen) fn frame(app: &mut GitScreen, width: u16, height: u16) -> 
     let reply = app.form.as_ref().filter(|form| {
         matches!(
             &form.action,
-            FormAction::Github(Action::Comment(..) | Action::Reply { .. })
+            FormAction::Github(action) if matches!(action.unscoped(), Action::Comment(..) | Action::Reply { .. })
         ) && geometry.reader.is_some()
     });
     let reply_rows = reply.map_or(0, |_| 9);
@@ -2464,10 +2464,12 @@ fn reply_box(
         .next()
         .filter(|first| first.starts_with("Reply to "));
     let label = match (&form.action, login) {
-        (FormAction::Github(Action::Reply { .. }), Some(login)) => {
+        (FormAction::Github(action), Some(login))
+            if matches!(action.unscoped(), Action::Reply { .. }) =>
+        {
             format!("{} · as {login}", target.unwrap_or("Reply in thread"))
         }
-        (FormAction::Github(Action::Reply { .. }), None) => {
+        (FormAction::Github(action), None) if matches!(action.unscoped(), Action::Reply { .. }) => {
             target.unwrap_or("Reply in thread").to_owned()
         }
         (_, Some(login)) => format!("Comment as {login}"),
@@ -2535,7 +2537,7 @@ fn footer(app: &GitScreen, frame: &mut Frame, rect: Rect, filter: bool) {
         } else if super::forms::owns(form) {
             // Review and merge: the send key stays in the footer with the field keys.
             let multiline = form.fields.iter().any(|field| field.multiline);
-            let merge = matches!(&form.action, FormAction::Github(Action::Merge(..)));
+            let merge = matches!(&form.action, FormAction::Github(action) if matches!(action.unscoped(), Action::Merge(..)));
             vec![
                 (
                     if multiline { "Ctrl+Enter" } else { "Enter" },
@@ -2547,7 +2549,7 @@ fn footer(app: &GitScreen, frame: &mut Frame, rect: Rect, filter: bool) {
             ]
         } else if matches!(
             &form.action,
-            FormAction::Github(Action::Comment(..) | Action::Reply { .. })
+            FormAction::Github(action) if matches!(action.unscoped(), Action::Comment(..) | Action::Reply { .. })
         ) {
             // The composer: Esc leaves the text in place for the next `c`.
             vec![("Ctrl+Enter", "submit"), ("Esc", "keep draft")]

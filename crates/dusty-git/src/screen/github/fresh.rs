@@ -99,7 +99,7 @@ pub(super) struct Fresh {
     pub(super) live: Option<Live>,
     pub(super) live_key: Option<Key>,
     /// Values replaced by an optimistic write, restored if the forge refuses it.
-    undo: Vec<(Key, Option<Value>)>,
+    undo: Vec<Undo>,
     /// Gitea's and Forgejo's list check marks, asked for the rows on screen.
     pub(super) rows: super::row_checks::Rows,
     /// Disk reads for the rows the cursor passes over, off the UI thread.
@@ -112,6 +112,12 @@ pub(super) struct Fresh {
     /// The warm-up's keys still being read from disk: queued for the forge once the disk says
     /// whether it holds them, fresh.
     warm_disk: Vec<Request>,
+}
+
+struct Undo {
+    key: Key,
+    scope: CacheScope,
+    before: Value,
 }
 
 impl Fresh {
@@ -445,7 +451,14 @@ impl Workspace {
         self.note_totals(key, &envelope.data);
         let (mut value, text) = crate::forge::legacy::encode(shape(key), &envelope.data);
         if let Key::Inbox(host, page, state, _) = key
-            && inbox::validate_rows(&mut value, host, *page, state).is_err()
+            && inbox::validate_rows(
+                &mut value,
+                host,
+                self.advertised_web_host().as_ref(),
+                *page,
+                state,
+            )
+            .is_err()
         {
             return false;
         }
@@ -620,10 +633,21 @@ impl Workspace {
                 self.note_totals(&request.key, &value);
                 let (mut value, text) = crate::forge::legacy::encode(shape(&request.key), &value);
                 match &request.key {
-                    Key::Inbox(host, page, state, _) => {
-                        inbox::validate_rows(&mut value, host, *page, state)
-                            .map(|()| Reply { value, text })
+                    Key::Repository => {
+                        if self.apply_repository(&value, routing_host.as_ref()) {
+                            Ok(Reply { value, text })
+                        } else {
+                            Err("Forge returned an invalid repository".into())
+                        }
                     }
+                    Key::Inbox(host, page, state, _) => inbox::validate_rows(
+                        &mut value,
+                        host,
+                        self.advertised_web_host().as_ref(),
+                        *page,
+                        state,
+                    )
+                    .map(|()| Reply { value, text }),
                     _ => Ok(Reply { value, text }),
                 }
             }
@@ -713,6 +737,9 @@ impl Workspace {
             Err(error) => {
                 self.cache.insert(request.key.clone(), Err(error));
             }
+        }
+        if request.key == self.list_key() {
+            self.refresh_reader_preview();
         }
         if let Some(id) = selected_item {
             let index = self.page.saturating_sub(1).min(1);
@@ -1271,17 +1298,33 @@ impl Workspace {
                     Key::Item(page, *id),
                     Box::new(move |item| item["state"] = word.into()),
                 ));
-                let id = *id;
-                edits.push((
-                    self.list_key_at(page, &self.states[page - 1], &self.queries[page - 1]),
-                    Box::new(move |rows| {
-                        for row in rows.as_array_mut().into_iter().flatten() {
-                            if number(row, "number") == id {
-                                row["state"] = word.into();
+                if self.inbox.enabled || self.repo.eq_ignore_ascii_case(self.list_repository()) {
+                    let id = *id;
+                    let scope = self.inbox.enabled.then(|| {
+                        (
+                            self.host.clone(),
+                            self.repo.clone(),
+                            self.advertised_web_host(),
+                        )
+                    });
+                    edits.push((
+                        self.list_key_at(page, &self.states[page - 1], &self.queries[page - 1]),
+                        Box::new(move |rows| {
+                            for row in rows.as_array_mut().into_iter().flatten() {
+                                if number(row, "number") == id
+                                    && scope.as_ref().is_none_or(|(host, repo, alias)| {
+                                        inbox::Target::from_row(row, host, alias.as_ref(), page)
+                                            .is_ok_and(|target| {
+                                                target.repo.eq_ignore_ascii_case(repo)
+                                            })
+                                    })
+                                {
+                                    row["state"] = word.into();
+                                }
                             }
-                        }
-                    }),
-                ));
+                        }),
+                    ));
+                }
             }
             Write::SetLabels {
                 kind,
@@ -1314,12 +1357,15 @@ impl Workspace {
             _ => {}
         }
         for (key, edit) in edits {
+            let scope = self.cache_scope(&key);
             let Some(Ok(reply)) = self.cache.get_mut(&key) else {
                 continue;
             };
-            self.fresh
-                .undo
-                .push((key.clone(), Some(reply.value.clone())));
+            self.fresh.undo.push(Undo {
+                scope,
+                key: key.clone(),
+                before: reply.value.clone(),
+            });
             edit(&mut reply.value);
             reply.text = reply.value.to_string();
             // A read of it already on its way answers for the time before the write: dropped,
@@ -1335,20 +1381,15 @@ impl Workspace {
         if confirmed {
             return;
         }
-        for (key, value) in undo.into_iter().rev() {
-            match value {
-                Some(value) => {
-                    self.cache.insert(
-                        key,
-                        Ok(Reply {
-                            text: value.to_string(),
-                            value,
-                        }),
-                    );
-                }
-                None => {
-                    self.cache.remove(&key);
-                }
+        for Undo { key, scope, before } in undo.into_iter().rev() {
+            if scope == self.cache_scope(&key) {
+                self.cache.insert(
+                    key,
+                    Ok(Reply {
+                        text: before.to_string(),
+                        value: before,
+                    }),
+                );
             }
         }
     }

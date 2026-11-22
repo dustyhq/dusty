@@ -5,6 +5,7 @@ use super::super::shell::chrome::{self, Span, bold, st};
 use super::super::shell::glyphs::{Glyph, glyph};
 use super::super::shell::layout::Rect;
 use super::super::{Field, Form, FormAction};
+use super::actions::SourceBranch;
 use super::*;
 use crate::config::ExplorerIconMode;
 use crate::forge::records::DetailRecord;
@@ -17,7 +18,7 @@ const PANE: GitSurface = GitSurface::Pane;
 pub(super) fn owns(form: &Form) -> bool {
     matches!(
         &form.action,
-        FormAction::Github(Action::Review(_) | Action::Merge(..))
+        FormAction::Github(action) if matches!(action.unscoped(), Action::Review(_) | Action::Merge(..))
     )
 }
 
@@ -187,7 +188,7 @@ pub(super) fn paint(
     notice: &str,
 ) {
     chrome::fill(&mut frame.grid, rect, st(GitRole::Text, PANE));
-    let merge = matches!(&form.action, FormAction::Github(Action::Merge(..)));
+    let merge = matches!(&form.action, FormAction::Github(action) if matches!(action.unscoped(), Action::Merge(..)));
     let title: Vec<Span> = vec![
         (
             format!(
@@ -563,11 +564,12 @@ pub(super) fn paint(
         let delete = form
             .fields
             .iter()
-            .any(|field| field.input.input == "Delete it after the merge");
-        if delete {
-            "the source branch is deleted afterwards"
-        } else {
-            "the source branch stays"
+            .find(|field| field.label == SourceBranch::LABEL)
+            .and_then(|field| SourceBranch::parse(&field.input.input));
+        match source_branch {
+            Some(SourceBranch::Delete) => "the source branch is deleted afterwards",
+            Some(SourceBranch::Keep) => "the source branch stays",
+            None => "",
         }
         .to_owned()
     } else {
@@ -576,18 +578,19 @@ pub(super) fn paint(
             .get(&workspace.number())
             .map_or(0, Vec::len);
         // What the send carries; the threads above are already counted there.
-        let detail = match drafts {
+        match drafts {
             0 => "summary only, no pending comments".to_owned(),
             n => super::drafts::pending(n),
-        };
+        }
+    };
+    if !detail.is_empty() {
         at = frame
             .grid
             .put_text_clipped(at, y + 1, " · ", st(GitRole::Border, PANE), right);
-        detail
-    };
-    frame
-        .grid
-        .put_text_clipped(at, y + 1, &detail, st(GitRole::Muted, PANE), right);
+        frame
+            .grid
+            .put_text_clipped(at, y + 1, &detail, st(GitRole::Muted, PANE), right);
+    }
     if !notice.is_empty() {
         frame.grid.put_text_clipped(
             x,

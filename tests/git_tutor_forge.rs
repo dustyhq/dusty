@@ -83,6 +83,34 @@ fn rendered(frame: &Frame) -> String {
 fn view(screen: &mut GitScreen) -> String {
     rendered(&screen.frame(WIDTH, HEIGHT))
 }
+fn focused_row(screen: &mut GitScreen) -> String {
+    let frame = screen.frame(WIDTH, HEIGHT);
+    frame
+        .cursor
+        .map_or_else(String::new, |(_, y, _)| frame.grid.row_text(y))
+}
+
+fn active_section(screen: &mut GitScreen, label: &str) -> bool {
+    use dusty::ui::{GitSurface, Style};
+    let frame = screen.frame(WIDTH, HEIGHT);
+    (1..HEIGHT - 1).any(|y| {
+        (1..WIDTH).any(|x| {
+            label.chars().enumerate().all(|(i, ch)| {
+                frame.grid.get(x + i as u16, y).is_some_and(|cell| {
+                    cell.symbol.starts_with(ch)
+                        && matches!(
+                            cell.style,
+                            Style::Git {
+                                surface: GitSurface::ChipActive,
+                                ..
+                            }
+                        )
+                })
+            })
+        })
+    })
+}
+
 fn wait(screen: &mut GitScreen, what: &str, mut ready: impl FnMut(&mut GitScreen) -> bool) {
     // Every lesson starts its own practice forge; a loaded CI runner needs the slack.
     let deadline = Instant::now() + Duration::from_secs(60);
@@ -436,7 +464,7 @@ fn every_forge_lesson_advances_on_real_input_against_the_practice_forge() {
     idle(s);
     char(s, 'X');
     shows(s, "Reopen issue #");
-    ctrl_enter(s);
+    key(s, KeyCode::Enter);
     lesson(s, "Issues · New issue");
     key(s, KeyCode::Escape);
     char(s, 'n');
@@ -513,30 +541,51 @@ fn every_forge_lesson_advances_on_real_input_against_the_practice_forge() {
         ctrl_enter(s);
     });
     char(s, 'j');
-    until(s, "Actions · Rerun", |s| {
-        char(s, 'A');
-        ctrl_enter(s);
-    });
+    char(s, 'A');
+    shows(s, "Approve run");
+    key(s, KeyCode::Tab);
+    assert!(focused_row(s).contains("›[ Approve ]"), "{}", view(s));
+    key(s, KeyCode::Enter);
+    lesson(s, "Actions · Rerun");
     char(s, ']');
-    until(s, "Actions · Artifacts", |s| {
-        if view(s).contains("Failed jobs only") {
-            ctrl_enter(s);
-        } else {
-            char(s, 'r');
-        }
+    let run = "Exercise the retry-limit regression check";
+    wait(s, "the failing run selected", |s| {
+        active_section(s, "Failing") && focused_row(s).contains(run)
+    });
+    char(s, 'r');
+    shows(s, "Failed jobs only");
+    key(s, KeyCode::Tab);
+    assert!(focused_row(s).contains("Off"), "{}", view(s));
+    key(s, KeyCode::Tab);
+    assert!(focused_row(s).contains("›[ Re-run jobs ]"), "{}", view(s));
+    key(s, KeyCode::Enter);
+    lesson(s, "Actions · Artifacts");
+    wait(s, "the same run selected under Running", |s| {
+        let row = focused_row(s);
+        active_section(s, "Running")
+            && row.contains(run)
+            && (row.contains("queued") || row.contains("running"))
     });
     key(s, KeyCode::Enter);
-    until(s, "Notifications · Inbox", |s| {
-        let shown = view(s);
-        if shown.contains("Download artifact") {
-            ctrl_enter(s);
-        } else if shown.contains("junit.xml") || shown.contains("coverage.json") {
-            char(s, 's');
-        } else {
-            char(s, 'G');
-            key(s, KeyCode::Enter);
-        }
-    });
+    shows(s, "Artifacts (");
+    char(s, 'G');
+    assert!(focused_row(s).contains("Artifacts ("), "{}", view(s));
+    key(s, KeyCode::Enter);
+    char(s, 'j');
+    let archive = focused_row(s);
+    let (name, file) = if archive.contains("test-report") {
+        ("test-report", "junit.xml")
+    } else {
+        assert!(archive.contains("coverage"), "{}", view(s));
+        ("coverage", "coverage.json")
+    };
+    key(s, KeyCode::Enter);
+    shows(s, file);
+    assert!(focused_row(s).contains(name), "{}", view(s));
+    char(s, 's');
+    shows(s, "Download artifact");
+    ctrl_enter(s);
+    lesson(s, "Notifications · Inbox");
 
     // Notifications: the inbox, read, unread, filter, sidebar, save, done, unsubscribe.
     char(s, '<');

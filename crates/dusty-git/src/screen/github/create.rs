@@ -656,14 +656,23 @@ impl Workspace {
             Some(count) => note.push_str(&format!(" · {count} commits")),
         }
         if web {
-            let reason = self
-                .refusal(&Action::CreatePullRequest)
-                .unwrap_or("Signed out");
-            let reason = reason.split(" · ").next().unwrap_or(reason);
-            note.push_str(&format!(
-                "\n{} · the forge's own form opens with these filled in.",
-                reason.trim_end_matches('.')
-            ));
+            if fields
+                .iter()
+                .find(|field| field.label == "Description")
+                .is_some_and(|field| web_body_shortened(&field.input.input))
+            {
+                note.push('\n');
+                note.push_str(SHORTENED_WEB_BODY);
+            } else {
+                let reason = self
+                    .refusal(&Action::CreatePullRequest)
+                    .unwrap_or("Signed out");
+                let reason = reason.split(" · ").next().unwrap_or(reason);
+                note.push_str(&format!(
+                    "\n{} · the forge's own form opens with these filled in.",
+                    reason.trim_end_matches('.')
+                ));
+            }
             return Some(note);
         }
         if self.pr_value(fields, "Publish branch") != PUSH {
@@ -816,7 +825,7 @@ impl Workspace {
 
 /// The footer's word for a feature sheet's submit key, matching its button.
 pub(super) fn submit_verb(action: &Action) -> Option<&'static str> {
-    match action {
+    match action.unscoped() {
         Action::CreatePullRequest => Some("review"),
         Action::CreatePullRequestWeb | Action::Browser(..) | Action::Web(..) => {
             Some("open in browser")

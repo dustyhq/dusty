@@ -97,6 +97,13 @@ pub(in crate::screen) enum Action {
     MergeMethod(u64),
 }
 impl Action {
+    pub(in crate::screen) fn unscoped(&self) -> &Self {
+        match self {
+            Self::Scoped { action, .. } => action.unscoped(),
+            _ => self,
+        }
+    }
+
     pub(super) fn item_scoped(&self) -> bool {
         matches!(
             self,
@@ -176,6 +183,30 @@ pub(super) fn choice(label: &str, value: &str, choices: &[&str]) -> Field {
     field.choices = choices.iter().map(|s| (*s).into()).collect();
     field
 }
+#[derive(PartialEq, Eq)]
+pub(super) enum SourceBranch {
+    Keep,
+    Delete,
+}
+
+impl SourceBranch {
+    pub(super) const LABEL: &str = "Source branch";
+    pub(super) const KEEP: &str = "Keep it";
+    pub(super) const DELETE: &str = "Delete it after the merge";
+
+    fn field() -> Field {
+        choice(Self::LABEL, Self::KEEP, &[Self::KEEP, Self::DELETE])
+    }
+
+    pub(super) fn parse(value: &str) -> Option<Self> {
+        match value {
+            Self::KEEP => Some(Self::Keep),
+            Self::DELETE => Some(Self::Delete),
+            _ => None,
+        }
+    }
+}
+
 fn kind(page: usize) -> ItemKind {
     if page == 1 {
         ItemKind::Issue
@@ -199,7 +230,11 @@ impl Workspace {
         repo: &str,
         host: &str,
     ) -> Result<&Value, String> {
-        if self.repo != repo || self.host != host || self.page != 2 || self.number() != number {
+        if !self.repo.eq_ignore_ascii_case(repo)
+            || self.host != host
+            || self.page != 2
+            || self.number() != number
+        {
             return Err(
                 "This conversation changed · reopen it to reply · your draft is kept".into(),
             );
@@ -234,14 +269,27 @@ impl Workspace {
         Ok(())
     }
     pub(in crate::screen) fn activate(&mut self, action: Action) -> Result<Option<Form>, String> {
+        if action.writes() || matches!(action, Action::Run(_)) {
+            self.cancel_pending_run_forms();
+        }
+        self.check_inbox_action(&action)?;
+        if matches!(
+            action,
+            Action::Review(_)
+                | Action::Inline { .. }
+                | Action::InlineRange { .. }
+                | Action::Draft(..)
+        ) {
+            self.sync_drafts();
+        }
         if let Some(result) = self.activate_feature(&action) {
             return result;
         }
-        self.check_inbox_action(&action)?;
         if let Some(reason) = self.refusal(&action) {
             // The sign-in key and this forge's own way in: `gh`, `glab`, or the token
             // settings page on Gitea and Forgejo.
-            let hint = super::states::sign_in_hint(self.forge_kind(), &self.host);
+            let site = self.advertised_site_base();
+            let hint = super::states::sign_in_hint(self.forge_kind(), &self.host, site.as_deref());
             return Err(format!("{reason} · {hint}"));
         }
         if self.repo.is_empty() {
@@ -284,8 +332,7 @@ impl Workspace {
                 if target.host != self.host {
                     return Err("Linked item belongs to another host".into());
                 }
-                self.remember_list_selection();
-                self.inbox.origin_page.get_or_insert(self.page);
+                self.remember_remote_link(target.page);
                 self.switch_detail_repository(target.repo.clone());
                 self.reset_remote_detail();
                 self.page = target.page;
@@ -306,6 +353,7 @@ impl Workspace {
                     self.restore_list_selection();
                 }
                 self.opened = Some((*page, *id));
+                self.reader_row = None;
                 self.focus = 2;
                 self.reading = true;
                 self.detail_cursor = 0;
@@ -945,11 +993,29 @@ impl Workspace {
                 self.drafts.remove(&self.draft_key(&action));
                 return Ok(());
             }
-            Action::Browser(page, id) => Write::OpenInBrowser {
-                kind: kind(*page),
-                number: *id,
-                url: None,
-            },
+            Action::Browser(page, id) => {
+                let kind = kind(*page);
+                let url = target.repo.as_deref().and_then(|repo| {
+                    let base = self.advertised_repository_base(repo)?;
+                    let host = target.host.as_deref()?;
+                    // Retain the provider's browser command when the advertised address
+                    // already matches the ordinary forge address.
+                    (base != format!("https://{host}/{repo}")).then(|| {
+                        crate::forge::checkout::item_web_url(
+                            &base,
+                            self.forge_kind()
+                                .unwrap_or(crate::forge::provider::ProviderKind::GitHub),
+                            kind,
+                            *id,
+                        )
+                    })
+                });
+                Write::OpenInBrowser {
+                    kind,
+                    number: *id,
+                    url,
+                }
+            }
             Action::Web(page, id, url) => Write::OpenInBrowser {
                 kind: kind(*page),
                 number: *id,
@@ -1331,10 +1397,11 @@ impl Workspace {
                 .map(|comment| (*id, comment.clone())),
             _ => None,
         };
-        self.then_write = None;
         let write = match closing {
             Some((number, body)) => {
-                self.then_write = Some(write);
+                self.close_with_comment = Some(CloseWithComment::Posting(Box::new(
+                    self.write_op(target.clone(), write),
+                )));
                 Write::Comment {
                     kind: kind(1),
                     number,

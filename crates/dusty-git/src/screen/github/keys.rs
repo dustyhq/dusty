@@ -94,7 +94,6 @@ impl Workspace {
             KeyCode::Char('2') => {
                 self.focus = 0;
                 self.last_list = 0;
-                self.return_inbox_list();
                 Ok(None)
             }
             KeyCode::Char('3' | '0') => {
@@ -194,8 +193,8 @@ impl Workspace {
                 if pull && reader && matches!(self.pr_tab, pr::FILES | pr::COMMITS) =>
             {
                 match self.editor_location() {
-                    Some(_) if self.foreign_inbox_item() => {
-                        Err("Remote inbox item: open its local repository to edit its files".into())
+                    Some(_) if self.foreign_item() => {
+                        Err("Open the item's local repository to edit its files.".into())
                     }
                     Some((path, line)) => Err(format!("open-at:{line}:{path}")),
                     None if self.pr_tab == pr::FILES => {

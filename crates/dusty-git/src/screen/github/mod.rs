@@ -86,13 +86,43 @@ struct Reply {
     value: Value,
 }
 /// What a queued request asks the forge worker for.
+#[allow(clippy::large_enum_variant)]
 enum Op {
     Read(ForgeTarget, Read),
-    Write(ForgeTarget, Write),
+    Write(ForgeTarget, Write, Option<AccountNamespace>),
 }
 struct Request {
     key: Key,
     op: Op,
+}
+
+/// The namespace a deferred edit or read belongs to. Lists outlive detail switches.
+#[derive(PartialEq, Eq)]
+enum CacheScope {
+    Detail(lanes::Scope),
+    List(ForgeTarget),
+    Inbox(String),
+}
+
+struct DeferredRead {
+    scope: CacheScope,
+    target: ForgeTarget,
+    read: Read,
+}
+
+struct ReaderPreview {
+    item: (usize, u64),
+    row: Value,
+    confirmed_open: Option<bool>,
+}
+
+impl ReaderPreview {
+    fn update(&mut self, mut row: Value) {
+        if let Some(open) = self.confirmed_open {
+            row["state"] = if open { "OPEN" } else { "CLOSED" }.into();
+        }
+        self.row = row;
+    }
 }
 impl Request {
     fn list_limit(&self) -> Option<usize> {
@@ -169,6 +199,38 @@ pub(super) struct ReturnTarget {
     position: lines::ReadingPosition,
 }
 
+enum CloseWithComment {
+    Posting(Box<Op>),
+    Closing,
+}
+
+enum WritingDraft {
+    Form(String),
+    BrowserPr {
+        key: String,
+        shortened: bool,
+        page: usize,
+    },
+}
+
+impl WritingDraft {
+    fn key(&self) -> &str {
+        match self {
+            Self::Form(key) | Self::BrowserPr { key, .. } => key,
+        }
+    }
+
+    fn keep_after_success(&self) -> bool {
+        matches!(
+            self,
+            Self::BrowserPr {
+                shortened: true,
+                ..
+            }
+        )
+    }
+}
+
 pub(super) struct Workspace {
     root: PathBuf,
     /// The reads (and the one write) running now (`lanes.rs`).
@@ -179,9 +241,16 @@ pub(super) struct Workspace {
     host: String,
     inbox: inbox::Inbox,
     scope_epoch: u64,
+    account: Option<AccountNamespace>,
+    /// Look up the remembered account only once for the current host.
+    skip_remembered_account: bool,
+    /// The explicit recheck keeps its existing projection until its foreground reads settle.
+    account_recheck: Option<u64>,
     page: usize,
     selected: [usize; 2],
     opened: Option<(usize, u64)>,
+    /// The opened row's preview, even if a refresh removes it before detail loads.
+    reader_row: Option<ReaderPreview>,
     /// Where Esc goes from a run opened off a pull request's check.
     pub(super) return_to: Option<ReturnTarget>,
     /// The highlighted row of the live filter, if it has any matches.
@@ -251,23 +320,23 @@ pub(super) struct Workspace {
     /// The notice lasts until the next key (`Added to your review`, r15 prs-07): the file
     /// header badge and the `Review changes` row keep the count.
     notice_transient: bool,
-    /// The write that follows the one in flight once it is saved (a closing comment, then
-    /// the close).
-    then_write: Option<Write>,
-    writing_draft: Option<String>,
+    close_with_comment: Option<CloseWithComment>,
+    writing_draft: Option<WritingDraft>,
+    /// The local IDs sent by the one confirmed review in the write lane.
+    sent_review: Option<drafts::SentReview>,
     pending_pr: bool,
     /// A deep link (`dusty-git --page prs --open 13`) waiting for the repository to resolve.
     deep_link: Option<(usize, u64)>,
     ready_form: Option<Form>,
     /// Reads a refresh (`R`) found already on their way: asked again once they land, so the
     /// refresh shows what changed after the first one left.
-    again: HashMap<Key, (ForgeTarget, Read)>,
+    again: HashMap<Key, DeferredRead>,
     fresh: fresh::Fresh,
     accounts: accounts::Accounts,
     notify: notifications::Inbox,
     /// Inline comments held for the next review of each pull request: sent
     /// with it, as one batch, when the forge batches reviews.
-    inline_drafts: BTreeMap<u64, Vec<(crate::forge::request::InlineDraft, String)>>,
+    inline_drafts: drafts::Drafts,
     /// Where those drafts are saved, and a range's first line (`drafts.rs`).
     review: drafts::Review,
     /// Create pull request from a branch (`create.rs`).
@@ -287,9 +356,13 @@ impl Workspace {
             host: String::new(),
             inbox: inbox::Inbox::default(),
             scope_epoch: 0,
+            account: None,
+            skip_remembered_account: false,
+            account_recheck: None,
             page: 0,
             selected: [0; 2],
             opened: None,
+            reader_row: None,
             return_to: None,
             live_pick: None,
             detail_scroll: 0,
@@ -336,8 +409,9 @@ impl Workspace {
             notice: String::new(),
             notice_error: false,
             notice_transient: false,
-            then_write: None,
+            close_with_comment: None,
             writing_draft: None,
+            sent_review: None,
             pending_pr: false,
             deep_link: None,
             ready_form: None,
@@ -365,14 +439,17 @@ impl Workspace {
             // Workflows and local Git always use the original repository.
             let _ = self.toggle_inbox();
         }
-        self.remember_list_selection();
+        if self.restore_local_list_repository().is_none() {
+            self.remember_list_selection();
+        }
         self.drop_ghosts();
         // Changing page by hand ends a deep link's way back.
         self.return_to = None;
         self.notify.back = false;
         self.pending_pr = false;
+        self.compose = create::Compose::default();
         self.ready_form = None;
-        self.actions.pending_rerun = None;
+        self.cancel_pending_run_forms();
         self.notice.clear();
         self.notice_error = false;
         self.page = page;
@@ -386,6 +463,7 @@ impl Workspace {
         self.detail_scroll = 0;
         self.horizontal = 0;
         self.opened = None;
+        self.reader_row = None;
         self.selected_commit = None;
         self.detail_rows.clear();
         self.reveal_file = false;
@@ -426,7 +504,7 @@ impl Workspace {
         };
         self.drop_ghosts();
         self.ready_form = None;
-        self.actions.pending_rerun = None;
+        self.cancel_pending_run_forms();
         self.notice.clear();
         self.notice_error = false;
         self.page = target.page;
@@ -526,8 +604,10 @@ impl Workspace {
         self.active_views = Default::default();
         self.list_selections.clear();
         self.list_limits.clear();
+        self.list_totals.clear();
         self.selected = [0; 2];
         self.opened = None;
+        self.reader_row = None;
         self.selected_commit = None;
         self.detail_rows.clear();
         self.detail_cursor = 0;
@@ -574,8 +654,21 @@ impl Workspace {
     fn target(&self) -> ForgeTarget {
         ForgeTarget::repository(&self.host, &self.repo)
     }
+
+    fn is_current_repository(&self, target: &ForgeTarget) -> bool {
+        target.host.as_deref() == Some(self.host.as_str())
+            && target
+                .repo
+                .as_deref()
+                .is_some_and(|repo| repo.eq_ignore_ascii_case(&self.repo))
+    }
     fn read(&self, read: Read) -> Op {
-        Op::Read(self.target(), read)
+        let target = if matches!(read, Read::List { .. }) {
+            ForgeTarget::repository(&self.host, self.list_repository())
+        } else {
+            self.target()
+        };
+        Op::Read(target, read)
     }
     fn enqueue(&mut self, key: Key, op: Op, refresh: bool) {
         // A memory miss is filled from disk and painted at once; stale entries are
@@ -610,6 +703,12 @@ impl Workspace {
         }
         if self.cache.contains_key(&key) && !refresh {
             if self.needs_check(&key) {
+                let op = if key == Key::Repository && !self.host.is_empty() {
+                    // The disk may have just resolved the initial remote target.
+                    self.read(Read::Repository)
+                } else {
+                    op
+                };
                 self.revalidate(key, op);
             }
             return;
@@ -620,16 +719,49 @@ impl Workspace {
             && let Op::Read(target, read) = &op
             && (self.active.contains(&key) || self.fresh.warm_pending(&key))
         {
-            self.again
-                .insert(key.clone(), (target.clone(), read.clone()));
+            let scope = self.cache_scope(&key);
+            self.again.insert(
+                key.clone(),
+                DeferredRead {
+                    scope,
+                    target: target.clone(),
+                    read: read.clone(),
+                },
+            );
         }
         self.enqueue_refresh(key, op);
     }
     /// The read a refresh joined has landed: ask for it once more (`again`).
     fn ask_again(&mut self, key: &Key) {
-        if let Some((target, read)) = self.again.remove(key) {
+        if let Some(DeferredRead {
+            scope,
+            target,
+            read,
+        }) = self.again.remove(key)
+            && scope == self.cache_scope(key)
+        {
             self.enqueue_refresh(key.clone(), Op::Read(target, read));
         }
+    }
+    fn write_op(&self, target: ForgeTarget, write: Write) -> Op {
+        let account = self.account.as_ref().filter(|account| {
+            target
+                .host
+                .as_deref()
+                .is_some_and(|host| HostKey::new(host) == *account.host())
+        });
+        Op::Write(target, write, account.cloned())
+    }
+
+    fn enqueue_write(&mut self, op: Op) {
+        let Op::Write(target, write, _) = &op else {
+            unreachable!("only a confirmed write goes on the write queue");
+        };
+        self.cache.remove(&Key::Write);
+        if self.is_current_repository(target) {
+            self.optimistic(write);
+        }
+        self.enqueue(Key::Write, op, false);
     }
     fn enqueue_refresh(&mut self, key: Key, op: Op) {
         // The warm worker already asks for it: one request, two consumers.
@@ -789,30 +921,83 @@ impl Workspace {
             .or_else(|| self.list_row().map(|row| number(row, "number")))
             .unwrap_or(0)
     }
+    /// The reader has an explicit target; a list action belongs to its selected row.
+    fn selected_item_target(&self) -> Option<inbox::Target> {
+        let page = self.page;
+        let (repo, number) = if let Some(number) = self.opened_number() {
+            (&*self.repo, number)
+        } else {
+            let row = self.list_row()?;
+            if self.inbox.enabled {
+                let mut target = self.inbox_row_target(row, page).ok()?;
+                if let Some(repo) = self.known_repository_spelling(&target.repo) {
+                    target.repo = repo.to_owned();
+                }
+                return Some(target);
+            }
+            (self.list_repository(), number(row, "number"))
+        };
+        (number != 0 && matches!(page, 1 | 2)).then(|| inbox::Target {
+            host: self.host.clone(),
+            repo: repo.to_owned(),
+            page,
+            number,
+        })
+    }
+
     fn item(&self) -> Option<&Value> {
         match self.number() {
             0 => None,
             id => self.value(&Key::Item(self.page, id)),
         }
     }
-    // A list description is readable prose, not loaded metadata. Keep it in the
-    // current query/state/page cache, scoped to this workspace's host/repository.
-    fn list_item(&self) -> Option<&Value> {
-        if !matches!(self.page, 1 | 2) {
-            return None;
-        }
-        let row = if let Some(id) = self.opened_number() {
-            self.value(&self.list_key())?
-                .as_array()?
-                .iter()
-                .find(|row| number(row, "number") == id)?
+    fn row_belongs_to_repository(&self, row: &Value) -> bool {
+        if self.inbox.enabled {
+            self.inbox_row_target(row, self.page)
+                .is_ok_and(|target| target.repo.eq_ignore_ascii_case(&self.repo))
         } else {
-            self.list_row()?
+            self.repo.eq_ignore_ascii_case(self.list_repository())
+        }
+    }
+
+    fn matching_list_item(&self, id: u64) -> Option<&Value> {
+        self.value(&self.list_key())?
+            .as_array()?
+            .iter()
+            .find(|row| number(row, "number") == id && self.row_belongs_to_repository(row))
+    }
+
+    // A list description is readable prose, not loaded metadata.
+    fn list_item(&self) -> Option<&Value> {
+        let Some(id) = self.opened_number() else {
+            return self
+                .list_row()
+                .filter(|row| self.row_belongs_to_repository(row));
         };
-        (!self.inbox.enabled
-            || inbox::Target::from_row(row, &self.host, self.page)
-                .is_ok_and(|target| target.repo == self.repo))
-        .then_some(row)
+        let current = self.matching_list_item(id);
+        let preview = self
+            .reader_row
+            .as_ref()
+            .filter(|preview| preview.item == (self.page, id));
+        if preview.is_some_and(|preview| preview.confirmed_open.is_some()) {
+            // A list can still report the previous state after a successful close/reopen.
+            preview.map(|preview| &preview.row)
+        } else {
+            current.or_else(|| preview.map(|preview| &preview.row))
+        }
+    }
+
+    fn refresh_reader_preview(&mut self) {
+        if let Some(id) = self.opened_number()
+            && self
+                .reader_row
+                .as_ref()
+                .is_some_and(|preview| preview.item == (self.page, id))
+            && let Some(row) = self.matching_list_item(id).cloned()
+            && let Some(preview) = &mut self.reader_row
+        {
+            preview.update(row);
+        }
     }
     fn file_viewed(&self, id: u64, path: &str) -> Option<bool> {
         let value = self.value(&Key::Viewed(id))?;
@@ -888,8 +1073,11 @@ impl Workspace {
             Key::Threads(id) => {
                 self.page == 2 && *id == self.number() && matches!(self.pr_tab, 0 | 3 | 4 | 5)
             }
-            Key::Viewed(id) | Key::Diff(id) => {
-                self.page == 2 && self.pr_tab == 3 && *id == self.number()
+            Key::Viewed(id) => self.page == 2 && self.pr_tab == pr::FILES && *id == self.number(),
+            Key::Diff(id) => {
+                self.page == 2
+                    && *id == self.number()
+                    && (self.pr_tab == pr::FILES || self.wants_suggestion_patch(*id))
             }
             Key::Commit(sha) => {
                 self.page == 2 && self.pr_tab == 1 && self.selected_commit.as_ref() == Some(sha)
@@ -1000,11 +1188,13 @@ impl Workspace {
         } else {
             self.target()
         };
-        self.enqueue(
-            Key::Repository,
-            Op::Read(target, Read::Repository),
-            refresh && !cached,
-        );
+        if self.repo.eq_ignore_ascii_case(self.list_repository()) {
+            self.enqueue(
+                Key::Repository,
+                Op::Read(target, Read::Repository),
+                refresh && !cached,
+            );
+        }
         if self.repo.is_empty() || !self.cache.contains_key(&Key::Repository) {
             return;
         }
@@ -1169,9 +1359,35 @@ impl Workspace {
             match reply {
                 ForgeReply::Written(write, result) => {
                     changed = true;
-                    self.accounts.observe(&self.host, result.as_ref().err());
-                    let same_target =
-                        matches!(&request.op, Op::Write(target, _) if *target == self.target());
+                    let Op::Write(target, _, account) = &request.op else {
+                        unreachable!("a write receipt belongs to a write request");
+                    };
+                    if (!write.porcelain()
+                        || matches!(write, Write::Develop { .. } | Write::SetProjects { .. }))
+                        && account != &self.account
+                    {
+                        let sent = self.sent_review.take();
+                        if let (Ok(_), Write::SubmitReview { number, .. }, Some(sent)) =
+                            (&result, &write, sent)
+                            && self
+                                .clear_sent_review_drafts(target, *number, &sent)
+                                .is_err()
+                        {
+                            self.notice =
+                                "Review sent. Couldn't update saved review drafts.".into();
+                            self.notice_error = true;
+                        }
+                        if let Err(error) = result {
+                            self.notice = self.explain(&error.to_string()).line();
+                            self.notice_error = true;
+                        }
+                        self.ensure(false);
+                        continue;
+                    }
+                    let same_target = self.is_current_repository(target);
+                    if let Some(host) = &target.host {
+                        self.accounts.observe(host, result.as_ref().err());
+                    }
                     if let Ok(receipt) = &result
                         && same_target
                     {
@@ -1187,18 +1403,29 @@ impl Workspace {
                             }
                         }
                     }
-                    self.written(
-                        &write,
-                        result.map_err(|error| error.to_string()),
-                        same_target,
-                    );
+                    self.written(&write, result.map_err(|error| error.to_string()), target);
                     self.ensure(refresh);
                 }
-                ForgeReply::Fetched(_, result) => {
+                ForgeReply::Fetched(_, routing_host, result, account) => {
                     changed = true;
+                    let protect_projection = self.protects_read(&request.key)
+                        || self.fresh.implicit.contains(&request.key) && self.has_read_projection();
+                    if !self.accept_read_account(
+                        routing_host.is_some(),
+                        account,
+                        result.as_ref().err(),
+                        protect_projection,
+                    ) {
+                        continue;
+                    }
                     self.accounts.observe(&self.host, result.as_ref().err());
                     let key = request.key.clone();
-                    self.apply(request, result.map_err(|error| error.to_string()), false);
+                    self.apply(
+                        request,
+                        routing_host,
+                        result.map_err(|error| error.to_string()),
+                        false,
+                    );
                     self.ask_again(&key);
                 }
                 _ => {}
@@ -1263,6 +1490,9 @@ impl Workspace {
             }
             changed = true;
         }
+        if self.queue.is_empty() && self.active.idle() {
+            self.account_recheck = None;
+        }
         changed
     }
     /// A confirmed write finished: notice, draft and queue bookkeeping.
@@ -1270,15 +1500,18 @@ impl Workspace {
         &mut self,
         write: &Write,
         result: Result<crate::forge::request::Receipt, String>,
-        same_target: bool,
+        target: &ForgeTarget,
     ) {
+        let same_target = self.is_current_repository(target);
+        let close_step = self.close_with_comment.take();
+        let sent = self.sent_review.take();
         match result {
             Ok(receipt) => {
-                self.actions_written(write, &receipt.summary);
+                self.actions_written(write, &receipt.summary, same_target);
                 self.settle(true);
                 self.notice_error = false;
                 if let Write::CreatePullRequest(pr) = write {
-                    self.change_repository(pr.base_repository.clone(), pr.host.clone());
+                    self.change_repository(pr.base_repository.clone(), self.host.clone());
                     self.cache.clear();
                     if let Some((ItemKind::PullRequest, number)) = receipt.created_item {
                         self.opened = Some((2, number));
@@ -1289,7 +1522,9 @@ impl Workspace {
                 } else {
                     self.notice = if matches!(write, Write::OpenInBrowser { .. }) {
                         "Opened in browser".into()
-                    } else if let Some(receipt) = self.notification_written(write) {
+                    } else if target.host.as_deref() == Some(self.host.as_str())
+                        && let Some(receipt) = self.notification_written(write)
+                    {
                         receipt
                     } else if matches!(write, Write::DownloadArtifact { .. } | Write::CancelRun(_))
                     {
@@ -1305,6 +1540,15 @@ impl Workspace {
                             if self.page == page && self.focus == 2 && self.number() == *number {
                                 // The next list read may remove this row, but not the open reader.
                                 self.opened = Some((page, *number));
+                                if let Some(row) = self.list_item().cloned() {
+                                    let mut preview = ReaderPreview {
+                                        item: (page, *number),
+                                        row: Value::Null,
+                                        confirmed_open: Some(*open),
+                                    };
+                                    preview.update(row);
+                                    self.reader_row = Some(preview);
+                                }
                             }
                             if let Some(Ok(reply)) = self.cache.get_mut(&Key::Item(page, *number)) {
                                 reply.value["state"] = if *open { "OPEN" } else { "CLOSED" }.into();
@@ -1312,16 +1556,35 @@ impl Workspace {
                             }
                         }
                         let verb = if *open { "Reopened" } else { "Closed" };
-                        format!("{verb} {}{number}", self.sigil(page == 2))
+                        if same_target {
+                            format!("{verb} {}{number}", self.sigil(page == 2))
+                        } else {
+                            let repo = target.repo.as_deref().unwrap_or_default();
+                            let kind = target.host.as_deref().and_then(Self::forge_kind_for_host);
+                            let sigil = if page == 2 {
+                                crate::forge::capability::terms_for(kind).pr_glyph
+                            } else {
+                                "#"
+                            };
+                            format!("{verb} {repo}{sigil}{number}")
+                        }
                     } else if let Write::SubmitReview { number, drafts, .. } = write
                         && !drafts.is_empty()
                     {
-                        self.inline_drafts.remove(number);
-                        format!(
-                            "Review sent with {} inline comment{}",
-                            drafts.len(),
-                            if drafts.len() == 1 { "" } else { "s" }
-                        )
+                        if let Some(sent) = sent
+                            && self
+                                .clear_sent_review_drafts(target, *number, &sent)
+                                .is_err()
+                        {
+                            self.notice_error = true;
+                            "Review sent. Couldn't update saved review drafts.".into()
+                        } else {
+                            format!(
+                                "Review sent with {} inline comment{}",
+                                drafts.len(),
+                                if drafts.len() == 1 { "" } else { "s" }
+                            )
+                        }
                     } else {
                         let kind = self.forge_kind();
                         format!(
@@ -1343,24 +1606,51 @@ impl Workspace {
                             | Key::PullRequestDefaults
                     )
                 });
-                if let Some(next) = self.then_write.take() {
-                    self.cache.remove(&Key::Write);
-                    self.optimistic(&next);
-                    self.enqueue(Key::Write, Op::Write(self.target(), next), false);
-                    self.notice = format!("Sending to {}…", self.forge_name());
+                if let Some(CloseWithComment::Posting(close)) = close_step {
+                    self.close_with_comment = Some(CloseWithComment::Closing);
+                    self.enqueue_write(*close);
+                    self.notice = "Comment posted. Closing issue…".into();
+                } else if let Some(draft) = self.writing_draft.take()
+                    && !draft.keep_after_success()
+                {
+                    self.drafts.remove(draft.key());
                 }
             }
             Err(error) => {
-                self.then_write = None;
                 self.settle(false);
                 self.notice_error = true;
-                let has_draft = self
-                    .writing_draft
-                    .take()
-                    .and_then(|key| self.drafts.get(&key))
+                let draft = self.writing_draft.take();
+                if matches!(close_step, Some(CloseWithComment::Closing)) {
+                    // A retry must not send the comment that already reached the forge.
+                    if let Some(comment) = draft
+                        .as_ref()
+                        .and_then(|draft| self.drafts.get_mut(draft.key()))
+                        .and_then(|values| values.last_mut())
+                    {
+                        comment.clear();
+                    }
+                    self.notice = format!(
+                        "Comment posted. Couldn't confirm the close. {}",
+                        self.explain(&error).headline,
+                    );
+                    return;
+                }
+                let has_draft = draft
+                    .as_ref()
+                    .and_then(|draft| self.drafts.get(draft.key()))
                     .is_some_and(|values| values.iter().any(|value| !value.trim().is_empty()));
                 self.notice = if let Some(notice) = self.notification_write_error(write, &error) {
                     notice
+                } else if matches!(write, Write::OpenInBrowser { .. })
+                    && !crate::forge::sandbox::active()
+                {
+                    // Real opener errors need plain wording. In practice, keep the
+                    // specific explanation that the forge has no web pages.
+                    if has_draft {
+                        "Couldn't open the browser. Your draft is kept.".into()
+                    } else {
+                        "Couldn't open the browser.".into()
+                    }
                 } else {
                     let headline = self.explain(&error).headline;
                     if has_draft {
@@ -1449,12 +1739,38 @@ impl Workspace {
         } else {
             self.repo.clone()
         };
-        let action = if self.inbox.enabled && action.item_scoped() {
-            Action::Scoped {
+        let run_write = matches!(
+            action,
+            Action::Cancel(_)
+                | Action::Rerun(_)
+                | Action::Approve(_)
+                | Action::Dispatch(_)
+                | Action::Download(..)
+        );
+        let scope = if run_write {
+            Some(inbox::Target {
                 host: self.host.clone(),
                 repo: self.repo.clone(),
                 page: self.page,
                 number: self.number(),
+            })
+        } else if action.item_scoped() {
+            self.selected_item_target()
+        } else {
+            None
+        };
+        let action = if let Some(inbox::Target {
+            host,
+            repo,
+            page,
+            number,
+        }) = scope
+        {
+            Action::Scoped {
+                host,
+                repo,
+                page,
+                number,
                 action: Box::new(action),
             }
         } else {
@@ -1480,10 +1796,20 @@ impl Workspace {
         let was_reading = self.focus == 2;
         let result = self.handle_key(key, write_refusal);
         if was_reading && self.page == page && self.focus != 2 && self.opened.is_some() {
-            self.return_inbox_list();
-            self.opened = None;
-            self.detail_rows.clear();
-            self.ensure(false);
+            self.return_to_list();
+        } else if !was_reading
+            && self.page == page
+            && self.focus == 2
+            && self.opened.is_none()
+            && let Some(row) = self.list_item()
+        {
+            let target = (page, number(row, "number"));
+            self.reader_row = Some(ReaderPreview {
+                item: target,
+                row: row.clone(),
+                confirmed_open: None,
+            });
+            self.opened = Some(target);
         }
         result
     }
@@ -1606,7 +1932,6 @@ impl Workspace {
             match key.code {
                 KeyCode::Char('h' | 'H') if self.focus == 2 && !key.modifiers.alt => {
                     self.focus = self.last_list;
-                    self.return_inbox_list();
                 }
                 KeyCode::Char('l' | 'L') if self.focus < 2 && !key.modifiers.alt => {
                     self.focus = 2;
@@ -1634,7 +1959,6 @@ impl Workspace {
                 }
                 KeyCode::Escape if self.focus == 2 => {
                     self.focus = self.last_list;
-                    self.return_inbox_list();
                 }
                 KeyCode::Char('i') if matches!(self.page, 1 | 2) => self.toggle_inbox()?,
                 KeyCode::Char('o') if matches!(self.page, 1 | 2) => {
@@ -1886,6 +2210,28 @@ mod list_tests {
     use super::*;
     use crate::screen::GitScreen;
 
+    #[test]
+    fn advertised_commit_base_keeps_the_gitlab_fallback_before_detection() {
+        let mut workspace = Workspace::new(PathBuf::new());
+        workspace.host = "gitlab.cached-forge.example".into();
+        workspace.repo = "o/r".into();
+        workspace.cache.insert(
+            Key::Repository,
+            Ok(Reply {
+                text: String::new(),
+                value: serde_json::json!({
+                    "nameWithOwner": "o/r",
+                    "url": "https://forge.example/o/r",
+                }),
+            }),
+        );
+        assert_eq!(workspace.forge_kind(), None);
+        assert_eq!(
+            workspace.advertised_checkout_base("https://gitlab.cached-forge.example/o/r"),
+            Some(("https://forge.example/o/r".into(), true))
+        );
+    }
+
     fn cached_workspace() -> Workspace {
         let mut workspace = Workspace::new(PathBuf::new());
         workspace.page = 1;
@@ -1993,14 +2339,26 @@ mod list_tests {
     }
 
     #[test]
-    fn confirmed_close_keeps_the_reader_on_the_closed_issue() {
+    fn confirmed_close_keeps_the_reader_when_a_refresh_removes_its_issue() {
+        use crate::forge::{
+            model::ItemRow,
+            provider::Fetched,
+            request::{PageOf, Payload},
+        };
+
         let (_root, mut app) = item_screen(1);
         app.github.host = "gitlab.com".into();
+        app.github.fresh = fresh::Fresh::with(None);
+        let list = app.github.cache.remove(&app.github.list_key()).unwrap();
+        app.github.queries[0] = "label:bug".into();
+        app.github.cache.insert(app.github.list_key(), list);
+        app.github.cache.remove(&Key::Item(1, 16));
         press(&mut app, KeyEvent::plain(KeyCode::Enter));
+        press(&mut app, KeyEvent::character('R'));
         press(&mut app, KeyEvent::character('x'));
         assert!(matches!(
             app.form.as_ref().map(|form| &form.action),
-            Some(FormAction::Github(Action::State(1, 16, true)))
+            Some(FormAction::Github(action)) if matches!(action.unscoped(), Action::State(1, 16, true))
         ));
         let mut confirm = KeyEvent::plain(KeyCode::Enter);
         confirm.modifiers.control = true;
@@ -2010,25 +2368,47 @@ mod list_tests {
             .github
             .queue
             .iter()
-            .position(|request| matches!(&request.op, Op::Write(_, Write::SetState { .. })))
+            .position(|request| matches!(&request.op, Op::Write(_, Write::SetState { .. }, _)))
             .expect("confirmed close");
-        let Some(Request {
-            op: Op::Write(_, write),
-            ..
-        }) = app.github.queue.remove(at)
-        else {
+        let write_request = app.github.queue.remove(at).unwrap();
+        let scope = (
+            app.github.host.clone(),
+            app.github.repo.clone(),
+            app.github.scope_epoch,
+        );
+        let key = app.github.list_key();
+        let op = app.github.list_read(LIST_BATCH);
+        let Op::Read(_, read) = &op else {
             unreachable!()
         };
-        app.github.written(&write, Ok(Default::default()), true);
-        // The refreshed Open list only contains the other issue.
-        let value = serde_json::json!([app.github.value(&Key::Item(1, 14)).unwrap()]);
-        app.github.cache.insert(
-            app.github.list_key(),
-            Ok(Reply {
-                text: value.to_string(),
-                value,
-            }),
+        let read = read.clone();
+        let rows = PageOf {
+            items: vec![ItemRow {
+                number: 14,
+                title: "Unrelated issue".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        app.github.active.answer_for_test(
+            Request { key, op },
+            scope.clone(),
+            ForgeReply::Fetched(read, None, Ok(Fetched::payload(Payload::Rows(rows))), None),
         );
+        assert!(app.github.poll());
+        assert_eq!(
+            app.github.number(),
+            16,
+            "a pending close stays on its issue"
+        );
+        let Op::Write(_, write, _) = &write_request.op else {
+            unreachable!()
+        };
+        let result = ForgeReply::Written(write.clone(), Ok(Default::default()));
+        app.github
+            .active
+            .answer_for_test(write_request, scope, result);
+        assert!(app.github.poll());
         let closed = app.frame(120, 30);
         assert!(closed.grid.row_text(2).contains("#16 Issue being read"));
         assert!(closed.grid.row_text(3).contains("Closed"));

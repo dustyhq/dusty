@@ -543,7 +543,8 @@ class Legacy:
                      "labels": [{"name": "bug"}], "assignees": [{"login": "bob"}], "milestone": {"title": "v1"},
                      "projectItems": [{"title": "Native editor"}],
                      "closedByPullRequestsReferences": [{"number": 9, "title": "Native review"}]}
-        self.pr = dict(self.item, id="PR_NODE_9", number=9, title="Native review", baseRefName="main",
+        self.pr = dict(self.item, id="PR_NODE_9", number=9,
+                       title=state.get("pr_title", "Native review"), baseRefName="main",
                        headRefName="feature/native", headRefOid="a" * 40, isDraft=False, mergeStateStatus="CLEAN",
                        mergeable="MERGEABLE", reviewDecision="APPROVED",
                        reviews=[{"author": {"login": "reviewer"}, "state": "APPROVED",
@@ -735,6 +736,21 @@ class Legacy:
             resolved = operation == "ResolveThread"
             self.state.setdefault("thread_resolved", {})[variables["thread"]] = resolved
             return {"data": {"saved": {"thread": {"id": variables["thread"], "isResolved": resolved}}}}
+        if operation == "CommitReviewSuggestion":
+            commit = variables["input"]
+            branch = commit["branch"]
+            pull = next((entry for entry in self.entries("pr")
+                         if entry.get("headRefOid", "a" * 40) == commit["expectedHeadOid"]
+                         and entry.get("headRefName", "feature") == branch["branchName"]), None)
+            if pull is None:
+                fail_graphql("The branch moved before the commit")
+            for file in commit["fileChanges"]["additions"]:
+                self.state["contents"][file["path"]] = base64.b64decode(file["contents"]).decode()
+            head = ("d" if commit["expectedHeadOid"] == "c" * 40 else "c") * 40
+            self.advance_pull_head(pull["number"], head)
+            if "diff_after_suggestion" in self.state:
+                self.state["diff"] = self.state.pop("diff_after_suggestion")
+            return {"data": {"createCommitOnBranch": {"commit": {"oid": head}}}}
         if operation == "UpdateSubscription":
             self.state.setdefault("subscriptions", []).append(variables)
             return {"data": {"updateSubscription": {"subscribable": {"id": variables.get("subject")}}}}
@@ -762,11 +778,14 @@ class Legacy:
                           "diffSide": first.get("diffSide", "RIGHT"),
                           "comments": {"totalCount": len(thread["comments"]["nodes"]), "nodes": [
                               dict({"id": f"{thread['id']}_COMMENT_{index}", "createdAt": "2026-11-08T10:00:00Z",
-                                    "commit": {"oid": "a" * 40}}, **comment)
+                                    "commit": {"oid": "a" * 40},
+                                    "originalCommit": comment.get("commit", {"oid": "a" * 40})}, **comment)
                               for index, comment in enumerate(thread["comments"]["nodes"])]}})
             # A multi-line thread's first line (GitHub's `startLine`).
             if thread.get("startLine"):
                 nodes[-1]["startLine"] = thread["startLine"]
+                nodes[-1]["originalStartLine"] = thread.get("originalStartLine", thread["startLine"])
+                nodes[-1]["startDiffSide"] = thread.get("startDiffSide", "RIGHT")
         # Two pages exercise the provider's connection paging, including an empty last page.
         second = variables.get("after") == "next"
         page = nodes[1:] if second else nodes[:1]
@@ -807,6 +826,13 @@ class Legacy:
 
     # ---- F7: the REST reads an anonymous client makes instead of GraphQL
 
+    def advance_pull_head(self, number, head):
+        pulls = self.state.setdefault("prs", self.entries("pr"))
+        for pull in pulls:
+            if pull["number"] == number:
+                pull["headRefOid"] = head
+                return
+
     def rest_item(self, entry, kind, repo, listed=False):
         host = self.state.get("host", self.host)
         word = str(entry.get("state", "OPEN")).upper()
@@ -830,7 +856,7 @@ class Legacy:
                 head = entry.get("headRefOid", "a" * 40)
                 item.update({"merged_at": merged, "draft": entry.get("isDraft", False),
                              "head": {"ref": entry.get("headRefName", "feature"), "sha": head, "repo": {"full_name": repo}},
-                             "base": {"ref": entry.get("baseRefName", "main"), "sha": "b" * 40, "repo": {"full_name": repo}},
+                             "base": {"ref": entry.get("baseRefName", "main"), "sha": entry.get("baseRefOid", "b" * 40), "repo": {"full_name": repo}},
                              "mergeable": entry.get("mergeable", "MERGEABLE") == "MERGEABLE",
                              "mergeable_state": str(entry.get("mergeStateStatus", "CLEAN")).lower(),
                              "additions": sum(f.get("additions", 0) for f in entry.get("files", [])),
@@ -933,7 +959,10 @@ class Legacy:
         match = re.fullmatch(r"pulls/(\d+)", tail)
         if match and self.request.wants_diff():
             number = match.group(1)
-            return 200, state.get("diffs", {}).get(number, state.get("diff", DEFAULT_DIFF))
+            patch = state.get("diffs", {}).get(number, state.get("diff", DEFAULT_DIFF))
+            if moves := state.get("move_head_after_diff"):
+                self.advance_pull_head(int(number), moves.pop(0))
+            return 200, patch
         if match:
             # The head a suggestion is committed to.
             return 200, self.rest_item(self.find("pr", int(match.group(1))), "pr", repo)
@@ -1142,6 +1171,8 @@ class Inbox:
         request, state = self.request, self.state
         if request.rest == "user":
             return 200, {"login": "rowan", "id": 1}
+        if request.rest == "notifications" and request.method == "GET":
+            return 200, state.get("notifications", [])
         repo, tail = request.repo, request.tail
         if tail is None:
             fail_rest(404, "Not Found")
@@ -1152,6 +1183,9 @@ class Inbox:
         if tail in ("labels", "assignees", "milestones"):
             return 200, []
         match = re.fullmatch(r"pulls/(\d+)", tail)
+        if match and not request.wants_diff():
+            item = self.item(repo, "pr", int(match.group(1)))
+            return 200, {"base": {"sha": "b" * 40}, "head": {"sha": item["headRefOid"]}}
         if match and request.wants_diff():
             filename = repo.split("/")[0] + ".rs"
             return 200, (f"diff --git a/{filename} b/{filename}\n--- a/{filename}\n+++ b/{filename}\n@@ -1 +1 @@\n"
@@ -1168,6 +1202,10 @@ class Inbox:
                 fail_rest(422, "Fixture comment write refused")
             state.setdefault("writes", []).append(attempt)
             return 201, {"id": 1, "html_url": f"https://{self.host}/{repo}/comment/1", "body": body}
+        if re.fullmatch(r"issues/\d+", tail) and request.method == "PATCH":
+            return 200, request.json
+        if re.fullmatch(r"pulls/\d+/reviews", tail) and request.method == "POST":
+            return 200, {"id": 1, "state": "COMMENTED"}
         fail_rest(404, "Unexpected fake inbox request: " + request.method + " " + tail)
 
     def porcelain(self, argv):
@@ -1253,8 +1291,8 @@ def describe(state, request, world):
         if tail == "":
             return ["repo", "view", "--repo", f"{host}/{repo}"]
         match = re.fullmatch(r"pulls/(\d+)", tail or "")
-        if match and request.wants_diff():
-            return ["pr", "diff", match.group(1)] + scope
+        if match:
+            return ["pr", "diff", match.group(1)] + scope if request.wants_diff() else None
         match = re.fullmatch(r"actions/workflows/(\d+)", tail or "")
         if match:
             return None
@@ -1618,7 +1656,7 @@ class Handler(BaseHTTPRequestHandler):
                          "path": request.rest if not request.graphql else "graphql", "query": request.query,
                          "operation": request.operation, "variables": request.variables or None,
                          "body": request.json if not request.graphql else None, "auth": request.auth,
-                         "gh_argv": request.gh_argv,
+                         "gh_argv": request.gh_argv, "accept": request.accept,
                          "call": describe(state, request, world)
                          if world not in ("recorded", "gitlab", "gitea", "forgejo", "actions") and request.api == "github" and request.full not in PROBES
                          else None}
@@ -1752,7 +1790,10 @@ class Handler(BaseHTTPRequestHandler):
             state.setdefault("blob_requests", []).append(
                 {"path": self.path, "authorization": "present" if self.headers.get("Authorization") else "absent"})
             save_state(state)
-        found = world_actions.blob(self.path.split("?", 1)[0])
+        path = self.path.split("?", 1)[0]
+        if failure := state.get("blob_failures", {}).get(path):
+            return self.respond(failure["status"], {"message": failure["message"]})
+        found = world_actions.blob(path)
         if found:
             content_type, payload = found
             return self.respond(200, payload, {"Content-Type": content_type})

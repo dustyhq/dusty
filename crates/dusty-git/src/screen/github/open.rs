@@ -414,6 +414,52 @@ mod tests {
     }
 
     #[test]
+    fn links_to_another_port_are_foreign() {
+        let mut workspace = Workspace::new(PathBuf::new());
+        workspace.host = "git.example.test:8443".into();
+        workspace.repo = "o/r".into();
+
+        for url in [
+            "https://git.example.test:8444/o/r/issues/7",
+            "https://git.example.test/o/r/issues/7",
+        ] {
+            workspace.follow(parse(url).unwrap());
+            assert!(workspace.notice_error);
+            assert!(workspace.notice.starts_with("That link is on "));
+            assert!(workspace.opened.is_none());
+        }
+        let link = parse("https://git.example.test:8443/o/r/issues/7").unwrap();
+        assert_eq!(link.host.as_deref(), Some("git.example.test:8443"));
+    }
+
+    #[test]
+    fn advertised_issue_links_use_the_checkout_routing_authority() {
+        let mut workspace = Workspace::new(PathBuf::new());
+        workspace.fresh = fresh::Fresh::with(None);
+        workspace.host = "git.internal.example".into();
+        workspace.repo = "o/r".into();
+        workspace.cache.insert(Key::Repository, Ok(Reply {
+            value: serde_json::json!({"nameWithOwner": "o/r", "url": "https://forge.example/o/r"}),
+            text: String::new(),
+        }));
+
+        for foreign in [
+            "https://forge.example:8443/o/r/issues/7",
+            "https://elsewhere.example/o/r/issues/7",
+        ] {
+            workspace.follow(parse(foreign).unwrap());
+            assert!(workspace.notice_error);
+            assert!(workspace.opened.is_none());
+        }
+        workspace.follow(parse("https://forge.example/o/r/issues/7").unwrap());
+        assert_eq!(workspace.opened, Some((1, 7)));
+        assert!(workspace.queue.iter().any(|request| matches!(
+            &request.op,
+            Op::Read(target, Read::Issue(7)) if target == &ForgeTarget::repository("git.internal.example", "o/r")
+        )));
+    }
+
+    #[test]
     fn web_addresses_of_every_forge() {
         assert_eq!(
             parse("https://github.com/example/demo/pull/9/files?diff=split#r1").unwrap(),
