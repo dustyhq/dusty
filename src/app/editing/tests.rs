@@ -3552,16 +3552,13 @@ fn recovery_through_an_alias_preserves_the_already_open_dirty_buffer() {
         .unwrap();
     let journal = app.state.workspace_root.join("journal.toml");
     fs::write(&journal, "journal").unwrap();
+    let record = crate::files::RecoveryRecord::new(Some(&alias), 1, "recovered draft".into());
     let id = app
         .documents
         .read_scoped(alias, vec![app.state.workspace_root.clone()])
         .unwrap();
-    app.recovery.register_read(
-        id,
-        journal,
-        "recovered draft".into(),
-        app.workspace.version(),
-    );
+    app.recovery
+        .register_read(id, journal, record, app.workspace.version(), None);
     wait_vfs(&mut app);
     let recovered = app.state.active_buffer_id().unwrap();
     assert_ne!(recovered, original);
@@ -3589,11 +3586,14 @@ fn recovery_replies_never_replace_a_buffer_opened_during_the_read() {
         .documents
         .read_scoped(path.clone(), vec![app.state.workspace_root.clone()])
         .unwrap();
+    let mut record = crate::files::RecoveryRecord::new(Some(&path), 1, "recovered".into());
+    record.base = crate::files::RecoveryBase::from_persisted(b"disk");
     app.recovery.register_read(
         id,
         path.with_extension("journal"),
-        "recovered".into(),
+        record,
         app.workspace.version(),
+        None,
     );
     let (buffer, _) = app
         .state
@@ -3617,11 +3617,14 @@ fn recovery_missing_original_is_bound_only_inside_the_workspace() {
         .documents
         .read_scoped(path.clone(), vec![app.state.workspace_root.clone()])
         .unwrap();
+    let mut record = crate::files::RecoveryRecord::new(Some(&path), 1, "recovered".into());
+    record.base = crate::files::RecoveryBase::Missing;
     app.recovery.register_read(
         id,
         path.with_extension("journal"),
-        "recovered".into(),
+        record,
         app.workspace.version(),
+        None,
     );
     wait_vfs(&mut app);
     let recovered = &app.state.buffers[app.state.active_buffer_id().unwrap()];
@@ -3637,11 +3640,14 @@ fn recovery_missing_parent_does_not_bind_an_unvalidated_destination() {
         .documents
         .read_scoped(path.clone(), vec![app.state.workspace_root.clone()])
         .unwrap();
+    let mut record = crate::files::RecoveryRecord::new(Some(&path), 1, "recovered".into());
+    record.base = crate::files::RecoveryBase::Missing;
     app.recovery.register_read(
         id,
         path.with_extension("journal"),
-        "recovered".into(),
+        record,
         app.workspace.version(),
+        None,
     );
     wait_vfs(&mut app);
     let recovered = &app.state.buffers[app.state.active_buffer_id().unwrap()];
@@ -3666,11 +3672,18 @@ fn recovery_rejected_paths_and_missing_files_under_outside_symlinks_become_scrat
             .documents
             .read_scoped(path.clone(), vec![app.state.workspace_root.clone()])
             .unwrap();
+        let mut record = crate::files::RecoveryRecord::new(Some(&path), 1, "recovered".into());
+        record.base = if exists {
+            crate::files::RecoveryBase::from_persisted(b"")
+        } else {
+            crate::files::RecoveryBase::Missing
+        };
         app.recovery.register_read(
             id,
             path.with_extension("journal"),
-            "recovered".into(),
+            record,
             app.workspace.version(),
+            None,
         );
         wait_vfs(&mut app);
         let recovered = &app.state.buffers[app.state.active_buffer_id().unwrap()];
@@ -3696,14 +3709,19 @@ fn recovery_failure_and_cancelled_reads_preserve_the_journal() {
     fs::write(&path, "disk").unwrap();
     let journal = app.state.workspace_root.join("journal.toml");
     fs::write(&journal, "recoverable").unwrap();
-    let id = app
-        .documents
-        .read_scoped(path, vec![app.state.workspace_root.clone()])
-        .unwrap();
+    let record = crate::files::RecoveryRecord::new(Some(&path), 1, "draft".into());
     app.recovery
-        .register_read(id, journal.clone(), "draft".into(), app.workspace.version());
+        .fixture_records(vec![(journal.clone(), record)]);
+    app.recover_journal(&journal);
+    app.open_recovery_picker();
+    assert!(!app.recovery_picker_open());
     app.workspace.fixture_safe_mode(true);
     wait_vfs(&mut app);
+    app.open_recovery_picker();
+    assert!(
+        app.recovery_picker_open(),
+        "cancelled reads release the journal"
+    );
     assert_eq!(fs::read_to_string(journal).unwrap(), "recoverable");
     assert!(
         app.state

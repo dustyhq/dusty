@@ -8,6 +8,7 @@ use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc;
@@ -46,6 +47,10 @@ use crate::files::recovery::discover_recovery_bounded;
 use crate::files::recovery::read_bounded_bytes;
 
 use crate::files::recovery::write_recovery;
+
+/// Original bytes still to fingerprint on the first journal write, and the cell that
+/// caches the result for the buffer.
+type PendingRecoveryBase = (Arc<[u8]>, Arc<OnceLock<RecoveryBase>>);
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct RequestId(pub u64);
@@ -126,6 +131,7 @@ pub enum VfsRequest {
         id: RequestId,
         path: PathBuf,
         record: RecoveryRecord,
+        pending_base: Option<PendingRecoveryBase>,
     },
     CleanupRecovery {
         id: RequestId,
@@ -228,11 +234,15 @@ pub enum VfsResult {
         id: RequestId,
         path: PathBuf,
         result: Result<Vec<u8>, VfsError>,
+        /// Fingerprint of the bytes from a successful document read.
+        recovery_base: Option<RecoveryBase>,
     },
     Write {
         id: RequestId,
         path: PathBuf,
         result: Result<(), VfsError>,
+        /// Fingerprint of the bytes from a successful document write.
+        recovery_base: Option<RecoveryBase>,
     },
     Directory {
         id: RequestId,
@@ -257,6 +267,20 @@ pub enum VfsResult {
         path: PathBuf,
         result: Result<(), VfsError>,
     },
+}
+
+fn document_read_result(
+    id: RequestId,
+    result: Result<Vec<u8>, VfsError>,
+    path: PathBuf,
+) -> VfsResult {
+    let recovery_base = result.as_deref().ok().map(RecoveryBase::from_persisted);
+    VfsResult::Read {
+        id,
+        path,
+        result,
+        recovery_base,
+    }
 }
 
 impl VfsResult {
@@ -440,11 +464,13 @@ impl VfsWorker {
                                 id,
                                 path,
                                 result: Ok(bytes),
+                                recovery_base: None,
                             },
                             Err(error) => VfsResult::Read {
                                 id,
                                 path,
                                 result: Err(error),
+                                recovery_base: None,
                             },
                         })
                     } else {
@@ -465,12 +491,14 @@ impl VfsWorker {
                                         id,
                                         path,
                                         result: Err(error),
+                                        recovery_base: None,
                                     }
                                 }
                                 VfsRequest::Write { id, path, .. } => VfsResult::Write {
                                     id,
                                     path,
                                     result: Err(error),
+                                    recovery_base: None,
                                 },
                                 VfsRequest::ResolveCreate { id, .. } => VfsResult::CreateTarget {
                                     id,
@@ -517,19 +545,16 @@ impl VfsWorker {
                                     bytes,
                                 } => {
                                     let result = agent_atomic_write(&root, &path, &bytes);
-                                    VfsResult::Write { id, path, result }
+                                    VfsResult::Write {
+                                        id,
+                                        path,
+                                        result,
+                                        recovery_base: None,
+                                    }
                                 }
                                 VfsRequest::Read { id, path } => match canonical_path(&path) {
-                                    Ok(path) => VfsResult::Read {
-                                        id,
-                                        result: read_file(&path),
-                                        path,
-                                    },
-                                    Err(error) => VfsResult::Read {
-                                        id,
-                                        path,
-                                        result: Err(error),
-                                    },
+                                    Ok(path) => document_read_result(id, read_file(&path), path),
+                                    Err(error) => document_read_result(id, Err(error), path),
                                 },
                                 VfsRequest::ReadScoped {
                                     id,
@@ -541,26 +566,19 @@ impl VfsWorker {
                                             .iter()
                                             .any(|root| path.starts_with(root)) =>
                                     {
-                                        VfsResult::Read {
-                                            id,
-                                            result: read_scoped_file(
-                                                &path,
-                                                &canonical_roots,
-                                                DOCUMENT_BYTE_LIMIT,
-                                            ),
-                                            path,
-                                        }
+                                        let result = read_scoped_file(
+                                            &path,
+                                            &canonical_roots,
+                                            DOCUMENT_BYTE_LIMIT,
+                                        );
+                                        document_read_result(id, result, path)
                                     }
-                                    Ok(path) => VfsResult::Read {
+                                    Ok(path) => document_read_result(
                                         id,
-                                        result: Err(VfsError::OutsideScope(path.clone())),
+                                        Err(VfsError::OutsideScope(path.clone())),
                                         path,
-                                    },
-                                    Err(error) => VfsResult::Read {
-                                        id,
-                                        path,
-                                        result: Err(error),
-                                    },
+                                    ),
+                                    Err(error) => document_read_result(id, Err(error), path),
                                 },
                                 VfsRequest::ReadScopedBounded {
                                     id,
@@ -581,17 +599,20 @@ impl VfsWorker {
                                                 maximum_bytes,
                                             ),
                                             path,
+                                            recovery_base: None,
                                         }
                                     }
                                     Ok(path) => VfsResult::Read {
                                         id,
                                         result: Err(VfsError::OutsideScope(path.clone())),
                                         path,
+                                        recovery_base: None,
                                     },
                                     Err(error) => VfsResult::Read {
                                         id,
                                         path,
                                         result: Err(error),
+                                        recovery_base: None,
                                     },
                                 },
                                 VfsRequest::ResolveResource {
@@ -734,7 +755,14 @@ impl VfsWorker {
                                     } else {
                                         path
                                     };
-                                    VfsResult::Write { id, path, result }
+                                    let recovery_base = (document && result.is_ok())
+                                        .then(|| RecoveryBase::from_persisted(&bytes));
+                                    VfsResult::Write {
+                                        id,
+                                        path,
+                                        result,
+                                        recovery_base,
+                                    }
                                 }
                                 VfsRequest::ListDirectory {
                                     id,
@@ -758,7 +786,12 @@ impl VfsWorker {
                                     );
                                     VfsResult::RecoveryDiscovered { id, discovery }
                                 }
-                                VfsRequest::WriteRecovery { id, path, record } => {
+                                VfsRequest::WriteRecovery {
+                                    id,
+                                    path,
+                                    mut record,
+                                    pending_base,
+                                } => {
                                     let result = path
                                         .parent()
                                         .map_or(Ok(()), fs::create_dir_all)
@@ -767,7 +800,14 @@ impl VfsWorker {
                                             path: path.clone(),
                                             source,
                                         })
-                                        .and_then(|()| write_recovery(&path, &record));
+                                        .and_then(|()| {
+                                            if let Some((bytes, cache)) = pending_base {
+                                                record.base = *cache.get_or_init(|| {
+                                                    RecoveryBase::from_persisted(&bytes)
+                                                });
+                                            }
+                                            write_recovery(&path, &record)
+                                        });
                                     VfsResult::RecoveryWritten { id, path, result }
                                 }
                                 VfsRequest::CleanupRecovery {
@@ -1129,8 +1169,34 @@ impl VfsWorker {
         path: PathBuf,
         record: RecoveryRecord,
     ) -> Result<RequestId, VfsError> {
+        self.queue_recovery_write(path, record, None)
+    }
+
+    /// Write a journal using a fingerprint computed on the worker and shared by all writes
+    /// from the same saved snapshot.
+    pub fn write_recovery_from_snapshot(
+        &mut self,
+        path: PathBuf,
+        record: RecoveryRecord,
+        bytes: Arc<[u8]>,
+        cache: Arc<OnceLock<RecoveryBase>>,
+    ) -> Result<RequestId, VfsError> {
+        self.queue_recovery_write(path, record, Some((bytes, cache)))
+    }
+
+    fn queue_recovery_write(
+        &mut self,
+        path: PathBuf,
+        record: RecoveryRecord,
+        pending_base: Option<PendingRecoveryBase>,
+    ) -> Result<RequestId, VfsError> {
         let id = self.next_request_id()?;
-        self.submit(VfsRequest::WriteRecovery { id, path, record })?;
+        self.submit(VfsRequest::WriteRecovery {
+            id,
+            path,
+            record,
+            pending_base,
+        })?;
         Ok(id)
     }
 
@@ -3699,6 +3765,38 @@ mod lifecycle_tests {
         assert!(matches!(result(&worker),VfsResult::Write{id,result:Ok(()),..} if id==accepted));
         assert_eq!(fs::read(path).unwrap(), b"saved");
     }
+    #[test]
+    fn document_io_reports_the_fingerprint_of_the_exact_bytes() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("file.txt");
+        let previous = b"\xef\xbb\xbfbefore\r\n";
+        let saved = b"\xef\xbb\xbfafter\r\n";
+        fs::write(&path, previous).unwrap();
+        let mut worker = VfsWorker::start(2);
+        worker.read(path.clone()).unwrap();
+        assert!(matches!(
+            result(&worker),
+            VfsResult::Read { result: Ok(bytes), recovery_base: Some(base), .. }
+                if bytes == previous && base == RecoveryBase::from_persisted(previous)
+        ));
+
+        worker
+            .write_document(
+                path.clone(),
+                saved.to_vec(),
+                WriteExpectation::Exact(previous.to_vec()),
+                false,
+                Some(path),
+                Vec::new(),
+            )
+            .unwrap();
+        assert!(matches!(
+            result(&worker),
+            VfsResult::Write { result: Ok(()), recovery_base: Some(base), .. }
+                if base == RecoveryBase::from_persisted(saved)
+        ));
+    }
+
     #[test]
     fn non_reader_and_full_queue_shutdown_do_not_join_or_block_drop() {
         let root = tempfile::tempdir().unwrap();

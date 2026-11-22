@@ -543,6 +543,49 @@ pub(in crate::app) fn wait_explorer(app: &mut App) {
 }
 
 #[test]
+fn recovery_from_explorer_defers_the_fingerprint_until_a_journal_write() {
+    let (_dirs, mut app) = app();
+    app.recovery.skip_maintenance();
+    let path = app.state.workspace_root.join("explorer-recovery.txt");
+    let saved = b"\xef\xbb\xbfbase\r\n";
+    fs::write(&path, saved).unwrap();
+    let mut fixture = app.configuration.fixture_snapshot();
+    fixture.settings.recovery.enabled = false;
+    app.configuration.install_fixture(fixture);
+
+    app.open_explorer();
+    app.explorer_toggle();
+    wait_explorer(&mut app);
+    app.explorer.navigate(1);
+    app.reconcile_editor_windows();
+    app.explorer_open_file(false);
+    wait_vfs(&mut app);
+    let buffer = app.state.active_buffer_id().expect("explorer file opened");
+    assert_eq!(app.state.buffers[buffer].path.as_ref(), Some(&path));
+    let base = app.state.buffers[buffer].recovery_base();
+    assert_eq!(base.fingerprint(), None);
+
+    app.replace_with_recovered(buffer, "draft\n".into())
+        .unwrap();
+    app.queue_dirty_recovery_before_exit();
+    wait_vfs(&mut app);
+    assert_eq!(base.fingerprint(), None);
+    assert!(!app.recovery.path(buffer).exists());
+
+    let mut fixture = app.configuration.fixture_snapshot();
+    fixture.settings.recovery.enabled = true;
+    app.configuration.install_fixture(fixture);
+    app.queue_dirty_recovery_before_exit();
+    wait_vfs(&mut app);
+    let fingerprint = crate::files::RecoveryBase::from_persisted(saved);
+    let journals = crate::files::discover_recovery(app.recovery.directory());
+    assert_eq!(journals.records.len(), 1);
+    assert_eq!(journals.records[0].1.content, "draft\n");
+    assert_eq!(journals.records[0].1.base, fingerprint);
+    assert_eq!(base.fingerprint(), Some(fingerprint));
+}
+
+#[test]
 fn explorer_lazily_loads_and_opens_scoped_file() {
     let (_app_dirs, mut app) = app();
     let path = app.state.workspace_root.join("explorer.txt");

@@ -13,6 +13,7 @@ use crate::editor::text::FileFormat;
 use crate::editor::text::LineEnding;
 use crate::editor::text::TextBuffer;
 use crate::editor::text::TextVersion;
+use crate::files::RecoveryBase;
 use crate::files::RequestId;
 use crate::files::VfsError;
 use crate::files::VfsResult;
@@ -26,6 +27,7 @@ pub(in crate::app) struct DocumentView<'a> {
     pub path: Option<&'a Path>,
     pub text: &'a TextBuffer,
     pub persisted: &'a [u8],
+    pub recovery_conflict: bool,
     pub new_file: bool,
     pub dirty: bool,
     pub virtual_read_only: bool,
@@ -157,6 +159,10 @@ pub(in crate::app) enum DocumentChange {
         text: TextBuffer,
         path: PathBuf,
     },
+    ReloadReplaced {
+        buffer: BufferId,
+        path: PathBuf,
+    },
     DiskChecked {
         buffer: BufferId,
         path: PathBuf,
@@ -168,6 +174,7 @@ pub(in crate::app) enum DocumentChange {
         snapshot: Box<(Arc<str>, FileFormat)>,
         revision: BufferRevision,
         bytes: Vec<u8>,
+        recovery_base: Option<RecoveryBase>,
         line_ending: Option<LineEnding>,
         target: PathBuf,
         quit: bool,
@@ -342,9 +349,15 @@ impl Documents {
         if request.other_open_paths.iter().any(|path| path == &target) {
             return Err(VfsError::OpenBufferDestination.into());
         }
-        let bytes = configured_file_bytes(view.text, request.policy);
         let expectation = if request.force {
             WriteExpectation::Any
+        } else if view.recovery_conflict {
+            if view.path == Some(target.as_path()) {
+                return Err(VfsError::ExternalModification(target).into());
+            }
+            // A different name is a save-as, not permission to overwrite another
+            // file (or an alias of the original).
+            WriteExpectation::Missing
         } else if view.new_file {
             WriteExpectation::Missing
         } else {
@@ -355,6 +368,7 @@ impl Documents {
             .authority
             .require(crate::editor::CommandAccess::Files)
             .map_err(|error| DocumentFailure::Error(error.to_string()))?;
+        let bytes = configured_file_bytes(view.text, request.policy);
         let id = self.vfs.write_document(
             target.clone(),
             bytes.clone(),
@@ -459,7 +473,12 @@ impl Documents {
                     closed_paths,
                     ..
                 },
-                VfsResult::Read { path, result, .. },
+                VfsResult::Read {
+                    path,
+                    result,
+                    recovery_base,
+                    ..
+                },
             ) => {
                 if closed_paths.contains(&path) {
                     return Err(stale());
@@ -469,7 +488,7 @@ impl Documents {
                     line,
                     navigation,
                     activate: Arc::ptr_eq(&open_request, &self.latest_open),
-                    text: TextBuffer::from_bytes(&result?)
+                    text: TextBuffer::from_bytes_with_recovery_base(&result?, recovery_base)
                         .map_err(|e| DocumentFailure::Error(e.to_string()))?,
                 }
             }
@@ -478,7 +497,12 @@ impl Documents {
                     version,
                     check_disk,
                 },
-                VfsResult::Read { path, result, .. },
+                VfsResult::Read {
+                    path,
+                    result,
+                    recovery_base,
+                    ..
+                },
             ) => {
                 let current = view.ok_or_else(stale)?;
                 if current.id != version.id
@@ -488,20 +512,28 @@ impl Documents {
                 {
                     return Err(stale());
                 }
-                let bytes = result?;
-                let changed = check_disk && bytes != current.persisted;
-                if check_disk && (!changed || current.dirty) {
-                    DocumentChange::DiskChecked {
+                let requested_path = version.path.ok_or_else(stale)?;
+                if path != requested_path {
+                    DocumentChange::ReloadReplaced {
                         buffer: version.id,
-                        path,
-                        changed,
+                        path: requested_path,
                     }
                 } else {
-                    DocumentChange::Reload {
-                        buffer: version.id,
-                        path,
-                        text: TextBuffer::from_bytes(&bytes)
-                            .map_err(|e| DocumentFailure::Error(e.to_string()))?,
+                    let bytes = result?;
+                    let changed = check_disk && bytes != current.persisted;
+                    if check_disk && (!changed || current.dirty) {
+                        DocumentChange::DiskChecked {
+                            buffer: version.id,
+                            path: requested_path,
+                            changed,
+                        }
+                    } else {
+                        DocumentChange::Reload {
+                            buffer: version.id,
+                            path: requested_path,
+                            text: TextBuffer::from_bytes_with_recovery_base(&bytes, recovery_base)
+                                .map_err(|e| DocumentFailure::Error(e.to_string()))?,
+                        }
                     }
                 }
             }
@@ -518,6 +550,7 @@ impl Documents {
                 VfsResult::Write {
                     result,
                     path: target,
+                    recovery_base,
                     ..
                 },
             ) => {
@@ -536,6 +569,7 @@ impl Documents {
                     snapshot: version.snapshot.expect("save snapshot"),
                     revision: version.revision,
                     bytes,
+                    recovery_base,
                     line_ending,
                     target,
                     quit: quit && same_workspace,
@@ -681,6 +715,7 @@ mod tests {
             path: b.path.as_deref(),
             text: &b.text,
             persisted: b.persisted_bytes(),
+            recovery_conflict: b.recovery_conflict.is_some(),
             new_file: b.new_file,
             dirty: b.dirty,
             virtual_read_only: b.is_virtual_read_only(),
@@ -712,6 +747,7 @@ mod tests {
                 },
             },
             event: VfsResult::Read {
+                recovery_base: None,
                 id: RequestId(1),
                 path: "/workspace/file".into(),
                 result: Ok(vec![255]),
@@ -838,6 +874,7 @@ mod tests {
         );
         let mut reply = reload(&state, &workspace, buffer);
         reply.event = VfsResult::Read {
+            recovery_base: None,
             id: RequestId(1),
             path: "/workspace/b".into(),
             result: Ok(b"b".to_vec()),
@@ -936,6 +973,7 @@ mod tests {
                 },
             },
             event: VfsResult::Write {
+                recovery_base: None,
                 id: RequestId(1),
                 path: "/workspace/file".into(),
                 result: Ok(()),
@@ -1036,6 +1074,7 @@ mod tests {
                 },
             },
             event: VfsResult::Write {
+                recovery_base: None,
                 id: RequestId(1),
                 path: "/workspace/file".into(),
                 result: Ok(()),

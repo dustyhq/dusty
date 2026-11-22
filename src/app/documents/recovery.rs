@@ -1,13 +1,19 @@
 //! Recovery scheduling, retention and completion policy.
 use crate::app::documents::RecoveryIo;
+use crate::app::workspace::WorkspaceVersion;
 use crate::config::RecoveryConfig;
 use crate::editor::BufferId;
 use crate::editor::EditorState;
 use crate::editor::text::BufferRevision;
+use crate::editor::text::FileFormat;
+#[cfg(test)]
+use crate::files::RecoveryBase;
+use crate::files::RecoveryBaseSource;
 use crate::files::RecoveryRecord;
 use crate::files::RequestId;
 use crate::files::VfsResult;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::ops::ControlFlow;
 use std::ops::ControlFlow::Break;
 use std::ops::ControlFlow::Continue;
@@ -24,6 +30,7 @@ enum Pending {
         revision: BufferRevision,
         path: PathBuf,
         original_path: Option<PathBuf>,
+        base: RecoveryBaseSource,
     },
     Delete {
         path: PathBuf,
@@ -51,12 +58,19 @@ const MAXIMUM_JOURNAL_AGE_DAYS: u64 = 30;
 /// How long an edit waits before its journal is written.
 pub(in crate::app) const WRITE_DEBOUNCE_MS: u64 = 250;
 
+pub(in crate::app) struct RecoveryRead {
+    pub journal: PathBuf,
+    pub record: RecoveryRecord,
+    pub detached_format: Option<FileFormat>,
+}
+
 pub(in crate::app) struct Recovery {
     directory: PathBuf,
     session: String,
     records: Vec<(PathBuf, RecoveryRecord)>,
     recovered: HashMap<BufferId, PathBuf>,
     revisions: HashMap<BufferId, BufferRevision>,
+    bases: HashMap<BufferId, RecoveryBaseSource>,
     paths: HashMap<BufferId, Option<PathBuf>>,
     closed_journals: std::collections::HashSet<PathBuf>,
     oversized: std::collections::HashSet<BufferId>,
@@ -65,9 +79,8 @@ pub(in crate::app) struct Recovery {
     discovery_queued: bool,
     cleanup_queued: bool,
     pending: HashMap<RequestId, Pending>,
-    /// Original files being read so a journal can be recovered into them: the journal's path
-    /// and the text it holds, by read.
-    reads: HashMap<RequestId, (PathBuf, String, crate::app::workspace::WorkspaceVersion)>,
+    /// Original files being checked before recovery.
+    reads: HashMap<RequestId, (RecoveryRead, WorkspaceVersion)>,
 }
 impl Recovery {
     pub(in crate::app) fn new(directory: PathBuf) -> Self {
@@ -87,6 +100,7 @@ impl Recovery {
             records: Vec::new(),
             recovered: HashMap::new(),
             revisions: HashMap::new(),
+            bases: HashMap::new(),
             paths: HashMap::new(),
             closed_journals: std::collections::HashSet::new(),
             oversized: std::collections::HashSet::new(),
@@ -102,23 +116,70 @@ impl Recovery {
         &mut self,
         id: RequestId,
         journal: PathBuf,
-        content: String,
-        workspace: crate::app::workspace::WorkspaceVersion,
+        record: RecoveryRecord,
+        workspace: WorkspaceVersion,
+        detached_format: Option<FileFormat>,
     ) {
-        self.reads.insert(id, (journal, content, workspace));
+        self.reads.insert(
+            id,
+            (
+                RecoveryRead {
+                    journal,
+                    record,
+                    detached_format,
+                },
+                workspace,
+            ),
+        );
     }
     pub(in crate::app) fn take_read(
         &mut self,
         id: RequestId,
-        workspace: crate::app::workspace::WorkspaceVersion,
-    ) -> Option<(PathBuf, String)> {
+        workspace: WorkspaceVersion,
+    ) -> Option<RecoveryRead> {
         self.reads
             .remove(&id)
-            .filter(|(_, _, source)| *source == workspace)
-            .map(|(journal, content, _)| (journal, content))
+            .filter(|(_, source)| *source == workspace)
+            .map(|(read, _)| read)
     }
     pub(in crate::app) fn records(&self) -> &[(PathBuf, RecoveryRecord)] {
         &self.records
+    }
+    // Use the same path resolution as writes: a live buffer owns either its
+    // session journal or the one it was recovered from.
+    fn live_journal_paths<'a>(
+        &'a self,
+        editor: &'a EditorState,
+    ) -> impl Iterator<Item = PathBuf> + 'a {
+        editor.buffers.keys().map(move |buffer| self.path(buffer))
+    }
+
+    pub(super) fn claimable_records<'a>(
+        &'a self,
+        editor: &'a EditorState,
+    ) -> impl DoubleEndedIterator<Item = &'a (PathBuf, RecoveryRecord)> {
+        let owned: HashSet<_> = self.live_journal_paths(editor).collect();
+        self.records
+            .iter()
+            .filter(move |(journal, _)| !owned.contains(journal) && !self.journal_reserved(journal))
+    }
+
+    pub(super) fn journal_in_use(&self, journal: &Path, editor: &EditorState) -> bool {
+        self.journal_reserved(journal)
+            || self
+                .live_journal_paths(editor)
+                .any(|path| path.as_path() == journal)
+    }
+
+    /// A queued read or delete reserves the journal until its reply is consumed.
+    fn journal_reserved(&self, journal: &Path) -> bool {
+        self.reads
+            .values()
+            .any(|(read, _)| read.journal.as_path() == journal)
+            || self
+                .pending
+                .values()
+                .any(|pending| matches!(pending, Pending::Delete { path, .. } if path == journal))
     }
     pub(in crate::app) fn configure(&mut self, old: &RecoveryConfig, new: &RecoveryConfig) {
         if old != new {
@@ -144,8 +205,10 @@ impl Recovery {
         self.directory
             .join(format!("buffer-{}-{identifier}.toml", self.session))
     }
-    fn recorded(&self, buffer: BufferId, revision: BufferRevision, path: &Option<PathBuf>) -> bool {
-        self.paths.get(&buffer) == Some(path) && self.revisions.get(&buffer) == Some(&revision)
+    fn recorded(&self, buffer: BufferId, state: &crate::editor::Buffer) -> bool {
+        self.paths.get(&buffer) == Some(&state.path)
+            && self.revisions.get(&buffer) == Some(&state.text.revision())
+            && self.bases.get(&buffer) == Some(&state.recovery_base())
     }
     pub(in crate::app) fn forget_buffer(&mut self, buffer: BufferId, clean: bool) {
         if clean && (self.revisions.contains_key(&buffer) || self.recovered.contains_key(&buffer)) {
@@ -154,6 +217,7 @@ impl Recovery {
         self.recovered.remove(&buffer);
         self.revisions.remove(&buffer);
         self.paths.remove(&buffer);
+        self.bases.remove(&buffer);
         self.oversized.remove(&buffer);
         self.scheduled.remove(&buffer);
     }
@@ -202,10 +266,8 @@ impl Recovery {
                 &self.directory,
                 MAXIMUM_RETAINED_JOURNALS,
                 MAXIMUM_JOURNAL_AGE_DAYS,
-                editor
-                    .buffers
-                    .iter()
-                    .map(|(buffer, _)| self.path(buffer))
+                self.live_journal_paths(editor)
+                    .chain(self.reads.values().map(|(read, _)| read.journal.clone()))
                     .chain(self.pending.values().filter_map(|pending| match pending {
                         Pending::Write { path, .. } => Some(path.clone()),
                         _ => None,
@@ -228,7 +290,7 @@ impl Recovery {
                 continue;
             }
             if state.dirty {
-                if !self.recorded(buffer, revision, &state.path)
+                if !self.recorded(buffer, state)
                     && (exiting
                         || self
                             .scheduled
@@ -283,10 +345,12 @@ impl Recovery {
                 continue;
             };
             let path = self.path(buffer);
-            if let Ok(id) = io.write(&path, state) {
+            let base = state.recovery_base();
+            if let Ok(id) = io.write(&path, state, &base) {
                 self.scheduled.remove(&buffer);
                 self.revisions.insert(buffer, revision);
                 self.paths.insert(buffer, state.path.clone());
+                self.bases.insert(buffer, base.clone());
                 self.pending.insert(
                     id,
                     Pending::Write {
@@ -294,6 +358,7 @@ impl Recovery {
                         revision,
                         path,
                         original_path: state.path.clone(),
+                        base,
                     },
                 );
             }
@@ -314,13 +379,10 @@ impl Recovery {
         &mut self,
         path: &Path,
         announce: bool,
+        editor: &EditorState,
         mut io: RecoveryIo<'_>,
     ) -> Result<(), String> {
-        if self
-            .pending
-            .values()
-            .any(|p| matches!(p, Pending::Delete { path: p, .. } if p == path))
-        {
+        if self.journal_in_use(path, editor) {
             return Ok(());
         }
         let id = io.delete(path).map_err(|e| e.to_string())?;
@@ -336,7 +398,9 @@ impl Recovery {
     }
     pub(in crate::app) fn stopped(&mut self) {
         self.pending.clear();
+        self.reads.clear();
         self.revisions.clear();
+        self.bases.clear();
         self.scheduled.clear();
     }
     pub(in crate::app) fn unwritten(&self, editor: &EditorState, config: &RecoveryConfig) -> usize {
@@ -346,7 +410,7 @@ impl Recovery {
         editor.buffers.iter().filter(|(buffer, state)| {
             state.dirty
                 && !state.is_virtual_read_only()
-                && (!self.recorded(*buffer, state.text.revision(), &state.path)
+                && (!self.recorded(*buffer, state)
                     || self.pending.values().any(|pending| {
                         matches!(pending, Pending::Write { buffer: writing, .. } if writing == buffer)
                     }))
@@ -417,6 +481,7 @@ impl Recovery {
                     buffer,
                     revision,
                     original_path,
+                    base,
                     ..
                 },
                 VfsResult::RecoveryWritten { result, .. },
@@ -428,6 +493,7 @@ impl Recovery {
                 Err(error) => {
                     if self.revisions.get(&buffer) == Some(&revision)
                         && self.paths.get(&buffer) == Some(&original_path)
+                        && self.bases.get(&buffer) == Some(&base)
                     {
                         self.revisions.remove(&buffer);
                     }
@@ -463,6 +529,7 @@ impl Recovery {
                             self.recovered.remove(&buffer);
                             self.revisions.remove(&buffer);
                             self.paths.remove(&buffer);
+                            self.bases.remove(&buffer);
                         }
                         RecoveryUpdate::Quiet
                     } else if announce {
@@ -557,6 +624,9 @@ mod tests {
         recovery.revisions.insert(buffer, revision);
         recovery.paths.insert(buffer, None);
         recovery
+            .bases
+            .insert(buffer, RecoveryBaseSource::Known(RecoveryBase::Unknown));
+        recovery
             .scheduled
             .insert(buffer, (revision, Instant::now()));
         recovery.oversized.insert(buffer);
@@ -568,6 +638,7 @@ mod tests {
                 revision,
                 path: path.clone(),
                 original_path: None,
+                base: RecoveryBaseSource::Known(RecoveryBase::Unknown),
             },
         );
 
@@ -575,6 +646,7 @@ mod tests {
         assert!(recovery.recovered.is_empty());
         assert!(recovery.revisions.is_empty());
         assert!(recovery.paths.is_empty());
+        assert!(recovery.bases.is_empty());
         assert!(recovery.scheduled.is_empty());
         assert!(recovery.oversized.is_empty());
         assert!(recovery.pending.contains_key(&id));

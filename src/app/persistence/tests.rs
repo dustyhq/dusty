@@ -307,6 +307,7 @@ fn restore_skips_a_leaf_with_a_read_io_error() {
     let bad = paths[0].clone();
     let result = app.persistence.accept_restore(
         VfsResult::Read {
+            recovery_base: None,
             id: RequestId(1),
             path: bad.clone(),
             result: Err(VfsError::Io {
@@ -320,6 +321,7 @@ fn restore_skips_a_leaf_with_a_read_io_error() {
     assert!(matches!(result, Break(RestoreUpdate::Waiting)));
     let result = app.persistence.accept_restore(
         VfsResult::Read {
+            recovery_base: None,
             id: RequestId(2),
             path: paths[1].clone(),
             result: Ok(b"still readable".to_vec()),

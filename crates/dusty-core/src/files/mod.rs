@@ -10,6 +10,8 @@ pub use icons::file_icon;
 mod recovery;
 pub use recovery::DOCUMENT_BYTE_LIMIT;
 pub use recovery::RECOVERY_VERSION;
+pub use recovery::RecoveryBase;
+pub use recovery::RecoveryBaseSource;
 pub use recovery::RecoveryCleanup;
 pub use recovery::RecoveryDiscovery;
 pub use recovery::RecoveryRecord;

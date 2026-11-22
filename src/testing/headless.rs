@@ -62,15 +62,20 @@ fn load_headless_startup(
             continue;
         }
         let request = worker.read(path.clone())?;
-        let (resolved, bytes) = loop {
+        let (resolved, bytes, recovery_base) = loop {
             match worker.try_result()? {
-                Some(crate::files::VfsResult::Read { id, path, result }) if id == request => {
-                    break (path, result?);
+                Some(crate::files::VfsResult::Read {
+                    id,
+                    path,
+                    result,
+                    recovery_base,
+                }) if id == request => {
+                    break (path, result?, recovery_base);
                 }
                 Some(_) | None => std::thread::yield_now(),
             }
         };
-        let text = TextBuffer::from_bytes(&bytes)?;
+        let text = TextBuffer::from_bytes_with_recovery_base(&bytes, recovery_base)?;
         let (buffer, _) = state.open_text(text, Some(resolved)).map_err(|error| {
             ApplicationError::Command(CommandError::InvalidArguments(error.into()))
         })?;

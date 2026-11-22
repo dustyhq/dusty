@@ -598,7 +598,7 @@ impl App {
                     && let Some(journal) = journal
                     && self
                         .recovery
-                        .discard(&journal, true, self.documents.recovery_io())
+                        .discard(&journal, true, &self.state, self.documents.recovery_io())
                         .is_err()
                 {
                     self.show_error("Couldn't discard the unsaved work.");

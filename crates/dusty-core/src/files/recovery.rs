@@ -11,12 +11,16 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::ffi::OsStringExt;
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::OnceLock;
 use std::time::Duration;
 use std::time::SystemTime;
 
 use serde::Deserialize;
 
 use serde::Serialize;
+use sha2::Digest;
+use sha2::Sha256;
 
 use crate::files::error::VfsError;
 
@@ -77,12 +81,66 @@ pub(super) fn bounded_recovery_entries<T>(entries: impl IntoIterator<Item = T>) 
     (paths, truncated)
 }
 
+/// The on-disk state from which the recovered edits were made.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", content = "digest", rename_all = "snake_case")]
+pub enum RecoveryBase {
+    /// Journals written before the base was recorded have no trusted baseline.
+    #[default]
+    Unknown,
+    /// The original file did not exist yet.
+    Missing,
+    /// SHA-256 of the exact saved bytes, including any BOM and line endings.
+    Sha256([u8; 32]),
+}
+impl RecoveryBase {
+    /// Fingerprint the bytes last saved or read from the original file.
+    #[must_use]
+    pub fn from_persisted(bytes: &[u8]) -> Self {
+        Self::Sha256(Sha256::digest(bytes).into())
+    }
+
+    fn is_unknown(&self) -> bool {
+        *self == Self::Unknown
+    }
+}
+
+/// A journal base or the cache for one immutable persisted snapshot.
+#[derive(Clone, Debug)]
+pub enum RecoveryBaseSource {
+    Known(RecoveryBase),
+    Persisted(Arc<OnceLock<RecoveryBase>>),
+}
+impl RecoveryBaseSource {
+    /// Return the fingerprint if it has already been computed, without hashing.
+    #[must_use]
+    pub fn fingerprint(&self) -> Option<RecoveryBase> {
+        match self {
+            Self::Known(base) => Some(*base),
+            Self::Persisted(cache) => cache.get().copied(),
+        }
+    }
+}
+impl PartialEq for RecoveryBaseSource {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Known(a), Self::Known(b)) => a == b,
+            (Self::Persisted(a), Self::Persisted(b)) => Arc::ptr_eq(a, b),
+            _ => false,
+        }
+    }
+}
+impl Eq for RecoveryBaseSource {}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct RecoveryRecord {
     pub version: u32,
     pub original_path: Option<String>,
     pub revision: u64,
     pub content: String,
+    /// The saved version these edits started from, if known.
+    #[serde(default, skip_serializing_if = "RecoveryBase::is_unknown")]
+    pub base: RecoveryBase,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -115,6 +173,7 @@ impl RecoveryRecord {
             }),
             revision,
             content,
+            base: RecoveryBase::Unknown,
         }
     }
 

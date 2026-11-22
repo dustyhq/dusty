@@ -14,9 +14,12 @@ mod task_io;
 use crate::app::startup::StartupTarget;
 use crate::editor::BufferId;
 use crate::editor::EditorWindowVersion;
+use crate::editor::text::FileFormat;
 use crate::editor::text::TextBuffer;
 use crate::files::CheckedResourceIntent;
 use crate::files::ExplorerMutation;
+use crate::files::RecoveryBase;
+use crate::files::RecoveryBaseSource;
 use crate::files::RecoveryRecord;
 use crate::files::RequestId;
 use crate::files::VfsError;
@@ -281,7 +284,13 @@ impl Documents {
         {
             return self.file_reply(*id, event);
         }
-        if let VfsResult::Read { id, path, result } = event {
+        if let VfsResult::Read {
+            id,
+            path,
+            result,
+            recovery_base,
+        } = event
+        {
             if self.pending_startup.contains_key(&id) {
                 if !self.startup_current(editor, root_revision) {
                     self.pending_startup.remove(&id);
@@ -297,9 +306,10 @@ impl Documents {
                     return DocumentEvent::Discarded;
                 }
                 intent.delivered = true;
-                let text = result
-                    .map_err(|e| e.to_string())
-                    .and_then(|bytes| TextBuffer::from_bytes(&bytes).map_err(|e| e.to_string()));
+                let text = result.map_err(|e| e.to_string()).and_then(|bytes| {
+                    TextBuffer::from_bytes_with_recovery_base(&bytes, recovery_base)
+                        .map_err(|e| e.to_string())
+                });
                 return DocumentEvent::Startup {
                     read: StartupRead {
                         owner: self.owner.clone(),
@@ -310,7 +320,12 @@ impl Documents {
                 };
             }
             return if self.pending_legacy.remove(&id) {
-                DocumentEvent::Legacy(VfsResult::Read { id, path, result })
+                DocumentEvent::Legacy(VfsResult::Read {
+                    id,
+                    path,
+                    result,
+                    recovery_base,
+                })
             } else {
                 DocumentEvent::Discarded
             };
@@ -767,16 +782,30 @@ impl RecoveryIo<'_> {
         &mut self,
         path: &Path,
         buffer: &crate::editor::Buffer,
+        base: &RecoveryBaseSource,
     ) -> Result<RequestId, VfsError> {
         self.submit(|vfs| {
-            vfs.write_recovery(
-                path.to_owned(),
-                RecoveryRecord::new(
-                    buffer.path.as_deref(),
-                    buffer.text.revision().0,
-                    buffer.text.to_string(),
-                ),
-            )
+            let mut record = RecoveryRecord::new(
+                buffer.path.as_deref(),
+                buffer.text.revision().0,
+                buffer.text.to_string(),
+            );
+            match base {
+                RecoveryBaseSource::Known(base) => record.base = *base,
+                RecoveryBaseSource::Persisted(cache) => {
+                    if let Some(base) = cache.get() {
+                        record.base = *base;
+                    } else {
+                        return vfs.write_recovery_from_snapshot(
+                            path.to_owned(),
+                            record,
+                            buffer.persisted_bytes_snapshot(),
+                            cache.clone(),
+                        );
+                    }
+                }
+            }
+            vfs.write_recovery(path.to_owned(), record)
         })
     }
 }
@@ -1162,7 +1191,12 @@ impl App {
                 VfsResult::ResourceApplied { .. }
                 | VfsResult::ResourceResolved { .. }
                 | VfsResult::CreateTarget { .. } => self.show_error("unowned workspace I/O result"),
-                VfsResult::Read { id, path, result } => {
+                VfsResult::Read {
+                    id,
+                    path,
+                    result,
+                    recovery_base,
+                } => {
                     if self.search.accept_preview(
                         id,
                         &result,
@@ -1194,9 +1228,9 @@ impl App {
                                 .map(|(range, snapshot)| NavigationRead::ByteRange(range, snapshot))
                         })
                         .or_else(|| {
-                            self.recovery.take_read(id, self.workspace.version()).map(
-                                |(journal, content)| NavigationRead::Recovered(journal, content),
-                            )
+                            self.recovery
+                                .take_read(id, self.workspace.version())
+                                .map(NavigationRead::Recovered)
                         });
                     if let Some((navigation, capture)) = self.navigation_reads.remove(&id)
                         && (!self.window_session.navigation_current(
@@ -1207,34 +1241,75 @@ impl App {
                     {
                         continue;
                     }
-                    if let Some(NavigationRead::Recovered(journal, content)) = &pending {
+                    if let Some(NavigationRead::Recovered(recovery::RecoveryRead {
+                        journal,
+                        record,
+                        detached_format,
+                    })) = pending
+                    {
                         // A read may finish after another command opened this file. Never
                         // replace that buffer, and never bind a rejected path to recovered text.
-                        let already_open = self
+                        let open_buffer = self
                             .state
                             .buffers
                             .values()
-                            .any(|buffer| buffer.path.as_ref() == Some(&path));
+                            .find(|buffer| buffer.path.as_ref() == Some(&path));
                         let missing = matches!(&result, Err(crate::files::VfsError::Io {
                             operation: "open for reading" | "open scoped path", source, ..
                         }) if source.kind() == std::io::ErrorKind::NotFound);
-                        let writable = self.workspace.require_path(&path).is_ok();
+                        let disk_checked = result.is_ok() || missing;
+                        let same_path = record.path().as_deref() == Some(path.as_path());
+                        let base_matches = same_path
+                            && match (&result, record.base) {
+                                (Ok(_), RecoveryBase::Sha256(_)) => {
+                                    recovery_base == Some(record.base)
+                                }
+                                (Err(_), RecoveryBase::Missing) => missing,
+                                _ => false,
+                            };
+                        let can_bind = same_path
+                            && detached_format.is_none()
+                            && open_buffer.is_none()
+                            && self.workspace.require_path(&path).is_ok();
                         let (text, destination) = match result {
-                            Ok(bytes) if !already_open && writable => {
-                                match TextBuffer::from_bytes(&bytes) {
+                            Ok(bytes) if can_bind && base_matches => {
+                                match TextBuffer::from_bytes_with_recovery_base(
+                                    &bytes,
+                                    recovery_base,
+                                ) {
                                     Ok(text) => (text, Some(path)),
                                     Err(_) => (TextBuffer::from_text(""), None),
                                 }
                             }
-                            Err(_) if missing && !already_open && writable => {
+                            Ok(bytes) if can_bind => {
+                                let text = crate::editor::text::decode_utf8(&bytes).map_or_else(
+                                    |_| TextBuffer::from_text(""),
+                                    |decoded| TextBuffer::empty_with_file_format(&decoded.format),
+                                );
+                                (text, Some(path))
+                            }
+                            Err(_) if missing && can_bind => {
                                 (TextBuffer::from_text(""), Some(path))
                             }
-                            _ => (TextBuffer::from_text(""), None),
+                            _ => {
+                                // Neither an already-open original nor one opened during the
+                                // read needs another decode just to recover its format defaults.
+                                let format = detached_format.as_ref().or_else(|| {
+                                    open_buffer
+                                        .filter(|_| same_path)
+                                        .map(|buffer| buffer.text.format())
+                                });
+                                (recovery_scratch(format), None)
+                            }
                         };
                         if let Some(path) = &destination {
                             self.record_recent_file(path.clone());
                         }
-                        let (buffer, _) = if missing && let Some(path) = destination.as_ref() {
+                        let bound = destination.is_some();
+                        let (buffer, _) = if missing
+                            && base_matches
+                            && let Some(path) = destination.as_ref()
+                        {
                             let mut candidate = self.state.draft();
                             let opened = match candidate.open_new_document(path.clone()) {
                                 Ok(opened) => opened,
@@ -1257,11 +1332,26 @@ impl App {
                                 }
                             }
                         };
-                        if let Err(error) = self.replace_with_recovered(buffer, content.clone()) {
+                        if let Err(error) = self.replace_with_recovered(buffer, record.content) {
                             self.show_error(error);
                             continue;
                         }
-                        self.finish_recovery(journal, "recovery_restored");
+                        if !bound || !base_matches {
+                            self.mark_recovery_unsaved(buffer, bound.then_some(record.base));
+                        }
+                        let message = if !base_matches {
+                            if record.base == RecoveryBase::Unknown || (same_path && !disk_checked)
+                            {
+                                "recovery_base_unverified"
+                            } else {
+                                "recovery_file_changed"
+                            }
+                        } else if bound {
+                            "recovery_restored"
+                        } else {
+                            "recovery_opened"
+                        };
+                        self.finish_recovery(&journal, message);
                         continue;
                     }
                     if let Some(NavigationRead::ByteRange(_, Some(snapshot))) = &pending {
@@ -1284,7 +1374,8 @@ impl App {
                         }
                     }
                     match result.map_err(InteractiveError::from).and_then(|bytes| {
-                        TextBuffer::from_bytes(&bytes).map_err(InteractiveError::from)
+                        TextBuffer::from_bytes_with_recovery_base(&bytes, recovery_base)
+                            .map_err(InteractiveError::from)
                     }) {
                         Ok(text) => match pending {
                             Some(NavigationRead::Matcher(source)) => {
@@ -1542,6 +1633,7 @@ impl App {
             path: buffer.path.as_deref(),
             text: &buffer.text,
             persisted: buffer.persisted_bytes(),
+            recovery_conflict: buffer.recovery_conflict.is_some(),
             new_file: buffer.new_file,
             dirty: buffer.dirty,
             virtual_read_only: buffer.is_virtual_read_only(),
@@ -1594,13 +1686,12 @@ impl App {
 }
 
 impl App {
-    /// The dashboard's Recover Unsaved Work: every journal with the file it was written for.
+    /// The dashboard's Recover Unsaved Work: unclaimed journals and their original files.
     /// Enter opens one, ctrl-x (`d` in Normal mode) discards it, Escape leaves them for later.
     pub(in crate::app) fn open_recovery_picker(&mut self) {
         let items = self
             .recovery
-            .records()
-            .iter()
+            .claimable_records(&self.state)
             .rev()
             .map(|(journal, record)| {
                 let label = record.path().as_deref().map_or_else(
@@ -1650,10 +1741,11 @@ impl App {
 }
 
 impl App {
-    /// Recover a journal into its file, as an unsaved change on top of what is on disk, so undo
-    /// goes back to the saved version. Work that never had a file, or whose file is already
-    /// open, comes back in a new buffer.
+    /// Recover unsaved work. Only a verified original can supply the saved baseline.
     pub(in crate::app) fn recover_journal(&mut self, journal: &Path) {
+        if self.recovery.journal_in_use(journal, &self.state) {
+            return;
+        }
         let Some(record) = self
             .recovery
             .records()
@@ -1664,14 +1756,17 @@ impl App {
             self.show_error(self.message("recovery_none", &[]));
             return;
         };
-        let original = record.path().filter(|path| {
-            !self
+        if let Some(original) = record.path() {
+            let detached_format = self
                 .state
                 .buffers
                 .values()
-                .any(|buffer| buffer.path.as_ref() == Some(path))
-        });
-        if let Some(original) = original {
+                .find(|buffer| buffer.path.as_ref() == Some(&original))
+                .map(|buffer| FileFormat {
+                    utf8_bom: buffer.text.format().utf8_bom,
+                    preferred_line_ending: buffer.text.format().preferred_line_ending,
+                    ..FileFormat::default()
+                });
             let roots = self
                 .workspace
                 .roots()
@@ -1683,27 +1778,59 @@ impl App {
                     self.recovery.register_read(
                         id,
                         journal.to_path_buf(),
-                        record.content,
+                        record,
                         self.workspace.version(),
+                        detached_format,
                     );
                 }
+                Err(_) if detached_format.is_some() => self.recover_detached(
+                    journal,
+                    record.content,
+                    detached_format.as_ref(),
+                    "recovery_base_unverified",
+                ),
                 Err(error) => self.show_error(error),
             }
-            return;
+        } else {
+            self.recover_detached(journal, record.content, None, "recovery_opened");
         }
-        let (buffer, _) = match self.state.open_text(TextBuffer::from_text(""), None) {
+    }
+
+    fn recover_detached(
+        &mut self,
+        journal: &Path,
+        content: String,
+        format: Option<&FileFormat>,
+        message: &str,
+    ) {
+        let (buffer, _) = match self.state.open_text(recovery_scratch(format), None) {
             Ok(opened) => opened,
             Err(error) => {
                 self.show_error(error);
                 return;
             }
         };
-        if let Err(error) = self.replace_with_recovered(buffer, record.content) {
+        if let Err(error) = self.replace_with_recovered(buffer, content) {
             self.show_error(error);
             return;
         }
-        self.finish_recovery(journal, "recovery_opened");
+        self.mark_recovery_unsaved(buffer, None);
+        self.finish_recovery(journal, message);
     }
+
+    fn mark_recovery_unsaved(&mut self, buffer: BufferId, recovery_conflict: Option<RecoveryBase>) {
+        self.state.set_buffer_dirty(buffer, true);
+        let target = &mut self.state.buffers[buffer];
+        target.set_saved_snapshot(None);
+        target.recovery_conflict = recovery_conflict;
+    }
+}
+
+fn recovery_scratch(format: Option<&FileFormat>) -> TextBuffer {
+    format.map_or_else(
+        || TextBuffer::from_text(""),
+        TextBuffer::empty_with_file_format,
+    )
 }
 
 impl App {
@@ -2573,6 +2700,13 @@ impl App {
                     self.clear_notice();
                 }
             }
+            DocumentChange::ReloadReplaced { buffer, path } => {
+                if let Some(stamp) = self.reload_stamps.remove(&buffer) {
+                    self.disk_stamps.insert(buffer, stamp);
+                }
+                let shown = self.notice_file_label(&path);
+                self.notify_warning(self.message("reload_file_replaced", &[("path", shown)]));
+            }
             DocumentChange::DiskChecked {
                 buffer,
                 path,
@@ -2622,6 +2756,7 @@ impl App {
                 text,
                 revision,
                 bytes,
+                recovery_base,
                 snapshot,
                 line_ending,
                 target: path,
@@ -2652,6 +2787,9 @@ impl App {
                 // A staged save that was waiting on this completion replays now, against the
                 // saved bytes, using the exact effect that was refused.
                 let buffer_state = &self.state.buffers[buffer];
+                if let Some(base) = recovery_base {
+                    buffer_state.cache_persisted_recovery_base(base);
+                }
                 let still_dirty = buffer_state.dirty;
                 if let (Some(directory), false) = (&self.state.undo_directory, still_dirty) {
                     self.persistence.track_undo_save(

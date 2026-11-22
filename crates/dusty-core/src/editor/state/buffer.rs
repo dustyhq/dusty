@@ -36,6 +36,10 @@ pub struct Buffer {
     saved_format: FileFormat,
     pub saved_view: Option<View>,
     persisted_bytes: std::sync::Arc<[u8]>,
+    persisted_recovery_base: std::sync::Arc<std::sync::OnceLock<crate::files::RecoveryBase>>,
+    /// A recovered original with no verified saved state. Keep its journal's base until
+    /// an explicit write or reload establishes a new one.
+    pub recovery_conflict: Option<crate::files::RecoveryBase>,
     pub new_file: bool,
     pub undo: UndoTree,
     /// Tree-sitter text objects from the parse of `revision`, set by the syntax session.
@@ -77,10 +81,11 @@ impl Buffer {
     }
 
     #[must_use]
-    pub fn new(text: TextBuffer, path: Option<PathBuf>) -> Self {
+    pub fn new(mut text: TextBuffer, path: Option<PathBuf>) -> Self {
         let saved_text = Some(text.to_string().into());
         let saved_revision = text.revision();
-        let persisted_bytes = text.to_bytes().into();
+        let persisted_bytes: std::sync::Arc<[u8]> = text.to_bytes().into();
+        let persisted_recovery_base = text.take_read_recovery_base();
         Self {
             undo: UndoTree::default(),
             decorations: crate::editor::decorations::Decorations::default(),
@@ -97,6 +102,11 @@ impl Buffer {
             saved_text,
             saved_view: None,
             persisted_bytes,
+            persisted_recovery_base: std::sync::Arc::new(
+                persisted_recovery_base
+                    .map_or_else(std::sync::OnceLock::new, std::sync::OnceLock::from),
+            ),
+            recovery_conflict: None,
             new_file: false,
             syntax_objects: None,
             last_insert: None,
@@ -201,6 +211,8 @@ impl Buffer {
             self.saved_format = saved.format().clone();
         }
         self.persisted_bytes = bytes.into();
+        self.persisted_recovery_base = std::sync::Arc::default();
+        self.recovery_conflict = None;
         self.new_file = false;
         self.refresh_dirty();
     }
@@ -217,6 +229,33 @@ impl Buffer {
         {
             self.undo = tree;
         }
+    }
+
+    /// Attach the worker's fingerprint of the newly saved bytes.
+    pub fn cache_persisted_recovery_base(&self, base: crate::files::RecoveryBase) {
+        let _ = self.persisted_recovery_base.set(base);
+    }
+
+    /// Return the journal base or its cache, without hashing on the editor thread.
+    #[must_use]
+    pub fn recovery_base(&self) -> crate::files::RecoveryBaseSource {
+        use crate::files::RecoveryBase;
+        use crate::files::RecoveryBaseSource;
+        if self.path.is_none() {
+            RecoveryBaseSource::Known(RecoveryBase::Unknown)
+        } else if let Some(base) = self.recovery_conflict {
+            RecoveryBaseSource::Known(base)
+        } else if self.new_file {
+            RecoveryBaseSource::Known(RecoveryBase::Missing)
+        } else {
+            RecoveryBaseSource::Persisted(self.persisted_recovery_base.clone())
+        }
+    }
+
+    /// Share the exact saved bytes with the recovery worker without copying them.
+    #[must_use]
+    pub fn persisted_bytes_snapshot(&self) -> std::sync::Arc<[u8]> {
+        self.persisted_bytes.clone()
     }
 
     #[must_use]

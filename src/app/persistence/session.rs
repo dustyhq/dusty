@@ -289,7 +289,13 @@ impl Persistence {
         else {
             return Continue(event);
         };
-        let VfsResult::Read { path, result, .. } = event else {
+        let VfsResult::Read {
+            path,
+            result,
+            recovery_base,
+            ..
+        } = event
+        else {
             return Continue(event);
         };
         let current = !self.closing && restore.source.current(&context);
@@ -314,7 +320,7 @@ impl Persistence {
             ));
         }
         let text = match result {
-            Ok(bytes) => TextBuffer::from_bytes(&bytes).ok(),
+            Ok(bytes) => TextBuffer::from_bytes_with_recovery_base(&bytes, recovery_base).ok(),
             Err(
                 VfsError::Io { .. }
                 | VfsError::NotRegularFile(_)

@@ -3662,11 +3662,10 @@ fn recovery_dialog_discards_one_journal_and_recovers_another() {
     std::fs::write(&dropped, "").unwrap();
     let notes = app.state.workspace_root.join("notes.md");
     std::fs::write(&notes, "saved\n").unwrap();
+    let mut record = crate::files::RecoveryRecord::new(Some(&notes), 3, "draft\nsecond\n".into());
+    record.base = crate::files::RecoveryBase::from_persisted(b"saved\n");
     app.recovery.fixture_records(vec![
-        (
-            kept.clone(),
-            crate::files::RecoveryRecord::new(Some(&notes), 3, "draft\nsecond\n".into()),
-        ),
+        (kept.clone(), record),
         (
             dropped.clone(),
             crate::files::RecoveryRecord {
@@ -3674,6 +3673,7 @@ fn recovery_dialog_discards_one_journal_and_recovers_another() {
                 original_path: None,
                 revision: 1,
                 content: "scratch".into(),
+                base: crate::files::RecoveryBase::Unknown,
             },
         ),
     ]);
@@ -3716,6 +3716,11 @@ fn recovery_dialog_discards_one_journal_and_recovers_another() {
     );
     app.invoke_mapped_command("history.undo");
     assert_eq!(app.state.buffers[buffer].text.to_bytes(), b"saved\n");
+    app.invoke_mapped_command("history.redo");
+    app.invoke_mapped_command("file.save");
+    wait_vfs(&mut app);
+    assert_eq!(fs::read(notes).unwrap(), b"draft\nsecond\n");
+    assert!(!app.state.buffers[buffer].dirty);
 }
 
 #[test]
@@ -4620,6 +4625,392 @@ fn clipped_dirty_close_cannot_save_or_discard() {
 }
 
 #[test]
+fn recovered_edits_cannot_overwrite_a_changed_file_with_an_ordinary_save() {
+    let (_app_dirs, mut app) = app();
+    app.recovery.skip_maintenance();
+    let path = app.state.workspace_root.join("changed.txt");
+    let base = b"\xef\xbb\xbfbase\r\n";
+    fs::write(&path, base).unwrap();
+    app.start_open(path);
+    wait_vfs(&mut app);
+    let original = app.state.active_buffer_id().unwrap();
+    let path = app.state.buffers[original].path.clone().unwrap();
+    app.replace_with_recovered(original, "recovered\n".into())
+        .unwrap();
+    app.queue_dirty_recovery_before_exit();
+    wait_vfs(&mut app);
+    app.close_active_buffer(true);
+    assert!(!app.state.buffers.contains_key(original));
+
+    let disk = b"\xef\xbb\xbfnew disk text\r\n";
+    fs::write(&path, disk).unwrap();
+    let discovery = crate::files::discover_recovery(app.recovery.directory());
+    assert!(discovery.diagnostics.is_empty());
+    assert_eq!(discovery.records.len(), 1);
+    let original_base = crate::files::RecoveryBase::from_persisted(base);
+    assert_eq!(discovery.records[0].1.base, original_base);
+    app.recovery.fixture_records(discovery.records);
+    app.open_recovery_picker();
+    app.accept_picker();
+    wait_vfs(&mut app);
+    let buffer = app.state.active_buffer_id().unwrap();
+    assert_eq!(app.state.buffers[buffer].path.as_ref(), Some(&path));
+    assert_eq!(app.state.buffers[buffer].text.to_string(), "recovered\n");
+    assert!(app.state.buffers[buffer].dirty);
+    assert_eq!(
+        app.ui.notification.as_deref(),
+        Some("The file changed since this recovery copy was made.")
+    );
+
+    app.invoke_mapped_command("file.save");
+    wait_vfs(&mut app);
+    let refusal = crate::files::VfsError::ExternalModification(path.clone()).to_string();
+    assert_eq!(app.ui.notification.as_deref(), Some(refusal.as_str()));
+    assert_eq!(fs::read(&path).unwrap(), disk);
+    assert!(app.state.buffers[buffer].dirty);
+
+    app.replace_with_recovered(buffer, "edited recovery\n".into())
+        .unwrap();
+    app.queue_dirty_recovery_before_exit();
+    wait_vfs(&mut app);
+    let discovery = crate::files::discover_recovery(app.recovery.directory());
+    assert_eq!(discovery.records[0].1.content, "edited recovery\n");
+    assert_eq!(discovery.records[0].1.base, original_base);
+
+    let copy = path.with_file_name("recovered-copy.txt");
+    app.start_save(false, Some(copy.clone()), false);
+    wait_vfs(&mut app);
+    assert_eq!(fs::read(copy).unwrap(), b"\xef\xbb\xbfedited recovery\r\n");
+    assert_eq!(fs::read(path).unwrap(), disk);
+}
+
+#[test]
+fn recovery_rewrites_an_unchanged_draft_after_its_in_flight_save_changes_the_base() {
+    let (_dirs, mut app) = app();
+    app.recovery.skip_maintenance();
+    let path = app.state.workspace_root.join("recover-in-flight.txt");
+    fs::write(&path, b"A\n").unwrap();
+    app.start_open(path.clone());
+    wait_vfs(&mut app);
+    let buffer = app.state.active_buffer_id().unwrap();
+    app.replace_with_recovered(buffer, "B\n".into()).unwrap();
+    app.start_save(false, None, false);
+    assert!(app.documents.file_work_pending());
+    app.replace_with_recovered(buffer, "C\n".into()).unwrap();
+    let revision = app.state.buffers[buffer].text.revision();
+
+    // Capture the draft before the app consumes the save acknowledgement.
+    app.queue_dirty_recovery_before_exit();
+    wait_vfs(&mut app);
+    assert_eq!(fs::read(path).unwrap(), b"B\n");
+    assert_eq!(app.state.buffers[buffer].text.revision(), revision);
+    assert!(app.state.buffers[buffer].dirty);
+    let original = crate::files::discover_recovery(app.recovery.directory());
+    assert_eq!(original.records[0].1.content, "C\n");
+    assert_eq!(
+        original.records[0].1.base,
+        crate::files::RecoveryBase::from_persisted(b"A\n")
+    );
+
+    app.queue_dirty_recovery_before_exit();
+    wait_vfs(&mut app);
+    let updated = crate::files::discover_recovery(app.recovery.directory());
+    assert_eq!(updated.records[0].1.content, "C\n");
+    assert_eq!(updated.records[0].1.revision, revision.0);
+    assert_eq!(
+        updated.records[0].1.base,
+        crate::files::RecoveryBase::from_persisted(b"B\n")
+    );
+}
+
+#[test]
+fn recovery_rediscovery_keeps_live_journals_out_of_the_picker() {
+    let (_dirs, mut app) = app();
+    let path = app.state.workspace_root.join("file.txt");
+    fs::write(&path, "saved\n").unwrap();
+    app.start_open(path.clone());
+    wait_vfs(&mut app);
+    let buffer = app.state.active_buffer_id().unwrap();
+    app.replace_with_recovered(buffer, "first draft\n".into())
+        .unwrap();
+    app.queue_dirty_recovery_before_exit();
+    wait_vfs(&mut app);
+    let journal = app.recovery.path(buffer);
+    assert!(journal.exists());
+
+    for enabled in [false, true] {
+        let mut candidate = crate::config::load_bundled_config();
+        candidate.config.recovery.enabled = enabled;
+        app.apply_configuration_candidate(candidate, false).unwrap();
+        app.schedule_recovery_work();
+        wait_vfs(&mut app);
+    }
+
+    // Rediscovery sees the journal on disk, but it still belongs to the open buffer.
+    assert!(
+        app.recovery
+            .records()
+            .iter()
+            .any(|(path, _)| path == &journal)
+    );
+    let buffer_count = app.state.buffers.len();
+    app.invoke_mapped_command("recovery.inspect");
+    assert!(!app.recovery_picker_open());
+
+    // Stale accept and discard actions must also respect the live owner.
+    app.recover_journal(&journal);
+    app.recovery
+        .discard(&journal, true, &app.state, app.documents.recovery_io())
+        .unwrap();
+    assert_eq!(app.documents.legacy_count(), 0);
+    assert_eq!(app.state.buffers.len(), buffer_count);
+    assert_eq!(app.state.active_buffer_id(), Some(buffer));
+    assert!(journal.exists());
+
+    app.replace_with_recovered(buffer, "second draft\n".into())
+        .unwrap();
+    app.queue_dirty_recovery_before_exit();
+    wait_vfs(&mut app);
+    let discovered = crate::files::discover_recovery(app.recovery.directory());
+    assert_eq!(discovered.records.len(), 1);
+    assert_eq!(discovered.records[0].0, journal);
+    assert_eq!(discovered.records[0].1.content, "second draft\n");
+    assert_eq!(fs::read_to_string(path).unwrap(), "saved\n");
+}
+
+#[test]
+fn recovery_picker_reserves_a_journal_until_the_read_finishes() {
+    let (_dirs, mut app) = app();
+    app.recovery.skip_maintenance();
+    let path = app.state.workspace_root.join("file.txt");
+    fs::write(&path, b"saved\n").unwrap();
+    let path = crate::files::canonicalize(&path).unwrap();
+    let (original, _) = app
+        .state
+        .open_text(TextBuffer::from_text("saved\n"), Some(path.clone()))
+        .unwrap();
+    let record = crate::files::RecoveryRecord::new(Some(&path), 1, "draft\n".into());
+    let journal = app.recovery.directory().join("draft.toml");
+    app.recovery
+        .fixture_records(vec![(journal.clone(), record)]);
+    let gate = gate_document_worker(&mut app);
+
+    app.open_recovery_picker();
+    app.accept_picker();
+    assert_eq!(app.documents.legacy_count(), 1);
+    app.open_recovery_picker();
+    assert!(!app.recovery_picker_open());
+    // A stale picker selection must not queue the journal either.
+    app.recover_journal(&journal);
+    assert_eq!(app.documents.legacy_count(), 1);
+    gate.send(()).unwrap();
+    wait_vfs(&mut app);
+
+    let recovered = app.state.active_buffer_id().unwrap();
+    assert_ne!(recovered, original);
+    assert_eq!(
+        app.state
+            .buffers
+            .values()
+            .filter(|buffer| buffer.dirty)
+            .count(),
+        1
+    );
+    app.replace_with_recovered(recovered, "kept edit\n".into())
+        .unwrap();
+    app.queue_dirty_recovery_before_exit();
+    wait_vfs(&mut app);
+    let discovered = crate::files::discover_recovery(app.recovery.directory());
+    assert_eq!(discovered.records.len(), 1);
+    assert_eq!(discovered.records[0].0, journal);
+    assert_eq!(discovered.records[0].1.content, "kept edit\n");
+}
+
+#[test]
+fn recovery_of_an_open_original_falls_back_when_the_document_queue_is_full() {
+    let (_dirs, mut app) = app();
+    app.recovery.skip_maintenance();
+    let path = app.state.workspace_root.join("file.txt");
+    let saved = b"\xef\xbb\xbfsaved\r\n";
+    fs::write(&path, saved).unwrap();
+    let path = crate::files::canonicalize(&path).unwrap();
+    let (original, _) = app
+        .state
+        .open_text(TextBuffer::from_bytes(saved).unwrap(), Some(path.clone()))
+        .unwrap();
+    let record = crate::files::RecoveryRecord::new(Some(&path), 1, "draft\n".into());
+    let journal = app.recovery.directory().join("draft.toml");
+    app.recovery
+        .fixture_records(vec![(journal.clone(), record)]);
+    let gate = gate_document_worker(&mut app);
+    for _ in 0..crate::app::documents::VFS_QUEUE_CAPACITY {
+        app.documents.read(path.clone()).unwrap();
+    }
+    assert!(matches!(
+        app.documents.check_capacity(),
+        Err(crate::files::VfsError::QueueFull)
+    ));
+
+    app.open_recovery_picker();
+    app.accept_picker();
+    let recovered = app.state.active_buffer_id().unwrap();
+    assert_ne!(recovered, original);
+    assert_eq!(app.state.buffers[recovered].path, None);
+    assert!(app.state.buffers[recovered].dirty);
+    assert_eq!(
+        app.state.buffers[recovered].text.to_bytes(),
+        b"\xef\xbb\xbfdraft\r\n"
+    );
+    assert_eq!(app.recovery.path(recovered), journal);
+    assert_eq!(
+        app.ui.notification.as_deref(),
+        Some("Couldn't check whether the file changed since this recovery copy was made.")
+    );
+    assert_eq!(app.state.buffers[original].text.to_bytes(), saved);
+
+    gate.send(()).unwrap();
+    wait_vfs(&mut app);
+}
+
+#[test]
+fn recovery_for_an_open_original_reports_changed_and_legacy_bases() {
+    use crate::files::RecoveryBase;
+    for (base, notice) in [
+        (
+            RecoveryBase::from_persisted(b"old\n"),
+            "The file changed since this recovery copy was made.",
+        ),
+        (
+            RecoveryBase::Unknown,
+            "Couldn't check whether the file changed since this recovery copy was made.",
+        ),
+    ] {
+        let (_dirs, mut app) = app();
+        app.recovery.skip_maintenance();
+        let path = app.state.workspace_root.join("file.txt");
+        fs::write(&path, b"\xef\xbb\xbfnew\r\n").unwrap();
+        app.start_open(path);
+        wait_vfs(&mut app);
+        let original = app.state.active_buffer_id().unwrap();
+        let path = app.state.buffers[original].path.clone().unwrap();
+        // The detached draft should use the open buffer's format, not today's disk format.
+        fs::write(&path, b"new\n").unwrap();
+        let mut record = crate::files::RecoveryRecord::new(Some(&path), 1, "draft\n".into());
+        record.base = base;
+        let journal = app.recovery.directory().join("draft.toml");
+        app.recovery
+            .fixture_records(vec![(journal.clone(), record)]);
+
+        app.recover_journal(&journal);
+        wait_vfs(&mut app);
+        let recovered = app.state.active_buffer_id().unwrap();
+        assert_ne!(recovered, original);
+        assert_eq!(app.state.buffers[recovered].path, None);
+        assert_eq!(
+            app.state.buffers[recovered].text.to_bytes(),
+            b"\xef\xbb\xbfdraft\r\n"
+        );
+        assert_eq!(
+            app.state.buffers[original].text.to_bytes(),
+            b"\xef\xbb\xbfnew\r\n"
+        );
+        assert_eq!(app.ui.notification.as_deref(), Some(notice));
+    }
+}
+
+#[test]
+fn an_empty_recovery_for_an_open_original_stays_dirty_and_keeps_its_journal() {
+    for open_before_read in [true, false] {
+        let (_dirs, mut app) = app();
+        app.recovery.skip_maintenance();
+        let path = app.state.workspace_root.join("deleted-text.txt");
+        fs::write(&path, b"saved\n").unwrap();
+        let path = crate::files::canonicalize(&path).unwrap();
+        let journal = app.recovery.directory().join("deleted-text.toml");
+        let mut record = crate::files::RecoveryRecord::new(Some(&path), 1, String::new());
+        if !open_before_read {
+            record.base = crate::files::RecoveryBase::from_persisted(b"saved\n");
+        }
+        fs::create_dir_all(journal.parent().unwrap()).unwrap();
+        crate::files::write_recovery(&journal, &record).unwrap();
+        app.recovery
+            .fixture_records(vec![(journal.clone(), record)]);
+        if !open_before_read {
+            app.recover_journal(&journal);
+        }
+        let (original, _) = app
+            .state
+            .open_text(TextBuffer::from_text("saved\n"), Some(path))
+            .unwrap();
+        if open_before_read {
+            app.recover_journal(&journal);
+        }
+        wait_vfs(&mut app);
+        let recovered = app.state.active_buffer_id().unwrap();
+        assert_ne!(recovered, original);
+        assert_eq!(app.state.buffers[original].text.to_string(), "saved\n");
+        assert!(app.state.buffers[recovered].path.is_none());
+        assert!(app.state.buffers[recovered].text.is_empty());
+        assert!(app.state.buffers[recovered].dirty);
+        app.queue_dirty_recovery_before_exit();
+        wait_vfs(&mut app);
+        assert!(journal.exists());
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn disk_poll_and_explicit_reload_do_not_follow_a_replaced_path() {
+    let (_app_dirs, mut app) = app();
+    let root = &app.state.workspace_root;
+    let original = root.join("original");
+    let replacement = root.join("replacement");
+    fs::create_dir(&original).unwrap();
+    fs::create_dir(&replacement).unwrap();
+    let path = original.join("file.txt");
+    fs::write(&path, "original\n").unwrap();
+    fs::write(replacement.join("file.txt"), "replacement text\n").unwrap();
+    let archived = root.join("archived");
+    app.start_open(path.clone());
+    wait_vfs(&mut app);
+    let buffer = app.state.active_buffer_id().unwrap();
+    let source = app.state.buffers[buffer].text.source_version();
+    let path = app.state.buffers[buffer].path.clone().unwrap();
+
+    fs::rename(&original, archived).unwrap();
+    std::os::unix::fs::symlink(&replacement, &original).unwrap();
+    for automatic in [true, false] {
+        app.clear_notice();
+        if automatic {
+            app.next_disk_check = None;
+            app.process_disk_changes();
+        } else {
+            app.start_reload(false);
+        }
+        wait_vfs(&mut app);
+        let current = &app.state.buffers[buffer];
+        assert_eq!(current.path.as_ref(), Some(&path), "automatic: {automatic}");
+        assert_eq!(
+            current.text.to_string(),
+            "original\n",
+            "automatic: {automatic}"
+        );
+        assert_eq!(
+            current.text.source_version(),
+            source,
+            "automatic: {automatic}"
+        );
+        assert!(
+            app.ui.notification.as_deref().is_some_and(|notice| {
+                notice.ends_with("was replaced. The buffer was not reloaded.")
+            }),
+            "automatic: {automatic}, notice: {:?}",
+            app.ui.notification,
+        );
+    }
+}
+
+#[test]
 fn recovered_missing_file_can_be_saved_without_force() {
     let (_app_dirs, mut app) = app();
     app.recovery.skip_maintenance();
@@ -4627,10 +5018,10 @@ fn recovered_missing_file_can_be_saved_without_force() {
     let journal = app.recovery.directory().join("deleted.toml");
     fs::create_dir_all(journal.parent().unwrap()).unwrap();
     fs::write(&journal, "durable copy").unwrap();
-    app.recovery.fixture_records(vec![(
-        journal.clone(),
-        crate::files::RecoveryRecord::new(Some(&path), 1, "recovered\n".into()),
-    )]);
+    let mut record = crate::files::RecoveryRecord::new(Some(&path), 1, "recovered\n".into());
+    record.base = crate::files::RecoveryBase::Missing;
+    app.recovery
+        .fixture_records(vec![(journal.clone(), record)]);
     app.open_recovery_picker();
     app.accept_picker();
     wait_vfs(&mut app);
@@ -4722,6 +5113,7 @@ fn startup_reply_is_exact_once_and_rejects_root_or_editor_replacement_before_dec
             id,
             path: "old".into(),
             result: Ok(vec![255]),
+            recovery_base: None,
         },
         &state.window_version(),
         8,
@@ -4741,7 +5133,8 @@ fn startup_reply_is_exact_once_and_rejects_root_or_editor_replacement_before_dec
             VfsResult::Read {
                 id,
                 path: "old".into(),
-                result: Ok(vec![255])
+                result: Ok(vec![255]),
+                recovery_base: None,
             },
             &foreign.window_version(),
             7
@@ -4762,7 +5155,8 @@ fn startup_reply_is_exact_once_and_rejects_root_or_editor_replacement_before_dec
             VfsResult::Read {
                 id,
                 path: "old".into(),
-                result: Ok(vec![255])
+                result: Ok(vec![255]),
+                recovery_base: None,
             },
             &state.window_version(),
             7
@@ -4785,7 +5179,8 @@ fn startup_reply_is_exact_once_and_rejects_root_or_editor_replacement_before_dec
             VfsResult::Read {
                 id,
                 path: "exhausted".into(),
-                result: Ok(vec![255])
+                result: Ok(vec![255]),
+                recovery_base: None,
             },
             &exhausted.window_version(),
             7
@@ -4805,6 +5200,7 @@ fn startup_reply_is_exact_once_and_rejects_root_or_editor_replacement_before_dec
             id,
             path: "first".into(),
             result: Ok(b"hello".to_vec()),
+            recovery_base: None,
         },
         &state.window_version(),
         7,
@@ -4818,7 +5214,8 @@ fn startup_reply_is_exact_once_and_rejects_root_or_editor_replacement_before_dec
             VfsResult::Read {
                 id,
                 path: "duplicate".into(),
-                result: Ok(vec![255])
+                result: Ok(vec![255]),
+                recovery_base: None,
             },
             &state.window_version(),
             7
@@ -4832,7 +5229,8 @@ fn startup_reply_is_exact_once_and_rejects_root_or_editor_replacement_before_dec
             VfsResult::Read {
                 id,
                 path: "late".into(),
-                result: Ok(vec![255])
+                result: Ok(vec![255]),
+                recovery_base: None,
             },
             &state.window_version(),
             7
@@ -4850,6 +5248,7 @@ fn total_outstanding_requests_are_bounded_and_policy_does_not_follow_reused_buff
     ));
     owner.route(
         VfsResult::Read {
+            recovery_base: None,
             id: RequestId(1),
             path: "one".into(),
             result: Err(VfsError::QueueFull),

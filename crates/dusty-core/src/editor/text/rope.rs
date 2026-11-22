@@ -25,6 +25,7 @@ use crate::editor::text::PositionError;
 use crate::editor::text::decode_utf8;
 
 use crate::editor::text::encode_utf8;
+use crate::files::RecoveryBase;
 
 /// How many recent edits a buffer remembers for moving highlights forward.
 const RECENT_EDITS: usize = 64;
@@ -41,6 +42,7 @@ pub struct TextBuffer {
     revision: BufferRevision,
     pub(in crate::editor::text) format: FileFormat,
     source: TextVersion,
+    read_recovery_base: Option<RecoveryBase>,
     /// The latest edits, each with the revision it was applied to, so highlights computed for
     /// an older revision can be moved onto the current text until a new parse arrives.
     recent_edits: Vec<(BufferRevision, EditDelta)>,
@@ -124,12 +126,21 @@ impl TextBuffer {
             revision: BufferRevision::initial(),
             format,
             source: TextVersion::new(),
+            read_recovery_base: None,
             recent_edits: Vec::new(),
             recent_texts: Vec::new(),
         }
     }
 
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, EncodingError> {
+        Self::from_bytes_with_recovery_base(bytes, None)
+    }
+
+    /// Decode file bytes with a fingerprint computed by the file worker.
+    pub fn from_bytes_with_recovery_base(
+        bytes: &[u8],
+        read_recovery_base: Option<RecoveryBase>,
+    ) -> Result<Self, EncodingError> {
         #[cfg(any(test, feature = "test-support"))]
         TEXT_MATERIALIZATIONS.with(|n| {
             let (decode, display) = n.get();
@@ -141,9 +152,23 @@ impl TextBuffer {
             revision: BufferRevision::initial(),
             format,
             source: TextVersion::new(),
+            read_recovery_base,
             recent_edits: Vec::new(),
             recent_texts: Vec::new(),
         })
+    }
+
+    /// Start without saved text but use the same encoding and default line separator.
+    #[must_use]
+    pub fn empty_with_file_format(format: &FileFormat) -> Self {
+        let mut text = Self::from_text("");
+        text.format.utf8_bom = format.utf8_bom;
+        text.format.preferred_line_ending = format.preferred_line_ending;
+        text
+    }
+
+    pub(in crate::editor) fn take_read_recovery_base(&mut self) -> Option<RecoveryBase> {
+        self.read_recovery_base.take()
     }
 
     pub fn source_version(&self) -> TextVersion {
@@ -157,6 +182,7 @@ impl TextBuffer {
 
     pub fn set_preferred_line_ending(&mut self, ending: crate::editor::text::LineEnding) {
         self.format.preferred_line_ending = ending;
+        self.read_recovery_base = None;
     }
 
     #[must_use]
@@ -206,6 +232,7 @@ impl TextBuffer {
     pub fn set_line_ending(&mut self, ending: crate::editor::text::LineEnding) {
         self.format.preferred_line_ending = ending;
         self.format.line_endings.fill(ending);
+        self.read_recovery_base = None;
     }
 
     pub fn validate_offset(&self, offset: ByteOffset) -> Result<(), PositionError> {
@@ -290,6 +317,7 @@ impl TextBuffer {
     pub fn bump_revision(&mut self) -> Result<(), PositionError> {
         self.revision = self.revision.next()?;
         self.source.snapshot = std::sync::Arc::new(());
+        self.read_recovery_base = None;
         Ok(())
     }
 
@@ -308,6 +336,7 @@ impl TextBuffer {
     }
 
     pub fn set_line_endings(&mut self, first: usize, endings: &[crate::editor::text::LineEnding]) {
+        self.read_recovery_base = None;
         for (index, ending) in endings.iter().enumerate() {
             if let Some(target) = self.format.line_endings.get_mut(first + index) {
                 *target = *ending;
@@ -375,6 +404,7 @@ impl TextBuffer {
             revision,
             format: self.format.clone(),
             source: self.source.clone(),
+            read_recovery_base: None,
             recent_edits: Vec::new(),
             recent_texts: Vec::new(),
         })

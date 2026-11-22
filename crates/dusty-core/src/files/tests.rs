@@ -23,6 +23,7 @@ use crate::files::ExplorerWatchPolicy;
 use crate::files::ExplorerWatchWorker;
 use crate::files::ProjectRootStrategy;
 use crate::files::ProjectRootWorker;
+use crate::files::RecoveryBase;
 use crate::files::RecoveryRecord;
 use crate::files::VfsError;
 use crate::files::VfsResult;
@@ -556,13 +557,29 @@ fn recovery_journals_are_versioned_atomic_and_corruption_tolerant() {
     let valid = root.path().join("buffer-a.toml");
     let source = root.path().join("source.rs");
     fs::write(&source, b"source stays intact").expect("source");
-    let record = RecoveryRecord::new(Some(&source), 42, "unsaved text".into());
+    let mut record = RecoveryRecord::new(Some(&source), 42, "unsaved text".into());
+    record.base = RecoveryBase::from_persisted(b"source stays intact");
     write_recovery(&valid, &record).expect("journal");
     fs::write(root.path().join("broken.toml"), b"not = [valid").expect("broken");
     let discovery = discover_recovery(root.path());
     assert_eq!(discovery.records, vec![(valid, record)]);
     assert_eq!(discovery.diagnostics.len(), 1);
     assert_eq!(fs::read(source).expect("source"), b"source stays intact");
+}
+
+#[test]
+fn legacy_recovery_journal_decodes_with_an_unknown_base() {
+    let record: RecoveryRecord = toml::from_str(
+        r#"version = 1
+original_path = "old.txt"
+revision = 0
+content = "old"
+"#,
+    )
+    .unwrap();
+    assert_eq!(record.path(), Some("old.txt".into()));
+    assert_eq!(record.content, "old");
+    assert_eq!(record.base, RecoveryBase::Unknown);
 }
 
 // Unix paths can contain arbitrary non-UTF-8 bytes.
@@ -585,6 +602,7 @@ fn recovery_paths_round_trip_native_bytes_and_read_legacy_journals() {
         original_path: Some("old.txt".into()),
         revision: 0,
         content: "old".into(),
+        base: RecoveryBase::Unknown,
     };
     fs::write(
         root.path().join("legacy.toml"),

@@ -1457,8 +1457,8 @@ pub(in crate::app) enum NavigationRead {
         crate::app::workspace::WorkspaceVersion,
     ),
     ByteRange(ByteRange, Option<std::sync::Arc<[u8]>>),
-    /// A recovery journal's path and text, to put into the file once it is open.
-    Recovered(std::path::PathBuf, String),
+    /// The journal path and record to restore after checking the original file.
+    Recovered(crate::app::documents::recovery::RecoveryRead),
 }
 impl App {
     fn clear_lsp_ui_rows(&mut self) {
