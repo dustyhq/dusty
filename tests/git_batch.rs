@@ -305,7 +305,14 @@ fn disjoint_marks_finish_partial_rename_binary_and_untracked_then_reverse_only_t
     screen.write_refusal = None;
     key(&mut screen, KeyCode::Char('-'));
     assert!(screen.busy());
-    key(&mut screen, KeyCode::Char('-')); // busy/post-write refresh cannot reverse early
+    key(&mut screen, KeyCode::Char('-')); // Repeated input cannot bypass the worker.
+    wait(&mut screen, |screen| !screen.busy());
+    let shown = view(&mut screen);
+    assert!(shown.contains("Replace staged changes?"), "{shown}");
+    assert_eq!(git(root, &["show", ":alpha/edit.txt"]), "partially staged");
+    key(&mut screen, KeyCode::Tab); // Move from Cancel to Stage anyway.
+    key(&mut screen, KeyCode::Enter);
+    assert!(screen.busy(), "confirmed stage did not start");
     wait(&mut screen, |screen| !screen.busy());
     assert_eq!(git(root, &["show", ":alpha/edit.txt"]), "remaining edit");
     assert_eq!(git(root, &["show", ":beta/moved.txt"]), "renamed content");

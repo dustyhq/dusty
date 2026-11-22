@@ -1,12 +1,22 @@
 //! Native Git selections use the existing checked mutation and bounded command workers.
 use super::*;
-use crate::mutation::{MARKED_DIRECTORY_SCOPE, indexed_file_ancestors};
+use crate::mutation::{
+    IndexLock, IndexWrite, MARKED_DIRECTORY_SCOPE, index_entries_fingerprint, index_fingerprint,
+    indexed_file_ancestors, run_index_command,
+};
+use std::ops::Range;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, TryRecvError};
 
 #[cfg(test)]
 mod tests;
 
 const CHECK_STAGE: &str = "Couldn't check what is staged";
-const STAGE_CHANGED: &str = "Files changed while you were deciding. Try staging again.";
+const STAGE_FAILED: &str = "Couldn't stage the selected files.";
+const STAGE_CHANGED: &str = "Files changed. Refresh and try staging again.";
+const DISCARD_LOCKED: &str = "Another Git command is using the repository. Try discarding again.";
+const STAGE_GIT_TIMEOUT: Duration = Duration::from_secs(30);
 const DIRECTORY_SCOPE: &str = "Show the replaced file and all its changed contents before staging.";
 
 #[derive(Clone, Copy)]
@@ -29,11 +39,28 @@ impl StageScope {
 pub(super) struct BulkStage {
     scope: StageScope,
     paths: BTreeSet<PathBuf>,
-    replacing: BTreeSet<PathBuf>,
+    candidate: GitIndexFingerprint,
     index: GitIndexFingerprint,
     head: Option<GitHeadId>,
     notice: Option<String>,
     pub(super) warning: String,
+}
+
+pub(super) struct BulkStageWorker {
+    receiver: Receiver<Result<BulkStageResult, String>>,
+    cancel: Arc<AtomicBool>,
+    pending_consent: Option<BulkStage>,
+}
+
+impl Drop for BulkStageWorker {
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::Release);
+    }
+}
+
+enum BulkStageResult {
+    NeedsConsent(BulkStage),
+    Staged(Option<String>),
 }
 
 fn unmerged_paths(index: &git2::Index) -> Result<BTreeSet<PathBuf>, git2::Error> {
@@ -50,78 +77,357 @@ fn unmerged_paths(index: &git2::Index) -> Result<BTreeSet<PathBuf>, git2::Error>
     Ok(paths)
 }
 
-/// Find staged blobs that would disappear because the worktree reverted or replaced the file.
-fn staged_only_paths(
+type IndexVersion = (git2::Oid, u32);
+
+fn stage_zero(index: &git2::Index, path: &Path) -> Option<IndexVersion> {
+    index.get_path(path, 0).map(|entry| (entry.id, entry.mode))
+}
+
+fn staged_replacements(
     repo: &git2::Repository,
-    index: &git2::Index,
+    before: &git2::Index,
+    after: &git2::Index,
     paths: &BTreeSet<PathBuf>,
     head: Option<GitHeadId>,
 ) -> Result<BTreeSet<PathBuf>, git2::Error> {
     let tree = head
         .map(|id| repo.find_commit(git2::Oid::from_bytes(&id.0)?)?.tree())
         .transpose()?;
-    let root = repo
-        .workdir()
-        .ok_or_else(|| git2::Error::from_str("missing working tree"))?;
-    let mut present_in_head = BTreeSet::new();
-    let mut staged_only = BTreeSet::new();
+    let mut replacing = BTreeSet::new();
     for path in paths {
-        let Some(staged) = index.get_path(path, 0) else {
-            continue;
-        };
-        let committed = match tree.as_ref().map(|tree| tree.get_path(path)).transpose() {
-            Ok(committed) => committed,
-            Err(error) if error.code() == git2::ErrorCode::NotFound => None,
-            Err(error) => return Err(error),
-        };
-        if committed
+        let staged = before.get_path(path, 0);
+        // Intent-to-add does not contain any staged work to lose.
+        if staged
             .as_ref()
-            .is_some_and(|entry| entry.id() == staged.id)
+            .is_some_and(|entry| entry.flags_extended & INTENT_TO_ADD != 0)
         {
             continue;
         }
-        match std::fs::symlink_metadata(root.join(path)) {
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
-                ) =>
-            {
-                staged_only.insert(path.clone());
-            }
-            Err(_) => return Err(git2::Error::from_str("cannot read working tree")),
-            Ok(metadata) if metadata.is_dir() && staged.mode != 0o160000 => {
-                // The directory exists, but Git will remove the staged file it replaced.
-                staged_only.insert(path.clone());
-            }
-            Ok(_) if committed.is_some() => {
-                present_in_head.insert(path.clone());
-            }
-            Ok(_) => {}
+        let staged = staged.map(|entry| (entry.id, entry.mode));
+        let candidate = stage_zero(after, path);
+        if staged == candidate {
+            continue;
+        }
+        let committed = match tree.as_ref().map(|tree| tree.get_path(path)).transpose() {
+            Ok(entry) => entry
+                .filter(|entry| entry.kind() != Some(git2::ObjectType::Tree))
+                .map(|entry| (entry.id(), entry.filemode() as u32)),
+            Err(error) if error.code() == git2::ErrorCode::NotFound => None,
+            Err(error) => return Err(error),
+        };
+        if staged != committed && !keeps_staged_changes(repo, committed, staged, candidate) {
+            replacing.insert(path.clone());
         }
     }
-    if !present_in_head.is_empty() {
-        // Two sides only: using the index here would obscure a reverted working copy.
-        // Libgit2 compares worktree blob IDs with Git's built-in clean filters applied.
-        let mut options = git2::DiffOptions::new();
-        options
-            .disable_pathspec_match(true)
-            .ignore_filemode(true)
-            .include_typechange(true);
-        for path in &present_in_head {
-            options.pathspec(path.as_path());
-        }
-        let diff = repo.diff_tree_to_workdir(tree.as_ref(), Some(&mut options))?;
-        for delta in diff.deltas() {
-            if delta.status() != git2::Delta::Deleted
-                && let Some(path) = delta.old_file().path()
-            {
-                present_in_head.remove(path);
+    Ok(replacing)
+}
+
+fn keeps_staged_changes(
+    repo: &git2::Repository,
+    committed: Option<IndexVersion>,
+    staged: Option<IndexVersion>,
+    candidate: Option<IndexVersion>,
+) -> bool {
+    let (Some((staged_blob, staged_mode)), Some((candidate_blob, candidate_mode))) =
+        (staged, candidate)
+    else {
+        // Adding back a staged deletion or removing a staged file loses staged work.
+        return false;
+    };
+    if committed.is_none_or(|(_, mode)| mode != staged_mode) && staged_mode != candidate_mode {
+        return false;
+    }
+    if staged_blob == candidate_blob || committed.is_some_and(|(blob, _)| blob == staged_blob) {
+        return true;
+    }
+
+    // Only text blobs have changes that can be checked line by line. A different
+    // binary, symlink, or submodule version requires consent.
+    let regular = |mode| matches!(mode, 0o100644 | 0o100755);
+    regular(staged_mode)
+        && regular(candidate_mode)
+        && committed.is_none_or(|(_, mode)| regular(mode))
+        && text_changes_survive(
+            repo,
+            committed.map(|(blob, _)| blob),
+            staged_blob,
+            candidate_blob,
+        )
+        .unwrap_or(false)
+}
+
+fn text_changes_survive(
+    repo: &git2::Repository,
+    committed: Option<git2::Oid>,
+    staged: git2::Oid,
+    candidate: git2::Oid,
+) -> Result<bool, git2::Error> {
+    let committed = committed.map(|oid| repo.find_blob(oid)).transpose()?;
+    let committed_bytes: &[u8] = committed.as_ref().map_or(&[], git2::Blob::content);
+    let staged = repo.find_blob(staged)?;
+    let candidate = repo.find_blob(candidate)?;
+    if committed.as_ref().is_some_and(git2::Blob::is_binary)
+        || staged.is_binary()
+        || candidate.is_binary()
+    {
+        return Ok(false);
+    }
+
+    // Both sets of ranges use the staged blob's coordinates. Zero-context hunks
+    // distinguish a staged edit from changes elsewhere in the candidate.
+    let mut options = git2::DiffOptions::new();
+    options.context_lines(0);
+    let staged_patch = git2::Patch::from_buffers(
+        committed_bytes,
+        None,
+        staged.content(),
+        None,
+        Some(&mut options),
+    )?;
+    let candidate_patch =
+        git2::Patch::from_blobs(&staged, None, &candidate, None, Some(&mut options))?;
+    if staged_patch.num_hunks() == 0 || candidate_patch.num_hunks() == 0 {
+        return Ok(false);
+    }
+    let range = |start, lines| -> Range<u32> {
+        let start = if lines == 0 { start } else { start - 1 };
+        start..start + lines
+    };
+    let mut removed = BTreeSet::new();
+    let mut next = 0;
+    for i in 0..staged_patch.num_hunks() {
+        let (staged_hunk, staged_lines) = staged_patch.hunk(i)?;
+        for line in 0..staged_lines {
+            let line = staged_patch.line_in_hunk(i, line)?;
+            if line.origin() == '-' {
+                removed.insert(line.content());
             }
         }
-        staged_only.append(&mut present_in_head);
+        let staged = range(staged_hunk.new_start(), staged_hunk.new_lines());
+        while next < candidate_patch.num_hunks() {
+            let (hunk, _) = candidate_patch.hunk(next)?;
+            let changed = range(hunk.old_start(), hunk.old_lines());
+            // A deletion has no lines to match. Protect its gap and its anchors.
+            let overlaps = if staged.is_empty() {
+                changed.start <= staged.start && staged.start <= changed.end
+            } else {
+                changed.start < staged.end && staged.start < changed.end
+            };
+            if overlaps {
+                return Ok(false);
+            }
+            if changed.end > staged.start {
+                break;
+            }
+            next += 1;
+        }
     }
-    Ok(staged_only)
+
+    // Diff alignment can move a reintroduced line away from its original gap.
+    // Compare additions across the whole candidate instead of trusting adjacency.
+    if !removed.is_empty() {
+        for i in 0..candidate_patch.num_hunks() {
+            let (hunk, changed_lines) = candidate_patch.hunk(i)?;
+            if hunk.new_lines() == 0 {
+                continue;
+            }
+            for line in 0..changed_lines {
+                let line = candidate_patch.line_in_hunk(i, line)?;
+                if line.origin() == '+' && removed.contains(line.content()) {
+                    return Ok(false);
+                }
+            }
+        }
+    }
+    Ok(true)
+}
+
+fn verify_stage_state(
+    root: &Path,
+    index: GitIndexFingerprint,
+    head: Option<GitHeadId>,
+) -> Result<(), String> {
+    if git_index_fingerprint(root).map_err(|_| CHECK_STAGE)? != index
+        || git_head_id(root).map_err(|_| CHECK_STAGE)? != head
+    {
+        return Err(STAGE_CHANGED.into());
+    }
+    Ok(())
+}
+
+fn private_stage_args(root: &Path, empty_hooks: &Path) -> Result<Vec<OsString>, String> {
+    let mut hooks_path = OsString::from("core.hooksPath=");
+    hooks_path.push(empty_hooks);
+    let mut args = vec![
+        "--literal-pathspecs".into(),
+        "-c".into(),
+        "core.splitIndex=false".into(),
+        "-c".into(),
+        hooks_path,
+    ];
+
+    // Newer Git also supports hooks declared in config, outside the hooks directory.
+    let keys = crate::command::supervised_git_output(
+        root,
+        &[
+            "config",
+            "--null",
+            "--name-only",
+            "--get-regexp",
+            r"^hook\..*\.event$",
+        ]
+        .map(OsString::from),
+        &[],
+        STAGE_GIT_TIMEOUT,
+    )
+    .map_err(|_| STAGE_FAILED)?;
+    match keys.code {
+        Some(0) => {
+            let keys = keys.stdout.strip_suffix(&[0]).ok_or(STAGE_FAILED)?;
+            let mut names = BTreeSet::new();
+            for key in keys.split(|&byte| byte == 0) {
+                let key = std::str::from_utf8(key).map_err(|_| STAGE_FAILED)?;
+                names.insert(key.strip_suffix(".event").ok_or(STAGE_FAILED)?);
+            }
+            for name in names {
+                args.extend(["-c".into(), format!("{name}.enabled=false").into()]);
+            }
+        }
+        Some(1) if keys.stdout.is_empty() => {} // No matching config keys.
+        _ => return Err(STAGE_FAILED.into()),
+    }
+    args.extend(
+        [
+            "add",
+            "--all",
+            "--pathspec-from-file=-",
+            "--pathspec-file-nul",
+        ]
+        .map(OsString::from),
+    );
+    Ok(args)
+}
+
+fn notify_stage_hook(root: &Path) {
+    // The real index is already installed. Git owns hook discovery and execution.
+    // Git before 2.36 lacks this command; silently skip the notification there.
+    let _ = crate::command::supervised_git_output(
+        root,
+        &[
+            "hook",
+            "run",
+            "--ignore-missing",
+            "post-index-change",
+            "--",
+            "0",
+            "0",
+        ]
+        .map(OsString::from),
+        &[],
+        STAGE_GIT_TIMEOUT,
+    );
+}
+
+struct BulkStageRequest {
+    paths: BTreeSet<PathBuf>,
+    scope: StageScope,
+    index: GitIndexFingerprint,
+    head: Option<GitHeadId>,
+    notice: Option<String>,
+    reviewed: Option<GitIndexFingerprint>,
+}
+
+impl BulkStageRequest {
+    fn apply(self, root: &Path, cancel: &AtomicBool) -> Result<BulkStageResult, String> {
+        if cancel.load(Ordering::Acquire) {
+            return Err(STAGE_FAILED.into());
+        }
+        let repo = git2::Repository::open(root).map_err(|_| CHECK_STAGE)?;
+        let empty_hooks = tempfile::tempdir_in(repo.path()).map_err(|_| STAGE_FAILED)?;
+        let args = private_stage_args(root, empty_hooks.path())?;
+        let write = IndexWrite::start(&repo).map_err(|_| STAGE_CHANGED)?;
+        verify_stage_state(root, self.index, self.head)?;
+        let before = repo.index().map_err(|_| CHECK_STAGE)?;
+        if index_fingerprint(&before) != self.index {
+            return Err(STAGE_CHANGED.into());
+        }
+
+        // Ask Git itself what add would publish, with its actual clean filters,
+        // symlink/submodule handling, and file mode rules. It writes only the copy.
+        let mut input = Vec::new();
+        let selected: BTreeSet<_> = self
+            .paths
+            .iter()
+            .map(|path| path.as_os_str().as_encoded_bytes())
+            .collect();
+        for path in &selected {
+            input.extend_from_slice(path);
+            input.push(0);
+        }
+        run_index_command(root, &write.temporary, args, input, cancel).map_err(|_| {
+            if self.reviewed.is_some() {
+                STAGE_CHANGED
+            } else {
+                STAGE_FAILED
+            }
+        })?;
+        let after = git2::Index::open(&write.temporary).map_err(|_| CHECK_STAGE)?;
+        let outside_selection = |index: &git2::Index| {
+            index_entries_fingerprint(
+                index
+                    .iter()
+                    .filter(|entry| !selected.contains(entry.path.as_slice())),
+            )
+        };
+        if outside_selection(&before) != outside_selection(&after) {
+            return Err(match self.reviewed {
+                Some(_) => STAGE_CHANGED,
+                None => self.scope.replacement_refusal(),
+            }
+            .into());
+        }
+        verify_stage_state(root, self.index, self.head)?;
+
+        let candidate = index_fingerprint(&after);
+        if let Some(reviewed) = self.reviewed {
+            if candidate != reviewed {
+                return Err(STAGE_CHANGED.into());
+            }
+        } else {
+            let replacing = staged_replacements(&repo, &before, &after, &self.paths, self.head)
+                .map_err(|_| CHECK_STAGE)?;
+            if let Some(first) = replacing.first() {
+                let more = if replacing.len() > 1 {
+                    format!(" (and {} more)", replacing.len() - 1)
+                } else {
+                    String::new()
+                };
+                let warning = format!(
+                    "Staging the working copy would erase the staged version of {}{more}, which isn't saved anywhere else.",
+                    first.display()
+                );
+                return Ok(BulkStageResult::NeedsConsent(BulkStage {
+                    scope: self.scope,
+                    paths: self.paths,
+                    candidate,
+                    index: self.index,
+                    head: self.head,
+                    notice: self.notice,
+                    warning,
+                }));
+            }
+        }
+
+        if cancel.load(Ordering::Acquire) {
+            return Err(STAGE_FAILED.into());
+        }
+        verify_stage_state(root, self.index, self.head)?;
+        // There is no second add: the exact index we checked is the one installed.
+        write.commit().map_err(|_| STAGE_FAILED)?;
+        drop(write); // The hook can read or even write the live index.
+        notify_stage_hook(root);
+        Ok(BulkStageResult::Staged(self.notice))
+    }
 }
 
 impl GitScreen {
@@ -291,36 +597,14 @@ impl GitScreen {
         }
 
         self.check_stage_paths(&repository, &index, &paths, scope)?;
-        let replacing =
-            staged_only_paths(&repository, &index, &paths, head).map_err(|_| CHECK_STAGE)?;
-        self.check_bulk_stage_state(index_before, head)?;
-        if let Some(first) = replacing.first() {
-            let more = if replacing.len() > 1 {
-                format!(" (and {} more)", replacing.len() - 1)
-            } else {
-                String::new()
-            };
-            let warning = format!(
-                "Staging the working copy would erase the staged version of {}{more}, which isn't saved anywhere else.",
-                first.display()
-            );
-            self.form(
-                "Replace staged changes?",
-                FormAction::StageAnyway(Box::new(BulkStage {
-                    scope,
-                    paths,
-                    replacing,
-                    index: index_before,
-                    head,
-                    notice,
-                    warning,
-                })),
-                vec![],
-            );
-            self.form.as_mut().expect("just opened").selected = 1; // Cancel.
-            return Ok(());
-        }
-        self.write_stage_paths(paths, notice)
+        self.start_bulk_stage(BulkStageRequest {
+            paths,
+            scope,
+            index: index_before,
+            head,
+            notice,
+            reviewed: None,
+        })
     }
 
     fn bulk_stage_state(&self) -> Result<(GitIndexFingerprint, Option<GitHeadId>), String> {
@@ -330,17 +614,6 @@ impl GitScreen {
         ))
     }
 
-    fn check_bulk_stage_state(
-        &self,
-        index: GitIndexFingerprint,
-        head: Option<GitHeadId>,
-    ) -> Result<(), String> {
-        if self.bulk_stage_state()? != (index, head) {
-            return Err(STAGE_CHANGED.into());
-        }
-        Ok(())
-    }
-
     fn stage_index(&self) -> Result<(git2::Repository, git2::Index), String> {
         let repo = git2::Repository::open(&self.root).map_err(|_| CHECK_STAGE)?;
         let index = repo.index().map_err(|_| CHECK_STAGE)?;
@@ -348,16 +621,91 @@ impl GitScreen {
     }
 
     pub(super) fn stage_anyway(&mut self, plan: BulkStage) -> Result<(), String> {
-        self.check_bulk_stage_state(plan.index, plan.head)?;
-        let (repository, index) = self.stage_index()?;
-        self.check_stage_paths(&repository, &index, &plan.paths, plan.scope)?;
-        let replacing = staged_only_paths(&repository, &index, &plan.paths, plan.head)
-            .map_err(|_| CHECK_STAGE)?;
-        if !replacing.is_subset(&plan.replacing) {
-            return Err(STAGE_CHANGED.into());
+        self.start_bulk_stage(BulkStageRequest {
+            scope: plan.scope,
+            paths: plan.paths,
+            index: plan.index,
+            head: plan.head,
+            notice: plan.notice,
+            reviewed: Some(plan.candidate),
+        })
+    }
+
+    fn start_bulk_stage(&mut self, request: BulkStageRequest) -> Result<(), String> {
+        self.allow_write()?;
+        if self.bulk_stage_worker.is_some() {
+            // A decision is already waiting to be shown.
+            return Ok(());
         }
-        self.check_bulk_stage_state(plan.index, plan.head)?;
-        self.write_stage_paths(plan.paths, plan.notice)
+        let root = self.root.clone();
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = Arc::clone(&cancel);
+        std::thread::Builder::new()
+            .name("dusty-git-bulk-stage".into())
+            .spawn(move || {
+                let _ = sender.send(request.apply(&root, &worker_cancel));
+            })
+            .map_err(|_| STAGE_FAILED)?;
+        self.bulk_stage_worker = Some(BulkStageWorker {
+            receiver,
+            cancel,
+            pending_consent: None,
+        });
+        self.busy = true;
+        self.notice = "Running Git…".into();
+        Ok(())
+    }
+
+    pub(super) fn poll_bulk_stage(&mut self) -> bool {
+        let Some(worker) = &mut self.bulk_stage_worker else {
+            return false;
+        };
+        if worker.pending_consent.is_some()
+            && (self.form.is_some() || self.busy || self.refreshing_after_write)
+        {
+            return false;
+        }
+        let result = if let Some(plan) = worker.pending_consent.take() {
+            Ok(BulkStageResult::NeedsConsent(plan))
+        } else {
+            match worker.receiver.try_recv() {
+                Ok(result) => result,
+                Err(TryRecvError::Empty) => return false,
+                Err(TryRecvError::Disconnected) => Err(STAGE_FAILED.into()),
+            }
+        };
+        self.busy = false;
+        match result {
+            Ok(BulkStageResult::NeedsConsent(plan)) if self.form.is_some() => {
+                worker.pending_consent = Some(plan);
+                if self.notice == "Running Git…" {
+                    self.notice.clear();
+                }
+                return true;
+            }
+            Ok(BulkStageResult::NeedsConsent(plan)) => {
+                self.form(
+                    "Replace staged changes?",
+                    FormAction::StageAnyway(Box::new(plan)),
+                    vec![],
+                );
+                self.form.as_mut().expect("just opened").selected = 1; // Cancel.
+            }
+            Ok(BulkStageResult::Staged(notice)) => {
+                self.receipt = None;
+                self.notice = notice.unwrap_or_default();
+                let result = self.refresh();
+                self.refreshing_after_write = result.is_ok();
+                self.report(result);
+            }
+            Err(error) => {
+                self.receipt = None;
+                self.notice = error;
+            }
+        }
+        self.bulk_stage_worker = None;
+        true
     }
 
     fn check_stage_paths(
@@ -432,29 +780,6 @@ impl GitScreen {
         self.stage_notice = notice;
         self.busy = true;
         self.notice = "Running Git…".into();
-        Ok(())
-    }
-
-    fn write_stage_paths(
-        &mut self,
-        paths: BTreeSet<PathBuf>,
-        notice: Option<String>,
-    ) -> Result<(), String> {
-        let mut args: Vec<OsString> = ["--literal-pathspecs", "add", "--all"]
-            .into_iter()
-            .map(Into::into)
-            .collect();
-        // Keep arbitrary/non-UTF8 names literal, and large selections below ARG_MAX.
-        // JobRequest bounds stdin; no temporary pathspec or request files are needed.
-        args.extend(["--pathspec-from-file=-", "--pathspec-file-nul"].map(Into::into));
-        let mut input = Vec::new();
-        for path in paths {
-            input.extend_from_slice(path.as_os_str().as_encoded_bytes());
-            input.push(0);
-        }
-        self.write_with_input(args, Some(input))?;
-        // Shown when the write finishes, in place of its silent success.
-        self.stage_notice = notice;
         Ok(())
     }
 
@@ -825,7 +1150,7 @@ struct DiscardTarget {
     path: PathBuf,
     /// `(blob, mode)` of the stage-0 index entry; `None` for an untracked path, which is
     /// deleted rather than restored.
-    index: Option<(git2::Oid, u32)>,
+    index: Option<IndexVersion>,
     disk: DiskIdentity,
 }
 
@@ -834,6 +1159,8 @@ struct DiscardTarget {
 #[derive(Clone, Debug)]
 pub(super) struct FileDiscard {
     targets: Vec<DiscardTarget>,
+    // A staged rename source need not be restored, but it must still be checked.
+    rename_sources: Vec<(PathBuf, Option<IndexVersion>)>,
     /// Rows the sheet named, for the receipt.
     restored: Vec<PathBuf>,
     deleted: Vec<PathBuf>,
@@ -880,6 +1207,24 @@ fn disk_identity(path: &Path) -> Result<DiskIdentity, String> {
     })
 }
 
+fn discard_conflict(path: &Path) -> String {
+    format!(
+        "Resolve the conflict in {} before discarding.",
+        path.display()
+    )
+}
+
+fn check_discard_conflict(index: &git2::Index, path: &Path) -> Result<(), String> {
+    if (1..=3).any(|stage| index.get_path(path, stage).is_some()) {
+        return Err(discard_conflict(path));
+    }
+    Ok(())
+}
+
+fn discard_changed(path: &Path) -> String {
+    format!("{} changed. Refresh and try again.", path.display())
+}
+
 /// The identity of one path, refusing what a file discard must never touch.
 fn discard_target(root: &Path, index: &git2::Index, path: &Path) -> Result<DiscardTarget, String> {
     if !path
@@ -888,6 +1233,7 @@ fn discard_target(root: &Path, index: &git2::Index, path: &Path) -> Result<Disca
     {
         return Err(format!("{} is not a repository path", path.display()));
     }
+    check_discard_conflict(index, path)?;
     let entry = index.get_path(path, 0);
     if let Some(entry) = &entry {
         if entry.mode == 0o160000 {
@@ -927,13 +1273,23 @@ fn apply_file_discard(root: &Path, plan: &FileDiscard) -> Result<(), String> {
     let mut index = repository
         .index()
         .map_err(|error| error.message().to_owned())?;
+    // A competing Git command must not change the index while we hash the
+    // workfiles or after validation, before a reviewed untracked file is deleted.
+    let _lock =
+        IndexLock::acquire(index.path().ok_or(DISCARD_LOCKED)?).map_err(|_| DISCARD_LOCKED)?;
+    index
+        .read(true)
+        .map_err(|error| error.message().to_owned())?;
+    for (path, version) in &plan.rename_sources {
+        check_discard_conflict(&index, path)?;
+        if stage_zero(&index, path) != *version {
+            return Err(discard_changed(path));
+        }
+    }
     for target in &plan.targets {
         let now = discard_target(root, &index, &target.path)?;
         if &now != target {
-            return Err(format!(
-                "{} changed since this sheet opened; nothing was discarded",
-                target.path.display()
-            ));
+            return Err(discard_changed(&target.path));
         }
     }
     let restore = plan
@@ -1013,22 +1369,36 @@ impl GitScreen {
         let repository = git2::Repository::open(&self.root).map_err(|error| error.to_string())?;
         let index = repository.index().map_err(|error| error.to_string())?;
         let mut targets = Vec::new();
+        let mut rename_sources = Vec::new();
         let (mut restored, mut deleted, mut kept) = (Vec::new(), Vec::new(), Vec::new());
         let mut rows = Vec::new();
         for entry in entries {
             let path = &entry.relative_path;
             if entry.status == GitFileStatus::Conflicted {
-                return Err(format!(
-                    "{} is conflicted; resolve it with o/t or Enter instead of discarding",
-                    path.display()
-                ));
+                return Err(discard_conflict(path));
+            }
+            let original = entry
+                .original_path
+                .as_ref()
+                .filter(|source| *source != path);
+            if let Some(original) = original {
+                check_discard_conflict(&index, original)?;
             }
             if !entry.sources.unstaged {
+                check_discard_conflict(&index, path)?;
                 kept.push(path.clone());
                 continue;
             }
             let target = discard_target(&self.root, &index, path)?;
-            if target.index.is_none() {
+            let original = original.map(|path| (path, stage_zero(&index, path)));
+            if let Some((source, version)) = original {
+                rename_sources.push((source.clone(), version));
+            }
+            let delete = entry.unstaged_status == Some(GitFileStatus::Untracked);
+            if delete != target.index.is_none() {
+                return Err(discard_changed(path));
+            }
+            if delete {
                 // Not in the index (untracked, or re-created after a staged delete): the
                 // worktree change IS the file, so discarding it deletes it.
                 targets.push(target);
@@ -1041,12 +1411,8 @@ impl GitScreen {
             // An unstaged rename's source is still in the index: restore it too, so the
             // row's whole worktree change is undone. A staged rename's source is not.
             let mut label = format!("{} · {}", path.display(), code.trim());
-            if let Some(original) = entry
-                .original_path
-                .as_ref()
-                .filter(|original| *original != path)
-            {
-                if index.get_path(original, 0).is_some() {
+            if let Some((original, version)) = original {
+                if version.is_some() {
                     targets.push(discard_target(&self.root, &index, original)?);
                 }
                 label = format!("{label} · renamed from {}", original.display());
@@ -1113,6 +1479,7 @@ impl GitScreen {
             title,
             action: FormAction::DiscardFiles(Box::new(FileDiscard {
                 targets,
+                rename_sources,
                 restored,
                 deleted,
                 marked,

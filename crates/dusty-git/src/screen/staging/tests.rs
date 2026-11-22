@@ -414,7 +414,7 @@ fn stage_all_confirms_before_a_directory_replaces_a_staged_file() {
     wait(&mut screen);
     for control in [false, true] {
         press(&mut screen, KeyCode::Char('a'));
-        assert!(!screen.busy);
+        wait(&mut screen);
         let form = screen.form.as_ref().unwrap();
         assert_eq!(form.title, "Replace staged changes?");
         assert!(form.cancel_focused());
@@ -431,10 +431,256 @@ fn stage_all_confirms_before_a_directory_replaces_a_staged_file() {
     }
 
     press(&mut screen, KeyCode::Char('a'));
+    wait(&mut screen);
     press(&mut screen, KeyCode::Tab);
     press(&mut screen, KeyCode::Enter);
     wait(&mut screen);
     assert_config_replacement_staged(root, &screen.notice);
+}
+
+#[test]
+fn bulk_stage_reviews_a_lost_staged_edit_and_refuses_a_changed_candidate() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    let name = "edit.txt";
+    let file = root.join(name);
+    run(root, &["init", "-b", "main"]);
+    std::fs::write(&file, "top=0\nbottom=0\n").unwrap();
+    run(root, &["add", name]);
+    run(root, &["commit", "-m", "Base"]);
+    let staged = b"top=1\nbottom=0\n";
+    std::fs::write(&file, staged).unwrap();
+    run(root, &["add", name]);
+    std::fs::write(&file, "top=0\nbottom=1\n").unwrap();
+
+    let mut screen = GitScreen::open(root).unwrap();
+    wait(&mut screen);
+    press(&mut screen, KeyCode::Char('a'));
+    wait(&mut screen);
+    assert!(matches!(
+        screen.form.as_ref().map(|form| &form.action),
+        Some(FormAction::StageAnyway(_))
+    ));
+    assert_eq!(index_blob(root, name).as_deref(), Some(staged.as_slice()));
+
+    let changed = b"top=0\nbottom=2\n";
+    std::fs::write(&file, changed).unwrap();
+    press(&mut screen, KeyCode::Tab);
+    press(&mut screen, KeyCode::Enter);
+    wait(&mut screen);
+    assert_eq!(screen.notice, STAGE_CHANGED);
+    assert_eq!(index_blob(root, name).as_deref(), Some(staged.as_slice()));
+
+    screen.refresh().unwrap();
+    wait(&mut screen);
+    press(&mut screen, KeyCode::Char('a'));
+    wait(&mut screen);
+    assert!(screen.form.as_ref().is_some_and(Form::cancel_focused));
+    press(&mut screen, KeyCode::Tab);
+    press(&mut screen, KeyCode::Enter);
+    wait(&mut screen);
+    assert_eq!(index_blob(root, name).as_deref(), Some(changed.as_slice()));
+}
+
+#[test]
+fn bulk_stage_asks_when_a_staged_deletion_reappears_away_from_its_gap() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    let file = root.join("edit.txt");
+    run(root, &["init", "-b", "main"]);
+    std::fs::write(&file, "A\nB\n").unwrap();
+    run(root, &["add", "edit.txt"]);
+    run(root, &["commit", "-m", "Base"]);
+    std::fs::write(&file, "B\n").unwrap();
+    run(root, &["add", "edit.txt"]);
+    std::fs::write(&file, "B\nA\nB\n").unwrap();
+
+    let mut screen = GitScreen::open(root).unwrap();
+    wait(&mut screen);
+    press(&mut screen, KeyCode::Char('a'));
+    wait(&mut screen);
+    assert!(matches!(
+        screen.form.as_ref().map(|form| &form.action),
+        Some(FormAction::StageAnyway(_))
+    ));
+    assert_eq!(
+        index_blob(root, "edit.txt").as_deref(),
+        Some(b"B\n".as_slice())
+    );
+
+    press(&mut screen, KeyCode::Tab);
+    press(&mut screen, KeyCode::Enter);
+    wait(&mut screen);
+    assert_eq!(
+        index_blob(root, "edit.txt").as_deref(),
+        Some(b"B\nA\nB\n".as_slice())
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn bulk_stage_notifies_post_index_change_only_after_publishing() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    let file = root.join("edit.txt");
+    run(root, &["init", "-b", "main"]);
+    std::fs::write(&file, "base\n").unwrap();
+    run(root, &["add", "edit.txt"]);
+    run(root, &["commit", "-m", "Base"]);
+    std::fs::write(&file, "reviewed in the index\n").unwrap();
+    run(root, &["add", "edit.txt"]);
+    std::fs::write(&file, "new worktree contents\n").unwrap();
+
+    let hooks = root.join(".git/test-hooks");
+    std::fs::create_dir(&hooks).unwrap();
+    run(root, &["config", "core.hooksPath", ".git/test-hooks"]);
+    let hook = hooks.join("post-index-change");
+    std::fs::write(
+        &hook,
+        r#"#!/bin/sh
+if test -e .git/index.lock; then
+    echo locked >> .git/hook-events
+fi
+git show :edit.txt >> .git/hook-events || exit 1
+printf '%s,%s\n' "$1" "$2" >> .git/hook-events
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let events = root.join(".git/hook-events");
+
+    let mut screen = GitScreen::open(root).unwrap();
+    wait(&mut screen);
+    press(&mut screen, KeyCode::Char('a'));
+    wait(&mut screen);
+    assert!(screen.form.as_ref().is_some_and(Form::cancel_focused));
+    assert!(!events.exists(), "preparation must not call the hook");
+    press(&mut screen, KeyCode::Enter);
+    assert!(screen.form.is_none());
+    assert!(!events.exists(), "cancellation must not call the hook");
+
+    press(&mut screen, KeyCode::Char('a'));
+    wait(&mut screen);
+    press(&mut screen, KeyCode::Tab);
+    press(&mut screen, KeyCode::Enter);
+    wait(&mut screen);
+    assert_eq!(
+        std::fs::read_to_string(events).unwrap(),
+        "new worktree contents\n0,0\n",
+        "one hook call must see the published, unlocked index"
+    );
+}
+
+#[test]
+fn marked_discard_leaves_workfiles_alone_during_a_competing_index_write() {
+    const TRACKED: &str = "z-tracked.txt";
+    const UNTRACKED: &str = "a-untracked.txt";
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    run(root, &["init", "-b", "main"]);
+    std::fs::write(root.join(TRACKED), "base\n").unwrap();
+    run(root, &["add", TRACKED]);
+    run(root, &["commit", "-m", "Base"]);
+    std::fs::write(root.join(TRACKED), "modified\n").unwrap();
+    std::fs::write(root.join(UNTRACKED), "untracked\n").unwrap();
+
+    let mut screen = GitScreen::open(root).unwrap();
+    wait(&mut screen);
+    screen.file_selection.marked = [TRACKED, UNTRACKED].map(PathBuf::from).into();
+    press(&mut screen, KeyCode::Char('D'));
+    assert!(matches!(
+        screen.form.as_ref().map(|form| &form.action),
+        Some(FormAction::DiscardFiles(_))
+    ));
+
+    // A writer may be about to publish unmerged stages for the untracked file.
+    // Its ownership of the lock must keep discard from touching either path.
+    let lock = root.join(".git/index.lock");
+    std::fs::write(&lock, "other writer's lock").unwrap();
+    press(&mut screen, KeyCode::Enter);
+    assert_eq!(screen.notice, DISCARD_LOCKED);
+    assert_eq!(std::fs::read(root.join(TRACKED)).unwrap(), b"modified\n");
+    assert_eq!(std::fs::read(root.join(UNTRACKED)).unwrap(), b"untracked\n");
+    assert_eq!(std::fs::read(lock).unwrap(), b"other writer's lock");
+}
+
+#[test]
+fn whole_file_discard_refuses_a_live_conflict_in_the_file_or_rename_source() {
+    const SOURCE: &str = "old.txt";
+    const TARGET: &str = "new.txt";
+    const UNTRACKED: &str = "untracked.txt";
+    for conflict in [TARGET, SOURCE] {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        run(root, &["init", "-b", "main"]);
+        std::fs::write(root.join(SOURCE), "base\n").unwrap();
+        run(root, &["add", SOURCE]);
+        run(root, &["commit", "-m", "Base"]);
+        run(root, &["mv", SOURCE, TARGET]);
+        std::fs::write(root.join(TARGET), "unstaged edit\n").unwrap();
+        std::fs::write(root.join(UNTRACKED), "untracked\n").unwrap();
+
+        let mut screen = GitScreen::open(root).unwrap();
+        wait(&mut screen);
+        screen.selected[0] = screen
+            .rows(0)
+            .iter()
+            .position(|row| row.value == Path::new(TARGET))
+            .unwrap();
+        screen.file_selection.marked = [TARGET, UNTRACKED].map(PathBuf::from).into();
+        press(&mut screen, KeyCode::Char('D'));
+        assert!(matches!(
+            screen.form.as_ref().map(|form| &form.action),
+            Some(FormAction::DiscardFiles(_))
+        ));
+
+        // Change only the index; the workfile being discarded still matches.
+        // The rename source already had no stage-zero entry at review time.
+        let repo = git2::Repository::open(root).unwrap();
+        let mut index = repo.index().unwrap();
+        let target = index.get_path(Path::new(TARGET), 0).unwrap();
+        let mut entry = index.get_path(Path::new(TARGET), 0).unwrap();
+        if conflict == TARGET {
+            index.remove(Path::new(TARGET), 0).unwrap();
+        }
+        entry.path = conflict.as_bytes().to_vec();
+        entry.flags = (entry.flags & !(3 << 12)) | (2 << 12);
+        index.add(&entry).unwrap();
+        index.write().unwrap();
+        assert!(index_id(root, conflict, 2).is_some());
+
+        press(&mut screen, KeyCode::Enter);
+        let notice = format!("Resolve the conflict in {conflict} before discarding.");
+        assert_eq!(screen.notice, notice);
+        assert!(screen.form.is_none());
+        assert_eq!(
+            std::fs::read(root.join(TARGET)).unwrap(),
+            b"unstaged edit\n"
+        );
+        assert!(root.join(UNTRACKED).is_file());
+
+        press(&mut screen, KeyCode::Char('D'));
+        assert_eq!(screen.notice, notice);
+        assert!(screen.form.is_none());
+        screen.clear_file_selection();
+        press(&mut screen, KeyCode::Char('d'));
+        assert_eq!(screen.notice, notice);
+        assert!(screen.form.is_none());
+
+        // Once there is no conflict, tracked restores and untracked deletes still work.
+        index.remove(Path::new(conflict), 2).unwrap();
+        if conflict == TARGET {
+            index.add(&target).unwrap();
+        }
+        index.write().unwrap();
+        screen.file_selection.marked = [TARGET, UNTRACKED].map(PathBuf::from).into();
+        press(&mut screen, KeyCode::Char('D'));
+        press(&mut screen, KeyCode::Enter);
+        assert_eq!(std::fs::read(root.join(TARGET)).unwrap(), b"base\n");
+        assert!(!root.join(UNTRACKED).exists());
+    }
 }
 
 #[test]

@@ -49,11 +49,11 @@ pub fn git_index_fingerprint(repository: &Path) -> Result<GitIndexFingerprint, G
     Ok(index_fingerprint(&index))
 }
 
-fn index_fingerprint(index: &git2::Index) -> GitIndexFingerprint {
+pub(super) fn index_fingerprint(index: &git2::Index) -> GitIndexFingerprint {
     index_entries_fingerprint(index.iter())
 }
 
-fn index_entries_fingerprint(
+pub(super) fn index_entries_fingerprint(
     entries: impl Iterator<Item = git2::IndexEntry>,
 ) -> GitIndexFingerprint {
     use sha2::{Digest, Sha256};
@@ -467,38 +467,42 @@ pub(super) fn exact_mutation_repository(
     Ok((root, repository, workdir))
 }
 
-/// Keep Git's index lock from the first read through the final replacement. Libgit2 writes
-/// to a temporary index while the real index stays locked and unchanged.
-struct IndexLock {
+/// Exclude Git writers while checking or replacing the live index.
+pub(super) struct IndexLock {
     path: PathBuf,
+}
+impl IndexLock {
+    pub(super) fn acquire(index: &Path) -> Result<Self, GitMutationError> {
+        let path = index.with_extension("lock");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .map_err(|_| GitMutationError::StaleIndex)?;
+        Ok(Self { path })
+    }
 }
 impl Drop for IndexLock {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.path);
     }
 }
-struct IndexWrite {
+pub(super) struct IndexWrite {
     _lock: IndexLock,
     path: PathBuf,
     // Only the path is kept: Windows refuses to rename over a file that is held open,
     // and libgit2 writes the index by renaming over it.
-    temporary: tempfile::TempPath,
+    pub(super) temporary: tempfile::TempPath,
 }
 impl IndexWrite {
-    fn start(repo: &git2::Repository) -> Result<Self, GitMutationError> {
+    pub(super) fn start(repo: &git2::Repository) -> Result<Self, GitMutationError> {
         let path = repo
             .index()
             .map_err(|_| GitMutationError::Backend)?
             .path()
             .ok_or(GitMutationError::Backend)?
             .to_path_buf();
-        let lock_path = path.with_extension("lock");
-        std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&lock_path)
-            .map_err(|_| GitMutationError::StaleIndex)?;
-        let lock = IndexLock { path: lock_path };
+        let lock = IndexLock::acquire(&path)?;
         let temporary =
             tempfile::NamedTempFile::new_in(path.parent().ok_or(GitMutationError::Backend)?)
                 .map_err(|_| GitMutationError::Backend)?
@@ -529,7 +533,7 @@ impl IndexWrite {
             temporary,
         })
     }
-    fn commit(&self) -> Result<(), GitMutationError> {
+    pub(super) fn commit(&self) -> Result<(), GitMutationError> {
         // Windows flushes a file only through a writable handle.
         std::fs::OpenOptions::new()
             .write(true)
@@ -1332,7 +1336,12 @@ pub(super) fn unstage_paths(
         args.extend(["rm", "--cached", "--ignore-unmatch", "-r", "-f"].map(OsString::from));
     }
     args.extend(["--pathspec-from-file=-", "--pathspec-file-nul"].map(OsString::from));
-    run_index_restore(workdir, &write.temporary, args, input, cancel)?;
+    run_index_command(workdir, &write.temporary, args, input, cancel).map_err(
+        |error| match error {
+            GitMutationError::Cancelled => error,
+            _ => GitMutationError::BulkUnstage,
+        },
+    )?;
     if cancel.load(Ordering::Acquire) {
         return Err(GitMutationError::Cancelled);
     }
@@ -1364,7 +1373,7 @@ pub(super) fn unstage_paths(
     })
 }
 
-fn run_index_restore(
+pub(super) fn run_index_command(
     workdir: &Path,
     index: &Path,
     arguments: Vec<OsString>,
@@ -1376,11 +1385,10 @@ fn run_index_restore(
 
     let mut environment = crate::command::environment();
     environment.insert("GIT_INDEX_FILE".into(), index.as_os_str().to_owned());
-    let mut jobs = JobSupervisor::try_new(16).map_err(|_| GitMutationError::BulkUnstage)?;
+    let mut jobs = JobSupervisor::try_new(16).map_err(|_| GitMutationError::Backend)?;
     let id = jobs
         .start(JobRequest {
-            program: crate::process::discover_executable("git")
-                .ok_or(GitMutationError::BulkUnstage)?,
+            program: crate::process::discover_executable("git").ok_or(GitMutationError::Backend)?,
             argv0: None,
             arguments,
             cwd: workdir.to_path_buf(),
@@ -1392,7 +1400,7 @@ fn run_index_restore(
                 ..JobPolicy::default()
             },
         })
-        .map_err(|_| GitMutationError::BulkUnstage)?;
+        .map_err(|_| GitMutationError::Backend)?;
     loop {
         let cancelled = cancel.load(Ordering::Acquire);
         if cancelled {
@@ -1410,7 +1418,7 @@ fn run_index_restore(
                     ..
                 } => return Ok(()),
                 JobEvent::Exited { .. } | JobEvent::Failed { .. } => {
-                    return Err(GitMutationError::BulkUnstage);
+                    return Err(GitMutationError::Backend);
                 }
                 JobEvent::Started { .. } | JobEvent::Output { .. } => {}
             }

@@ -1045,7 +1045,11 @@ fn changes_discard_rechecks_host_authorization_and_refuses_changed_files() {
     write(root, "other.rs", "fn external_edit() {}\n");
     key(&mut screen, KeyCode::Enter);
     let shown = view(&mut screen);
-    assert!(shown.contains("changed since this sheet opened"), "{shown}");
+    assert!(
+        shown.contains("other.rs changed. Refresh and try again."),
+        "{shown}"
+    );
+    assert!(!shown.contains("Discard changes in other.rs?"), "{shown}");
     assert_eq!(
         std::fs::read_to_string(root.join("other.rs")).unwrap(),
         "fn external_edit() {}\n"
@@ -1055,7 +1059,6 @@ fn changes_discard_rechecks_host_authorization_and_refuses_changed_files() {
         std::fs::read_to_string(root.join("change.rs")).unwrap(),
         working
     );
-    key(&mut screen, KeyCode::Escape);
 
     // A path replaced by a directory is refused, and its contents survive.
     choose_file(&mut screen, "untracked.txt");

@@ -282,6 +282,13 @@ fn mixed_directory_finishes_partial_staging_and_unstages_both_rename_paths() {
     assert!(selected(&mut screen).contains("docs/"));
     key(&mut screen, KeyCode::Char('-'));
     wait(&mut screen, |screen| !screen.busy());
+    let shown = view(&mut screen);
+    assert!(shown.contains("Replace staged changes?"), "{shown}");
+    assert_eq!(git(root, &["show", ":docs/edit.txt"]), "staged");
+    key(&mut screen, KeyCode::Tab); // Move from Cancel to Stage anyway.
+    key(&mut screen, KeyCode::Enter);
+    assert!(screen.busy(), "confirmed stage did not start");
+    wait(&mut screen, |screen| !screen.busy());
     assert_eq!(git(root, &["show", ":docs/edit.txt"]), "remaining edit");
     key(&mut screen, KeyCode::Char('-'));
     wait(&mut screen, |screen| !screen.busy());

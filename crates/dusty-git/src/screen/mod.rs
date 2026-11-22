@@ -577,6 +577,7 @@ pub struct GitScreen {
     /// `s` (stage only) or `u` (unstage only) for the staging key being handled; `-` toggles.
     stage_intent: Option<bool>,
     stage_notice: Option<String>,
+    bulk_stage_worker: Option<staging::BulkStageWorker>,
     /// The confirmed pull, undo, rewrite or tag push still running (`ops.rs`).
     running: Option<ops::Running>,
     checkout_reply: Option<ops::CheckoutReply>,
@@ -707,6 +708,7 @@ impl GitScreen {
             commit_draft: None,
             stage_intent: None,
             stage_notice: None,
+            bulk_stage_worker: None,
             running: None,
             checkout_reply: None,
             outcome: None,
@@ -1249,6 +1251,7 @@ impl GitScreen {
         }
         changed |= self.op_progress();
         changed |= self.poll_rewrite();
+        changed |= self.poll_bulk_stage();
         for jobs::Reply {
             request,
             result,
@@ -2450,8 +2453,9 @@ impl GitScreen {
                 self.preview_anchor = None;
             }
             FormAction::DiscardFiles(plan) => {
-                // allow_write above rechecked the host; the plan rechecks every path.
+                // Recheck the captured paths and close the sheet even on drift.
                 let plan = plan.as_ref().clone();
+                self.form = None;
                 self.discard_files(&plan)?;
             }
             FormAction::Github(github::Action::CreatePullRequest) => {
@@ -4814,7 +4818,7 @@ mod context_tests {
         screen.refresh().unwrap();
         wait(&mut screen);
         bulk(&mut screen);
-        assert!(!screen.busy);
+        wait(&mut screen);
         let form = screen.form.as_ref().unwrap();
         assert_eq!(form.title, "Replace staged changes?");
         assert_eq!(form.selected, form.fields.len() + 1);
@@ -4825,6 +4829,7 @@ mod context_tests {
 
         // With the worktree back at HEAD, the staged blob is still the only copy.
         bulk(&mut screen);
+        wait(&mut screen);
         assert_eq!(
             screen.form.as_ref().unwrap().title,
             "Replace staged changes?"
@@ -4839,8 +4844,8 @@ mod context_tests {
         screen.refresh().unwrap();
         wait(&mut screen);
         bulk(&mut screen);
-        assert!(screen.form.is_none());
         wait(&mut screen);
+        assert!(screen.form.is_none());
         let staged_with_more = indexed("edit.txt").unwrap();
         assert_eq!(
             repo.find_blob(staged_with_more).unwrap().content(),
@@ -4853,7 +4858,7 @@ mod context_tests {
         screen.refresh().unwrap();
         wait(&mut screen);
         bulk(&mut screen);
-        assert!(!screen.busy);
+        wait(&mut screen);
         assert!(screen.form.is_some());
         assert!(indexed("edit.txt").is_some());
         press(&mut screen, KeyCode::Tab);
