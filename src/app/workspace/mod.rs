@@ -1161,7 +1161,10 @@ impl App {
             || self.search.pending()
             || self.workspace_edits.preparing()
             || self.workspace_edits.proposal().is_some()
-            || self.documents.legacy_pending()
+            // Successful removal invalidates and cancels the read-only clipboard inspection.
+            || self
+                .documents
+                .legacy_pending_except(self.explorer.pending_clipboard_inspection())
             || self.workspace.persist_pending()
             || self.documents.has_startup_work()
             || self.documents.file_work_pending();
@@ -1271,11 +1274,16 @@ impl App {
         let before = self.workspace.version();
         match self.workspace.set_active_root(id) {
             Ok(()) => {
-                if before != self.workspace.version() {
+                let current = self.workspace.version();
+                if before != current {
+                    self.cancel_stale_explorer_clipboard();
+                    self.switch_ends_terminals = None;
                     self.documents.cancel_startup();
+                    self.terminal_session
+                        .retain_on_root_activation(&before, &current);
+                    self.reject_terminal_responses("workspace changed");
                 }
-                self.documents
-                    .cancel_old_workspace_requests(&self.workspace.version());
+                self.documents.cancel_old_workspace_requests(&current);
                 self.clear_git_status();
                 let root = self
                     .workspace
@@ -1429,6 +1437,7 @@ impl App {
         let before = self.workspace.version();
         let updates = self.workspace.poll(&self.state);
         if before != self.workspace.version() {
+            self.cancel_stale_explorer_clipboard();
             self.documents
                 .cancel_old_workspace_requests(&self.workspace.version());
         }
@@ -1513,7 +1522,9 @@ impl App {
 
 impl App {
     pub(in crate::app) fn revoke_workspace_trust(&mut self) {
-        match self.workspace.revoke() {
+        let result = self.workspace.revoke();
+        self.cancel_stale_explorer_clipboard();
+        match result {
             Ok(()) => self.notify_message(self.message("workspace_trust_saving", &[]), false),
             Err(e) => self.show_workspace_failure(e),
         }

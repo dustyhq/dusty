@@ -3,6 +3,7 @@ use crate::files::ExplorerMutation;
 use crate::files::RequestId;
 use crate::files::RootIdentity;
 use crate::files::VfsError;
+use crate::files::root_identity::file_identity;
 #[cfg(unix)]
 use crate::files::vfs::directory_open_flags;
 use crate::files::vfs::roots_current;
@@ -10,42 +11,149 @@ use std::fs;
 use std::io;
 use std::path::Path;
 use std::path::PathBuf;
+use std::time::SystemTime;
 
 #[derive(Debug)]
 pub struct PreparedExplorerMutation {
     operation: ExplorerMutation,
     roots: Vec<RootIdentity>,
     identities: Vec<(PathBuf, fs::File)>,
+    inspected_source: Option<ExplorerSource>,
     maximum: u64,
 }
-/// Read-only source inspection retained while the user edits a rename prompt.
+/// Read-only source inspection retained by a rename prompt or Explorer clipboard.
 #[derive(Clone, Debug)]
-pub struct ExplorerRenameSource {
-    inspected: std::sync::Arc<PreparedExplorerMutation>,
+pub struct ExplorerSource {
+    inspected: std::sync::Arc<InspectedSource>,
     roots: std::sync::Arc<[RootIdentity]>,
 }
-impl ExplorerRenameSource {
+#[derive(Debug)]
+enum InspectedSource {
+    Held(PreparedExplorerMutation),
+    Snapshot {
+        path: PathBuf,
+        identity: ClipboardIdentity,
+        roots: Vec<RootIdentity>,
+        maximum: u64,
+    },
+}
+#[derive(Debug)]
+struct ClipboardIdentity {
+    file_id: (u64, u64),
+    created: Option<SystemTime>,
+}
+impl ClipboardIdentity {
+    fn capture(file: &fs::File) -> io::Result<Self> {
+        Ok(Self {
+            file_id: file_identity(file)?,
+            created: file.metadata()?.created().ok(),
+        })
+    }
+
+    fn matches(&self, current: &Self) -> bool {
+        self.file_id == current.file_id
+            && match (self.created, current.created) {
+                (Some(original), Some(current)) => original == current,
+                // Some filesystems cannot report birth time.
+                _ => true,
+            }
+    }
+
+    fn matches_file(&self, file: &fs::File) -> bool {
+        Self::capture(file).is_ok_and(|current| self.matches(&current))
+    }
+}
+impl ExplorerSource {
     pub fn path(&self) -> &Path {
-        self.inspected
-            .operation
-            .source()
-            .expect("inspected rename source")
+        match self.inspected.as_ref() {
+            InspectedSource::Held(prepared) => prepared
+                .operation
+                .source()
+                .expect("inspected explorer source"),
+            InspectedSource::Snapshot { path, .. } => path,
+        }
+    }
+
+    fn maximum(&self) -> u64 {
+        match self.inspected.as_ref() {
+            InspectedSource::Held(prepared) => prepared.maximum,
+            InspectedSource::Snapshot { maximum, .. } => *maximum,
+        }
+    }
+
+    fn check(&self) -> Result<(), VfsError> {
+        match self.inspected.as_ref() {
+            InspectedSource::Held(prepared) => check_identities(prepared),
+            InspectedSource::Snapshot {
+                path,
+                identity,
+                roots,
+                ..
+            } => roots_current(roots).and_then(|()| {
+                // Resolve the stored name with the same scope rules as prepare.
+                let root_paths = roots
+                    .iter()
+                    .map(|root| root.canonical_path.clone())
+                    .collect::<Vec<_>>();
+                let resolved = crate::files::vfs::scoped_existing_path(path, &root_paths)?;
+                let file = reopen_identity_path(&resolved)?;
+                if identity.matches_file(&file) {
+                    Ok(())
+                } else {
+                    Err(VfsError::ExplorerSourceChanged)
+                }
+            }),
+        }
+        .map_err(|_| VfsError::ExplorerSourceChanged)
+    }
+
+    fn check_prepared(&self, prepared: &PreparedExplorerMutation) -> Result<(), VfsError> {
+        let file = prepared
+            .source_handle()
+            .ok_or(VfsError::ExplorerSourceChanged)?;
+        let matches = match self.inspected.as_ref() {
+            InspectedSource::Held(original) => original.source_handle().is_some_and(|original| {
+                file_identity(original)
+                    .and_then(|original| file_identity(file).map(|current| original == current))
+                    .unwrap_or(false)
+            }),
+            InspectedSource::Snapshot { identity, .. } => identity.matches_file(file),
+        };
+        if matches {
+            Ok(())
+        } else {
+            Err(VfsError::ExplorerSourceChanged)
+        }
     }
 }
 impl PreparedExplorerMutation {
     pub fn operation(&self) -> &ExplorerMutation {
         &self.operation
     }
+
+    fn source_handle(&self) -> Option<&fs::File> {
+        let source = self.operation.source()?;
+        self.identities
+            .iter()
+            .find(|(path, _)| path.as_path() == source)
+            .map(|(_, file)| file)
+    }
 }
+pub enum SourceRetention {
+    HoldHandles,
+    Snapshot,
+}
+
 pub enum ExplorerIo {
-    InspectRename {
+    InspectSource {
         path: PathBuf,
         roots: Vec<RootIdentity>,
         maximum: u64,
+        retention: SourceRetention,
     },
-    PrepareRename {
-        source: ExplorerRenameSource,
-        target: PathBuf,
+    PrepareFromSource {
+        source: ExplorerSource,
+        operation: ExplorerMutation,
     },
     Open {
         path: PathBuf,
@@ -60,9 +168,9 @@ pub enum ExplorerIo {
 }
 #[derive(Debug)]
 pub enum ExplorerIoReply {
-    RenameInspected {
+    SourceInspected {
         id: RequestId,
-        result: Result<ExplorerRenameSource, VfsError>,
+        result: Result<ExplorerSource, VfsError>,
     },
     Opened {
         id: RequestId,
@@ -81,7 +189,7 @@ pub enum ExplorerIoReply {
 impl ExplorerIoReply {
     pub fn id(&self) -> RequestId {
         match self {
-            Self::RenameInspected { id, .. }
+            Self::SourceInspected { id, .. }
             | Self::Prepared { id, .. }
             | Self::Applied { id, .. }
             | Self::Opened { id, .. } => *id,
@@ -188,49 +296,88 @@ fn prepare(
         operation,
         roots,
         identities,
+        inspected_source: None,
         maximum,
     })
+}
+fn reopen_identity_path(path: &Path) -> Result<fs::File, VfsError> {
+    let current = fs::symlink_metadata(path).map_err(|e| error(path, e.to_string()))?;
+    if current.file_type().is_symlink() {
+        return Err(error(path, "explorer target filesystem identity changed"));
+    }
+    crate::files::vfs::open_path(path).map_err(|e| error(path, e.to_string()))
 }
 fn check_identities(intent: &PreparedExplorerMutation) -> Result<(), VfsError> {
     roots_current(&intent.roots)?;
     for (path, original) in &intent.identities {
-        let current = fs::symlink_metadata(path).map_err(|e| error(path, e.to_string()))?;
-        let reopened =
-            crate::files::vfs::open_path(path).map_err(|e| error(path, e.to_string()))?;
-        let current_identity = crate::files::root_identity::file_identity(&reopened)
-            .map_err(|e| error(path, e.to_string()))?;
-        let original_identity = crate::files::root_identity::file_identity(original)
-            .map_err(|e| error(path, e.to_string()))?;
-        if current.file_type().is_symlink() || current_identity != original_identity {
+        let original_identity = file_identity(original).map_err(|e| error(path, e.to_string()))?;
+        let reopened = reopen_identity_path(path)?;
+        let current_identity = file_identity(&reopened).map_err(|e| error(path, e.to_string()))?;
+        if current_identity != original_identity {
             return Err(error(path, "explorer target filesystem identity changed"));
         }
     }
     Ok(())
 }
-fn prepare_rename(
-    source: ExplorerRenameSource,
-    target: PathBuf,
+fn inspect_source(
+    path: PathBuf,
+    roots: Vec<RootIdentity>,
+    maximum: u64,
+    retention: SourceRetention,
+) -> Result<ExplorerSource, VfsError> {
+    // Reuse source-only inspection. No Apply request exists for this opaque token.
+    let prepared = prepare(ExplorerMutation::Delete { path }, roots.clone(), maximum)?;
+    let inspected = match retention {
+        SourceRetention::HoldHandles => InspectedSource::Held(prepared),
+        SourceRetention::Snapshot => {
+            let path = prepared
+                .operation
+                .source()
+                .expect("inspected explorer source");
+            let file = prepared
+                .source_handle()
+                .expect("inspection holds the source handle");
+            let identity =
+                ClipboardIdentity::capture(file).map_err(|e| error(path, e.to_string()))?;
+            // The remaining prepared fields (all open handles) drop before the reply.
+            InspectedSource::Snapshot {
+                path: path.into(),
+                identity,
+                roots: prepared.roots,
+                maximum,
+            }
+        }
+    };
+    Ok(ExplorerSource {
+        inspected: std::sync::Arc::new(inspected),
+        roots: roots.into(),
+    })
+}
+fn prepare_from_source(
+    source: ExplorerSource,
+    operation: ExplorerMutation,
 ) -> Result<PreparedExplorerMutation, VfsError> {
-    check_identities(&source.inspected)?;
-    let mut prepared = prepare(
-        ExplorerMutation::Rename {
-            source: source.path().into(),
-            target,
-        },
-        source.roots.to_vec(),
-        source.inspected.maximum,
-    )?;
-    check_identities(&source.inspected)?;
-    // Retain the original open file identities through application, not just a new path lookup.
-    for (path, file) in &source.inspected.identities {
-        prepared.identities.push((
-            path.clone(),
-            file.try_clone().map_err(|e| error(path, e.to_string()))?,
-        ));
+    if !matches!(
+        operation,
+        ExplorerMutation::Rename { .. } | ExplorerMutation::Copy { .. }
+    ) || operation.source() != Some(source.path())
+    {
+        return Err(VfsError::ExplorerSourceChanged);
     }
+    source.check()?;
+    let prepared = prepare(operation, source.roots.to_vec(), source.maximum());
+    source.check()?;
+    let mut prepared = prepared?;
+    // The scoped path can have different spelling. Check the handle prepare actually opened.
+    source.check_prepared(&prepared)?;
+    // Keep the original identity through apply, not just the newly opened paths.
+    prepared.inspected_source = Some(source);
     Ok(prepared)
 }
 fn apply(intent: PreparedExplorerMutation) -> Result<(), VfsError> {
+    if let Some(source) = &intent.inspected_source {
+        source.check()?;
+    }
     check_identities(&intent)?;
     let roots = intent
         .roots
@@ -312,30 +459,25 @@ impl ExplorerIo {
             ),
         };
         match self {
-            Self::InspectRename {
+            Self::InspectSource {
                 path,
                 roots,
                 maximum,
-            } => ExplorerIoReply::RenameInspected {
+                retention,
+            } => ExplorerIoReply::SourceInspected {
                 id,
                 result: if cancelled {
                     Err(cancellation())
                 } else {
-                    // Reuse source-only inspection. No Apply request exists for this opaque token.
-                    prepare(ExplorerMutation::Delete { path }, roots.clone(), maximum).map(
-                        |prepared| ExplorerRenameSource {
-                            inspected: std::sync::Arc::new(prepared),
-                            roots: roots.into(),
-                        },
-                    )
+                    inspect_source(path, roots, maximum, retention)
                 },
             },
-            Self::PrepareRename { source, target } => ExplorerIoReply::Prepared {
+            Self::PrepareFromSource { source, operation } => ExplorerIoReply::Prepared {
                 id,
                 result: if cancelled {
                     Err(cancellation())
                 } else {
-                    prepare_rename(source, target)
+                    prepare_from_source(source, operation)
                 },
             },
             Self::Open { path, roots } => {
@@ -424,6 +566,123 @@ mod tests {
         fs::rename(&sub, root.path().join("original-sub")).unwrap();
         std::os::unix::fs::symlink(outside.path(), &sub).unwrap();
         assert!(read_scoped_file(&path, &roots).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn explorer_paste_accepts_same_source_with_different_path_spelling() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = crate::files::canonicalize(temp.path()).unwrap();
+        let parent = root.join("notes");
+        let renamed = root.join("renamed-notes");
+        let source = parent.join("report.txt");
+        let destination = root.join("destination");
+        let target = destination.join("report.txt");
+        fs::create_dir(&parent).unwrap();
+        fs::create_dir(&destination).unwrap();
+        fs::write(&source, "original").unwrap();
+        let clipboard = inspect_source(
+            source.clone(),
+            vec![RootIdentity::capture(&root).unwrap()],
+            1024,
+            SourceRetention::Snapshot,
+        )
+        .unwrap();
+        assert_eq!(clipboard.path(), source);
+
+        fs::rename(&parent, &renamed).unwrap();
+        // Like a case-only rename on a case-insensitive filesystem, the old
+        // spelling still resolves to the source but canonicalizes differently.
+        std::os::unix::fs::symlink(&renamed, &parent).unwrap();
+        let prepared = prepare_from_source(
+            clipboard,
+            ExplorerMutation::Copy {
+                source: source.clone(),
+                target: target.clone(),
+            },
+        )
+        .unwrap();
+        let resolved = renamed.join("report.txt");
+        assert_ne!(source, resolved);
+        assert_eq!(prepared.operation().source(), Some(resolved.as_path()));
+        apply(prepared).unwrap();
+        assert_eq!(fs::read_to_string(target).unwrap(), "original");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn explorer_clipboard_rejects_reused_inode_and_accepts_in_place_edit() {
+        for cut in [true, false] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = crate::files::canonicalize(temp.path()).unwrap();
+            let source = root.join("report.txt");
+            let replacement = root.join("replacement.txt");
+            let destination = root.join("destination");
+            let target = destination.join("report.txt");
+            fs::create_dir(&destination).unwrap();
+            fs::write(&source, "original").unwrap();
+            let roots = vec![RootIdentity::capture(&root).unwrap()];
+            let inspect = || {
+                inspect_source(
+                    source.clone(),
+                    roots.clone(),
+                    1024,
+                    SourceRetention::Snapshot,
+                )
+                .unwrap()
+            };
+            let operation = if cut {
+                ExplorerMutation::Rename {
+                    source: source.clone(),
+                    target: target.clone(),
+                }
+            } else {
+                ExplorerMutation::Copy {
+                    source: source.clone(),
+                    target: target.clone(),
+                }
+            };
+            let mut clipboard = inspect();
+            // Allocate the replacement before unlinking so the fallback also has a
+            // distinct inode on filesystems without birth time.
+            fs::write(&replacement, "replacement").unwrap();
+            fs::remove_file(&source).unwrap();
+            fs::rename(&replacement, &source).unwrap();
+            let current = ClipboardIdentity::capture(&fs::File::open(&source).unwrap()).unwrap();
+            let InspectedSource::Snapshot { identity, .. } =
+                std::sync::Arc::get_mut(&mut clipboard.inspected).unwrap()
+            else {
+                panic!("clipboard must hold identity values only");
+            };
+            if let Some(created) = current.created {
+                // Model inode reuse even when the test filesystem allocates a new inode.
+                identity.file_id = current.file_id;
+                identity.created = Some(created - Duration::from_secs(1));
+            } else {
+                // Check the birth-time comparison even when this test mount lacks it.
+                let old = ClipboardIdentity {
+                    file_id: current.file_id,
+                    created: Some(SystemTime::UNIX_EPOCH),
+                };
+                let new = ClipboardIdentity {
+                    file_id: current.file_id,
+                    created: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(1)),
+                };
+                assert!(!old.matches(&new));
+            }
+            assert!(matches!(
+                prepare_from_source(clipboard, operation.clone()),
+                Err(VfsError::ExplorerSourceChanged)
+            ));
+            assert!(!target.exists());
+            assert_eq!(fs::read_to_string(&source).unwrap(), "replacement");
+
+            let clipboard = inspect();
+            fs::write(&source, "edited in place").unwrap();
+            apply(prepare_from_source(clipboard, operation).unwrap()).unwrap();
+            assert_eq!(fs::read_to_string(&target).unwrap(), "edited in place");
+            assert_eq!(source.exists(), !cut);
+        }
     }
 
     // Unix modes distinguish read permission from permission to rename. Only Linux
@@ -565,9 +824,9 @@ mod tests {
             fs::create_dir(&nested).unwrap();
             roots.push(RootIdentity::capture(&nested).unwrap());
             worker
-                .inspect_explorer_rename(source.clone(), roots.clone(), 1024)
+                .inspect_explorer_source(source.clone(), roots.clone(), 1024)
                 .unwrap();
-            let ExplorerIoReply::RenameInspected {
+            let ExplorerIoReply::SourceInspected {
                 result: Ok(rename_source),
                 ..
             } = reply(&worker)
@@ -577,7 +836,13 @@ mod tests {
             fs::rename(&nested, a.join("old-nested")).unwrap();
             std::os::unix::fs::symlink(&b, &nested).unwrap();
             worker
-                .prepare_explorer_rename(rename_source, nested.join("renamed"))
+                .prepare_explorer_from_source(
+                    rename_source,
+                    ExplorerMutation::Rename {
+                        source: source.clone(),
+                        target: nested.join("renamed"),
+                    },
+                )
                 .unwrap();
             assert!(matches!(
                 reply(&worker),

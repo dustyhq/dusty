@@ -66,6 +66,8 @@ pub enum VfsError {
     NotRegularFile(PathBuf),
     #[error("resource changed after preview")]
     ChangedOnDisk,
+    #[error("The source file or folder changed.")]
+    ExplorerSourceChanged,
     #[error("cross-filesystem rename is not supported atomically")]
     CrossFilesystem,
     #[error("directory entry limit is outside safe bounds")]

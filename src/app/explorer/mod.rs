@@ -75,7 +75,7 @@ pub(in crate::app) struct Explorer {
     mutation: Option<intent::MutationIntent>,
     rename: Option<intent::RenamePrompt>,
     open: Option<intent::OpenIntent>,
-    clipboard: Option<(PathBuf, bool, WorkspaceVersion)>,
+    clipboard: Option<intent::Clipboard>,
     directory: DirectoryWorker,
     maximum_entries: BTreeMap<ExplorerNodeId, usize>,
     pending: Option<PendingDirectoryLoad>,
@@ -1127,6 +1127,7 @@ impl App {
 
 impl App {
     pub(in crate::app) fn cancel_stale_explorer_intents(&mut self) {
+        self.cancel_stale_explorer_clipboard();
         let ids = self.explorer.cancel_stale_intents(
             self.workspace.version(),
             self.configuration.binding_revision(),
@@ -1160,10 +1161,29 @@ impl App {
 
 impl App {
     pub(in crate::app) fn cancel_explorer_intents(&mut self) {
+        self.cancel_stale_explorer_clipboard();
         for id in self.explorer.cancel_intents() {
             self.documents.cancel_request(id);
         }
     }
+
+    pub(in crate::app) fn cancel_stale_explorer_clipboard(&mut self) {
+        if let Some(id) = self
+            .explorer
+            .discard_stale_clipboard(&self.workspace.version())
+        {
+            self.documents.cancel_request(id);
+        }
+    }
+}
+
+enum MutationSource {
+    Path,
+    RenamePrompt,
+    Clipboard {
+        source: crate::files::ExplorerSource,
+        cut_clipboard: Option<crate::files::RequestId>,
+    },
 }
 
 impl App {
@@ -1171,7 +1191,7 @@ impl App {
         &mut self,
         operation: Result<ExplorerMutation, String>,
         confirmation: bool,
-        rename_prompt: bool,
+        source: MutationSource,
     ) -> Result<(), String> {
         let operation = operation?;
         if self.explorer.mutation_pending() {
@@ -1192,24 +1212,31 @@ impl App {
             editor: self.state.window_version(),
             change,
         };
+        let cut_clipboard = match &source {
+            MutationSource::Clipboard { cut_clipboard, .. } => *cut_clipboard,
+            _ => None,
+        };
         let request = self.explorer.prepare_mutation(
             operation,
             context,
             self.workspace.roots(),
             SEARCH_MAXIMUM_FILE_BYTES as u64,
             confirmation,
+            cut_clipboard,
         )?;
-        let result = if rename_prompt {
-            let source = self.explorer.submitted_rename_source();
-            let target = request
-                .operation
-                .target()
-                .expect("validated rename target")
-                .into();
-            self.documents.prepare_explorer_rename(source, target)
-        } else {
-            self.documents
-                .prepare_explorer(request.operation, request.roots, request.maximum)
+        let result = match source {
+            MutationSource::Path => {
+                self.documents
+                    .prepare_explorer(request.operation, request.roots, request.maximum)
+            }
+            MutationSource::RenamePrompt => {
+                let source = self.explorer.submitted_rename_source();
+                self.documents
+                    .prepare_explorer_from_source(source, request.operation)
+            }
+            MutationSource::Clipboard { source, .. } => self
+                .documents
+                .prepare_explorer_from_source(source, request.operation),
         }
         .map_err(|e| e.to_string());
         let id = result.as_ref().ok().copied();
@@ -1226,7 +1253,8 @@ impl App {
 
 impl App {
     pub(in crate::app) fn create_explorer_path(&mut self, input: String) {
-        if let Err(error) = self.queue_explorer_mutation(self.explorer.create(&input), false, false)
+        if let Err(error) =
+            self.queue_explorer_mutation(self.explorer.create(&input), false, MutationSource::Path)
         {
             self.show_error(error);
         }
@@ -1236,7 +1264,7 @@ impl App {
 impl App {
     pub(in crate::app) fn rename_explorer_path(&mut self, target: String) {
         if let Err(error) =
-            self.queue_explorer_mutation(self.explorer.rename(&target), false, false)
+            self.queue_explorer_mutation(self.explorer.rename(&target), false, MutationSource::Path)
         {
             self.show_error(error);
         }
@@ -1261,7 +1289,7 @@ impl App {
         let result = self.explorer.rename_inspection().and_then(|inspection| {
             let id = self
                 .documents
-                .inspect_explorer_rename(
+                .inspect_explorer_source(
                     request.path,
                     request.roots,
                     SEARCH_MAXIMUM_FILE_BYTES as u64,
@@ -1291,7 +1319,9 @@ impl App {
             self.configuration.binding_revision(),
             &self.state.window_version(),
         );
-        if let Err(error) = self.queue_explorer_mutation(operation, false, true) {
+        if let Err(error) =
+            self.queue_explorer_mutation(operation, false, MutationSource::RenamePrompt)
+        {
             self.prompt_error(error);
         } else {
             self.prompt_help("Checking rename target… Esc cancels before application.".into());
@@ -1310,7 +1340,9 @@ impl App {
 impl App {
     pub(in crate::app) fn request_explorer_delete(&mut self) {
         self.close_prompt();
-        if let Err(error) = self.queue_explorer_mutation(self.explorer.delete(), true, false) {
+        if let Err(error) =
+            self.queue_explorer_mutation(self.explorer.delete(), true, MutationSource::Path)
+        {
             self.show_error(error);
         }
     }
@@ -1354,20 +1386,52 @@ impl App {
 
 impl App {
     pub(in crate::app) fn set_explorer_clipboard(&mut self, cut: bool) {
-        match self.explorer.clipboard(cut, self.workspace.version()) {
-            Ok(message) => self.notify_message(message, false),
-            Err(error) => self.show_error(error),
+        let (path, roots) = match self
+            .explorer
+            .clipboard_inspection_request(self.workspace.roots())
+        {
+            Ok(request) => request,
+            Err(error) => {
+                self.show_error(error);
+                return;
+            }
+        };
+        match self.documents.inspect_explorer_clipboard_source(
+            path.clone(),
+            roots,
+            SEARCH_MAXIMUM_FILE_BYTES as u64,
+        ) {
+            Ok(id) => {
+                if let Some(previous) = self.explorer.track_clipboard_inspection(
+                    id,
+                    self.workspace.version(),
+                    path,
+                    cut,
+                ) {
+                    self.documents.cancel_request(previous);
+                }
+            }
+            Err(_) => self.show_error(intent::CLIPBOARD_CHECK_FAILED),
         }
     }
 }
 
 impl App {
     pub(in crate::app) fn paste_explorer_clipboard(&mut self) {
-        if let Err(error) = self.queue_explorer_mutation(
-            self.explorer.paste(&self.workspace.version()),
-            false,
-            false,
-        ) {
+        let result = self
+            .explorer
+            .paste(&self.workspace.version())
+            .and_then(|paste| {
+                self.queue_explorer_mutation(
+                    Ok(paste.operation),
+                    false,
+                    MutationSource::Clipboard {
+                        source: paste.source,
+                        cut_clipboard: paste.cut_clipboard,
+                    },
+                )
+            });
+        if let Err(error) = result {
             self.show_error(error);
         }
     }
@@ -1376,7 +1440,23 @@ impl App {
 impl App {
     pub(in crate::app) fn process_explorer_io(&mut self, reply: crate::files::ExplorerIoReply) {
         use crate::app::explorer::MutationUpdate;
-        if let crate::files::ExplorerIoReply::RenameInspected { id, result } = reply {
+        if let crate::files::ExplorerIoReply::SourceInspected { id, result } = reply {
+            // Inspection replies share a worker protocol; only the owner of the request
+            // may consume a reply.
+            match self
+                .explorer
+                .accept_clipboard_inspection(id, &result, &self.workspace.version())
+            {
+                Some(Ok(message)) => {
+                    self.notify_message(message, false);
+                    return;
+                }
+                Some(Err(error)) => {
+                    self.show_error(error);
+                    return;
+                }
+                None => {}
+            }
             match self.explorer.accept_rename_inspection(
                 id,
                 result,

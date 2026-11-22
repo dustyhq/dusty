@@ -7,8 +7,11 @@ use crate::editor::BufferPathChange;
 use crate::editor::EditorWindowVersion;
 use crate::files::ExplorerIoReply;
 use crate::files::ExplorerMutation;
+use crate::files::ExplorerSource;
 use crate::files::PreparedExplorerMutation;
 use crate::files::RequestId;
+use crate::files::RootIdentity;
+use crate::files::VfsError;
 use crate::workspace::WorkspaceRoot;
 use std::path::Path;
 use std::path::PathBuf;
@@ -22,7 +25,7 @@ pub(super) struct RenamePrompt {
     configuration: u64,
     editor: EditorWindowVersion,
     pending: Option<RequestId>,
-    inspected: Option<crate::files::ExplorerRenameSource>,
+    inspected: Option<ExplorerSource>,
     submitted: Option<Arc<()>>,
 }
 pub(in crate::app) struct RenameInspection<'a>(&'a mut RenamePrompt);
@@ -36,6 +39,28 @@ pub(in crate::app) struct RenamePromptRequest {
     pub root: PathBuf,
     pub path: PathBuf,
     pub roots: Vec<crate::files::RootIdentity>,
+}
+pub(super) const CLIPBOARD_CHECK_FAILED: &str = "Couldn't check the selected file or folder.";
+
+enum ClipboardState {
+    Pending(PathBuf),
+    Ready(ExplorerSource),
+}
+pub(super) struct Clipboard {
+    inspection: RequestId,
+    scope: WorkspaceVersion,
+    cut: bool,
+    state: ClipboardState,
+}
+impl Clipboard {
+    fn pending_request(&self) -> Option<RequestId> {
+        matches!(self.state, ClipboardState::Pending(_)).then_some(self.inspection)
+    }
+}
+pub(super) struct PasteRequest {
+    pub operation: ExplorerMutation,
+    pub source: ExplorerSource,
+    pub cut_clipboard: Option<RequestId>,
 }
 pub(in crate::app) struct MutationContext {
     pub workspace: WorkspaceVersion,
@@ -64,6 +89,7 @@ pub(super) struct MutationIntent {
     operation: ExplorerMutation,
     phase: Phase,
     confirmation: bool,
+    cut_clipboard: Option<RequestId>,
     invalid: bool,
 }
 pub(in crate::app) enum MutationUpdate {
@@ -212,7 +238,7 @@ impl Explorer {
     pub(in crate::app) fn accept_rename_inspection(
         &mut self,
         id: RequestId,
-        result: Result<crate::files::ExplorerRenameSource, crate::files::VfsError>,
+        result: Result<ExplorerSource, VfsError>,
         scope: WorkspaceVersion,
         configuration: u64,
         editor: &EditorWindowVersion,
@@ -293,7 +319,7 @@ impl Explorer {
             target,
         })
     }
-    pub(in crate::app) fn submitted_rename_source(&mut self) -> crate::files::ExplorerRenameSource {
+    pub(in crate::app) fn submitted_rename_source(&mut self) -> ExplorerSource {
         let rename = self.rename.as_mut().expect("validated rename prompt");
         rename.submitted = self.mutation.as_ref().map(|intent| intent.key.clone());
         rename
@@ -333,47 +359,112 @@ impl Explorer {
             path: self.mutable_path()?,
         })
     }
-    pub(in crate::app) fn clipboard(
-        &mut self,
-        cut: bool,
-        scope: WorkspaceVersion,
-    ) -> Result<String, String> {
+    pub(super) fn clipboard_inspection_request(
+        &self,
+        roots: &[WorkspaceRoot],
+    ) -> Result<(PathBuf, Vec<RootIdentity>), String> {
         let path = self.mutable_path()?;
+        if roots
+            .iter()
+            .map(|root| &root.identity.canonical_path)
+            .ne(self.roots.iter())
+        {
+            return Err(CLIPBOARD_CHECK_FAILED.into());
+        }
+        Ok((path, self.operation_roots(roots)))
+    }
+    pub(super) fn track_clipboard_inspection(
+        &mut self,
+        inspection: RequestId,
+        scope: WorkspaceVersion,
+        path: PathBuf,
+        cut: bool,
+    ) -> Option<RequestId> {
+        self.clipboard
+            .replace(Clipboard {
+                inspection,
+                scope,
+                cut,
+                state: ClipboardState::Pending(path),
+            })
+            .and_then(|entry| entry.pending_request())
+    }
+    pub(in crate::app) fn pending_clipboard_inspection(&self) -> Option<RequestId> {
+        self.clipboard.as_ref().and_then(Clipboard::pending_request)
+    }
+    pub(super) fn discard_stale_clipboard(
+        &mut self,
+        scope: &WorkspaceVersion,
+    ) -> Option<RequestId> {
+        self.clipboard
+            .take_if(|entry| &entry.scope != scope)
+            .and_then(|entry| entry.pending_request())
+    }
+    pub(super) fn accept_clipboard_inspection(
+        &mut self,
+        id: RequestId,
+        result: &Result<ExplorerSource, VfsError>,
+        scope: &WorkspaceVersion,
+    ) -> Option<Result<String, String>> {
+        let entry = self
+            .clipboard
+            .as_mut()
+            .filter(|entry| entry.inspection == id)?;
+        let ClipboardState::Pending(path) = &entry.state else {
+            return None;
+        };
+        if &entry.scope != scope {
+            self.clipboard = None;
+            return None;
+        }
+        // A differently spelled path (a stale row after an outside case-only rename on
+        // Windows) is refused: Paste and open buffers use the row's spelling. Cut again
+        // once Explorer reloads.
+        let Some(source) = result.as_ref().ok().filter(|source| source.path() == path) else {
+            self.clipboard = None;
+            return Some(Err(CLIPBOARD_CHECK_FAILED.into()));
+        };
         let notice = format!(
             "{} `{}`; select a destination and press p",
-            if cut { "moving" } else { "copied" },
+            if entry.cut { "moving" } else { "copied" },
             path.file_name().map_or_else(
                 || path.display().to_string(),
                 |name| name.to_string_lossy().into_owned()
             )
         );
-        self.clipboard = Some((path, cut, scope));
-        Ok(notice)
+        entry.state = ClipboardState::Ready(source.clone());
+        Some(Ok(notice))
     }
-    pub(in crate::app) fn paste(
-        &self,
-        scope: &WorkspaceVersion,
-    ) -> Result<ExplorerMutation, String> {
-        let (source, cut, expected) = self
+    pub(super) fn paste(&self, scope: &WorkspaceVersion) -> Result<PasteRequest, String> {
+        let entry = self
             .clipboard
             .as_ref()
             .ok_or("explorer clipboard is empty")?;
-        if expected != scope {
+        if &entry.scope != scope {
             return Err("explorer clipboard belongs to a previous workspace".into());
         }
+        let ClipboardState::Ready(source) = &entry.state else {
+            return Err("Still checking the source. Try Paste again.".into());
+        };
+        let path = source.path();
         let target = self
             .selected_parent()?
-            .join(source.file_name().ok_or("copied path has no filename")?);
-        Ok(if *cut {
+            .join(path.file_name().ok_or("copied path has no filename")?);
+        let operation = if entry.cut {
             ExplorerMutation::Rename {
-                source: source.clone(),
+                source: path.into(),
                 target,
             }
         } else {
             ExplorerMutation::Copy {
-                source: source.clone(),
+                source: path.into(),
                 target,
             }
+        };
+        Ok(PasteRequest {
+            operation,
+            source: source.clone(),
+            cut_clipboard: entry.cut.then_some(entry.inspection),
         })
     }
     pub(in crate::app) fn prepare_mutation(
@@ -383,6 +474,7 @@ impl Explorer {
         roots: &[WorkspaceRoot],
         maximum: u64,
         confirmation: bool,
+        cut_clipboard: Option<RequestId>,
     ) -> Result<MutationRequest, String> {
         if self.mutation.is_some() {
             return Err("an explorer operation is already pending".into());
@@ -403,6 +495,7 @@ impl Explorer {
             operation: operation.clone(),
             phase: Phase::Submitting,
             confirmation,
+            cut_clipboard,
             invalid: false,
         });
         Ok(MutationRequest {
@@ -492,11 +585,10 @@ impl Explorer {
                 Some(update)
             }
             (ExplorerIoReply::Applied { result: Ok(()), .. }, Phase::Applying(_)) => {
-                if let ExplorerMutation::Rename { source, .. } = &intent.operation
-                    && self
-                        .clipboard
-                        .as_ref()
-                        .is_some_and(|(path, cut, _)| *cut && path == source)
+                if self
+                    .clipboard
+                    .as_ref()
+                    .is_some_and(|entry| Some(entry.inspection) == intent.cut_clipboard)
                 {
                     self.clipboard = None;
                 }
@@ -630,6 +722,13 @@ impl Explorer {
     pub(in crate::app) fn transport_stopped(&mut self) {
         self.cancel_intents();
         self.mutation = None;
+        if self
+            .clipboard
+            .as_ref()
+            .is_some_and(|entry| matches!(entry.state, ClipboardState::Pending(_)))
+        {
+            self.clipboard = None;
+        }
     }
     pub(in crate::app) fn prepare_open(
         &mut self,

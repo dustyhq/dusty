@@ -504,8 +504,8 @@ impl Documents {
             .saturating_add(self.pending_tasks.len())
             .saturating_add(self.pending_startup.len())
     }
-    pub(in crate::app) fn legacy_pending(&self) -> bool {
-        !self.pending_legacy.is_empty()
+    pub(in crate::app) fn legacy_pending_except(&self, except: Option<RequestId>) -> bool {
+        self.pending_legacy.iter().any(|&id| Some(id) != except)
     }
     #[cfg(test)]
     pub(in crate::app) fn legacy_count(&self) -> usize {
@@ -654,24 +654,37 @@ impl Documents {
         self.pending_legacy.insert(id);
         Ok(id)
     }
-    pub(in crate::app) fn inspect_explorer_rename(
+    pub(in crate::app) fn inspect_explorer_source(
         &mut self,
         path: PathBuf,
         roots: Vec<crate::files::RootIdentity>,
         maximum: u64,
     ) -> Result<RequestId, VfsError> {
         self.check_capacity()?;
-        let id = self.vfs.inspect_explorer_rename(path, roots, maximum)?;
+        let id = self.vfs.inspect_explorer_source(path, roots, maximum)?;
         self.pending_legacy.insert(id);
         Ok(id)
     }
-    pub(in crate::app) fn prepare_explorer_rename(
+    pub(in crate::app) fn inspect_explorer_clipboard_source(
         &mut self,
-        source: crate::files::ExplorerRenameSource,
-        target: PathBuf,
+        path: PathBuf,
+        roots: Vec<crate::files::RootIdentity>,
+        maximum: u64,
     ) -> Result<RequestId, VfsError> {
         self.check_capacity()?;
-        let id = self.vfs.prepare_explorer_rename(source, target)?;
+        let id = self
+            .vfs
+            .inspect_explorer_clipboard_source(path, roots, maximum)?;
+        self.pending_legacy.insert(id);
+        Ok(id)
+    }
+    pub(in crate::app) fn prepare_explorer_from_source(
+        &mut self,
+        source: crate::files::ExplorerSource,
+        operation: ExplorerMutation,
+    ) -> Result<RequestId, VfsError> {
+        self.check_capacity()?;
+        let id = self.vfs.prepare_explorer_from_source(source, operation)?;
         self.pending_legacy.insert(id);
         Ok(id)
     }

@@ -31,8 +31,11 @@ use crate::files::explorer_intent::ExplorerIo;
 use crate::files::explorer_intent::ExplorerIoReply;
 
 use crate::files::explorer_intent::PreparedExplorerMutation;
+use crate::files::explorer_intent::SourceRetention;
 
 use crate::files::recovery::DOCUMENT_BYTE_LIMIT;
+
+use crate::files::recovery::RecoveryBase;
 
 use crate::files::recovery::RecoveryCleanup;
 
@@ -949,11 +952,29 @@ impl VfsWorker {
         )?;
         Ok(id)
     }
-    pub fn inspect_explorer_rename(
+    pub fn inspect_explorer_source(
         &mut self,
         path: PathBuf,
         roots: Vec<crate::files::RootIdentity>,
         maximum: u64,
+    ) -> Result<RequestId, VfsError> {
+        self.queue_explorer_source_inspection(path, roots, maximum, SourceRetention::HoldHandles)
+    }
+    /// Inspect a clipboard source without keeping any filesystem handles in the reply.
+    pub fn inspect_explorer_clipboard_source(
+        &mut self,
+        path: PathBuf,
+        roots: Vec<crate::files::RootIdentity>,
+        maximum: u64,
+    ) -> Result<RequestId, VfsError> {
+        self.queue_explorer_source_inspection(path, roots, maximum, SourceRetention::Snapshot)
+    }
+    fn queue_explorer_source_inspection(
+        &mut self,
+        path: PathBuf,
+        roots: Vec<crate::files::RootIdentity>,
+        maximum: u64,
+        retention: SourceRetention,
     ) -> Result<RequestId, VfsError> {
         let id = self.next_request_id()?;
         self.submit_io(
@@ -962,18 +983,19 @@ impl VfsWorker {
                 path: path.clone(),
             },
             None,
-            Some(ExplorerIo::InspectRename {
+            Some(ExplorerIo::InspectSource {
                 path,
                 roots,
                 maximum,
+                retention,
             }),
         )?;
         Ok(id)
     }
-    pub fn prepare_explorer_rename(
+    pub fn prepare_explorer_from_source(
         &mut self,
-        source: crate::files::ExplorerRenameSource,
-        target: PathBuf,
+        source: crate::files::ExplorerSource,
+        operation: ExplorerMutation,
     ) -> Result<RequestId, VfsError> {
         let id = self.next_request_id()?;
         self.submit_io(
@@ -982,7 +1004,7 @@ impl VfsWorker {
                 path: source.path().into(),
             },
             None,
-            Some(ExplorerIo::PrepareRename { source, target }),
+            Some(ExplorerIo::PrepareFromSource { source, operation }),
         )?;
         Ok(id)
     }

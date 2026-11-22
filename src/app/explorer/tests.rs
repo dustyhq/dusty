@@ -3,6 +3,7 @@
 use crate::app::App;
 use crate::app::AppEffect;
 use crate::app::documents::DocumentEvent;
+use crate::app::documents::tests::gate_document_worker;
 use crate::app::tests::*;
 use crate::editor::input::KeyEvent;
 use crate::editor::text::ByteOffset;
@@ -213,6 +214,182 @@ fn explorer_rename_prompt_refuses_replaced_files_and_stale_or_cancelled_requests
     wait_vfs(&mut app);
     assert!(app.input.prompt().is_none());
     assert!(!target.exists());
+}
+
+fn drain_clipboard_vfs(app: &mut App) {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while app.documents.has_work() {
+        app.queue_startup_reads();
+        app.process_vfs_results();
+        assert!(Instant::now() < deadline, "VFS completion timed out");
+        thread::yield_now();
+    }
+}
+
+#[test]
+fn explorer_clipboard_releases_source_and_refuses_replacement() {
+    for cut in [true, false] {
+        let (_app_dirs, mut app) = app();
+        let root = app.state.workspace_root.clone();
+        let folder = root.join("notes");
+        let source = folder.join("report.txt");
+        let parked = root.join("notes-old").join("report.txt");
+        let destination = root.join("destination");
+        let target = destination.join("report.txt");
+        fs::create_dir(&folder).unwrap();
+        fs::write(&source, "original").unwrap();
+        fs::create_dir(&destination).unwrap();
+        app.open_explorer();
+        wait_explorer(&mut app);
+        let folder_row = app
+            .explorer
+            .tree()
+            .id_for_path(&folder)
+            .expect("folder row");
+        app.load_explorer_node(folder_row);
+        wait_explorer(&mut app);
+        app.explorer.select(
+            app.explorer
+                .tree()
+                .id_for_path(&source)
+                .expect("source row"),
+        );
+        app.process_effect(AppEffect::ExplorerClipboard { cut });
+        drain_clipboard_vfs(&mut app);
+        assert!(app.explorer.paste(&app.workspace.version()).is_ok());
+
+        #[cfg(target_os = "linux")]
+        assert!(
+            fs::read_dir("/proc/self/fd")
+                .expect("list open file descriptors")
+                .filter_map(Result::ok)
+                .filter_map(|entry| fs::read_link(entry.path()).ok())
+                .all(|path| path != source),
+            "the ready clipboard kept its source open (cut={cut})"
+        );
+
+        app.explorer.select(folder_row);
+        app.rename_explorer_path("notes-old".into());
+        drain_clipboard_vfs(&mut app);
+        assert!(parked.is_file(), "{:?}", app.ui.notification);
+        wait_explorer(&mut app);
+        app.explorer.select(
+            app.explorer
+                .tree()
+                .id_for_path(&destination)
+                .expect("destination row"),
+        );
+
+        fs::create_dir(&folder).unwrap();
+        fs::write(&source, "replacement").unwrap();
+        app.process_effect(AppEffect::ExplorerPaste);
+        drain_clipboard_vfs(&mut app);
+
+        assert_eq!(fs::read_to_string(&source).unwrap(), "replacement");
+        assert_eq!(fs::read_to_string(&parked).unwrap(), "original");
+        assert!(!target.exists());
+        assert_eq!(
+            app.ui.notification.as_deref(),
+            Some("The source file or folder changed.")
+        );
+        assert!(app.ui.notification_error);
+
+        // Restoring the original allows the same clipboard entry to be pasted.
+        fs::remove_file(&source).unwrap();
+        fs::rename(&parked, &source).unwrap();
+        app.process_effect(AppEffect::ExplorerPaste);
+        drain_clipboard_vfs(&mut app);
+        assert_eq!(fs::read_to_string(&target).unwrap(), "original");
+        assert_eq!(source.exists(), !cut);
+        assert_eq!(app.explorer.paste(&app.workspace.version()).is_ok(), !cut);
+    }
+}
+
+#[test]
+fn explorer_root_removal_cancels_pending_clipboard_inspection() {
+    let (_app_dirs, mut app) = app();
+    prepare_trust_identity(&mut app);
+    let original = app.workspace.active_root().expect("original root");
+    let other = tempfile::tempdir().unwrap();
+    let other_id = app
+        .workspace
+        .fixture_add_root(
+            "other".into(),
+            crate::files::RootIdentity::capture(other.path()).unwrap(),
+        )
+        .unwrap();
+    app.activate_workspace_root(original);
+    wait_trust(&mut app);
+    let source = app.state.workspace_root.join("report.txt");
+    fs::write(&source, "original").unwrap();
+    app.open_explorer();
+    wait_explorer(&mut app);
+    app.explorer.select(
+        app.explorer
+            .tree()
+            .id_for_path(&source)
+            .expect("source row"),
+    );
+    assert!(app.root_removal_blocker(other_id).is_none());
+
+    let gate = gate_document_worker(&mut app);
+    app.process_effect(AppEffect::ExplorerClipboard { cut: false });
+    assert_eq!(app.documents.legacy_count(), 1);
+    app.remove_workspace_root(other_id);
+    assert_eq!(app.workspace.roots().len(), 1, "{:?}", app.ui.notification);
+    assert_eq!(app.workspace.roots()[0].id, original);
+    assert_eq!(app.documents.legacy_count(), 0);
+    assert!(app.explorer.clipboard.is_none());
+
+    gate.send(()).unwrap();
+    drain_clipboard_vfs(&mut app);
+    assert!(app.explorer.clipboard.is_none());
+}
+
+#[test]
+fn explorer_workspace_switch_drops_clipboard_and_cancels_pending_inspection() {
+    for ready in [true, false] {
+        let (_app_dirs, mut app) = app();
+        let next_root = tempfile::tempdir().unwrap();
+        let next_path = crate::files::canonicalize(next_root.path()).unwrap();
+        let source = app.state.workspace_root.join("report.txt");
+        fs::write(&source, "original").unwrap();
+        app.open_explorer();
+
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let source_row = loop {
+            if let Some(row) = app.explorer.tree().id_for_path(&source) {
+                break row;
+            }
+            app.process_explorer_result();
+            assert!(
+                Instant::now() < deadline,
+                "Explorer did not list the source"
+            );
+            thread::yield_now();
+        };
+        app.explorer.select(source_row);
+        app.process_effect(AppEffect::ExplorerClipboard { cut: false });
+        assert_eq!(app.documents.legacy_count(), 1);
+        if ready {
+            drain_clipboard_vfs(&mut app);
+            assert!(app.explorer.paste(&app.workspace.version()).is_ok());
+        }
+
+        app.switch_workspace_root(next_path.clone());
+        // Poll the root worker, not VFS: an undelivered inspection must be cancelled.
+        crate::app::workspace::tests::wait_root_operation(&mut app);
+        assert_eq!(app.state.workspace_root, next_path);
+        assert!(
+            app.explorer.clipboard.is_none(),
+            "the old clipboard was kept"
+        );
+        assert_eq!(
+            app.documents.legacy_count(),
+            0,
+            "inspection was not cancelled"
+        );
+    }
 }
 
 #[test]

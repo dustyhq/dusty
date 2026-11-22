@@ -21,7 +21,7 @@ pub use recovery::recovery_size_allowed;
 pub use recovery::write_recovery;
 mod explorer_intent;
 pub use explorer_intent::ExplorerIoReply;
-pub use explorer_intent::ExplorerRenameSource;
+pub use explorer_intent::ExplorerSource;
 pub use explorer_intent::PreparedExplorerMutation;
 mod vfs;
 pub use vfs::CheckedResourceIntent;
