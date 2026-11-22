@@ -24,6 +24,7 @@ impl Workspace {
         let Ok(names) = repo.remotes() else {
             return Vec::new();
         };
+        let ssh_host_alias = self.advertised_web_host();
         names
             .iter()
             .flatten()
@@ -31,7 +32,11 @@ impl Workspace {
                 let remote = repo.find_remote(name).ok()?;
                 Some((
                     name.into(),
-                    repository_from_url(remote.pushurl().or(remote.url())?, &self.host)?,
+                    repository_from_url(
+                        remote.pushurl().or(remote.url())?,
+                        &self.host,
+                        ssh_host_alias.as_ref(),
+                    )?,
                 ))
             })
             .collect()
@@ -218,7 +223,11 @@ impl Workspace {
                 .map_err(|error| error.to_string())?
                 .id()
                 .to_string();
-            Some(PullRequestPush { remote, commit })
+            Some(PullRequestPush {
+                remote,
+                commit,
+                ssh_host_alias: self.advertised_web_host(),
+            })
         } else {
             None
         };
@@ -243,16 +252,19 @@ impl Workspace {
                 )
             },
         );
+        let display_host = self
+            .advertised_web_host()
+            .map_or_else(|| request.host.clone(), |host| host.to_string());
         let mut fields = vec![
             actions::field(
                 "From",
-                &format!("{}/{} : {}", request.host, head_repository, head_branch),
+                &format!("{display_host}/{head_repository} : {head_branch}"),
                 false,
                 false,
             ),
             actions::field(
                 "Into",
-                &format!("{}/{} : {}", request.host, base_repository, base_branch),
+                &format!("{display_host}/{base_repository} : {base_branch}"),
                 false,
                 false,
             ),
@@ -364,5 +376,69 @@ pub(in crate::screen) fn template_chosen(workspace: &Workspace, form: &mut Form)
             description.input.input = format!("{}{text}", kept);
             description.input.cursor = 0;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pr_review_offers_the_advertised_ssh_pushurl_for_an_internal_https_forge() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = git2::Repository::init(root.path()).unwrap();
+        repo.remote("origin", "https://git.internal.example:8443/o/r")
+            .unwrap();
+        repo.remote_set_pushurl("origin", Some("git@forge.example:o/r.git"))
+            .unwrap();
+        let tree_id = repo.treebuilder(None).unwrap().write().unwrap();
+        let tree = repo.find_tree(tree_id).unwrap();
+        let sig = git2::Signature::now("Test", "test@example.test").unwrap();
+        let commit = repo
+            .commit(Some("refs/heads/topic"), &sig, &sig, "Test", &tree, &[])
+            .unwrap();
+
+        let mut workspace = Workspace::new(root.path().into());
+        workspace.host = "git.internal.example:8443".into();
+        workspace.repo = "o/r".into();
+        workspace.cache.insert(
+            Key::Repository,
+            Ok(Reply {
+                text: String::new(),
+                value: serde_json::json!({
+                    "nameWithOwner": "o/r",
+                    "url": "https://forge.example/o/r",
+                }),
+            }),
+        );
+        assert_eq!(
+            workspace.pr_remotes(),
+            [("origin".to_owned(), "o/r".to_owned())]
+        );
+        let form = workspace
+            .review_pr(
+                [
+                    "Title",
+                    "",
+                    "o/r",
+                    "main",
+                    "o/r",
+                    "topic",
+                    "Push local branch",
+                    "false",
+                ]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+            )
+            .unwrap();
+        let FormAction::Github(Action::ConfirmPullRequest(request)) = form.action else {
+            panic!("expected a pull request confirmation");
+        };
+        assert_eq!(request.host, "git.internal.example:8443");
+        let push = request.push.unwrap();
+        assert_eq!(push.remote, "origin");
+        assert_eq!(push.commit, commit.to_string());
+        assert_eq!(push.ssh_host_alias, Some(HostKey::new("forge.example")));
     }
 }

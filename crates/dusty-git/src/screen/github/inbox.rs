@@ -13,16 +13,19 @@ impl Target {
     pub(super) fn from_url(
         text: &str,
         host: &str,
+        web_alias: Option<&HostKey>,
         page: usize,
         number: u64,
     ) -> Result<Self, String> {
         let url = reqwest::Url::parse(text).map_err(|_| "Search returned an invalid item URL")?;
+        let same_host = HostKey::from_url(&url).is_some_and(|found| {
+            Some(&found) == web_alias || HostKey::parse_authority(host).as_ref() == Some(&found)
+        });
         let parts = url.path().trim_matches('/').split('/').collect::<Vec<_>>();
         if url.scheme() != "https"
-            || url.host_str() != Some(host)
+            || !same_host
             || !url.username().is_empty()
             || url.password().is_some()
-            || url.port().is_some()
             || url.query().is_some()
             || url.fragment().is_some()
             || parts.len() != 4
@@ -84,11 +87,14 @@ pub(super) struct Inbox {
     local: Option<Settings>,
     remote: Option<Settings>,
     pub origin_page: Option<usize>,
+    /// The repository list behind a link opened outside the Inbox.
+    local_link_origin: Option<(usize, String)>,
 }
 
 pub(super) fn validate_rows(
     value: &mut Value,
     host: &str,
+    web_alias: Option<&HostKey>,
     page: usize,
     state: &str,
 ) -> Result<(), String> {
@@ -100,7 +106,7 @@ pub(super) fn validate_rows(
     }
     let mut identities = BTreeSet::new();
     for row in rows {
-        let target = Target::from_row(row, host, page)?;
+        let target = Target::from_row(row, host, web_alias, page)?;
         if !identities.insert(target.identity()) {
             return Err("Search returned duplicate item identities; reload the section".into());
         }
@@ -479,7 +485,7 @@ mod tests {
             }),
         );
         let mut rows = json!([row("alpha/one", 2), row("beta/two", 2)]);
-        validate_rows(&mut rows, "github.com", 2, "open").unwrap();
+        validate_rows(&mut rows, "github.com", None, 2, "open").unwrap();
         workspace.cache.insert(
             workspace.list_key(),
             Ok(Reply {
@@ -1011,15 +1017,15 @@ mod tests {
             ("all", "CLOSED"),
         ] {
             let mut reply = rows.clone();
-            validate_rows(&mut reply, "github.com", 2, state).unwrap();
+            validate_rows(&mut reply, "github.com", None, 2, state).unwrap();
             assert_eq!(reply[0]["state"], expected);
         }
         let mut issue = json!([row("alpha/one", 1)]);
         issue[0]["state"] = "closed".into();
-        validate_rows(&mut issue, "github.com", 1, "closed").unwrap();
+        validate_rows(&mut issue, "github.com", None, 1, "closed").unwrap();
         assert_eq!(issue[0]["state"], "CLOSED");
         let mut wrong_state = json!([row("alpha/one", 2)]);
-        assert!(validate_rows(&mut wrong_state, "github.com", 2, "merged").is_err());
+        assert!(validate_rows(&mut wrong_state, "github.com", None, 2, "merged").is_err());
         let mut workspace = workspace(PathBuf::new());
         workspace.states[1] = "merged".into();
         let Op::Read(_, Read::Search { filter, .. }) = workspace.list_read(100) else {
@@ -1118,11 +1124,11 @@ mod tests {
         );
         let mut invalid = json!([row("alpha/one", 2)]);
         invalid[0]["url"] = "https://elsewhere.test/alpha/one/pull/7".into();
-        assert!(validate_rows(&mut invalid, "github.com", 2, "open").is_err());
+        assert!(validate_rows(&mut invalid, "github.com", None, 2, "open").is_err());
         let mut duplicate = json!([row("alpha/one", 2), row("alpha/one", 2)]);
-        assert!(validate_rows(&mut duplicate, "github.com", 2, "open").is_err());
+        assert!(validate_rows(&mut duplicate, "github.com", None, 2, "open").is_err());
         let mut disagreement = json!([row("alpha/one", 2)]);
         disagreement[0]["repository"]["nameWithOwner"] = "beta/two".into();
-        assert!(validate_rows(&mut disagreement, "github.com", 2, "open").is_err());
+        assert!(validate_rows(&mut disagreement, "github.com", None, 2, "open").is_err());
     }
 }

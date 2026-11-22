@@ -604,6 +604,7 @@ impl Workspace {
     pub(super) fn apply(
         &mut self,
         request: Request,
+        routing_host: Option<HostKey>,
         fetched: Result<Fetched, String>,
         background: bool,
     ) {

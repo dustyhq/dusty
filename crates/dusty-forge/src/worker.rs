@@ -58,7 +58,8 @@ impl ForgeTarget {
     pub fn resolve(&self, root: &Path) -> Result<(HostKey, Option<RepoRef>), ForgeError> {
         match &self.host {
             Some(host) => {
-                let host = super::valid_host(host).map_err(ForgeError::Failed)?;
+                let host = HostKey::parse_authority(host)
+                    .ok_or_else(|| ForgeError::Failed("Invalid forge host".into()))?;
                 let repo =
                     match &self.repo {
                         Some(repo) => Some(RepoRef::parse(repo).ok_or_else(|| {
@@ -66,7 +67,7 @@ impl ForgeTarget {
                         })?),
                         None => None,
                     };
-                Ok((HostKey::new(&host), repo))
+                Ok((host, repo))
             }
             None => {
                 let remote = detect::choose_remote(root)?;
@@ -367,7 +368,7 @@ fn dispatch_write(
     if let Ok(receipt) = &written {
         invalidate(ctx, &receipt.invalidates);
         if let Write::CreatePullRequest(request) = write {
-            crate::template::set_merge_base(root, &request.head_branch, &request.base_branch);
+            crate::template::set_merge_base(&ctx.root, &request.head_branch, &request.base_branch);
         }
     }
     written.map_err(|error| match error {

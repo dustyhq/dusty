@@ -37,13 +37,13 @@ pub mod yaml_lite;
 pub mod zip;
 
 pub use cli::redact;
-pub use web::web_base;
+pub use web::{matching_remote_url, web_base};
 pub use worker::ForgeTarget;
 pub use worker::Served;
-pub use worker::cached_fresh;
 pub use worker::cached_read;
 pub use worker::connect;
 pub use worker::connect_to;
+pub use worker::{ACCOUNT_CHANGED, UNVERIFIED_SIGN_IN};
 
 use crate::model::ItemKind;
 use crate::model::Side;

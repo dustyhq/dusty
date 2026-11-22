@@ -47,12 +47,9 @@ pub struct RemoteRef {
 /// every segment (`group/sub/repo`).
 pub fn parse_remote(url: &str) -> Option<(HostKey, RepoRef)> {
     let base = crate::web_base(url)?;
-    let host = match base.port() {
-        Some(port) => format!("{}:{port}", base.host_str()?),
-        None => base.host_str()?.to_owned(),
-    };
+    let host = HostKey::from_url(&base)?;
     let repo = RepoRef::parse(base.path().trim_matches('/'))?;
-    Some((HostKey::new(&host), repo))
+    Some((host, repo))
 }
 
 /// `DUSTY_FORGE_REMOTE` → `[forge].remote` → gh's choice (`remote.<name>.gh-resolved = base`)

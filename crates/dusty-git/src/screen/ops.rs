@@ -446,7 +446,7 @@ impl GitScreen {
             ("Short SHA".to_owned(), history::short(id)),
             ("Subject".to_owned(), subject),
         ];
-        if let Ok(url) = commit_url(&self.root, id) {
+        if let Ok(url) = commit_url(&self.root, id, &self.github) {
             items.push(("URL".to_owned(), url));
         }
         let mut field = Field::new("Copy", items[0].0.clone());
@@ -468,7 +468,7 @@ impl GitScreen {
 
     /// `o`: the commit's page on the forge behind the default remote, in the browser.
     fn open_commit(&mut self) -> Result<(), String> {
-        let url = commit_url(&self.root, self.commit_in_hand()?)?;
+        let url = commit_url(&self.root, self.commit_in_hand()?, &self.github)?;
         crate::forge::checkout::open_url(&url)?;
         self.notice = format!("Opened {url}");
         Ok(())
@@ -960,23 +960,27 @@ impl GitScreen {
 
 /// The web page of commit `id` on the forge behind the default remote: GitHub's and
 /// Gitea's `/commit/<sha>`, GitLab's `/-/commit/<sha>`.
-pub(super) fn commit_url(root: &Path, id: git2::Oid) -> Result<String, String> {
+fn commit_url(
+    root: &Path,
+    id: git2::Oid,
+    forge: &super::github::Workspace,
+) -> Result<String, String> {
     let remote =
         history::default_remote(root).map_err(|_| "No remote to open the commit on".to_owned())?;
     let repository = git2::Repository::open(root).map_err(|error| error.message().to_owned())?;
     let remote = repository
         .find_remote(&remote)
         .map_err(|error| error.message().to_owned())?;
-    let base = remote
-        .url()
-        .and_then(crate::web_base)
-        .ok_or("The remote is not a web forge")?;
-    let base = base.as_str().trim_end_matches('/').to_owned();
-    let host = reqwest::Url::parse(&base)
-        .ok()
-        .and_then(|url| url.host_str().map(str::to_owned))
-        .unwrap_or_default();
-    Ok(if host.contains("gitlab") {
+    let remote = remote.url().ok_or("The remote is not a web forge")?;
+    let (base, gitlab) = match forge.advertised_checkout_base(remote) {
+        Some(known) => known,
+        None => {
+            let base = crate::web_base(remote).ok_or("The remote is not a web forge")?;
+            let gitlab = base.host_str().is_some_and(|host| host.contains("gitlab"));
+            (base.as_str().trim_end_matches('/').to_owned(), gitlab)
+        }
+    };
+    Ok(if gitlab {
         format!("{base}/-/commit/{id}")
     } else {
         format!("{base}/commit/{id}")

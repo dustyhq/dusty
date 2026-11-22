@@ -21,10 +21,11 @@ use crate::request::Payload;
 use crate::request::Read;
 use crate::request::Receipt;
 use crate::request::Write;
-use crate::transport::Cli;
 use crate::transport::ConnectOptions;
 use crate::transport::Endpoints;
 use crate::transport::HostKey;
+use crate::transport::{AccountNamespace, Cli, Transport};
+use crate::worker::{Confirmation, check_confirmation};
 use std::path::Path;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -121,7 +122,12 @@ pub fn browser_url(endpoints: &Endpoints, repo: &RepoRef, kind: ItemKind, number
         endpoints.web_base.trim_end_matches('/'),
         repo.full()
     );
-    match (endpoints.kind, kind) {
+    item_web_url(&base, endpoints.kind, kind, number)
+}
+
+/// The provider's item path appended to a repository's web URL.
+pub fn item_web_url(base: &str, provider: ProviderKind, kind: ItemKind, number: u64) -> String {
+    match (provider, kind) {
         (ProviderKind::GitHub, ItemKind::PullRequest) => format!("{base}/pull/{number}"),
         (ProviderKind::GitLab, ItemKind::PullRequest) => {
             format!("{base}/-/merge_requests/{number}")
@@ -294,6 +300,7 @@ impl ForgeCommands<'_> {
         root: &Path,
         target: &ForgeTarget,
         write: &Write,
+        confirmation: Confirmation<'_>,
     ) -> Result<Receipt, ForgeError> {
         let site = Site::resolve(root, target, self.cancelled)?;
         let receipt = |summary: String| Receipt {
@@ -345,11 +352,12 @@ impl ForgeCommands<'_> {
                 branch,
                 base,
             } => {
-                let gh = self.github_cli(&site, "linked branches")?;
                 let number = number.to_string();
-                self.run(
+                self.github_change(
                     root,
-                    &gh.to_string_lossy(),
+                    &site,
+                    "linked branches",
+                    confirmation,
                     &[
                         "issue",
                         "develop",
@@ -361,8 +369,7 @@ impl ForgeCommands<'_> {
                         "--repo",
                         &site.scope(),
                     ],
-                )
-                .map_err(failed)?;
+                )?;
                 Ok(receipt("Saved".into()))
             }
             Write::SetProjects {
@@ -371,7 +378,6 @@ impl ForgeCommands<'_> {
                 add,
                 remove,
             } => {
-                let gh = self.github_cli(&site, "projects")?;
                 let number = number.to_string();
                 let scope = site.scope();
                 let mut args = vec![kind_word(*kind), "edit", number.as_str()];
@@ -382,8 +388,7 @@ impl ForgeCommands<'_> {
                     args.extend(["--add-project", project.as_str()]);
                 }
                 args.extend(["--repo", scope.as_str()]);
-                self.run(root, &gh.to_string_lossy(), &args)
-                    .map_err(failed)?;
+                self.github_change(root, &site, "projects", confirmation, &args)?;
                 Ok(receipt("Saved".into()))
             }
             _ => Err(ForgeError::Unsupported {
@@ -393,14 +398,28 @@ impl ForgeCommands<'_> {
         }
     }
 
-    fn github_cli(&self, site: &Site, capability: &'static str) -> Result<PathBuf, ForgeError> {
+    fn github_change(
+        &self,
+        root: &Path,
+        site: &Site,
+        capability: &'static str,
+        confirmation: Confirmation<'_>,
+        args: &[&str],
+    ) -> Result<(), ForgeError> {
         if site.kind() != ProviderKind::GitHub {
             return Err(ForgeError::Unsupported {
                 capability,
                 reason: format!("{} has no {capability} here", site.kind().name()),
             });
         }
-        site.cli(Cli::Gh).ok_or(ForgeError::CliMissing(Cli::Gh))
+        let cli = crate::transport::verified_cli(&site.endpoints, &site.options, self.cancelled)?;
+        if let Confirmation::Captured(expected) = confirmation {
+            let connected = cli
+                .verified_login()
+                .and_then(|login| AccountNamespace::signed_in(site.host.clone(), login));
+            check_confirmation(expected, connected.as_ref())?;
+        }
+        cli.change(root, args, self.cancelled)
     }
 
     /// Check the pull request out into `<parent>/<repo>-pr-<number>` on branch `pr-<number>`

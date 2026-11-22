@@ -406,13 +406,52 @@ pub struct HostKey {
 impl HostKey {
     pub fn new(host: &str) -> Self {
         let host = host.trim().trim_end_matches('.').to_ascii_lowercase();
-        match host.rsplit_once(':') {
-            Some((name, port)) if port.parse::<u16>().is_ok() && !name.contains(':') => Self {
-                host: name.into(),
-                port: port.parse().ok(),
-            },
-            _ => Self { host, port: None },
+        if let Some((name, port)) = host.rsplit_once(':')
+            && (!name.contains(':') || name.starts_with('[') && name.ends_with(']'))
+            && let Ok(port) = port.parse()
+        {
+            return Self {
+                host: name.trim_end_matches('.').into(),
+                port: Some(port),
+            };
         }
+        Self { host, port: None }
+    }
+
+    /// Validate a request authority and retain an explicitly supplied numeric port.
+    pub fn parse_authority(authority: &str) -> Option<Self> {
+        if authority
+            .chars()
+            .any(|c| c.is_whitespace() || c.is_control())
+            || authority.contains(['/', '\\', '@', '?', '#'])
+        {
+            return None;
+        }
+        let (host, port) = match authority.rsplit_once(':') {
+            Some((host, port)) if !authority.ends_with(']') => {
+                if port.is_empty() || !port.bytes().all(|b| b.is_ascii_digit()) {
+                    return None;
+                }
+                (host, Some(port.parse().ok()?))
+            }
+            _ => (authority, None),
+        };
+        let host = if host.starts_with('[') && host.ends_with(']') {
+            let url = reqwest::Url::parse(&format!("https://{host}")).ok()?;
+            Self::from_url(&url)?.host
+        } else {
+            super::valid_config_host(host).ok()?
+        };
+        Some(Self { host, port })
+    }
+
+    /// Get a web URL's host and non-default port, excluding its credentials and path.
+    pub fn from_url(url: &reqwest::Url) -> Option<Self> {
+        let host = url.host_str()?.trim_end_matches('.');
+        (!host.is_empty()).then(|| Self {
+            host: host.to_ascii_lowercase(),
+            port: url.port(),
+        })
     }
 }
 

@@ -239,6 +239,7 @@ pub(super) struct Workspace {
     queue: VecDeque<Request>,
     cache: HashMap<Key, Result<Reply, String>>,
     repo: String,
+    /// Canonical routing authority; the Repository payload's URL is only for display.
     host: String,
     inbox: inbox::Inbox,
     scope_epoch: u64,
@@ -567,7 +568,11 @@ impl Workspace {
     }
 
     pub(super) fn forge_kind(&self) -> Option<crate::forge::provider::ProviderKind> {
-        let host = crate::forge::transport::HostKey::new(&self.host);
+        Self::forge_kind_for_host(&self.host)
+    }
+
+    fn forge_kind_for_host(host: &str) -> Option<crate::forge::provider::ProviderKind> {
+        let host = crate::forge::transport::HostKey::new(host);
         crate::forge::host_state::account(&host)
             .and_then(|account| account.kind)
             .or_else(|| crate::forge::detect::known_host(&host))
@@ -580,19 +585,124 @@ impl Workspace {
             .name()
     }
 
+    /// Repository-supplied browser address, never used to choose a request target.
+    fn advertised_repository_url(&self) -> Option<reqwest::Url> {
+        let mut url = reqwest::Url::parse(string(self.value(&Key::Repository)?, "url")).ok()?;
+        if !matches!(url.scheme(), "https" | "http")
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || url.host_str().is_none()
+        {
+            return None;
+        }
+        url.set_query(None);
+        url.set_fragment(None);
+        Some(url)
+    }
+
+    fn advertised_web_host(&self) -> Option<HostKey> {
+        HostKey::from_url(&self.advertised_repository_url()?)
+    }
+
+    fn advertised_repository_base(&self, repo: &str) -> Option<String> {
+        let url = self.advertised_repository_url()?;
+        let metadata = self.value(&Key::Repository)?;
+        let name = string(metadata, "nameWithOwner");
+        let name = if name.is_empty() {
+            self.list_repository()
+        } else {
+            name
+        };
+        if name.eq_ignore_ascii_case(repo) {
+            return Some(url.as_str().trim_end_matches('/').into());
+        }
+        // Inbox items and notifications can refer to other repositories on the same site.
+        Some(format!("{}/{repo}", Self::site_base(&url, name)))
+    }
+
+    fn site_base(url: &reqwest::Url, repo: &str) -> String {
+        // Keep any installation path before the advertised repository's owner/name.
+        let path = url.path().trim_end_matches('/');
+        let prefix = path
+            .get(..path.len().saturating_sub(repo.len()))
+            .filter(|prefix| {
+                prefix.ends_with('/') && path[prefix.len()..].eq_ignore_ascii_case(repo)
+            })
+            .unwrap_or("/");
+        format!(
+            "{}{}",
+            url.origin().ascii_serialization(),
+            prefix.trim_end_matches('/')
+        )
+    }
+
+    fn advertised_site_base(&self) -> Option<String> {
+        let url = self.advertised_repository_url()?;
+        let name = string(self.value(&Key::Repository)?, "nameWithOwner");
+        Some(Self::site_base(&url, name))
+    }
+
+    /// The loaded web address can replace a Git browser base only for the same repository.
+    pub(super) fn advertised_checkout_base(&self, remote: &str) -> Option<(String, bool)> {
+        let url = crate::forge::matching_remote_url(remote, &self.host, None)?;
+        let repo = string(self.value(&Key::Repository)?, "nameWithOwner");
+        if !url.path().trim_matches('/').eq_ignore_ascii_case(repo) {
+            return None;
+        }
+        let gitlab = self.forge_kind().map_or_else(
+            || url.host_str().is_some_and(|host| host.contains("gitlab")),
+            |kind| kind == crate::forge::provider::ProviderKind::GitLab,
+        );
+        Some((self.advertised_repository_base(repo)?, gitlab))
+    }
+
+    fn repository_browser_base(&self, repo: &str) -> String {
+        self.advertised_repository_base(repo)
+            .unwrap_or_else(|| format!("https://{}/{repo}", self.host))
+    }
+
+    fn apply_repository(&mut self, value: &Value, routing_host: Option<&HostKey>) -> bool {
+        let name = string(value, "nameWithOwner");
+        if name.is_empty() {
+            return false;
+        }
+        let host = if self.host.is_empty() {
+            let Some(host) = routing_host else {
+                return false;
+            };
+            host.to_string()
+        } else {
+            self.host.clone()
+        };
+        self.change_repository(name.to_owned(), host);
+        true
+    }
+
     fn change_repository(&mut self, repo: String, host: String) {
         let host = host.trim_end_matches('.').to_ascii_lowercase();
         if self.repo.eq_ignore_ascii_case(&repo) && self.host == host {
             return;
         }
+        if !self.host.is_empty() && self.host != host {
+            self.skip_remembered_account = false;
+            self.retire_account(None);
+        }
+        self.repo = repo;
+        self.host = host;
+        self.clear_projections();
+    }
+
+    fn advance_scope(&mut self) {
         self.scope_epoch = self
             .scope_epoch
             .checked_add(1)
             .expect("GitHub scope generation exhausted");
+    }
+
+    fn clear_projections(&mut self) {
+        self.advance_scope();
         self.again.clear();
         self.inbox = inbox::Inbox::default();
-        self.repo = repo;
-        self.host = host;
         self.detail_find = find::DetailFind::default();
         self.notice.clear();
         self.notice_error = false;

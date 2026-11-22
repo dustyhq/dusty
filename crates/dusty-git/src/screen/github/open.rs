@@ -95,11 +95,9 @@ pub(in crate::screen) fn parse(text: &str) -> Result<Link, String> {
     if !matches!(url.scheme(), "https" | "http") {
         return Err(format!("`{text}` is not a web address"));
     }
-    let mut host = url.host_str().unwrap_or_default().to_ascii_lowercase();
-    if let Some(port) = url.port() {
-        host = format!("{host}:{port}");
-    }
-    let host = host.strip_prefix("www.").map(str::to_owned).unwrap_or(host);
+    let host = HostKey::from_url(&url)
+        .ok_or_else(|| format!("`{text}` is not a web address"))?
+        .to_string();
     let segments = url
         .path_segments()
         .map(|parts| parts.filter(|part| !part.is_empty()).collect::<Vec<_>>())
@@ -136,14 +134,6 @@ pub(in crate::screen) fn parse(text: &str) -> Result<Link, String> {
 }
 
 impl Workspace {
-    /// The host of the remote the forge was found through. The forge may name itself on
-    /// another host in its web addresses (`self.host`); links and remotes on either are ours.
-    pub(super) fn remote_host(&self) -> Option<String> {
-        crate::forge::detect::choose_remote(&self.root)
-            .ok()
-            .map(|remote| remote.host.to_string())
-    }
-
     /// Opens `link` now, or once the repository resolves.
     pub(in crate::screen) fn follow(&mut self, link: Link) {
         self.deep_link = None;
@@ -170,17 +160,17 @@ impl Workspace {
             return false;
         };
         let gitlab = self.forge_kind() == Some(ProviderKind::GitLab);
-        if let Some(host) = &link.host
-            && !host.eq_ignore_ascii_case(&self.host)
-            && self
-                .remote_host()
-                .is_none_or(|remote| !host.eq_ignore_ascii_case(&remote))
-        {
-            self.link_error(format!(
-                "That link is on {host}; this repository is on {}",
-                self.host
-            ));
-            return true;
+        if let Some(host) = &link.host {
+            let advertised = self.advertised_web_host().map(|host| host.to_string());
+            let on_route = host.eq_ignore_ascii_case(&self.host)
+                || host == "www.github.com" && self.host == "github.com";
+            if !on_route && advertised.as_ref() != Some(host) {
+                let display = advertised.as_deref().unwrap_or(&self.host);
+                self.link_error(format!(
+                    "That link is on {host}; this repository is on {display}"
+                ));
+                return true;
+            }
         }
         let kind = match link.kind {
             // GitLab numbers issues `#n` and merge requests `!n`.
@@ -467,7 +457,7 @@ mod tests {
         );
         assert_eq!(
             parse("https://www.github.com/example/demo/issues/7").unwrap(),
-            link(Kind::Issue, 7, Some("github.com"), Some("example/demo"))
+            link(Kind::Issue, 7, Some("www.github.com"), Some("example/demo"))
         );
         assert_eq!(
             parse("https://github.com/example/demo/actions/runs/91/job/42").unwrap(),

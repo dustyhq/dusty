@@ -163,8 +163,7 @@ fn encode(text: &str) -> String {
 /// What the forge's own "new pull request" page needs.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct WebRequest {
-    pub(super) host: String,
-    pub(super) repo: String,
+    pub(super) repository_url: String,
     /// The fork's owner when the head branch lives in another repository.
     pub(super) head_owner: Option<String>,
     pub(super) base: String,
@@ -186,7 +185,7 @@ pub(super) fn web_url(kind: ProviderKind, request: &WebRequest) -> String {
         body.push_str("\n\n…");
     }
     let (title, body) = (encode(&request.title), encode(&body));
-    let origin = format!("https://{}/{}", request.host, request.repo);
+    let origin = &request.repository_url;
     match kind {
         ProviderKind::GitLab => format!(
             "{origin}/-/merge_requests/new?merge_request%5Bsource_branch%5D={}&merge_request%5Btarget_branch%5D={}&merge_request%5Btitle%5D={title}&merge_request%5Bdescription%5D={body}",
@@ -277,26 +276,20 @@ impl Workspace {
         let Ok(names) = repo.remotes() else {
             return Vec::new();
         };
-        let found_through = self.remote_host();
-        let known = |host: &str| {
-            host.eq_ignore_ascii_case(&self.host)
-                || found_through
-                    .as_deref()
-                    .is_some_and(|found| host.eq_ignore_ascii_case(found))
-        };
+        let ssh_host_alias = self.advertised_web_host();
         names
             .iter()
             .flatten()
             .filter_map(|name| {
                 let remote = repo.find_remote(name).ok()?;
                 // GitLab projects may sit in nested groups (`orbit/team/orbit`).
-                let url = crate::web_base(remote.pushurl().or(remote.url())?)?;
-                let host = match url.port() {
-                    Some(port) => format!("{}:{port}", url.host_str()?),
-                    None => url.host_str()?.to_owned(),
-                };
+                let url = crate::forge::matching_remote_url(
+                    remote.pushurl().or(remote.url())?,
+                    &self.host,
+                    ssh_host_alias.as_ref(),
+                )?;
                 let path = url.path().trim_matches('/');
-                (known(&host) && self.valid_pr_repository(path))
+                self.valid_pr_repository(path)
                     .then(|| (name.to_owned(), path.to_owned()))
             })
             .collect()
@@ -554,8 +547,7 @@ impl Workspace {
                 !repo.eq_ignore_ascii_case(&self.repo) && self.head_remote_has(repo, head)
             });
         let request = WebRequest {
-            host: self.host.clone(),
-            repo: self.repo.clone(),
+            repository_url: self.repository_browser_base(&self.repo),
             head_owner: fork
                 .map(|repo| owner(&repo))
                 .filter(|owner| !owner.eq_ignore_ascii_case(&self.owner())),
@@ -909,10 +901,159 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_browser_opener_restores_the_full_pr_form_with_its_error() {
+        use super::super::super::GitScreen;
+
+        let root = tempfile::tempdir().unwrap();
+        git2::Repository::init(root.path()).unwrap();
+        let mut app = GitScreen::open(root.path()).unwrap();
+        app.page = 2;
+        let ws = &mut app.github;
+        ws.active = super::super::lanes::Lanes::dry();
+        ws.host = "github.com".into();
+        ws.repo = "team/project".into();
+        ws.page = 2;
+        let values = vec![
+            " Retry in the browser ".into(),
+            format!("{}\nFull draft tail", "é".repeat(WEB_BODY)),
+            "main".into(),
+            "feature/retry".into(),
+        ];
+        let action = Action::CreatePullRequestWeb;
+        ws.submit(action.clone(), values.clone()).unwrap();
+        assert_eq!(ws.drafts.get(&ws.draft_key(&action)), Some(&values));
+        let request = ws.queue.pop_front().unwrap();
+        let Op::Write(target, write @ Write::OpenInBrowser { .. }, _) = request.op else {
+            panic!("expected a browser handoff");
+        };
+        ws.written(&write, Err("Browser opener failed".into()), &target);
+        assert_eq!(ws.notice, "Couldn't open the browser. Your draft is kept.");
+        app.poll();
+        let restored = app
+            .form
+            .as_ref()
+            .expect("the failed handoff reopens the form");
+        assert_eq!(
+            restored
+                .fields
+                .iter()
+                .map(|field| &field.input.input)
+                .collect::<Vec<_>>(),
+            values.iter().collect::<Vec<_>>()
+        );
+        let note = app.github.create_note(&action, &restored.fields).unwrap();
+        assert!(note.contains(SHORTENED_WEB_BODY));
+        let frame = app.frame(120, 32);
+        let footer = frame.grid.row_text(31);
+        assert!(
+            footer.contains("Couldn't open the browser. Your draft is kept."),
+            "{footer}"
+        );
+    }
+
+    #[test]
+    fn browser_success_consumes_only_a_draft_that_fit_in_the_handoff() {
+        for body in [
+            "Short description".into(),
+            format!("{}\nFull draft tail", "x".repeat(WEB_BODY)),
+        ] {
+            let mut ws = Workspace::new(PathBuf::new());
+            ws.host = "github.com".into();
+            ws.repo = "team/project".into();
+            ws.page = 2;
+            let action = Action::CreatePullRequestWeb;
+            let shortened = web_body_shortened(&body);
+            let key = ws.draft_key(&action);
+            ws.submit(
+                action,
+                vec![
+                    "Retry".into(),
+                    body.clone(),
+                    "main".into(),
+                    "feature/retry".into(),
+                ],
+            )
+            .unwrap();
+            assert_eq!(ws.drafts.get(&key).map(|draft| &draft[1]), Some(&body));
+            let request = ws.queue.pop_front().unwrap();
+            let Op::Write(target, write @ Write::OpenInBrowser { .. }, _) = request.op else {
+                panic!("expected a browser handoff");
+            };
+            ws.written(
+                &write,
+                Ok(crate::forge::request::Receipt::default()),
+                &target,
+            );
+            assert_eq!(
+                ws.drafts.get(&key).map(|draft| &draft[1]),
+                shortened.then_some(&body)
+            );
+        }
+    }
+
+    #[test]
+    fn browser_actions_use_the_advertised_repository_without_changing_the_target() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = git2::Repository::init(root.path()).unwrap();
+        let remote = "https://git.example.test:8443/o/r";
+        repo.remote("origin", remote).unwrap();
+        let mut ws = Workspace::new(root.path().into());
+        ws.fresh = fresh::Fresh::with(None);
+        ws.host = "git.example.test:8443".into();
+        ws.repo = "o/r".into();
+        ws.page = 2;
+        ws.cache.insert(
+            Key::Repository,
+            Ok(Reply {
+                value: serde_json::json!({
+                    "nameWithOwner": "o/r",
+                    "url": "https://git.example.test/code/o/r",
+                }),
+                text: String::new(),
+            }),
+        );
+        assert_eq!(
+            ws.advertised_checkout_base(remote).unwrap().0,
+            "https://git.example.test/code/o/r"
+        );
+        assert!(
+            ws.advertised_checkout_base("https://git.example.test:8444/o/r")
+                .is_none()
+        );
+
+        ws.submit_web_pr(&["Title".into(), String::new(), "main".into(), "topic".into()])
+            .unwrap();
+        let Op::Write(target, Write::OpenInBrowser { url: Some(url), .. }, _) =
+            ws.queue.pop_front().unwrap().op
+        else {
+            panic!("expected the PR browser URL");
+        };
+        assert_eq!(
+            target,
+            ForgeTarget::repository("git.example.test:8443", "o/r")
+        );
+        assert!(url.starts_with("https://git.example.test/code/o/r/compare/main...topic?"));
+
+        // Item actions belong to the item that is open in the reader.
+        ws.page = 1;
+        ws.opened = Some((1, 7));
+        ws.submit(Action::Browser(1, 7), Vec::new()).unwrap();
+        let Op::Write(target, Write::OpenInBrowser { url: Some(url), .. }, _) =
+            ws.queue.pop_front().unwrap().op
+        else {
+            panic!("expected the issue browser URL");
+        };
+        assert_eq!(
+            target,
+            ForgeTarget::repository("git.example.test:8443", "o/r")
+        );
+        assert_eq!(url, "https://git.example.test/code/o/r/issues/7");
+    }
+
+    #[test]
     fn web_addresses_match_each_forge() {
         let request = WebRequest {
-            host: "example.test".into(),
-            repo: "team/app".into(),
+            repository_url: "https://example.test/team/app".into(),
             head_owner: None,
             base: "main".into(),
             head: "feature/retry".into(),

@@ -14,7 +14,14 @@ pub(super) fn link_action(workspace: &Workspace, link: &LinkRecord, page: usize)
     if workspace.inbox.enabled
         || !link.repo.is_empty() && !link.repo.eq_ignore_ascii_case(&workspace.repo)
     {
-        let target = inbox::Target::from_url(&link.url, &workspace.host, page, link.number).ok()?;
+        let target = inbox::Target::from_url(
+            &link.url,
+            &workspace.host,
+            workspace.advertised_web_host().as_ref(),
+            page,
+            link.number,
+        )
+        .ok()?;
         return Some(Action::OpenRemote(target));
     }
     Some(Action::OpenItem(page, link.number))
@@ -528,4 +535,44 @@ pub(super) fn empty(workspace: &Workspace, _width: usize) -> Vec<Line> {
     });
     rows.push(create);
     rows
+}
+
+#[cfg(test)]
+mod link_tests {
+    use super::*;
+
+    #[test]
+    fn linked_items_on_the_advertised_host_open_on_the_routing_host() {
+        let mut workspace = Workspace::new(PathBuf::new());
+        workspace.host = "git.internal.example:8443".into();
+        workspace.repo = "o/r".into();
+        workspace.cache.insert(
+            Key::Repository,
+            Ok(Reply {
+                text: String::new(),
+                value: serde_json::json!({
+                    "nameWithOwner": "o/r",
+                    "url": "https://forge.example/o/r",
+                }),
+            }),
+        );
+        for (page, route) in [(1, "issues"), (2, "pull")] {
+            let mut link = LinkRecord {
+                number: 7,
+                title: "Linked item".into(),
+                repo: "other/project".into(),
+                url: format!("https://forge.example/other/project/{route}/7"),
+            };
+            let Some(Action::OpenRemote(target)) = link_action(&workspace, &link, page) else {
+                panic!("expected an in-app linked item");
+            };
+            assert_eq!(target.page, page);
+            assert_eq!(
+                target.repository(),
+                ForgeTarget::repository("git.internal.example:8443", "other/project")
+            );
+            link.url = format!("https://forge.example:8444/other/project/{route}/7");
+            assert!(link_action(&workspace, &link, page).is_none());
+        }
+    }
 }
