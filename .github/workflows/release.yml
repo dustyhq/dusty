@@ -137,7 +137,8 @@ jobs:
           if-no-files-found: error
 
   publish:
-    if: startsWith(github.ref, 'refs/tags/v')
+    # A run started by hand on a tag must not publish: only the tag push does.
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     needs: [packages, flatpak, ports]
     runs-on: ubuntu-latest
     permissions:
