@@ -260,6 +260,20 @@ impl Config {
         {
             return Err("terminal policy is invalid".into());
         }
+        for (key, percent) in [
+            (
+                "agents.float_width_percent",
+                self.agents.float_width_percent,
+            ),
+            (
+                "agents.float_height_percent",
+                self.agents.float_height_percent,
+            ),
+        ] {
+            if !(50..=100).contains(&percent) {
+                return Err(format!("{key} must be between 50 and 100"));
+            }
+        }
         if (!self.agents.default.is_empty()
             && !self.agents.profiles.contains_key(&self.agents.default))
             || !(10..=90).contains(&self.agents.panel_width)
@@ -429,6 +443,7 @@ impl Config {
             "lsp_health",
             "lsp_unsupported",
             "lsp_request_failed",
+            "lsp_completion_insert_failed",
             "lsp_completion",
             "lsp_symbols",
             "lsp_code_actions",

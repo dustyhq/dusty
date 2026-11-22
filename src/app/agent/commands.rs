@@ -13,6 +13,7 @@ use crate::app::commands::register;
 use crate::app::App;
 use crate::app::agent::THINKING;
 use crate::app::commands::string_arg;
+use crate::config::AgentPlacement;
 use crate::editor::ArgumentSchema;
 use crate::editor::ArgumentType;
 use crate::editor::CommandError;
@@ -23,6 +24,7 @@ use crate::editor::ContextRequirement;
 pub enum AgentCommand {
     Ask,
     Toggle,
+    Place(AgentPlacement),
     AddFile,
     AddDiagnostics,
     New,
@@ -55,6 +57,21 @@ pub(in crate::app) fn register_commands(
             Ask,
         ),
         ("agent.toggle", "Show or hide the agent panel", Toggle),
+        (
+            "agent.float",
+            "Move the agent to a centred window",
+            Place(AgentPlacement::Float),
+        ),
+        (
+            "agent.fullscreen",
+            "Move the agent to fullscreen",
+            Place(AgentPlacement::Fullscreen),
+        ),
+        (
+            "agent.dock",
+            "Dock the agent beside the editor",
+            Place(AgentPlacement::Docked),
+        ),
         (
             "agent.add_file",
             "Ask the agent about the current file",
@@ -164,6 +181,7 @@ impl App {
         match command {
             AgentCommand::Ask => self.begin_agent_question(),
             AgentCommand::Toggle => self.toggle_agent_panel(),
+            AgentCommand::Place(placement) => self.set_agent_placement(placement),
             AgentCommand::AddFile => self.attach_agent_file(),
             AgentCommand::AddDiagnostics => self.attach_agent_diagnostics(),
             AgentCommand::New => self.open_agent_picker(),

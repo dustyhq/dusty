@@ -54,6 +54,7 @@ use serde::Deserialize;
 use serde::Serialize;
 mod settings;
 pub use settings::AgentConnection;
+pub use settings::AgentPlacement;
 pub use settings::AgentProfileConfig;
 pub use settings::AgentsConfig;
 pub use settings::AmbiguousWidth;

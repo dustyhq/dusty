@@ -390,13 +390,18 @@ close_on_exit = true
 [agents]
 default = "claude"
 # "acp" talks to the agent in Dusty's agent panel; "terminal" runs its own program (`cli`) in a
-# terminal beside the editor, where the panel opens, and it handles its own login, permissions
-# and history there.
+# terminal, where it handles its own login, permissions and history.
 connection = "acp"
-# Share of the editor width the agent panel opens at; drag its border or use ctrl-left and
+# "docked" opens the agent in a split on `side`; "float" opens it in a centred window over the
+# editor; "fullscreen" draws it over everything.
+placement = "docked"
+# Size of the floating agent, as a share of the screen.
+float_width_percent = 80
+float_height_percent = 85
+# Share of the editor width the docked agent opens at; drag its border or use ctrl-left and
 # ctrl-right in it to change it.
 panel_width = 35
-# "left" or "right": the side the agent panel or terminal agent opens on.
+# "left" or "right": the side used by the docked agent.
 side = "right"
 # Agents such as pi read MCP servers only from their own config, so Dusty gives them its tools,
 # such as subagents, by running the profile's `add_tools` command before they start. It
@@ -961,7 +966,7 @@ hidden = [
   "input.", "command_line.", "picker.", "surface.", "mode.", "completion.",
   "edit.", "view.cursor.", "view.selection.", "view.scroll", "explorer.search.",
   "multi.move", "multi.delete_char", "multi.next", "multi.previous", "multi.skip", "multi.remove",
-  "agent.input.", "agent.escape", "tools.category.", "tools.menu.next", "tools.menu.previous",
+  "agent.input.", "agent.escape", "terminal.escape", "tools.category.", "tools.menu.next", "tools.menu.previous",
   "tools.menu.close", "terminal.mode.", "terminal.send", "macro.", "workspace.edit.",
   "search.word", "search.repeat", "settings.page.", "settings.setup.",
   # These act on the tool manager's selected row, so they only work inside it.
@@ -1134,6 +1139,9 @@ workspace = "Project"
 "workspace.git.pr.comments" = "Review Comments"
 "workspace.git.pr.comment" = "Comment on Line"
 "agent.toggle" = "Toggle Agent Panel"
+"agent.float" = "Float Agent"
+"agent.fullscreen" = "Fullscreen Agent"
+"agent.dock" = "Dock Agent"
 "agent.add_file" = "Ask About File"
 "agent.add_diagnostics" = "Ask About Diagnostics"
 "agent.new" = "New Agent Session"
@@ -1510,6 +1518,7 @@ workspace = "Project"
 "terminal.hide" = "Hide selected terminal window"
 "terminal.send" = "Send terminal text"
 "terminal.mode.normal" = "Enter terminal Normal mode"
+"terminal.escape" = "Hide a floating or fullscreen terminal agent"
 "terminal.mode.input" = "Return to terminal input"
 "terminal.normal.move" = "Move terminal Normal cursor"
 "terminal.visual.start" = "Select terminal text"

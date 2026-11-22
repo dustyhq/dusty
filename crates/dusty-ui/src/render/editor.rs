@@ -210,7 +210,7 @@ pub(super) fn render_editor_view(
     if let Some(panel) = ui
         .agent_panel
         .as_ref()
-        .filter(|panel| panel.view == view_id)
+        .filter(|panel| panel.surface == super::AgentPanelSurface::Docked(view_id))
     {
         let focused = state.active_view() == Some(view_id) && !ui.explorer_focused;
         // Alone on screen the panel keeps the status line under it, like any editor view.
@@ -1302,7 +1302,7 @@ pub(super) fn render_status_line(
     let panel = ui
         .agent_panel
         .as_ref()
-        .filter(|panel| panel.view == view_id);
+        .filter(|panel| panel.surface == super::AgentPanelSurface::Docked(view_id));
     let agent = panel.is_some();
     // So does a focused terminal, whose typing mode is its own.
     let terminal = ui

@@ -150,6 +150,8 @@ pub(super) struct Windows {
     focus: FocusTarget,
     /// Where the keyboard was before the terminal took it, so hiding the terminal goes back there.
     before_terminal: FocusTarget,
+    before_agent: FocusTarget,
+    restored_agent_shell: Option<u64>,
     focus_stamp: Arc<()>,
     dashboard: bool,
     terminal_height: u16,
@@ -187,12 +189,21 @@ impl Windows {
         self.content = SurfaceContentGeometry::default();
     }
 
+    fn projection_snapshot(
+        &self,
+        tab: WorkspaceTabId,
+    ) -> Option<crate::windows::CompositorSnapshot> {
+        let mut snapshot = self.graph().compositor_snapshot(tab)?;
+        self.native_ids().fit_problems_projection(&mut snapshot);
+        Some(snapshot)
+    }
+
     pub(in crate::app) fn project(&mut self, request: ProjectionRequest) {
         if self.core.graph.revision() != Some(request.graph_revision) {
             self.invalidate();
             return;
         }
-        let Some(snapshot) = self.core.graph.compositor_snapshot(request.tab) else {
+        let Some(snapshot) = self.projection_snapshot(request.tab) else {
             self.invalidate();
             return;
         };
@@ -321,6 +332,7 @@ use crate::windows::PANE_MINIMUM_WIDTH;
 
 use crate::ui::EditorWindowBinding as UiEditorWindowBinding;
 use crate::ui::EditorWindowLayoutState;
+use crate::ui::PickerSurfaceKind;
 use crate::ui::explorer_panel_width;
 use crate::ui::render::TERMINAL_PANEL_RESIZE_STEP;
 use crate::ui::screen_foot_rows;
@@ -381,8 +393,14 @@ impl App {
         }
     }
 
-    pub(in crate::app) fn focus_surface(&mut self, direction: SpatialDirection) {
+    /// Whether focus moved, including between boxes in a single dashboard window.
+    pub(in crate::app) fn focus_surface(&mut self, direction: SpatialDirection) -> bool {
         self.reconcile_editor_windows();
+        // Like floating Git, hand off from the window under the agent. Fullscreen
+        // projections contain no editor windows, so reveal that layout before navigating.
+        if self.agent_overlay_keyboard_target() {
+            return self.focus_from_agent_overlay(direction);
+        }
         if self.focus_within_surface(direction) {
             return true;
         }
@@ -419,6 +437,7 @@ impl App {
         self.input.cancel_pending();
         self.ensure_cursor_visible();
         self.sync_terminal_panel();
+        true
     }
 }
 
@@ -566,12 +585,17 @@ impl App {
 
 impl App {
     pub(in crate::app) fn project_window_activation(&mut self) {
+        let restored_shell = self.window_session.restored_agent_shell.take().map(PtyId);
         if let Some(id) = self
             .window_session
             .focused_terminal()
             .map(PtyId)
             .filter(|id| self.terminal_session.contains(*id))
         {
+            // Restoring graph focus also restores the terminal tab used for cycling.
+            if restored_shell == Some(id) {
+                self.terminal_session.select(id);
+            }
             self.terminal_session.display(id);
         }
         self.ui.dashboard = self.window_session.dashboard_visible();
@@ -1082,6 +1106,20 @@ impl App {
                     && self.window_session.native_ids().terminal_placement(id.0)
                         != Some(WindowPlacement::Hidden)
             }),
+            agent_placement: self.agent_overlay_placement(),
+            agent_focused: self.window_session.focus() == FocusTarget::Agent,
+            acp_agent_shown: self.agent_panel_shown(),
+            shown_agent_terminal: self
+                .displayed_terminal()
+                .into_iter()
+                .chain(self.terminal_session.side_terminals())
+                .find(|id| {
+                    self.agent_terminal(*id)
+                        && self.window_session.native_ids().terminal_placement(id.0)
+                            != Some(WindowPlacement::Hidden)
+                })
+                .map(|id| id.0),
+            agent_terminals: self.terminal_session.agent_terminals().into(),
             terminal_size,
             terminal_shrunk: self.window_session.terminal_shrunk(),
             terminal_set_revision: self.terminal_session.revision(),
@@ -1225,7 +1263,7 @@ impl App {
                         .state
                         .active_tab()
                         .or_else(|| surfaces.workspace_tab())?;
-                    let snapshot = graph.compositor_snapshot(tab)?;
+                    let snapshot = self.window_session.projection_snapshot(tab)?;
                     let screen_bottom = screen_foot_rows(
                         &self.state,
                         &self.ui,
@@ -1307,6 +1345,15 @@ impl App {
                 });
                 if let Some(projection) = projection {
                     self.window_session.project(projection);
+                }
+                // Layout-only insets (e.g. the debug inspector) can reduce dock capacity
+                // after native reconciliation. Never route keys to an unprojected panel.
+                if self.window_session.focus() == FocusTarget::ProblemsPanel
+                    && self.problems_panel_rect().is_none()
+                {
+                    self.window_session.focus_editor_from_problems();
+                    self.reconcile_editor_windows();
+                    return;
                 }
                 self.project_window_geometry();
                 self.sync_explorer_ui();

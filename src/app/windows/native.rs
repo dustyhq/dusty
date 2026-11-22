@@ -2,8 +2,9 @@
 use crate::app::windows::content::sanitize_title;
 use crate::ui::PickerSurfaceKind;
 use crate::windows::{
-    ContentAdapterKind, ContentContract, ContentId, ContentLifecycle, ContentTypeId, ViewId,
-    WindowError, WindowGraph, WindowId, WindowPlacement, WindowRect, WorkspaceTabId,
+    CompositorSnapshot, ContentAdapterKind, ContentContract, ContentId, ContentLifecycle,
+    ContentTypeId, ViewId, WindowError, WindowGraph, WindowId, WindowPlacement, WindowRect,
+    WorkspaceTabId,
 };
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -22,6 +23,11 @@ pub(in crate::app) struct NativeSurfaceSignature {
     /// terminals such as a docked agent.
     pub shown_terminals: Arc<[u64]>,
     pub terminal_focused: bool,
+    pub agent_placement: Option<WindowPlacement>,
+    pub agent_focused: bool,
+    pub acp_agent_shown: bool,
+    pub shown_agent_terminal: Option<u64>,
+    pub agent_terminals: Arc<[u64]>,
     pub terminal_size: u16,
     pub terminal_shrunk: bool,
     pub terminal_set_revision: Option<u64>,
@@ -37,6 +43,27 @@ pub(in crate::app) struct NativeSurfaceSignature {
     pub protected_prompt_height: u16,
     pub configuration_reload_id: u64,
     pub screen_bottom: u16,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CoveringAgent {
+    Acp,
+    Terminal(u64),
+}
+
+impl CoveringAgent {
+    fn is_shown(self, signature: &NativeSurfaceSignature) -> bool {
+        match self {
+            Self::Acp => signature.acp_agent_shown,
+            Self::Terminal(id) => signature.shown_agent_terminal == Some(id),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CoveredShell {
+    id: u64,
+    agent: CoveringAgent,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -60,6 +87,7 @@ pub(in crate::app) struct NativeSurfaces {
     explorer: Option<NativeSurfaceIds>,
     explorer_views: BTreeMap<u64, NativeSurfaceIds>,
     dashboard: Option<NativeSurfaceIds>,
+    agent: Option<NativeSurfaceIds>,
     pickers: BTreeMap<PickerSurfaceKind, NativeSurfaceIds>,
     terminals: HashMap<u64, NativeSurfaceIds>,
     explorer_placement: Option<WindowPlacement>,
@@ -127,6 +155,7 @@ impl NativeSurfaces {
             && signature.editor_tab.is_none()
             && !signature.explorer_visible
             && !signature.dashboard_visible
+            && signature.agent_placement.is_none()
             && signature.picker_rect.is_none()
             && !signature.problems_panel
             && terminals.is_empty()
@@ -169,6 +198,7 @@ impl NativeSurfaces {
             self.explorer_view_restore_placements.remove(&view);
         }
         self.dashboard = self.dashboard.filter(|ids| live_ids(*ids, graph));
+        self.agent = self.agent.filter(|ids| live_ids(*ids, graph));
         self.pickers.retain(|_, ids| live_ids(*ids, graph));
         self.terminals.retain(|_, ids| live_ids(*ids, graph));
 
@@ -195,6 +225,45 @@ impl NativeSurfaces {
             tab
         };
         self.workspace_tab = Some(tab);
+        let agent_placement = signature.agent_placement.unwrap_or(WindowPlacement::Hidden);
+        let fullscreen_agent = if agent_placement == WindowPlacement::Fullscreen {
+            Some(CoveringAgent::Acp)
+        } else {
+            signature
+                .shown_agent_terminal
+                .filter(|id| {
+                    self.requested_terminal_placement(*id) == Some(WindowPlacement::Fullscreen)
+                })
+                .map(CoveringAgent::Terminal)
+        };
+        let previously_covered = self.covered_shell.filter(|shell| {
+            terminals.iter().any(|(id, ..)| *id == shell.id)
+                && self.requested_terminal_placement(shell.id) == Some(WindowPlacement::Fullscreen)
+        });
+        // Only an actual fullscreen takeover starts a cover. Once started, it follows the
+        // agent through placement changes until the agent is hidden or removed.
+        self.covered_shell = previously_covered
+            .filter(|shell| shell.agent.is_shown(&signature))
+            .or_else(|| {
+                let agent = fullscreen_agent?;
+                self.terminals.iter().find_map(|(&id, ids)| {
+                    (agent != CoveringAgent::Terminal(id)
+                        && terminals.iter().any(|(live, ..)| *live == id)
+                        && graph.window(ids.window).is_some_and(|window| {
+                            window.tab == previous_tab.unwrap_or(tab)
+                                && window.placement == WindowPlacement::Fullscreen
+                        }))
+                    .then_some(CoveredShell { id, agent })
+                })
+            });
+        let covered_shell = self.covered_shell.map(|shell| shell.id);
+        let restoring_shell = previously_covered.filter(|_| covered_shell.is_none());
+
+        if let Some(ids) = self.agent
+            && agent_placement != WindowPlacement::Fullscreen
+        {
+            graph.rehost(ids.window, tab, ids.view, agent_placement, true)?;
+        }
         // Release outgoing fullscreen terminals before placing the explorer.
         for (id, ids) in &self.terminals {
             let remains_fullscreen = (signature.active_terminal == Some(*id)
@@ -204,7 +273,7 @@ impl NativeSurfaces {
                     .terminal_placement(*id)
                     .or_else(|| self.configured_placements.get("builtin.terminal").copied())
                     == Some(WindowPlacement::Fullscreen);
-            if !remains_fullscreen
+            if (!remains_fullscreen || covered_shell == Some(*id))
                 && graph
                     .window(ids.window)
                     .is_some_and(|window| window.placement == WindowPlacement::Fullscreen)
@@ -472,12 +541,9 @@ impl NativeSurfaces {
             .map(|(id, profile, lifecycle)| {
                 let placement = if signature.active_terminal == Some(*id)
                     || signature.shown_terminals.contains(id)
+                    || restoring_shell.is_some_and(|shell| shell.id == *id)
                 {
-                    self.terminal_placements
-                        .get(id)
-                        .copied()
-                        .or(self.terminal_default_placement)
-                        .or_else(|| self.configured_placements.get("builtin.terminal").copied())
+                    self.requested_terminal_placement(*id)
                         .unwrap_or(WindowPlacement::Docked {
                             edge: crate::windows::DockEdge::Bottom,
                             size: signature.terminal_size.max(1),
@@ -486,6 +552,10 @@ impl NativeSurfaces {
                     WindowPlacement::Hidden
                 };
                 let placement = match placement {
+                    WindowPlacement::Fullscreen if covered_shell == Some(*id) => {
+                        // Keep the shell's requested placement intact so it can return.
+                        WindowPlacement::Hidden
+                    }
                     WindowPlacement::Docked {
                         edge:
                             edge @ (crate::windows::DockEdge::Top
@@ -530,6 +600,47 @@ impl NativeSurfaces {
             }
         }
 
+        if let Some(ids) = self.agent {
+            if agent_placement == WindowPlacement::Fullscreen {
+                graph.rehost(ids.window, tab, ids.view, agent_placement, true)?;
+            }
+        } else if agent_placement != WindowPlacement::Hidden {
+            let content = graph.create_content(
+                ContentTypeId::new("builtin.agent")?,
+                ContentAdapterKind::DeclarativeUi,
+                "Agent".into(),
+                false,
+                owner,
+                instance_id,
+            )?;
+            let view = graph.create_view(content, owner, instance_id)?;
+            let window = graph.open_window(tab, view, agent_placement, true, owner, instance_id)?;
+            self.agent = Some(NativeSurfaceIds {
+                content,
+                view,
+                window,
+            });
+        }
+
+        let problems_visible = if let Some(ids) = problems_panel {
+            let mut snapshot = graph
+                .compositor_snapshot(tab)
+                .ok_or(WindowError::UnknownWorkspaceTab)?;
+            let visible = self.fit_problems_dock(
+                &mut snapshot,
+                ids.window,
+                picker.map(|ids| ids.window),
+                &signature,
+            );
+            // Only visibility affects graph focus. The dock sizes are projection-only.
+            if !visible {
+                graph.place(ids.window, WindowPlacement::Hidden)?;
+            }
+            visible
+        } else {
+            false
+        };
+
         let mut focused = false;
         if signature.picker_rect.is_some()
             && let Some(picker) = picker
@@ -539,6 +650,23 @@ impl NativeSurfaces {
             && graph.can_focus(picker.window)
         {
             graph.focus(picker.window)?;
+            focused = true;
+        }
+        if !focused
+            && signature.agent_focused
+            && let Some(ids) = self.agent
+            && graph.can_focus(ids.window)
+        {
+            graph.focus(ids.window)?;
+            focused = true;
+        }
+        if !focused
+            && signature.problems_panel_focused
+            && problems_visible
+            && let Some(ids) = problems_panel
+            && graph.can_focus(ids.window)
+        {
+            graph.focus(ids.window)?;
             focused = true;
         }
         if !focused
@@ -806,6 +934,41 @@ impl NativeSurfaces {
             .chain(self.explorer_views.iter().map(|(view, ids)| (*view, *ids)))
     }
 
+    pub(in crate::app) fn covered_shell_id(&self) -> Option<u64> {
+        self.covered_shell.map(|shell| shell.id)
+    }
+
+    pub(in crate::app) fn terminal_agent_covers_shell(&self, agent: u64) -> bool {
+        self.covered_shell
+            .is_some_and(|shell| shell.agent == CoveringAgent::Terminal(agent))
+    }
+
+    /// Restore the shell in the same candidate that hides its covering agent PTY.
+    pub(super) fn take_shell_covered_by_terminal_agent(&mut self, agent: u64) -> Option<WindowId> {
+        if !self.terminal_agent_covers_shell(agent) {
+            return None;
+        }
+        let shell = self.covered_shell.take()?;
+        if self.requested_terminal_placement(shell.id) != Some(WindowPlacement::Fullscreen) {
+            return None;
+        }
+        self.terminal(shell.id).map(|ids| ids.window)
+    }
+
+    pub(in crate::app) fn saved_terminal_placement(&self, id: u64) -> Option<WindowPlacement> {
+        self.terminal_restore_placements.get(&id).copied()
+    }
+
+    pub(super) fn is_agent_terminal(&self, id: u64) -> bool {
+        self.signature
+            .as_ref()
+            .is_some_and(|signature| signature.agent_terminals.contains(&id))
+    }
+
+    pub(in crate::app) fn agent(&self) -> Option<NativeSurfaceIds> {
+        self.agent
+    }
+
     pub(in crate::app) fn dashboard(&self) -> Option<NativeSurfaceIds> {
         self.dashboard
     }
@@ -835,6 +998,12 @@ impl NativeSurfaces {
             .get(&id)
             .copied()
             .or(self.terminal_default_placement)
+    }
+
+    /// The semantic placement can differ from the graph while an agent covers a shell.
+    pub(super) fn requested_terminal_placement(&self, id: u64) -> Option<WindowPlacement> {
+        self.terminal_placement(id)
+            .or_else(|| self.configured_placements.get("builtin.terminal").copied())
     }
 
     pub(in crate::app) fn target_for_window(

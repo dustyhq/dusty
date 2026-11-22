@@ -167,6 +167,15 @@ impl Terminals {
     pub(in crate::app) fn is_agent(&self, id: PtyId) -> bool {
         self.tabs.get(&id).is_some_and(|tab| tab.agent)
     }
+    pub(in crate::app) fn agent_terminals(&self) -> Vec<u64> {
+        let mut ids = self
+            .tabs
+            .iter()
+            .filter_map(|(id, terminal)| terminal.agent.then_some(id.0))
+            .collect::<Vec<_>>();
+        ids.sort_unstable();
+        ids
+    }
     pub(in crate::app) fn side(&self, id: PtyId) -> bool {
         self.tabs.get(&id).is_some_and(|tab| tab.side)
     }
@@ -1491,23 +1500,80 @@ impl App {
 }
 
 impl App {
-    /// An agent's terminal opens at the agent panel's width on its side, where the ACP panel goes.
-    fn dock_agent_terminal(&mut self, id: PtyId) {
+    /// Route the agent through the same native placements as other terminals, keeping its PTY.
+    fn prefer_agent_terminal_placement(&mut self, id: PtyId) {
+        use crate::config::AgentPlacement;
         self.terminal_session.set_side(id);
+        let placement = match self.agent_placement() {
+            AgentPlacement::Docked => self.docked_agent_terminal_placement(),
+            AgentPlacement::Float => WindowPlacement::Floating(self.agent_float_rect()),
+            AgentPlacement::Fullscreen => WindowPlacement::Fullscreen,
+        };
+        self.window_session
+            .prefer_terminal_placement(id.0, placement);
+    }
+
+    /// Reopening a docked agent keeps the native width the user last dragged it to.
+    pub(in crate::app) fn reopen_agent_terminal(&mut self, id: PtyId) {
+        let saved = self
+            .window_session
+            .native_ids()
+            .saved_terminal_placement(id.0);
+        if self.agent_placement() == crate::config::AgentPlacement::Docked
+            && let (
+                WindowPlacement::Docked { edge, .. },
+                Some(WindowPlacement::Docked {
+                    edge: saved_edge, ..
+                }),
+            ) = (self.docked_agent_terminal_placement(), saved)
+            && edge == saved_edge
+        {
+            self.reveal_terminal(id);
+        } else {
+            self.show_agent_terminal(id);
+        }
+    }
+
+    pub(in crate::app) fn show_agent_terminal(&mut self, id: PtyId) {
+        self.terminal_session.select(id);
+        self.terminal_session.display(id);
+        self.prefer_agent_terminal_placement(id);
+        self.set_terminal_focus(true);
+        self.resize_active_terminal_to_panel();
+        self.sync_terminal_panel();
+    }
+
+    pub(in crate::app) fn recenter_agent_terminals(&mut self) {
+        if self.agent_placement() != crate::config::AgentPlacement::Float {
+            return;
+        }
+        let placement = WindowPlacement::Floating(self.agent_float_rect());
+        for id in self.terminal_session.side_terminals() {
+            if self.agent_terminal(id)
+                && matches!(
+                    self.window_session.native_ids().terminal_placement(id.0),
+                    Some(WindowPlacement::Floating(_))
+                )
+            {
+                self.window_session
+                    .prefer_terminal_placement(id.0, placement);
+            }
+        }
+    }
+
+    /// An agent's terminal docks at the agent panel's width and side.
+    fn docked_agent_terminal_placement(&self) -> WindowPlacement {
         let width = u32::from(self.window_session.width());
         let share = width * u32::from(self.configuration.settings().agents.panel_width) / 100;
         // A conversation needs about 40 columns, however narrow the terminal is.
         let size = share.max(40).min(width * 7 / 10).max(1);
-        self.window_session.prefer_terminal_placement(
-            id.0,
-            WindowPlacement::Docked {
-                edge: match self.configuration.settings().agents.side {
-                    crate::config::PanelSide::Left => DockEdge::Left,
-                    crate::config::PanelSide::Right => DockEdge::Right,
-                },
-                size: u16::try_from(size).unwrap_or(u16::MAX),
+        WindowPlacement::Docked {
+            edge: match self.configuration.settings().agents.side {
+                crate::config::PanelSide::Left => DockEdge::Left,
+                crate::config::PanelSide::Right => DockEdge::Right,
             },
-        );
+            size: u16::try_from(size).unwrap_or(u16::MAX),
+        }
     }
 }
 
@@ -1517,6 +1583,14 @@ impl App {
         if request_close {
             match self.terminal_session.request_stop(id) {
                 Ok(true) => {
+                    if self
+                        .window_session
+                        .native_ids()
+                        .terminal_agent_covers_shell(id.0)
+                        && self.hide_agent_terminal(id)
+                    {
+                        return;
+                    }
                     if focused {
                         self.set_terminal_focus(false);
                     }
@@ -1789,9 +1863,12 @@ impl App {
                             && self.ui.settings.is_none()
                         {
                             self.terminal_session.select(id);
-                            self.terminal_session.display(id);
-                            if self.agent_terminal(id) {
-                                self.dock_agent_terminal(id);
+                            let agent = self.agent_terminal(id);
+                            if !agent {
+                                self.terminal_session.display(id);
+                            }
+                            if agent {
+                                self.prefer_agent_terminal_placement(id);
                             } else if open.float
                                 || placement == crate::config::TerminalPlacement::Float
                             {

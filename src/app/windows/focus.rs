@@ -84,6 +84,27 @@ impl Windows {
             self.request_focus(FocusTarget::Editor);
         }
     }
+    pub(in crate::app) fn focus_agent_overlay(&mut self) {
+        if self.focus != FocusTarget::Agent {
+            self.before_agent = self.focus;
+            self.request_focus(FocusTarget::Agent);
+        }
+    }
+    pub(in crate::app) fn return_from_agent_overlay(&mut self) {
+        if self.focus == FocusTarget::Agent {
+            let before_terminal = self.before_terminal;
+            self.request_focus(self.before_agent);
+            self.before_terminal = before_terminal;
+        }
+    }
+    pub(in crate::app) fn focus_problems_panel(&mut self) {
+        self.request_focus(FocusTarget::ProblemsPanel);
+    }
+    pub(in crate::app) fn focus_editor_from_problems(&mut self) {
+        if self.focus == FocusTarget::ProblemsPanel {
+            self.request_focus(FocusTarget::Editor);
+        }
+    }
     fn request_focus(&mut self, focus: FocusTarget) {
         self.remember_before_terminal(focus);
         if self.focus != focus {
@@ -106,6 +127,18 @@ impl Windows {
             self.focus = FocusTarget::Editor;
             return;
         };
+        if self
+            .core
+            .native
+            .agent()
+            .is_some_and(|ids| ids.window == window)
+        {
+            if self.focus != FocusTarget::Agent {
+                self.before_agent = self.focus;
+            }
+            self.focus = FocusTarget::Agent;
+            return;
+        }
         match self.core.native.target_for_window(window) {
             Some(NativeSurfaceTarget::Picker(crate::ui::PickerSurfaceKind::ProblemsPanel)) => {
                 self.focus = FocusTarget::ProblemsPanel;
@@ -141,6 +174,8 @@ impl Windows {
                 self.core.native.explorer_view(view).map(|ids| ids.window)
             }
             FocusTarget::Terminal(id) => self.core.native.terminal(id).map(|ids| ids.window),
+            FocusTarget::Agent => self.core.native.agent().map(|ids| ids.window),
+            FocusTarget::ProblemsPanel => self.core.native.problems_panel().map(|ids| ids.window),
             FocusTarget::Plugin(window) => Some(window),
             FocusTarget::Editor => self.core.graph.focused(),
         }?;
@@ -184,6 +219,7 @@ impl Windows {
     ) -> Result<(), String> {
         self.require_projected_graph()?;
         let target = NativeSurfaceTarget::Terminal(id);
+        let sets_terminal_height = !self.core.native.is_agent_terminal(id);
         let current = match self.native_placement(target)? {
             crate::windows::WindowPlacement::Docked { size, .. } => size,
             crate::windows::WindowPlacement::Floating(rect) => rect.height,
@@ -227,8 +263,10 @@ impl Windows {
         if let Some(placement) = placement {
             self.place_native(target, placement, state)?;
         }
-        self.terminal_height = height;
-        self.terminal_shrunk = false;
+        if sets_terminal_height {
+            self.terminal_height = height;
+            self.terminal_shrunk = false;
+        }
         Ok(())
     }
     pub(in crate::app) fn constrain_terminal_height(&mut self, minimum: u16, maximum: u16) {

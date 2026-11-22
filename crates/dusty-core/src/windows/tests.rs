@@ -350,6 +350,7 @@ fn window_limit_rejects_even_a_shallow_balanced_tree() {
                 view,
                 placement: WindowPlacement::Tiled,
                 restore_placement: WindowPlacement::Tiled,
+                floating_since: 0,
                 focusable: true,
                 owner: "builtin".into(),
                 instance_id: 1,

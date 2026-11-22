@@ -33,8 +33,8 @@ pub struct AgentProfileConfig {
     /// the agent starts when `agents.add_tools` is on.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub add_tools: Vec<String>,
-    /// The agent's own command-line program and its arguments, run in a terminal on the
-    /// right when `agents.connection` is `terminal`.
+    /// The agent's own command-line program and its arguments, run when
+    /// `agents.connection` is `terminal`.
     #[serde(default)]
     pub cli: Vec<String>,
 }
@@ -50,6 +50,19 @@ pub enum AgentConnection {
     Terminal,
 }
 
+/// Where the agent panel or terminal agent opens.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentPlacement {
+    /// Split beside the editor.
+    #[default]
+    Docked,
+    /// Centred window over the editor.
+    Float,
+    /// Fill the screen.
+    Fullscreen,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentsConfig {
@@ -58,10 +71,19 @@ pub struct AgentsConfig {
     pub default: String,
     #[serde(default)]
     pub connection: AgentConnection,
+    /// Where to show either agent connection.
+    #[serde(default)]
+    pub placement: AgentPlacement,
+    /// Width of a floating agent as a percentage of the screen.
+    #[serde(default = "default_float_width")]
+    pub float_width_percent: i64,
+    /// Height of a floating agent as a percentage of the screen.
+    #[serde(default = "default_float_height")]
+    pub float_height_percent: i64,
     /// How much of the editor width the agent panel takes when it opens, in percent.
     #[serde(default = "default_panel_width")]
     pub panel_width: u16,
-    /// The side the agent panel, or a terminal agent, opens on.
+    /// The side the agent panel or terminal agent docks on.
     #[serde(default = "default_agent_side")]
     pub side: crate::config::settings::ui::PanelSide,
     /// Run each profile's `add_tools` command, which changes the agent's own config.
@@ -69,6 +91,14 @@ pub struct AgentsConfig {
     pub add_tools: bool,
     #[serde(default)]
     pub profiles: BTreeMap<String, AgentProfileConfig>,
+}
+
+const fn default_float_width() -> i64 {
+    80
+}
+
+const fn default_float_height() -> i64 {
+    85
 }
 
 const fn default_panel_width() -> u16 {
@@ -88,6 +118,9 @@ impl Default for AgentsConfig {
         Self {
             default: String::new(),
             connection: AgentConnection::default(),
+            placement: AgentPlacement::default(),
+            float_width_percent: default_float_width(),
+            float_height_percent: default_float_height(),
             panel_width: default_panel_width(),
             side: default_agent_side(),
             add_tools: default_add_tools(),

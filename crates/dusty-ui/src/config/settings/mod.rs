@@ -77,6 +77,7 @@ pub use debugger::DebugRequestKind;
 pub use debugger::DebugSessionConfig;
 mod agents;
 pub use agents::AgentConnection;
+pub use agents::AgentPlacement;
 pub use agents::AgentProfileConfig;
 pub use agents::AgentsConfig;
 mod terminal;

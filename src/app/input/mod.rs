@@ -2410,6 +2410,7 @@ impl App {
         match event {
             UiEvent::Resize(width, height) => {
                 self.window_session.observe_size((width, height));
+                self.recenter_agent_terminals();
                 self.window_session.invalidate();
                 self.project_window_geometry();
                 self.window_session.invalidate_native();
@@ -2877,7 +2878,7 @@ impl App {
         {
             return context;
         }
-        if !self.window_session.dashboard_visible() && self.agent_input_focused() {
+        if self.agent_input_focused() {
             return if self.agent_normal_mode() {
                 "agent_normal"
             } else {

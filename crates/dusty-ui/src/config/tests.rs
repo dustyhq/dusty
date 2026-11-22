@@ -284,6 +284,57 @@ fn viewport_horizontal_margin_is_nested_bounded_and_has_no_flat_alias() {
 }
 
 #[test]
+fn agent_placement_and_float_dimensions_are_validated() {
+    let root = tempdir().expect("tempdir");
+    let path = root.path().join("config.toml");
+    let defaults = load_bundled_config().config.agents;
+    assert_eq!(defaults.placement, crate::config::AgentPlacement::Docked);
+    assert_eq!(
+        (defaults.float_width_percent, defaults.float_height_percent),
+        (80, 85)
+    );
+
+    fs::write(
+        &path,
+        "[agents]\nplacement = \"float\"\nfloat_width_percent = 50\nfloat_height_percent = 100\n",
+    )
+    .expect("write config");
+    let loaded = load_config(&path);
+    assert!(loaded.diagnostic.is_none(), "{:?}", loaded.diagnostic);
+    assert_eq!(
+        loaded.config.agents.placement,
+        crate::config::AgentPlacement::Float
+    );
+    assert_eq!(
+        (
+            loaded.config.agents.float_width_percent,
+            loaded.config.agents.float_height_percent
+        ),
+        (50, 100)
+    );
+
+    for (key, value) in [
+        ("float_width_percent", -1),
+        ("float_width_percent", 49),
+        ("float_height_percent", -1),
+        ("float_height_percent", 101),
+    ] {
+        fs::write(&path, format!("[agents]\n{key} = {value}\n")).expect("write out of bounds");
+        let loaded = load_config(&path);
+        assert_eq!(loaded.config.agents, defaults);
+        let expected = format!("agents.{key} must be between 50 and 100");
+        assert!(
+            loaded
+                .diagnostic
+                .as_deref()
+                .is_some_and(|message| message.contains(expected.as_str())),
+            "{key}: {:?}",
+            loaded.diagnostic,
+        );
+    }
+}
+
+#[test]
 fn unpublished_explorer_schema_leaves_out_removed_overlay_fields() {
     let root = tempdir().expect("tempdir");
     let removed = [
@@ -1381,9 +1432,9 @@ label = "Files"
             ))
             .collect()
     );
-    assert_eq!(loaded.entries.len(), 14);
+    assert_eq!(loaded.entries.len(), 2 * surfaces.len());
     assert_eq!(loaded.entries.len(), loaded.user_spans.len());
-    assert_eq!(loaded.groups.len(), 7);
+    assert_eq!(loaded.groups.len(), surfaces.len());
     assert_eq!(loaded.groups.len(), loaded.user_group_spans.len());
 }
 

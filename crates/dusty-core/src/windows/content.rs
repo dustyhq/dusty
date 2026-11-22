@@ -184,6 +184,7 @@ pub struct WindowDescriptor {
     pub view: ViewId,
     pub placement: WindowPlacement,
     pub restore_placement: WindowPlacement,
+    pub(super) floating_since: u64,
     pub focusable: bool,
     pub owner: String,
     pub instance_id: u64,

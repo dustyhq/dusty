@@ -277,6 +277,7 @@ use crate::persistence::PersistedLargeFileOverride;
 use crate::persistence::PersistedSession;
 use crate::persistence::PersistedWindowRule;
 use crate::persistence::STATE_VERSION;
+use crate::process::PtyId;
 use crate::ui::PromptKind;
 use crate::ui::render::SCRATCH_LABEL;
 
@@ -351,8 +352,18 @@ impl App {
 
 impl App {
     pub(in crate::app) fn capture_window_rules(&self) -> Vec<PersistedWindowRule> {
-        self.window_session
-            .persisted_rules(self.terminal_session.selected().map(|id| id.0))
+        // An agent can take terminal selection without becoming the regular terminal panel.
+        // If it covered a shell, persist that shell's request rather than the agent's dock.
+        let terminal = self
+            .window_session
+            .native_ids()
+            .covered_shell_id()
+            .map(PtyId)
+            .into_iter()
+            .chain(self.terminal_session.selected())
+            .chain(self.terminal_session.panel())
+            .find(|&id| self.terminal_session.contains(id) && !self.agent_terminal(id));
+        self.window_session.persisted_rules(terminal.map(|id| id.0))
     }
 }
 

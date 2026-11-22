@@ -106,11 +106,18 @@ impl App {
                 found.len() - 1
             });
             let command = entry.command.clone().unwrap_or_default();
-            let mut title = entry
-                .desc
-                .as_ref()
-                .or_else(|| settings.command_labels.get(&command))
-                .cloned()
+            let overlay_escape_label = (entry.id == "builtin.agent-normal.escape"
+                && command == "agent.escape"
+                && entry
+                    .desc
+                    .as_deref()
+                    .is_none_or(|label| label == "Stop Agent")
+                && self.agent_placement() != crate::config::AgentPlacement::Docked)
+                .then_some("Hide Panel or Stop Agent");
+            let mut title = overlay_escape_label
+                .map(str::to_owned)
+                .or_else(|| entry.desc.clone())
+                .or_else(|| settings.command_labels.get(&command).cloned())
                 .or_else(|| {
                     self.commands
                         .specs()

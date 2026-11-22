@@ -33,6 +33,13 @@ pub enum SyntaxFoldAction {
     CloseAll,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub enum TerminalSendTarget {
+    Id(crate::process::PtyId),
+    Focused,
+    FocusedOrSelected,
+}
+
 #[derive(Clone, Debug)]
 pub enum AppEffect {
     Authorized {
@@ -1351,8 +1358,8 @@ impl App {
             | AppEffect::TerminalFullscreen
             | AppEffect::TerminalHide
             | AppEffect::TerminalUnfocus
-            | AppEffect::TerminalSend(..)
             | AppEffect::TerminalModeNormal
+            | AppEffect::TerminalEscape
             | AppEffect::TerminalModeInput
             | AppEffect::TerminalNormalMove(..)
             | AppEffect::TerminalVisualStart(..)
@@ -1775,6 +1782,8 @@ impl App {
                         .map(|buffer| buffer.text.source_version())
                 }) != text_before;
                 if text_changed {
+                    self.debugger_session
+                        .sync_breakpoint_locations(&mut self.state);
                     self.push_change_location();
                 }
                 // Submitting the command prompt closes it and invokes the semantic command.

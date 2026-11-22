@@ -1,7 +1,7 @@
 //! The first-start setup: one question per page, its choices down the left and, on the right,
 //! a small Dusty drawn in the theme's colours the way the highlighted choices would lay it out.
 
-use crate::config::AgentConnection;
+use crate::config::{AgentConnection, AgentPlacement};
 
 use crate::config::Config;
 
@@ -223,9 +223,8 @@ impl Area {
 /// the page is about open in it.
 struct Scene<'a> {
     explorer: PanelSide,
-    /// The agent panel's side, whether it is Dusty's panel (ACP) rather than the agent's own
-    /// program, and the agent's name.
-    agent: Option<(PanelSide, bool, &'a str)>,
+    /// The agent's dock side, placement, whether it uses ACP, and its name.
+    agent: Option<(PanelSide, AgentPlacement, bool, &'a str)>,
     terminal: Option<TerminalPlacement>,
     git: Option<crate::config::GitPlacement>,
     /// The leader key, with its shortcuts shown.
@@ -256,6 +255,12 @@ impl<'a> Scene<'a> {
         };
         let agent = (
             side("agents.side", config.agents.side),
+            match chosen("agents.placement") {
+                Some("docked") => AgentPlacement::Docked,
+                Some("float") => AgentPlacement::Float,
+                Some("fullscreen") => AgentPlacement::Fullscreen,
+                _ => config.agents.placement,
+            },
             acp,
             // "Ask every time" names no agent.
             Some(chosen("agents.default").unwrap_or(&config.agents.default))
@@ -377,7 +382,8 @@ fn render_preview(frame: &mut Frame, scene: &Scene, config: &Config, area: Area)
     let (explorer_x, explorer_divider) = place(scene.explorer, explorer_width);
     let agent = scene
         .agent
-        .map(|(side, acp, name)| (place(side, agent_width), acp, name));
+        .filter(|(_, placement, _, _)| *placement == AgentPlacement::Docked)
+        .map(|(side, _, acp, name)| (place(side, agent_width), acp, name));
     let code = Area {
         x: code_left,
         width: code_right.saturating_sub(code_left),
@@ -414,6 +420,35 @@ fn render_preview(frame: &mut Frame, scene: &Scene, config: &Config, area: Area)
         }
     }
     render_code(frame, code);
+    if let Some((_, placement, acp, name)) = scene.agent
+        && placement != AgentPlacement::Docked
+    {
+        let panel = if placement == AgentPlacement::Fullscreen {
+            framed(frame, body, Style::Default, Style::Default);
+            body
+        } else {
+            let w = (body.width * 4 / 5).min(body.width);
+            let h = (body.height * 85 / 100).max(6).min(body.height);
+            let area = Area {
+                x: body.x + (body.width - w) / 2,
+                y: body.y + (body.height - h) / 2,
+                width: w,
+                height: h,
+            };
+            framed(frame, area, Style::Border, Style::Default);
+            Area {
+                x: area.x + 1,
+                y: area.y + 1,
+                width: w - 2,
+                height: h - 2,
+            }
+        };
+        if acp {
+            render_agent_panel(frame, name, panel);
+        } else {
+            render_agent_program(frame, name, panel);
+        }
+    }
     match scene.terminal {
         Some(TerminalPlacement::Bottom) => {
             let height = (code.height * 2 / 5).max(4);

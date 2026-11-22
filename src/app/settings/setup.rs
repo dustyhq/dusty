@@ -241,6 +241,7 @@ mod tests {
                 "Terminal",
                 "Dusty Git",
                 "AI agent",
+                "Agent Placement",
                 "Agent",
                 "Agent tools",
                 "Leader key"

@@ -81,6 +81,26 @@ about = "claude, pi, codex and others run as you know them, in a terminal."
 settings = { "agents.connection" = "terminal" }
 
 [[page]]
+title = "Agent Placement"
+question = "Where should the agent open?"
+preview = "agent"
+
+[[page.choice]]
+label = "Docked"
+about = "Open the agent in a split beside the editor."
+settings = { "agents.placement" = "docked" }
+
+[[page.choice]]
+label = "Floating"
+about = "Open the agent in a centred window over the editor."
+settings = { "agents.placement" = "float" }
+
+[[page.choice]]
+label = "Fullscreen"
+about = "Use the whole terminal for the agent."
+settings = { "agents.placement" = "fullscreen" }
+
+[[page]]
 title = "Agent"
 question = "Which agent should <leader> a a start?"
 preview = "agent"

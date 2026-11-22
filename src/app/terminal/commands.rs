@@ -188,9 +188,20 @@ pub(in crate::app) fn register_commands(
             .field("text", ArgumentType::String, true)
             .field("id", ArgumentType::Integer, false),
         |invocation| {
-            Ok(AppEffect::TerminalSend(
-                string_arg(invocation, "text")?.to_owned(),
-            ))
+            let target = if let Some(id) = optional_integer_arg(invocation, "id") {
+                let id = u64::try_from(id).map_err(|_| {
+                    CommandError::InvalidArguments("Terminal number cannot be negative.".into())
+                })?;
+                TerminalSendTarget::Id(PtyId(id))
+            } else if invocation.source == InvocationSource::TerminalInput {
+                TerminalSendTarget::Focused
+            } else {
+                TerminalSendTarget::FocusedOrSelected
+            };
+            Ok(AppEffect::TerminalSend {
+                target,
+                text: string_arg(invocation, "text")?.to_owned(),
+            })
         },
     )?;
     register(
@@ -200,6 +211,14 @@ pub(in crate::app) fn register_commands(
         ContextRequirement::Application,
         ArgumentSchema::default(),
         |_| AppEffect::TerminalModeNormal,
+    )?;
+    register(
+        registry,
+        "terminal.escape",
+        "Hide a floating or fullscreen terminal agent",
+        ContextRequirement::Application,
+        ArgumentSchema::default(),
+        |_| AppEffect::TerminalEscape,
     )?;
     register(
         registry,
@@ -277,6 +296,42 @@ pub(in crate::app) fn register_commands(
 // Remaining editor/window routing; terminal data and algorithms live in the owner.
 
 impl App {
+    pub(in crate::app) fn send_terminal_command(
+        &mut self,
+        target: TerminalSendTarget,
+        text: &str,
+    ) -> bool {
+        let id = match target {
+            TerminalSendTarget::Id(id) => Some(id),
+            TerminalSendTarget::Focused => self.keyboard_terminal(),
+            TerminalSendTarget::FocusedOrSelected => self
+                .keyboard_terminal()
+                .or_else(|| self.terminal_session.selected()),
+        };
+        let Some(id) = id.filter(|id| self.terminal_session.has_input_destination(*id)) else {
+            self.show_error("No terminal to send to.");
+            return false;
+        };
+        let input = match text {
+            "\x1b[A" => TerminalInput::Key(PtyInputKey::Up),
+            "\x1b[B" => TerminalInput::Key(PtyInputKey::Down),
+            "\x1b[C" => TerminalInput::Key(PtyInputKey::Right),
+            "\x1b[D" => TerminalInput::Key(PtyInputKey::Left),
+            "\x1b[H" => TerminalInput::Key(PtyInputKey::Home),
+            "\x1b[F" => TerminalInput::Key(PtyInputKey::End),
+            "\x1b[5~" => TerminalInput::Key(PtyInputKey::PageUp),
+            "\x1b[6~" => TerminalInput::Key(PtyInputKey::PageDown),
+            _ => TerminalInput::Text(text),
+        };
+        match self.terminal_session.send(id, input, &self.workspace) {
+            Ok(_) => true,
+            Err(error) => {
+                self.show_error(error);
+                false
+            }
+        }
+    }
+
     pub(in crate::app) fn process_terminal_effect(
         &mut self,
         effect: AppEffect,
@@ -434,28 +489,8 @@ impl App {
                 self.sync_terminal_panel();
                 self.ensure_cursor_visible();
             }
-            AppEffect::TerminalSend(text) => {
-                if let Some(id) = self.terminal_session.selected()
-                    && let Err(error) = self.terminal_session.send(
-                        id,
-                        match text.as_str() {
-                            "\x1b[A" => TerminalInput::Key(crate::ui::PtyInputKey::Up),
-                            "\x1b[B" => TerminalInput::Key(crate::ui::PtyInputKey::Down),
-                            "\x1b[C" => TerminalInput::Key(crate::ui::PtyInputKey::Right),
-                            "\x1b[D" => TerminalInput::Key(crate::ui::PtyInputKey::Left),
-                            "\x1b[H" => TerminalInput::Key(crate::ui::PtyInputKey::Home),
-                            "\x1b[F" => TerminalInput::Key(crate::ui::PtyInputKey::End),
-                            "\x1b[5~" => TerminalInput::Key(crate::ui::PtyInputKey::PageUp),
-                            "\x1b[6~" => TerminalInput::Key(crate::ui::PtyInputKey::PageDown),
-                            _ => TerminalInput::Text(&text),
-                        },
-                        &self.workspace,
-                    )
-                {
-                    self.show_error(error);
-                }
-            }
             AppEffect::TerminalModeNormal => self.enter_terminal_normal_mode(),
+            AppEffect::TerminalEscape => self.escape_terminal_agent_overlay(),
             AppEffect::TerminalModeInput => self.enter_terminal_input_mode(),
             AppEffect::TerminalNormalMove(motion) => {
                 self.move_terminal_normal_cursor(&motion);

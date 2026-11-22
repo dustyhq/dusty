@@ -1,6 +1,815 @@
 //! Tests for agent conversations and permissions.
 
 use crate::app::agent::*;
+use crate::app::tests::driver::TestSession;
+use crate::windows::{CompositorLayer, TiledLayoutNode};
+
+fn placement_session(connection: AgentConnection, placement: AgentPlacement) -> TestSession {
+    let mut loaded = crate::config::load_bundled_config();
+    loaded.config.persistence.enabled = false;
+    let agents = &mut loaded.config.agents;
+    agents.connection = connection;
+    agents.placement = placement;
+    agents.side = crate::config::PanelSide::Left;
+    agents.add_tools = false;
+    if connection == AgentConnection::Terminal {
+        agents.default = "pi".into();
+        agents.profiles.get_mut("pi").unwrap().cli = vec!["cat".into()];
+    } else {
+        agents.default.clear();
+    }
+    let mut session = TestSession::new(loaded);
+    session.new_buffer();
+    session
+        .application_mut()
+        .apply_layout_action(LayoutAction::Split(TileAxis::Horizontal));
+    session
+}
+
+fn editor_tiles(app: &App) -> Option<TiledLayoutNode> {
+    app.state.tab_layout(app.state.active_tab().unwrap())
+}
+
+fn toggle_with_keys(session: &mut TestSession) {
+    for key in ["space", "a", "a"] {
+        session.key(key);
+    }
+}
+
+fn agent_window(app: &App) -> crate::windows::ProjectedCompositorWindow {
+    let AgentPanelSurface::Overlay(window) = app.ui.agent_panel.as_ref().unwrap().surface else {
+        panic!("the ACP panel is not an overlay");
+    };
+    app.compositor_projection().unwrap().window(window).unwrap()
+}
+
+#[test]
+fn acp_agent_toggles_each_placement_without_losing_its_panel() {
+    for placement in [
+        AgentPlacement::Docked,
+        AgentPlacement::Float,
+        AgentPlacement::Fullscreen,
+    ] {
+        let mut session = placement_session(AgentConnection::Acp, placement);
+        let before = editor_tiles(session.application());
+        let active = session.application().state.focused_window();
+        for opening in 0..2 {
+            toggle_with_keys(&mut session);
+            let app = session.application();
+            assert_eq!(
+                app.active_input_context(),
+                "agent",
+                "{placement:?}, opening {opening}"
+            );
+            match placement {
+                AgentPlacement::Docked => assert!(app.agent_pane().is_some()),
+                AgentPlacement::Float => {
+                    assert_eq!(agent_window(app).layer, CompositorLayer::Floating)
+                }
+                AgentPlacement::Fullscreen => {
+                    assert_eq!(agent_window(app).layer, CompositorLayer::Fullscreen)
+                }
+            }
+            if placement != AgentPlacement::Docked {
+                assert_eq!(
+                    editor_tiles(app),
+                    before,
+                    "{placement:?} changed the tiled tree"
+                );
+            }
+            session.key("escape");
+            toggle_with_keys(&mut session);
+            let app = session.application();
+            assert!(app.ui.agent_panel.is_none(), "{placement:?} did not hide");
+            assert_eq!(
+                app.state.focused_window(),
+                active,
+                "{placement:?}, opening {opening}"
+            );
+            assert_eq!(
+                editor_tiles(app),
+                before,
+                "{placement:?} changed the tiled tree"
+            );
+        }
+    }
+}
+
+#[test]
+fn floating_acp_agent_centres_reflows_and_hides_on_normal_escape() {
+    let mut session = placement_session(AgentConnection::Acp, AgentPlacement::Float);
+    let before = editor_tiles(session.application());
+    session.resize(100, 30);
+    toggle_with_keys(&mut session);
+    session.key("x");
+    for (width, height, expected) in [
+        (
+            100,
+            30,
+            WindowRect {
+                x: 10,
+                y: 2,
+                width: 80,
+                height: 25,
+            },
+        ),
+        (
+            80,
+            24,
+            WindowRect {
+                x: 8,
+                y: 2,
+                width: 64,
+                height: 20,
+            },
+        ),
+    ] {
+        session.resize(width, height);
+        let app = session.application();
+        assert_eq!(agent_window(app).rect, expected);
+        assert!(app.agent.width >= 40);
+        let (x, y, _) = frame(app).cursor.expect("agent input cursor");
+        assert!((expected.x + 1..expected.x + expected.width - 1).contains(&x));
+        assert!((expected.y + 1..expected.y + expected.height - 1).contains(&y));
+    }
+    session.key("escape");
+    assert_eq!(session.application().active_input_context(), "agent_normal");
+    session.key("escape");
+    let app = session.application();
+    assert!(app.ui.agent_panel.is_none());
+    assert_eq!(editor_tiles(app), before);
+    assert_eq!(app.agent.input, "x");
+}
+
+#[test]
+fn acp_placement_commands_keep_the_session_transcript_input_and_scroll() {
+    let mut session = placement_session(AgentConnection::Acp, AgentPlacement::Docked);
+    session.resize(100, 36);
+    let app = session.application_mut();
+    let index = tab(app);
+    let number = app.agent.sessions[index].number;
+    let entries = vec![Entry::Agent(
+        (0..1_000).map(|word| format!("word{word:03} ")).collect(),
+    )];
+    app.agent.sessions[index].entries = entries.clone();
+    toggle_with_keys(&mut session);
+    for key in ["d", "r", "a", "f", "t"] {
+        session.key(key);
+    }
+    // Leave enough output below the anchor to fill even the fullscreen viewport.
+    for _ in 0..6 {
+        session.key("pageup");
+    }
+    session.key("escape");
+    let app = session.application();
+    assert!(app.agent.scroll > 0, "Page Up must scroll the transcript");
+    let cursor = app.agent.cursor;
+    let first_line = |app: &App| {
+        let panel = app.ui.agent_panel.as_ref().unwrap();
+        let rect = app.agent_panel_rect(panel.surface).unwrap();
+        let grid = frame(app).grid;
+        (rect.x..rect.x + rect.width)
+            .filter_map(|x| grid.get(x, rect.y + 1))
+            .filter(|cell| !cell.continuation)
+            .map(|cell| cell.symbol.as_str())
+            .collect::<String>()
+    };
+    let marker = first_line(app)
+        .split_whitespace()
+        .find(|word| word.starts_with("word"))
+        .expect("first visible transcript line contains a word")
+        .to_owned();
+    assert_ne!(
+        marker, "word000",
+        "the transcript must be scrolled to its middle"
+    );
+    for (command, placement) in [
+        ("agent.float", AgentPlacement::Float),
+        ("agent.fullscreen", AgentPlacement::Fullscreen),
+        ("agent.dock", AgentPlacement::Docked),
+    ] {
+        session.key(":");
+        for key in command.chars() {
+            session.key(&key.to_string());
+        }
+        session.key("enter");
+        let app = session.application();
+        assert_eq!(app.agent_placement(), placement);
+        assert_eq!(
+            app.configuration.settings().agents.placement,
+            AgentPlacement::Docked
+        );
+        assert_eq!(app.active_input_context(), "agent_normal");
+        assert_eq!(app.agent.sessions.len(), 1);
+        assert_eq!(app.agent.sessions[index].number, number);
+        assert_eq!(app.agent.sessions[index].entries, entries);
+        assert_eq!(app.agent.input, "draft");
+        assert_eq!(app.agent.cursor, cursor);
+        assert!(
+            first_line(app).contains(&marker),
+            "{placement:?} lost {marker}"
+        );
+    }
+}
+
+#[test]
+fn leaving_docked_removes_the_agent_split_from_every_editor_tab() {
+    let mut session = placement_session(AgentConnection::Acp, AgentPlacement::Docked);
+    let first = session.application().state.active_tab().unwrap();
+    let first_layout = editor_tiles(session.application());
+    let code = session.application().state.focused_window().unwrap();
+    toggle_with_keys(&mut session);
+    let app = session.application_mut();
+    assert!(app.agent_pane_in(first).is_some());
+    app.state.focus_pane_id(code).unwrap();
+    app.reconcile_editor_windows();
+
+    session.new_tab();
+    let second = session.application().state.active_tab().unwrap();
+    assert_ne!(first, second);
+    let second_layout = editor_tiles(session.application());
+    toggle_with_keys(&mut session);
+    session.key("escape");
+    session.key(":");
+    for key in "agent.float".chars() {
+        session.key(&key.to_string());
+    }
+    session.key("enter");
+    let app = session.application_mut();
+    assert_eq!(app.state.active_tab(), Some(second));
+    assert_eq!(agent_window(app).layer, CompositorLayer::Floating);
+    assert_eq!(app.state.tab_layout(first), first_layout);
+    assert_eq!(app.state.tab_layout(second), second_layout);
+    app.state.activate_tab(first).unwrap();
+    app.reconcile_editor_windows();
+    toggle_with_keys(&mut session);
+    let app = session.application();
+    assert!(app.ui.agent_panel.is_none());
+    assert_eq!(app.state.tab_layout(first), first_layout);
+    assert_eq!(app.state.tab_layout(second), second_layout);
+}
+
+#[cfg(unix)]
+fn session_with_shell(
+    connection: AgentConnection,
+    placement: AgentPlacement,
+    shell_placement: crate::config::TerminalPlacement,
+) -> TestSession {
+    let mut loaded = crate::config::load_bundled_config();
+    loaded.config.persistence.enabled = false;
+    let agents = &mut loaded.config.agents;
+    agents.connection = connection;
+    agents.placement = placement;
+    agents.default = if connection == AgentConnection::Terminal {
+        "pi".into()
+    } else {
+        String::new()
+    };
+    agents.profiles.get_mut("pi").unwrap().cli = vec!["cat".into()];
+    agents.add_tools = false;
+    let shell = loaded.config.terminals.profiles.get_mut("shell").unwrap();
+    shell.program = "/bin/sh".into();
+    shell.arguments = vec![
+        "-c".into(),
+        "printf '\\033[8;20HSHELL_ON_TOP'; exec cat".into(),
+    ];
+    shell.float = false;
+    loaded.config.ui.terminal_panel.placement = shell_placement;
+    let mut session = TestSession::new(loaded);
+    session.new_buffer();
+    session.trust_owned_terminal_fixture();
+    session
+}
+
+#[cfg(unix)]
+#[test]
+fn fullscreen_agents_keep_the_shell_covered_across_placement_changes() {
+    for connection in [AgentConnection::Acp, AgentConnection::Terminal] {
+        let mut session = session_with_shell(
+            connection,
+            AgentPlacement::Fullscreen,
+            crate::config::TerminalPlacement::Fullscreen,
+        );
+        session.terminal_open("shell");
+        let first_shell = session.application().keyboard_terminal().unwrap();
+        session
+            .application_mut()
+            .apply_native_window_placement(
+                NativeSurfaceTarget::Terminal(first_shell.0),
+                WindowPlacement::Docked {
+                    edge: crate::windows::DockEdge::Bottom,
+                    size: 8,
+                },
+            )
+            .unwrap();
+        session.terminal_open("shell");
+        let shell = session.application().keyboard_terminal().unwrap();
+        assert_ne!(first_shell, shell);
+        let shell_target = NativeSurfaceTarget::Terminal(shell.0);
+        let before = editor_tiles(session.application());
+        assert_eq!(
+            session.application().current_native_placement(shell_target),
+            Ok(WindowPlacement::Fullscreen)
+        );
+        for key in ["escape", "escape"] {
+            session.key(key);
+        }
+        assert_eq!(
+            session.application().active_input_context(),
+            "terminal_normal"
+        );
+        toggle_with_keys(&mut session);
+        let app = session.application();
+        assert_eq!(
+            app.current_native_placement(shell_target),
+            Ok(WindowPlacement::Hidden)
+        );
+        let fullscreen = app
+            .compositor_projection()
+            .unwrap()
+            .windows
+            .iter()
+            .find(|window| window.layer == CompositorLayer::Fullscreen)
+            .unwrap();
+        let agent = if connection == AgentConnection::Terminal {
+            let id = app.keyboard_terminal().unwrap();
+            assert!(app.agent_terminal(id));
+            assert_eq!(
+                app.window_session.graph().focused(),
+                Some(fullscreen.window)
+            );
+            session.key("escape");
+            session.key("escape");
+            Some(id)
+        } else {
+            assert_eq!(agent_window(app), *fullscreen);
+            session.key("escape");
+            None
+        };
+
+        for (command, placement) in [
+            ("agent.float", AgentPlacement::Float),
+            ("agent.dock", AgentPlacement::Docked),
+        ]
+        .into_iter()
+        .chain(agent.map(|_| ("agent.float", AgentPlacement::Float)))
+        {
+            session
+                .application_mut()
+                .invoke(crate::app::command(command).unwrap());
+            let app = session.application();
+            assert_eq!(app.agent_placement(), placement);
+            assert_eq!(
+                app.current_native_placement(shell_target),
+                Ok(WindowPlacement::Hidden),
+                "{connection:?} agent in {placement:?} revealed the shell"
+            );
+            if let Some(id) = agent {
+                assert_eq!(app.keyboard_terminal(), Some(id));
+                let placement = app.current_native_placement(NativeSurfaceTarget::Terminal(id.0));
+                assert!(match app.agent_placement() {
+                    AgentPlacement::Float => matches!(placement, Ok(WindowPlacement::Floating(_))),
+                    AgentPlacement::Docked =>
+                        matches!(placement, Ok(WindowPlacement::Docked { .. })),
+                    AgentPlacement::Fullscreen => false,
+                });
+            } else {
+                assert_eq!(app.active_input_context(), "agent_normal");
+                if placement == AgentPlacement::Docked {
+                    assert!(app.agent_pane().is_some());
+                } else {
+                    assert_eq!(agent_window(app).layer, CompositorLayer::Floating);
+                }
+            }
+        }
+
+        if agent.is_some() {
+            session.key("escape");
+        } else {
+            toggle_with_keys(&mut session);
+        }
+        let app = session.application();
+        assert!(
+            app.agent_pane().is_none(),
+            "Toggle Agent left the docked split open"
+        );
+        assert_eq!(
+            app.current_native_placement(shell_target),
+            Ok(WindowPlacement::Fullscreen)
+        );
+        assert_eq!(app.keyboard_terminal(), Some(shell));
+        assert_eq!(app.terminal_session.selected(), Some(shell));
+        assert_eq!(app.active_input_context(), "terminal_normal");
+        assert_eq!(editor_tiles(app), before);
+        session.key("ctrl-shift-l");
+        assert_eq!(session.application().keyboard_terminal(), Some(first_shell));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn session_saves_the_covered_shell_placement_instead_of_the_docked_agent() {
+    use crate::config::TerminalPlacement;
+    use crate::persistence::PersistedWindowPlacement;
+
+    let mut session = session_with_shell(
+        AgentConnection::Terminal,
+        AgentPlacement::Fullscreen,
+        TerminalPlacement::Bottom,
+    );
+    let app = session.application_mut();
+    let path = app.state.workspace_root.join("saved.txt");
+    std::fs::write(&path, "saved layout\n").unwrap();
+    app.state
+        .open_text(TextBuffer::from_text("saved layout\n"), Some(path))
+        .unwrap();
+    app.reconcile_editor_windows();
+    session.terminal_open("shell");
+    let app = session.application_mut();
+    let shell = app.keyboard_terminal().unwrap();
+    let shell_target = NativeSurfaceTarget::Terminal(shell.0);
+    app.apply_native_window_placement(shell_target, WindowPlacement::Fullscreen)
+        .unwrap();
+    for key in ["escape", "escape"] {
+        session.key(key);
+    }
+    toggle_with_keys(&mut session);
+    let app = session.application_mut();
+    app.set_agent_placement(AgentPlacement::Docked);
+    let agent = app.terminal_session.selected().unwrap();
+    assert!(app.agent_terminal(agent));
+    assert!(matches!(
+        app.current_native_placement(NativeSurfaceTarget::Terminal(agent.0)),
+        Ok(WindowPlacement::Docked {
+            edge: crate::windows::DockEdge::Left | crate::windows::DockEdge::Right,
+            ..
+        })
+    ));
+    assert_eq!(
+        app.current_native_placement(shell_target),
+        Ok(WindowPlacement::Hidden)
+    );
+
+    let saved = app
+        .try_capture_session()
+        .unwrap()
+        .expect("saved file layout");
+    let terminal_rule = saved
+        .window_rules
+        .iter()
+        .find(|rule| rule.content_type == "builtin.terminal")
+        .expect("regular terminal rule");
+    assert_eq!(
+        terminal_rule.placement,
+        PersistedWindowPlacement::Fullscreen
+    );
+
+    let mut restored = session_with_shell(
+        AgentConnection::Terminal,
+        AgentPlacement::Fullscreen,
+        TerminalPlacement::Bottom,
+    );
+    restored.reconcile_windows();
+    restored
+        .application_mut()
+        .apply_persisted_window_rules(&saved.window_rules)
+        .unwrap();
+    restored.terminal_open("shell");
+    let app = restored.application();
+    let shell = app.keyboard_terminal().unwrap();
+    assert_eq!(
+        app.current_native_placement(NativeSurfaceTarget::Terminal(shell.0)),
+        Ok(WindowPlacement::Fullscreen)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn stopping_a_floated_terminal_agent_restores_its_covered_shell() {
+    let mut session = session_with_shell(
+        AgentConnection::Terminal,
+        AgentPlacement::Fullscreen,
+        crate::config::TerminalPlacement::Fullscreen,
+    );
+    session.terminal_open("shell");
+    let shell = session.application().keyboard_terminal().unwrap();
+    for key in ["escape", "escape"] {
+        session.key(key);
+    }
+    toggle_with_keys(&mut session);
+    let app = session.application_mut();
+    let agent = app.keyboard_terminal().unwrap();
+    assert_ne!(agent, shell);
+    app.set_agent_placement(AgentPlacement::Float);
+    let shell_target = NativeSurfaceTarget::Terminal(shell.0);
+    assert_eq!(
+        app.current_native_placement(shell_target),
+        Ok(WindowPlacement::Hidden)
+    );
+
+    app.stop_or_remove_terminal(agent, true);
+    assert_eq!(
+        app.current_native_placement(shell_target),
+        Ok(WindowPlacement::Fullscreen)
+    );
+    assert_eq!(app.keyboard_terminal(), Some(shell));
+    assert_eq!(app.terminal_session.selected(), Some(shell));
+}
+
+#[cfg(unix)]
+#[test]
+fn reopening_a_floating_shell_raises_it_above_the_acp_agent() {
+    let mut session = session_with_shell(
+        AgentConnection::Acp,
+        AgentPlacement::Float,
+        crate::config::TerminalPlacement::Float,
+    );
+    session.terminal_open("shell");
+    let shell = session.application().keyboard_terminal().unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !session
+        .terminal_lines()
+        .iter()
+        .any(|line| line.contains("SHELL_ON_TOP"))
+    {
+        session.pump_terminal();
+        assert!(
+            std::time::Instant::now() < deadline,
+            "shell did not print its marker"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    session.key("ctrl-/");
+    toggle_with_keys(&mut session);
+    let agent = agent_window(session.application());
+    session.key("ctrl-/");
+    let app = session.application();
+    let window = app
+        .window_session
+        .native_ids()
+        .terminal(shell.0)
+        .unwrap()
+        .window;
+    let projection = app.compositor_projection().unwrap();
+    let shell_rect = projection.window(window).unwrap().rect;
+    let x = shell_rect.x + 19;
+    let y = shell_rect.y + 8;
+    assert!((agent.rect.x..agent.rect.x + agent.rect.width).contains(&x));
+    assert!((agent.rect.y..agent.rect.y + agent.rect.height).contains(&y));
+    assert_eq!(projection.hit_test(x, y), Some(window));
+    assert_eq!(app.keyboard_terminal(), Some(shell));
+    assert!(frame(app).grid.row_text(y).contains("SHELL_ON_TOP"));
+}
+
+#[cfg(unix)]
+#[test]
+fn a_docked_terminal_agent_reopens_at_its_dragged_width() {
+    use crate::editor::input::KeyCode::{MouseLeftDown, MouseLeftDrag, MouseLeftUp};
+    let mut session = placement_session(AgentConnection::Terminal, AgentPlacement::Docked);
+    session.trust_owned_terminal_fixture();
+    toggle_with_keys(&mut session);
+    let app = session.application();
+    let id = app.keyboard_terminal().unwrap();
+    let before = app.terminal_rect(id).unwrap();
+    let border = before.x + before.width - 1;
+    session.mouse(MouseLeftDown, border, before.y + 2);
+    session.mouse(MouseLeftDrag, border + 8, before.y + 2);
+    session.mouse(MouseLeftUp, border + 8, before.y + 2);
+    let dragged = session.application().terminal_rect(id).unwrap();
+    assert_eq!(dragged.width, before.width + 8);
+    for key in ["escape", "escape"] {
+        session.key(key);
+    }
+    toggle_with_keys(&mut session);
+    assert!(session.application().terminal_rect(id).is_none());
+    toggle_with_keys(&mut session);
+    assert_eq!(session.application().terminal_rect(id), Some(dragged));
+}
+
+#[cfg(unix)]
+#[test]
+fn terminal_agent_insert_escape_reaches_the_pty_and_normal_escape_honors_remaps() {
+    let mut loaded = crate::config::load_bundled_config();
+    loaded.config.persistence.enabled = false;
+    loaded.config.agents.connection = AgentConnection::Terminal;
+    loaded.config.agents.placement = AgentPlacement::Float;
+    loaded.config.agents.add_tools = false;
+    loaded.config.agents.default = "pi".into();
+    loaded.config.agents.profiles.get_mut("pi").unwrap().cli = vec![
+        "/bin/sh".into(),
+        "-c".into(),
+        r#"
+stty -icanon -echo min 1 time 0 || exit 1
+printf 'ESC_FIXTURE_READY\r\n'
+case $(dd bs=1 count=1 2>/dev/null | od -An -tu1 | tr -d '[:space:]') in
+    27) printf 'RECEIVED_ESC_BYTE\r\n' ;;
+esac
+exec cat
+"#
+        .into(),
+    ];
+    let mapping_timeout = std::time::Duration::from_millis(loaded.config.input.mapping_timeout_ms);
+    loaded.keymaps.entries.push(
+        toml::from_str(
+            r#"id = "user.terminal.escape"
+context = "terminal_normal"
+keys = "escape"
+command = "terminal.mode.input"
+"#,
+        )
+        .unwrap(),
+    );
+    let mut session = TestSession::new(loaded);
+    session.new_buffer();
+    session.trust_owned_terminal_fixture();
+    toggle_with_keys(&mut session);
+    let agent = session.application().keyboard_terminal().unwrap();
+    let wait_for_marker = |session: &mut TestSession, marker: &str| {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            session.pump_terminal();
+            if session
+                .terminal_lines()
+                .iter()
+                .any(|line| line.contains(marker))
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "agent did not print {marker}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    };
+    wait_for_marker(&mut session, "ESC_FIXTURE_READY");
+    session.key("escape");
+    session.advance_input(mapping_timeout);
+    wait_for_marker(&mut session, "RECEIVED_ESC_BYTE");
+    let app = session.application();
+    assert_eq!(app.active_input_context(), "terminal");
+    assert_eq!(app.keyboard_terminal(), Some(agent));
+    assert!(matches!(
+        app.current_native_placement(NativeSurfaceTarget::Terminal(agent.0)),
+        Ok(WindowPlacement::Floating(_))
+    ));
+
+    for key in ["escape", "escape"] {
+        session.key(key);
+    }
+    assert_eq!(
+        session.application().active_input_context(),
+        "terminal_normal"
+    );
+    session.key("escape");
+    assert_eq!(session.application().active_input_context(), "terminal");
+    assert_eq!(session.application().keyboard_terminal(), Some(agent));
+}
+
+#[test]
+fn agent_escape_shortcut_label_matches_the_current_placement() {
+    let mut session = placement_session(AgentConnection::Acp, AgentPlacement::Docked);
+    for (placement, title) in [
+        (AgentPlacement::Docked, "Stop Agent"),
+        (AgentPlacement::Float, "Hide Panel or Stop Agent"),
+        (AgentPlacement::Fullscreen, "Hide Panel or Stop Agent"),
+    ] {
+        let app = session.application_mut();
+        app.set_agent_placement(placement);
+        let (_, rows) = app.shortcut_rows();
+        let escape = rows
+            .iter()
+            .find(|row| row.key == "builtin.agent-normal.escape")
+            .unwrap();
+        assert_eq!(escape.title, title);
+    }
+}
+
+#[test]
+fn overlay_agent_ctrl_h_hands_the_keyboard_to_the_left_split() {
+    for placement in [AgentPlacement::Float, AgentPlacement::Fullscreen] {
+        let mut session = placement_session(AgentConnection::Acp, placement);
+        let app = session.application();
+        let windows = app.state.tab_windows(app.state.active_tab().unwrap());
+        assert_eq!(app.state.focused_window(), Some(windows[1]));
+        toggle_with_keys(&mut session);
+        session.key("ctrl-h");
+        let app = session.application();
+        assert_eq!(app.state.focused_window(), Some(windows[0]));
+        assert_eq!(app.active_input_context(), "editor.normal");
+        assert!(app.ui.agent_panel.is_none());
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn terminal_agent_toggles_each_placement_with_the_same_pty() {
+    use crate::windows::DockEdge;
+
+    for placement in [
+        AgentPlacement::Docked,
+        AgentPlacement::Float,
+        AgentPlacement::Fullscreen,
+    ] {
+        let mut session = placement_session(AgentConnection::Terminal, placement);
+        session.trust_owned_terminal_fixture();
+        let before = editor_tiles(session.application());
+        let mut terminal = None;
+        for _ in 0..2 {
+            toggle_with_keys(&mut session);
+            let app = session.application();
+            let id = app.keyboard_terminal().unwrap();
+            assert!(app.agent_terminal(id));
+            assert_eq!(*terminal.get_or_insert(id), id);
+            let target = NativeSurfaceTarget::Terminal(id.0);
+            let actual = app.current_native_placement(target).unwrap();
+            match placement {
+                AgentPlacement::Docked => assert_eq!(
+                    actual,
+                    WindowPlacement::Docked {
+                        edge: DockEdge::Left,
+                        size: 40
+                    }
+                ),
+                AgentPlacement::Float => {
+                    assert_eq!(
+                        actual,
+                        WindowPlacement::Floating(WindowRect {
+                            x: 8,
+                            y: 2,
+                            width: 64,
+                            height: 20
+                        })
+                    );
+                    session.resize(100, 30);
+                    assert_eq!(
+                        session.application().terminal_rect(id),
+                        Some(WindowRect {
+                            x: 10,
+                            y: 2,
+                            width: 80,
+                            height: 25
+                        })
+                    );
+                    session.resize(80, 24);
+                }
+                AgentPlacement::Fullscreen => assert_eq!(actual, WindowPlacement::Fullscreen),
+            }
+            assert_eq!(editor_tiles(session.application()), before);
+            for key in ["escape", "escape"] {
+                session.key(key);
+            }
+            assert_eq!(
+                session.application().active_input_context(),
+                "terminal_normal"
+            );
+            if placement == AgentPlacement::Float {
+                session.key("escape");
+            } else {
+                toggle_with_keys(&mut session);
+            }
+            let app = session.application();
+            assert_eq!(
+                app.current_native_placement(target),
+                Ok(WindowPlacement::Hidden)
+            );
+            assert!(app.keyboard_terminal().is_none());
+            assert_eq!(editor_tiles(app), before);
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn terminal_agent_placement_commands_keep_the_pty_and_normal_mode() {
+    let mut session = placement_session(AgentConnection::Terminal, AgentPlacement::Docked);
+    session.trust_owned_terminal_fixture();
+    toggle_with_keys(&mut session);
+    let id = session.application().keyboard_terminal().unwrap();
+    session.key("escape");
+    session.key("escape");
+    for (label, placement) in [
+        ("Float Agent", AgentPlacement::Float),
+        ("Fullscreen Agent", AgentPlacement::Fullscreen),
+        ("Dock Agent", AgentPlacement::Docked),
+    ] {
+        session.key("f1");
+        assert_eq!(session.application().active_input_context(), "picker");
+        for key in label.chars() {
+            if key == ' ' {
+                session.key("space");
+            } else {
+                session.key(&key.to_string());
+            }
+        }
+        session.key("enter");
+        let app = session.application();
+        assert_eq!(app.agent_placement(), placement);
+        assert_eq!(app.keyboard_terminal(), Some(id));
+        assert_eq!(app.active_input_context(), "terminal_normal");
+        assert_eq!(app.terminal_session.descriptions().len(), 1);
+    }
+}
 
 fn test_app() -> ((tempfile::TempDir, tempfile::TempDir), App) {
     test_app_with(|_| {})
@@ -254,7 +1063,7 @@ fn agent_narrow_transcript_uses_the_panes_content_width() {
     app.reconcile_editor_windows();
     app.follow_agent_pane();
     let panel = app.ui.agent_panel.as_ref().unwrap();
-    let viewport = crate::ui::view_pane_viewport(&app.state, &app.ui, panel.view).unwrap();
+    let viewport = app.agent_panel_rect(panel.surface).unwrap();
     assert_eq!(viewport.width, 10);
     assert_eq!(app.agent.width, 8);
     assert_eq!(panel.transcript.text, "abcdefgh\nijklmnop\n");
@@ -276,7 +1085,7 @@ fn agent_streaming_keeps_scrolled_rows_in_place_and_follows_at_the_bottom() {
     app.show_agent_panel();
     app.scroll_agent(40);
     let panel = app.ui.agent_panel.as_ref().unwrap();
-    let viewport = crate::ui::view_pane_viewport(&app.state, &app.ui, panel.view).unwrap();
+    let viewport = app.agent_panel_rect(panel.surface).unwrap();
     let first = frame(&app).grid.row_text(viewport.y + 1);
     apply_update(
         &mut app.agent.sessions[index],

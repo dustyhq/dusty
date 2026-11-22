@@ -1,9 +1,7 @@
 //! The agent panel: ACP sessions as tabs. Each session has its own agent process, transcript,
-//! options (model, mode, thinking level) and permission requests. The panel is a split beside
-//! the code with its own tab line, the active session's conversation with its Markdown
-//! rendered, an input box and a footer; `ui::render::agent` draws it in place of the pane's
-//! placeholder buffer. Questions go to the active session. A session keeps the worktree it
-//! started in; switching worktrees does not move it.
+//! options (model, mode, thinking level) and permission requests. The panel docks beside
+//! the code or overlays it, with its own tab line, Markdown transcript, input and footer.
+//! Questions go to the active session. It stays in the worktree where it started.
 //!
 //! Each top-level session gets Dusty's MCP server (`agent::mcp`), whose `agent` tool starts a
 //! subagent: a session in its own tab that works on one task and whose final answer goes
@@ -41,11 +39,13 @@ use crate::agent::history::Entry;
 use crate::app::App;
 use crate::app::commands::PromptMove;
 use crate::app::picker::PickerPayload;
-use crate::app::windows::LayoutAction;
+use crate::app::windows::{FocusTarget, LayoutAction, NativeSurfaceTarget};
 use crate::config::Highlight;
+use crate::config::{AgentConnection, AgentPlacement};
 use crate::editor::BufferId;
 use crate::editor::EditorMode;
 use crate::editor::text::TextBuffer;
+use crate::process::PtyId;
 use crate::remote::AgentRequest;
 use crate::remote::Reply;
 use crate::tools::ToolKind;
@@ -60,8 +60,9 @@ use crate::ui::PickerSurfaceKind;
 use crate::ui::PromptKind;
 use crate::ui::ToolTint;
 use crate::ui::TranscriptBand;
+use crate::ui::render::{AgentPanelSurface, agent_overlay_body};
 use crate::windows::ContentLifecycle;
-use crate::windows::TileAxis;
+use crate::windows::{SpatialDirection, TileAxis, WindowId, WindowPlacement, WindowRect};
 
 use crate::ui::markdown::Styled;
 use crate::windows::ContentId;
@@ -130,6 +131,10 @@ pub(super) struct AgentPanel {
     /// What went wrong running those commands, shown by the next event pass.
     tool_failures: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
     buffer: Option<BufferId>,
+    /// Editor pane that was split to open each docked panel.
+    docked_return_panes: HashMap<WindowId, WindowId>,
+    placement_override: Option<AgentPlacement>,
+    overlay: Option<AgentPlacement>,
     /// Files, selections and diagnostics to send with the next question.
     context: Vec<PromptPart>,
     /// Permission requests waiting for the prompt line to be free.
@@ -142,6 +147,9 @@ pub(super) struct AgentPanel {
     /// Transcript rows scrolled up from the end, and how many rows there are.
     scroll: usize,
     lines: usize,
+    /// The first visible text when scrolled, and entry boundaries in the current rendering.
+    scroll_position: Option<TranscriptPosition>,
+    transcript_entries: Vec<(usize, usize)>,
     /// The width the transcript was wrapped to.
     width: usize,
     /// Whether the input is in Vim's Normal mode; it starts in Insert.
@@ -150,6 +158,44 @@ pub(super) struct AgentPanel {
     selected: usize,
     /// Tool calls shown as one summary line per run, such as `Edited 2 files, ran 1 command`.
     tools_hidden: bool,
+}
+
+/// Position within one conversation entry, not a screen row. Wrapping can replace
+/// a space with a newline (or split a long word), so count non-whitespace characters.
+#[derive(Clone, Copy)]
+struct TranscriptPosition {
+    entry: usize,
+    characters: usize,
+}
+
+impl TranscriptPosition {
+    fn at(text: &str, entries: &[(usize, usize)], byte: usize) -> Option<Self> {
+        let index = entries
+            .partition_point(|&(_, start)| start <= byte)
+            .checked_sub(1)?;
+        let (entry, start) = entries[index];
+        let characters = text[start..byte]
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .count();
+        Some(Self { entry, characters })
+    }
+
+    fn byte(self, text: &str, entries: &[(usize, usize)]) -> Option<usize> {
+        let index = entries.partition_point(|&(entry, _)| entry < self.entry);
+        let &(entry, start) = entries.get(index).or_else(|| entries.last())?;
+        if entry != self.entry {
+            return Some(start);
+        }
+        let end = entries.get(index + 1).map_or(text.len(), |&(_, end)| end);
+        Some(
+            text[start..end]
+                .char_indices()
+                .filter(|&(_, c)| !c.is_whitespace())
+                .nth(self.characters)
+                .map_or(start, |(offset, _)| start + offset),
+        )
+    }
 }
 
 struct AgentFileRequest {
@@ -594,18 +640,25 @@ impl App {
             self.show_error(format!("agents.default names no agent profile: {name}"));
             return;
         };
-        if profile.cli.is_empty() {
+        let Some((program, arguments)) = profile.cli.split_first() else {
             self.show_error(format!(
                 "agent {name} has no cli command to run in a terminal"
             ));
             return;
-        }
-        // Through the shell, as the lazygit profile does, so the program is found on PATH and a
-        // missing one says so in the terminal.
-        let arguments = ["-c".to_owned(), "exec \"$0\" \"$@\"".to_owned()]
-            .into_iter()
-            .chain(profile.cli.iter().cloned())
-            .collect();
+        };
+        // Keep the shell's on-screen command-not-found diagnostic on Unix. Windows starts
+        // the configured program through the normal terminal executable lookup.
+        let (program, arguments) = if cfg!(windows) {
+            (PathBuf::from(program.as_str()), arguments.to_vec())
+        } else {
+            (
+                PathBuf::from("/bin/sh"),
+                ["-c".to_owned(), "exec \"$0\" \"$@\"".to_owned()]
+                    .into_iter()
+                    .chain(profile.cli.iter().cloned())
+                    .collect(),
+            )
+        };
         let environment = profile.environment.clone();
         let running = self
             .terminal_session
@@ -636,7 +689,7 @@ impl App {
             })
         });
         if let Some(id) = running {
-            self.reveal_terminal(id);
+            self.reopen_agent_terminal(id);
             self.terminal_session.enter_terminal_input_mode(id);
             if let Some(text) = selection {
                 match self.terminal_session.send(
@@ -658,7 +711,7 @@ impl App {
             return;
         }
         let program = crate::config::TerminalProfileConfig {
-            program: "/bin/sh".into(),
+            program,
             arguments,
             cwd: None,
             environment,
@@ -1150,7 +1203,7 @@ impl App {
             AgentChoice::Session(number) => {
                 if let Some(index) = self.agent.sessions.iter().position(|s| s.number == number) {
                     self.agent.active = index;
-                    self.agent.scroll = 0;
+                    self.reset_agent_scroll();
                     self.show_agent_panel();
                 }
                 Ok(())
@@ -1201,7 +1254,7 @@ impl App {
         }
         self.agent.active =
             (self.agent.active as isize + offset).rem_euclid(count as isize) as usize;
-        self.agent.scroll = 0;
+        self.reset_agent_scroll();
         self.show_agent_panel();
         self.refresh_agent_transcript();
     }
@@ -1226,8 +1279,9 @@ impl App {
             .active
             .min(self.agent.sessions.len().saturating_sub(1));
         drop(session);
-        if self.agent.sessions.is_empty() && self.agent_pane().is_some() {
-            self.toggle_agent_panel();
+        self.reset_agent_scroll();
+        if self.agent.sessions.is_empty() && self.agent_panel_surface().is_some() {
+            self.hide_agent_panel();
         }
         self.refresh_agent_transcript();
     }
@@ -1309,7 +1363,7 @@ impl App {
     /// Start `name` in a new tab, as many as are asked for, empty or not.
     pub(in crate::app) fn open_agent_tab(&mut self, name: &str) -> Result<(), String> {
         self.start_agent_session(name)?;
-        self.agent.scroll = 0;
+        self.reset_agent_scroll();
         // A new tab keeps the mode the panel is in, as a new tab does in the editor.
         self.show_agent_panel();
         Ok(())
@@ -2316,31 +2370,107 @@ impl App {
         }
     }
 
+    pub(in crate::app) fn agent_placement(&self) -> AgentPlacement {
+        self.agent
+            .placement_override
+            .unwrap_or(self.configuration.settings().agents.placement)
+    }
+
+    /// Use Git's percentage sizing and centring, with enough room for the conversation
+    /// plus the panel padding and the floating window's frame.
+    pub(in crate::app) fn agent_float_rect(&self) -> WindowRect {
+        let settings = &self.configuration.settings().agents;
+        let width = self.window_session.width().max(1);
+        let height = self.window_session.height().max(1);
+        let sized = |total: u16, percent: i64, minimum: u16| {
+            ((i64::from(total) * percent.clamp(0, 100) / 100) as u16)
+                .max(minimum)
+                .min(total)
+        };
+        let w = sized(width, settings.float_width_percent, 44);
+        let h = sized(height, settings.float_height_percent, 8);
+        WindowRect {
+            x: (width - w) / 2,
+            y: (height - h) / 2,
+            width: w,
+            height: h,
+        }
+    }
+
+    pub(in crate::app) fn agent_overlay_placement(&self) -> Option<WindowPlacement> {
+        match self.agent.overlay? {
+            AgentPlacement::Docked => None,
+            AgentPlacement::Float => Some(WindowPlacement::Floating(self.agent_float_rect())),
+            AgentPlacement::Fullscreen => Some(WindowPlacement::Fullscreen),
+        }
+    }
+
+    pub(in crate::app) fn agent_panel_shown(&self) -> bool {
+        self.agent.overlay.is_some() || self.agent_pane().is_some()
+    }
+
+    fn shown_agent_terminal(&self) -> Option<PtyId> {
+        self.keyboard_terminal()
+            .filter(|id| self.agent_terminal(*id))
+            .or_else(|| {
+                self.terminal_session
+                    .side_terminals()
+                    .into_iter()
+                    .find(|id| {
+                        self.agent_terminal(*id)
+                            && self
+                                .current_native_placement(NativeSurfaceTarget::Terminal(id.0))
+                                .is_ok_and(|placement| placement != WindowPlacement::Hidden)
+                    })
+            })
+    }
+
+    pub(in crate::app) fn set_agent_placement(&mut self, placement: AgentPlacement) {
+        let terminal = self.configuration.settings().agents.connection == AgentConnection::Terminal;
+        let shown_terminal = terminal.then(|| self.shown_agent_terminal()).flatten();
+        let shown_panel = !terminal
+            && (self.agent.overlay.is_some()
+                || self.agent_pane().is_some()
+                || placement != AgentPlacement::Docked
+                    && self
+                        .state
+                        .editor_tabs()
+                        .any(|tab| self.agent_pane_in(tab.id).is_some()));
+        let normal = self.agent.normal;
+        self.agent.placement_override = Some(placement);
+        if let Some(id) = shown_terminal {
+            self.show_agent_terminal(id);
+        } else if shown_panel {
+            self.show_agent_panel();
+            self.agent.normal = normal;
+            self.refresh_agent_transcript();
+        }
+    }
+
     pub(in crate::app) fn toggle_agent_panel(&mut self) {
-        if self.configuration.settings().agents.connection
-            == crate::config::AgentConnection::Terminal
-        {
-            // Like the panel, a shown agent hides whether or not it has the keys.
-            let shown = self
-                .terminal_session
-                .side_terminals()
-                .into_iter()
-                .find(|id| self.agent_terminal(*id) && self.terminal_rect(*id).is_some());
-            match shown {
-                Some(id) => {
-                    if let Err(error) = self.apply_native_window_placement(
-                        crate::app::windows::NativeSurfaceTarget::Terminal(id.0),
-                        crate::windows::WindowPlacement::Hidden,
-                    ) {
-                        self.show_error(error);
-                    }
-                }
-                None => self.ask_terminal_agent(),
+        if self.configuration.settings().agents.connection == AgentConnection::Terminal {
+            if let Some(id) = self.shown_agent_terminal() {
+                self.hide_agent_terminal(id);
+            } else {
+                self.ask_terminal_agent();
             }
             return;
         }
-        if let Some(pane) = self.agent_pane() {
-            let previous = self.active_tab_focus();
+        if self.agent.overlay.is_some() || self.agent_pane().is_some() {
+            self.hide_agent_panel();
+        } else {
+            self.show_agent_panel();
+            self.start_default_agent();
+            self.refresh_agent_transcript();
+        }
+    }
+
+    fn hide_agent_panel(&mut self) {
+        if self.agent.overlay.take().is_some() {
+            self.window_session.return_from_agent_overlay();
+            self.reconcile_editor_windows();
+        } else if let Some(pane) = self.agent_pane() {
+            let previous = self.docked_agent_return_pane(pane, self.active_tab_focus());
             if self.state.focus_pane_id(pane).is_ok() {
                 // The only window cannot close: an empty buffer and the dashboard take its
                 // place instead, as when the last file is closed.
@@ -2358,16 +2488,32 @@ impl App {
                 let _ = self.state.focus_pane_id(previous);
             }
             self.reconcile_editor_windows();
-            self.ui.agent_panel = None;
-            return;
         }
-        self.show_agent_panel();
-        self.start_default_agent();
-        self.refresh_agent_transcript();
+        self.ui.agent_panel = None;
     }
 
-    /// Show the panel in a split on its side and put the cursor in its input.
+    /// Show the existing panel in its chosen placement and put the cursor in its input.
     pub(in crate::app) fn show_agent_panel(&mut self) {
+        let placement = self.agent_placement();
+        if placement != AgentPlacement::Docked {
+            if let Err(error) = self.remove_docked_agent_panes() {
+                self.show_error(error);
+                return;
+            }
+            if self.window_session.focus() != FocusTarget::Agent {
+                self.agent.normal = false;
+            }
+            self.agent.overlay = Some(placement);
+            self.window_session.focus_agent_overlay();
+            self.reconcile_editor_windows();
+            return;
+        }
+        if self.agent.overlay.is_some() {
+            // The overlay is unhosted during the split setup, but the agent is still shown.
+            self.agent.overlay = Some(AgentPlacement::Docked);
+            self.window_session.return_from_agent_overlay();
+            self.reconcile_editor_windows();
+        }
         let previous = self.active_tab_focus();
         if self.agent_pane().is_none() {
             let pane_width = crate::ui::active_editor_pane_viewport(&self.state, &self.ui)
@@ -2398,8 +2544,15 @@ impl App {
             if let Err(error) = shown {
                 self.show_error(error);
             }
-            // A plain split would give the panel half the screen; it opens narrower.
-            if let (Some(code), Some(panel)) = (previous, self.active_tab_focus()) {
+            if let (Some(code), Some(panel)) = (previous, self.agent_pane())
+                && code != panel
+            {
+                self.agent
+                    .docked_return_panes
+                    .retain(|&pane, _| self.state.window_view(pane).is_some());
+                self.agent.docked_return_panes.insert(panel, code);
+
+                // A plain split would give the panel half the screen; it opens narrower.
                 let share = u32::from(self.configuration.settings().agents.panel_width) * 10;
                 // A conversation needs about 40 columns, however narrow the terminal is.
                 let readable =
@@ -2417,12 +2570,14 @@ impl App {
                         1_000u16.saturating_sub(share)
                     },
                 );
-                if left && code != panel {
+                if left {
                     let _ = self.state.swap_panes(code, panel);
                 }
             }
         }
+        self.agent.overlay = None;
         let Some(pane) = self.agent_pane() else {
+            self.reconcile_editor_windows();
             return;
         };
         // Coming from another window starts typing, as in a chat box.
@@ -2437,17 +2592,62 @@ impl App {
     }
 
     pub(in crate::app) fn agent_pane(&self) -> Option<crate::windows::WindowId> {
+        self.agent_pane_in(self.state.active_tab()?)
+    }
+
+    fn agent_pane_in(
+        &self,
+        tab: crate::windows::WorkspaceTabId,
+    ) -> Option<crate::windows::WindowId> {
         let buffer = self.agent.buffer?;
-        let shown = self.state.active_tab_views();
-        shown
-            .into_iter()
-            .find(|view| {
-                self.state
-                    .views
-                    .get(*view)
-                    .is_some_and(|view| view.buffer == buffer)
-            })
-            .and_then(|view| self.state.view_window(view))
+        self.state.tab_windows(tab).into_iter().find(|&pane| {
+            self.state
+                .window_view(pane)
+                .and_then(|view| self.state.views.get(view))
+                .is_some_and(|view| view.buffer == buffer)
+        })
+    }
+
+    fn docked_agent_return_pane(
+        &mut self,
+        panel: WindowId,
+        focused: Option<WindowId>,
+    ) -> Option<WindowId> {
+        let previous = self.agent.docked_return_panes.remove(&panel);
+        focused.filter(|&pane| pane != panel).or(previous)
+    }
+
+    fn remove_docked_agent_panes(&mut self) -> Result<(), &'static str> {
+        let active = self.state.active_tab();
+        let tabs = self
+            .state
+            .editor_tabs()
+            .map(|tab| tab.id)
+            .filter(|&tab| self.agent_pane_in(tab).is_some())
+            .collect::<Vec<_>>();
+        for tab in tabs {
+            let mut previous = self.state.tab_focused_window(tab);
+            while let Some(pane) = self.agent_pane_in(tab) {
+                previous = self.docked_agent_return_pane(pane, previous);
+                self.state.activate_tab(tab)?;
+                self.state.focus_pane_id(pane)?;
+                if self.state.tab_windows(tab).len() == 1 {
+                    // The tab can outlive its last real editor view. Keep it, but replace
+                    // the agent view with a scratch buffer instead of leaving a stale host.
+                    self.state.replace_active_view(None)?;
+                } else {
+                    self.state.close_active_pane()?;
+                }
+            }
+            if let Some(previous) = previous.filter(|&pane| self.state.window_view(pane).is_some())
+            {
+                self.state.focus_pane_id(previous)?;
+            }
+        }
+        if let Some(active) = active.filter(|&tab| self.state.active_tab() != Some(tab)) {
+            self.state.activate_tab(active)?;
+        }
+        Ok(())
     }
 
     fn active_tab_focus(&self) -> Option<crate::windows::WindowId> {
@@ -2463,34 +2663,129 @@ impl App {
         self.state.window_view(self.agent_pane()?)
     }
 
+    fn agent_panel_surface(&self) -> Option<AgentPanelSurface> {
+        if self.agent_overlay_placement().is_some() {
+            let ids = self.window_session.native_ids().agent()?;
+            self.compositor_projection()?.window(ids.window)?;
+            return Some(AgentPanelSurface::Overlay(ids.window));
+        }
+        self.agent_view().map(AgentPanelSurface::Docked)
+    }
+
+    fn agent_panel_rect(&self, surface: AgentPanelSurface) -> Option<WindowRect> {
+        match surface {
+            AgentPanelSurface::Docked(view) => {
+                let pane = crate::ui::view_pane_viewport(&self.state, &self.ui, view)?;
+                Some(WindowRect {
+                    x: pane.x,
+                    y: pane.y,
+                    width: pane.width,
+                    height: pane.height,
+                })
+            }
+            AgentPanelSurface::Overlay(window) => {
+                let projected = self.compositor_projection()?.window(window)?;
+                Some(agent_overlay_body(&projected))
+            }
+        }
+    }
+
+    fn agent_transcript_width(&self, surface: AgentPanelSurface) -> usize {
+        self.agent_panel_rect(surface)
+            .map_or(80, |rect| usize::from(rect.width))
+            .saturating_sub(2)
+            .max(1)
+    }
+
     /// Whether keys go to the panel's input.
     pub(in crate::app) fn agent_input_focused(&self) -> bool {
-        self.ui
-            .agent_panel
-            .as_ref()
-            .is_some_and(|panel| Some(panel.view) == self.state.active_view())
+        match self.ui.agent_panel.as_ref().map(|panel| panel.surface) {
+            Some(AgentPanelSurface::Overlay(_)) => {
+                self.window_session.focus() == FocusTarget::Agent
+            }
+            Some(AgentPanelSurface::Docked(view)) => {
+                !self.window_session.dashboard_visible()
+                    && self.window_session.focus() == FocusTarget::Editor
+                    && self.state.active_view() == Some(view)
+            }
+            None => false,
+        }
+    }
+
+    fn focused_agent_terminal_overlay(&self) -> Option<PtyId> {
+        let id = self.keyboard_terminal()?;
+        (self.agent_terminal(id)
+            && matches!(
+                self.current_native_placement(NativeSurfaceTarget::Terminal(id.0)),
+                Ok(WindowPlacement::Floating(_) | WindowPlacement::Fullscreen)
+            ))
+        .then_some(id)
+    }
+
+    pub(in crate::app) fn agent_overlay_keyboard_target(&self) -> bool {
+        self.agent.overlay.is_some() && self.window_session.focus() == FocusTarget::Agent
+            || self.focused_agent_terminal_overlay().is_some()
+    }
+
+    pub(in crate::app) fn escape_terminal_agent_overlay(&mut self) {
+        if let Some(id) = self.focused_agent_terminal_overlay() {
+            self.hide_agent_terminal(id);
+        }
+    }
+
+    pub(in crate::app) fn hide_agent_terminal(&mut self, id: PtyId) -> bool {
+        match self.apply_native_window_placement(
+            NativeSurfaceTarget::Terminal(id.0),
+            WindowPlacement::Hidden,
+        ) {
+            Ok(()) => true,
+            Err(error) => {
+                self.show_error(error);
+                false
+            }
+        }
+    }
+
+    pub(in crate::app) fn focus_from_agent_overlay(&mut self, direction: SpatialDirection) -> bool {
+        if let Some(id) = self.focused_agent_terminal_overlay() {
+            if !self.hide_agent_terminal(id) {
+                return false;
+            }
+            if self.focus_surface(direction) {
+                return true;
+            }
+            self.show_agent_terminal(id);
+        } else {
+            let normal = self.agent.normal;
+            self.hide_agent_panel();
+            if self.focus_surface(direction) {
+                return true;
+            }
+            self.show_agent_panel();
+            self.agent.normal = normal;
+            self.sync_agent_chrome();
+            self.sync_agent_input();
+        }
+        false
     }
 
     /// Build what the panel draws from the active session.
     pub(in crate::app) fn refresh_agent_transcript(&mut self) {
-        let Some(view) = self.agent_view() else {
+        let Some(surface) = self.agent_panel_surface() else {
             self.ui.agent_panel = None;
             return;
         };
-        let width = crate::ui::view_pane_viewport(&self.state, &self.ui, view)
-            .map_or(80, |viewport| usize::from(viewport.width))
-            .saturating_sub(2)
-            .max(1);
-        let same_width = self.agent.width == width;
+        let width = self.agent_transcript_width(surface);
         self.agent.width = width;
         let mut text = Styled {
             ambiguous_width: self.configuration.settings().editor.ambiguous_width,
             ..Styled::default()
         };
         let mut bands = Vec::new();
+        let entry_starts;
         let (status, settings) = match self.active_agent() {
             Some(session) => {
-                transcript(
+                entry_starts = transcript(
                     &mut text,
                     &mut bands,
                     &session.name,
@@ -2507,6 +2802,7 @@ impl App {
                 (shown_root(&session.root, width / 2), settings)
             }
             None => {
+                entry_starts = vec![(0, 0)];
                 let agents = &self.configuration.settings().agents;
                 let name = &agents.default;
                 let ask = if name.is_empty() {
@@ -2543,16 +2839,10 @@ impl App {
                 (String::new(), String::new())
             }
         };
-        let lines = crate::ui::transcript_lines(&text.text, &bands).len();
-        if self.agent.scroll > 0 && same_width {
-            self.agent.scroll = self
-                .agent
-                .scroll
-                .saturating_add(lines.saturating_sub(self.agent.lines));
-        }
-        self.agent.lines = lines;
+        self.agent.lines = crate::ui::transcript_lines(&text.text, &bands).len();
+        self.agent.transcript_entries = entry_starts;
         self.ui.agent_panel = Some(AgentPanelUi {
-            view,
+            surface,
             tabs: Vec::new(),
             transcript: text,
             bands,
@@ -2618,7 +2908,14 @@ impl App {
                 let busy = match (session.working(), session.phase) {
                     (false, _) => String::new(),
                     (true, Phase::Prompting(_)) if self.agent.normal => {
-                        format!("{spinner} Working · esc to stop")
+                        if self.agent.overlay.is_some() {
+                            format!("{spinner} Working · esc to hide")
+                        } else {
+                            format!("{spinner} Working · esc to stop")
+                        }
+                    }
+                    (true, Phase::Prompting(_)) if self.agent.overlay.is_some() => {
+                        format!("{spinner} Working · esc twice to hide")
                     }
                     (true, Phase::Prompting(_)) => format!("{spinner} Working · esc esc to stop"),
                     (true, _) => format!("{spinner} Starting"),
@@ -2745,8 +3042,8 @@ impl App {
         let menu = self.slash_menu();
         self.agent.selected = self.agent.selected.min(menu.len().saturating_sub(1));
         let viewport = self
-            .agent_view()
-            .and_then(|view| crate::ui::view_pane_viewport(&self.state, &self.ui, view));
+            .agent_panel_surface()
+            .and_then(|surface| self.agent_panel_rect(surface));
         if let Some(panel) = self.ui.agent_panel.as_mut() {
             panel.selected = self.agent.selected;
             panel.menu = menu;
@@ -2756,32 +3053,39 @@ impl App {
                     viewport.width,
                     viewport.height,
                 );
-                self.agent.scroll = self
+                let hidden = self.agent.lines.saturating_sub(height);
+                let first = self
                     .agent
-                    .scroll
-                    .min(self.agent.lines.saturating_sub(height));
+                    .scroll_position
+                    .and_then(|position| {
+                        position.byte(&panel.transcript.text, &self.agent.transcript_entries)
+                    })
+                    .map_or_else(
+                        || hidden.saturating_sub(self.agent.scroll),
+                        |byte| {
+                            crate::ui::transcript_lines(&panel.transcript.text, &panel.bands)
+                                .partition_point(|line| line.start <= byte)
+                                .saturating_sub(1)
+                        },
+                    );
+                self.agent.scroll = hidden.saturating_sub(first);
+                panel.scroll = self.agent.scroll;
             }
-            panel.scroll = self.agent.scroll;
         }
     }
 
     /// The panel's width changed or it moved to another view: wrap the transcript again.
     pub(in crate::app) fn follow_agent_pane(&mut self) {
-        let Some(view) = self.agent_view() else {
-            if self.ui.agent_panel.is_some() {
-                self.ui.agent_panel = None;
-            }
+        let Some(surface) = self.agent_panel_surface() else {
+            self.ui.agent_panel = None;
             return;
         };
-        let width = crate::ui::view_pane_viewport(&self.state, &self.ui, view)
-            .map_or(80, |viewport| usize::from(viewport.width))
-            .saturating_sub(2)
-            .max(1);
+        let width = self.agent_transcript_width(surface);
         if self
             .ui
             .agent_panel
             .as_ref()
-            .is_none_or(|panel| panel.view != view)
+            .is_none_or(|panel| panel.surface != surface)
             || width != self.agent.width
         {
             self.refresh_agent_transcript();
@@ -2822,7 +3126,7 @@ impl App {
                     if !self.run_panel_command(&name) {
                         self.agent.input.clear();
                         self.agent.cursor = 0;
-                        self.agent.scroll = 0;
+                        self.reset_agent_scroll();
                         self.agent_ask(format!("/{name}"));
                     }
                     return;
@@ -2850,7 +3154,7 @@ impl App {
             "submit" => {
                 let question = std::mem::take(input);
                 self.agent.cursor = 0;
-                self.agent.scroll = 0;
+                self.reset_agent_scroll();
                 self.agent_ask(question);
                 return;
             }
@@ -3018,16 +3322,50 @@ impl App {
         true
     }
 
+    fn reset_agent_scroll(&mut self) {
+        self.agent.scroll = 0;
+        self.agent.scroll_position = None;
+    }
+
     /// Scroll the transcript; positive is up, toward older output.
     pub(in crate::app) fn scroll_agent(&mut self, rows: i64) {
         let rows = isize::try_from(rows).unwrap_or(0);
-        self.agent.scroll = self.agent.scroll.saturating_add_signed(rows);
+        let current = self
+            .ui
+            .agent_panel
+            .as_ref()
+            .map_or(self.agent.scroll, |panel| panel.scroll);
+        self.agent.scroll = current.saturating_add_signed(rows);
+        self.agent.scroll_position = None;
         self.sync_agent_input();
+        self.agent.scroll_position = (self.agent.scroll > 0)
+            .then(|| {
+                let panel = self.ui.agent_panel.as_ref()?;
+                let rect = self.agent_panel_rect(panel.surface)?;
+                let height =
+                    panel.transcript_height(self.configuration.settings(), rect.width, rect.height);
+                let start = self
+                    .agent
+                    .lines
+                    .saturating_sub(height)
+                    .saturating_sub(panel.scroll);
+                let lines = crate::ui::transcript_lines(&panel.transcript.text, &panel.bands);
+                TranscriptPosition::at(
+                    &panel.transcript.text,
+                    &self.agent.transcript_entries,
+                    lines.get(start)?.start,
+                )
+            })
+            .flatten();
     }
 
-    /// Escape in Normal mode: close the slash-command menu, or stop a turn that is running.
-    /// Insert mode's Escape goes to Normal; `ctrl-h/l` leave the panel like any window.
+    /// Escape in Normal mode hides an overlay; in a split it dismisses the menu or stops a turn.
+    /// Insert mode's Escape goes to Normal.
     pub(in crate::app) fn agent_escape(&mut self) {
+        if self.agent.overlay.is_some() {
+            self.hide_agent_panel();
+            return;
+        }
         if !self.slash_menu().is_empty() {
             self.agent.input.clear();
             self.agent.cursor = 0;
@@ -3056,13 +3394,38 @@ impl App {
         row: u16,
     ) -> bool {
         use crate::editor::input::TerminalMouseInput;
-        let Some(view) = self.ui.agent_panel.as_ref().map(|panel| panel.view) else {
+        let Some(surface) = self.agent_panel_surface() else {
             return false;
         };
-        let Some(viewport) = crate::ui::editor_pane_viewport_at(&self.state, &self.ui, column, row)
-            .filter(|viewport| viewport.view == view)
-        else {
-            return false;
+        let viewport = match surface {
+            AgentPanelSurface::Docked(view) => {
+                let Some(pane) =
+                    crate::ui::editor_pane_viewport_at(&self.state, &self.ui, column, row)
+                        .filter(|pane| pane.view == view)
+                else {
+                    return false;
+                };
+                WindowRect {
+                    x: pane.x,
+                    y: pane.y,
+                    width: pane.width,
+                    height: pane.height,
+                }
+            }
+            AgentPanelSurface::Overlay(window) => {
+                let Some(projected) = self
+                    .compositor_projection()
+                    .and_then(|projection| projection.window(window))
+                    .filter(|projected| {
+                        let rect = projected.rect;
+                        (rect.x..rect.x + rect.width).contains(&column)
+                            && (rect.y..rect.y + rect.height).contains(&row)
+                    })
+                else {
+                    return false;
+                };
+                agent_overlay_body(&projected)
+            }
         };
         match key.terminal_mouse() {
             Some(TerminalMouseInput::ScrollUp) => self.scroll_agent(3),
@@ -3085,7 +3448,7 @@ impl App {
                 if let Some(index) = tab {
                     // A middle click closes the tab, as on the buffer line.
                     self.agent.active = index;
-                    self.agent.scroll = 0;
+                    self.reset_agent_scroll();
                     if matches!(input, TerminalMouseInput::MiddleDown) {
                         self.close_agent_session();
                     }
@@ -3273,7 +3636,8 @@ fn transcript(
     entries: &[Entry],
     width: usize,
     tools: bool,
-) {
+) -> Vec<(usize, usize)> {
+    let mut starts = Vec::new();
     let plain = ("", None);
     let quote = Some(Highlight::QUOTE);
     // A call can start without a title; it shows once it has one.
@@ -3289,6 +3653,8 @@ fn transcript(
         if !shown(entry) {
             continue;
         }
+        let entry_index = index - 1;
+        let start = out.text.len();
         // A blank line between tool calls and the prose around them, and between two calls.
         if matches!(
             (previous, entry),
@@ -3327,7 +3693,6 @@ fn transcript(
                     let bar = ("▎ ", quote);
                     out.wrapped(text, quote, bar, bar, width);
                 }
-                continue;
             }
             Entry::Tool(call) if tools => tool_call(out, bands, call, root, width),
             Entry::Tool(call) => {
@@ -3368,8 +3733,14 @@ fn transcript(
                 out.wrapped(text, quote, plain, plain, width);
             }
         }
-        previous = Some(entry);
+        if out.text.len() > start {
+            starts.push((entry_index, start));
+        }
+        if !matches!(entry, Entry::Thought(_)) {
+            previous = Some(entry);
+        }
     }
+    starts
 }
 
 fn tool_tint(call: &ToolCall) -> ToolTint {

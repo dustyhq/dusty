@@ -3568,6 +3568,11 @@ arguments = { direction = 1 }
 # Terminal normal mode is host-owned over bounded scrollback. The PTY keeps
 # running, but navigation and yanks never become process input.
 [[keymap]]
+id = "builtin.terminal-normal.surface.terminal-escape.escape"
+context = "terminal_normal"
+keys = "escape"
+command = "terminal.escape"
+[[keymap]]
 id = "builtin.terminal-normal.surface.terminal-mode-input.i"
 context = "terminal_normal"
 keys = "i"
@@ -5388,6 +5393,20 @@ context = "global"
 keys = "<leader> u h"
 command = "lsp.inlay_hints.toggle"
 desc = "Toggle Inlay Hints"
+
+[[keymap]]
+id = "builtin.global.ui-inline-diagnostics"
+context = "global"
+keys = "<leader> u d"
+command = "lsp.inline_diagnostics.toggle"
+desc = "Toggle Messages Beside Code"
+
+[[keymap]]
+id = "builtin.global.ui-auto-completion"
+context = "global"
+keys = "<leader> u c"
+command = "lsp.auto_completion.toggle"
+desc = "Toggle Completion While Typing"
 
 [[keymap]]
 id = "builtin.global.ui-wrap"

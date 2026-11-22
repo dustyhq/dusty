@@ -102,8 +102,8 @@ use visual_rows::VisualRowSlice;
 
 pub use agent::AgentListRow;
 
-pub use agent::AgentPanelUi;
 pub use agent::TranscriptBand;
+pub use agent::{AgentPanelSurface, AgentPanelUi, agent_overlay_body};
 
 pub use agent::transcript_lines;
 
@@ -2346,6 +2346,29 @@ pub fn render_with_documentation_geometry(
         }
     }
     if let Some(compositor) = compositor {
+        let agent_overlay = ui.agent_panel.as_ref().and_then(|panel| {
+            let AgentPanelSurface::Overlay(window) = panel.surface else {
+                return None;
+            };
+            Some((panel, compositor.projection.window(window)?))
+        });
+        if let Some((panel, projected)) = agent_overlay
+            && projected.layer == crate::windows::CompositorLayer::Fullscreen
+        {
+            agent::render_agent_overlay(&mut frame, panel, &projected, config);
+        }
+        if let Some(panel) = &ui.problems_panel
+            && let Some(projected) = compositor
+                .surfaces
+                .problems_panel
+                .and_then(|window| compositor.projection.window(window))
+            && projected.layer != crate::windows::CompositorLayer::Floating
+        {
+            problems::render(&mut frame, panel, config, projected.rect, projected.focused);
+            if projected.focused {
+                frame.cursor = None;
+            }
+        }
         let mut plugin_surfaces = ui
             .plugin_surfaces
             .iter()
@@ -2403,7 +2426,22 @@ pub fn render_with_documentation_geometry(
             .iter()
             .filter(|window| window.layer == crate::windows::CompositorLayer::Floating)
         {
+            if let Some((panel, agent)) = agent_overlay
+                && agent.window == projected.window
+            {
+                agent::render_agent_overlay(&mut frame, panel, projected, config);
+                continue;
+            }
             if render_non_tiled_editor_window(&mut frame, state, ui, config, projected) {
+                continue;
+            }
+            if compositor.surfaces.problems_panel == Some(projected.window) {
+                if let Some(panel) = &ui.problems_panel {
+                    problems::render(&mut frame, panel, config, projected.rect, projected.focused);
+                    if projected.focused {
+                        frame.cursor = None;
+                    }
+                }
                 continue;
             }
             if compositor.surfaces.dashboard == Some(projected.window) {
@@ -2573,8 +2611,15 @@ pub fn render_with_documentation_geometry(
         let panel = ui
             .agent_panel
             .as_ref()
-            .and_then(|panel| view_pane_viewport(state, ui, panel.view))
-            .map(|viewport| viewport.x);
+            .and_then(|panel| match panel.surface {
+                AgentPanelSurface::Docked(view) => {
+                    view_pane_viewport(state, ui, view).map(|pane| pane.x)
+                }
+                AgentPanelSurface::Overlay(window) => compositor?
+                    .projection
+                    .window(window)
+                    .map(|pane| pane.rect.x),
+            });
         let place = (ui.key_hints.is_some(), panel);
         render_tutor_card(&mut frame, card, config, width, height - foot_rows, place);
     }

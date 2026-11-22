@@ -222,6 +222,31 @@ the child process.
 
 Terminal processes are never restored as fake live sessions. Zero-exit terminals close automatically; failed terminals retain bounded output.
 
+## Agent
+
+Press `<leader> a a` (`Space a a` by default, `agent.toggle`) to show or hide the agent.
+With `connection = "acp"`, Dusty shows the conversation and input; with
+`connection = "terminal"`, the agent's own program runs in a terminal. Either
+connection uses the same **Agent Placement** setting:
+
+```toml
+[agents]
+placement = "docked" # "docked", "float", or "fullscreen"
+float_width_percent = 80
+float_height_percent = 85
+```
+
+`docked` (the default) opens a split beside the editor using `side` and
+`panel_width`. `float` opens a centred window; its width and height are shares of
+the screen, each from 50 to 100 percent. `fullscreen` fills the screen. Floating
+and fullscreen do not rearrange editor splits.
+
+Run `agent.float`, `agent.fullscreen`, or `agent.dock` from the command palette to
+move the current session without restarting it or changing the saved setting.
+In a floating or fullscreen agent, Escape in Normal mode hides the window;
+`Ctrl-h/j/k/l` hands the keyboard to the window in that direction when there is
+one. For a terminal agent, press Escape twice to enter terminal Normal mode.
+
 ## Git
 
 `Space g g` (or `:workspace.git.open`) opens the native Dusty Git workspace in a

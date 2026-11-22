@@ -415,10 +415,19 @@ impl WindowGraph {
     #[must_use]
     pub fn compositor_snapshot(&self, tab: WorkspaceTabId) -> Option<CompositorSnapshot> {
         self.workspace_tabs.get(&tab)?;
-        let windows = self
+        let mut windows = self
             .windows
             .values()
             .filter(|window| window.tab == tab)
+            .collect::<Vec<_>>();
+        // A retained float comes to the front when shown again, without changing its
+        // identity or the ordering of docks and overlays.
+        windows.sort_by_key(|window| {
+            let floating = matches!(window.placement, WindowPlacement::Floating(_));
+            (floating, if floating { window.floating_since } else { 0 })
+        });
+        let windows = windows
+            .into_iter()
             .filter_map(|window| {
                 let view = self.views.get(&window.view)?;
                 let content = self.contents.get(&view.content)?;
@@ -545,6 +554,7 @@ impl WindowGraph {
                 } else {
                     placement
                 },
+                floating_since: self.revision,
                 focusable,
                 owner,
                 instance_id,
@@ -635,6 +645,11 @@ impl WindowGraph {
         }
         descriptor.placement = placement;
         descriptor.focusable = focusable;
+        if matches!(placement, WindowPlacement::Floating(_))
+            && (previous_tab != tab || !matches!(previous_placement, WindowPlacement::Floating(_)))
+        {
+            descriptor.floating_since = self.revision;
+        }
         if placement == WindowPlacement::Tiled
             && let Some(workspace_tab) = self.workspace_tabs.get_mut(&tab)
             && workspace_tab
@@ -787,6 +802,11 @@ impl WindowGraph {
             descriptor.restore_placement = previous_placement;
         }
         descriptor.placement = placement;
+        if matches!(placement, WindowPlacement::Floating(_))
+            && !matches!(previous_placement, WindowPlacement::Floating(_))
+        {
+            descriptor.floating_since = self.revision;
+        }
         if placement == WindowPlacement::Tiled
             && let Some(workspace_tab) = self.workspace_tabs.get_mut(&tab)
             && workspace_tab

@@ -1,8 +1,6 @@
 //! The agent panel: its session tabs on top (drawn like the buffer line), the conversation,
 //! the subagents or the slash-command menu, the input box with what the agent is doing in
-//! its top border, and a footer with where the session works and its model. It is drawn in
-//! place of the pane that holds it, so the pane still moves, resizes and zooms like any
-//! other window.
+//! its top border, and a footer with where the session works and its model.
 
 use crate::grid::CONTROL_CHARACTER_REPLACEMENT;
 
@@ -17,6 +15,7 @@ use crate::config::AmbiguousWidth;
 use crate::config::Config;
 
 use crate::editor::ViewId;
+use crate::windows::{CompositorLayer, ProjectedCompositorWindow, WindowId, WindowRect};
 
 use crate::CellGrid;
 
@@ -55,10 +54,17 @@ pub struct AgentListRow {
     pub status: String,
 }
 
-/// What the session hands the renderer for the pane that shows `view`.
+/// The host of the agent panel, either a tiled editor view or a native window.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AgentPanelSurface {
+    Docked(ViewId),
+    Overlay(WindowId),
+}
+
+/// What the session hands the renderer for its visible panel.
 #[derive(Clone, Debug)]
 pub struct AgentPanelUi {
-    pub view: ViewId,
+    pub surface: AgentPanelSurface,
     /// The sessions, as buffer-line entries whose identity is the session's index.
     pub tabs: Vec<ContentTabEntry>,
     /// The conversation, wrapped to the pane's width less the side padding.
@@ -123,6 +129,63 @@ impl AgentPanelUi {
         );
         let (rows, _) = wrap_input(&self.input, self.cursor, usize::from(width - 2), &grid);
         self.transcript_height_for_input(height, rows.len())
+    }
+}
+
+/// The panel body excludes the floating window's one-cell frame.
+#[must_use]
+pub fn agent_overlay_body(projected: &ProjectedCompositorWindow) -> WindowRect {
+    let rect = projected.rect;
+    if projected.layer == CompositorLayer::Floating && rect.width > 2 && rect.height > 2 {
+        WindowRect {
+            x: rect.x + 1,
+            y: rect.y + 1,
+            width: rect.width - 2,
+            height: rect.height - 2,
+        }
+    } else {
+        rect
+    }
+}
+
+pub(super) fn render_agent_overlay(
+    frame: &mut Frame,
+    panel: &AgentPanelUi,
+    projected: &ProjectedCompositorWindow,
+    config: &Config,
+) {
+    let rect = agent_overlay_body(projected);
+    let outer = projected.rect;
+    if rect != outer {
+        super::settings::draw_box(frame, outer.x, outer.y, outer.width, outer.height);
+    }
+    let rendered = render_agent_panel(
+        panel,
+        projected.focused,
+        config,
+        rect.width,
+        rect.height,
+        false,
+    );
+    for y in 0..rect.height {
+        for x in 0..rect.width {
+            if let Some(cell) = rendered.grid.get(x, y)
+                && !cell.continuation
+            {
+                frame
+                    .grid
+                    .set_cell(rect.x + x, rect.y + y, &cell.symbol, cell.style);
+            }
+        }
+    }
+    if projected.focused {
+        frame.cursor = rendered
+            .cursor
+            .map(|(x, y, shape)| (rect.x + x, rect.y + y, shape));
+    } else if frame.cursor.is_some_and(|(x, y, _)| {
+        x >= outer.x && x < outer.x + outer.width && y >= outer.y && y < outer.y + outer.height
+    }) {
+        frame.cursor = None;
     }
 }
 
@@ -467,7 +530,7 @@ mod tests {
 
     fn panel() -> AgentPanelUi {
         AgentPanelUi {
-            view: ViewId::default(),
+            surface: AgentPanelSurface::Docked(ViewId::default()),
             tabs: Vec::new(),
             transcript: Styled::default(),
             bands: Vec::new(),
@@ -484,6 +547,44 @@ mod tests {
             status: String::new(),
             settings: String::new(),
         }
+    }
+
+    #[test]
+    fn floating_agent_frame_and_cursor_use_the_projected_rectangle() {
+        let config = Config::default();
+        let mut panel = panel();
+        panel.input = "draft".to_owned();
+        panel.cursor = panel.input.len();
+        let mut frame = Frame {
+            grid: CellGrid::new_with_policy(
+                80,
+                24,
+                CONTROL_CHARACTER_REPLACEMENT,
+                ZERO_WIDTH_REPLACEMENT,
+                false,
+            ),
+            cursor: None,
+        };
+        frame.grid.set_cell(7, 2, "E", Style::Default);
+        let projected = ProjectedCompositorWindow {
+            window: WindowId(1),
+            rect: WindowRect {
+                x: 8,
+                y: 2,
+                width: 64,
+                height: 20,
+            },
+            layer: CompositorLayer::Floating,
+            z_index: 1,
+            focused: true,
+            focusable: true,
+        };
+        render_agent_overlay(&mut frame, &panel, &projected, &config);
+        assert_eq!(frame.grid.get(7, 2).unwrap().symbol, "E");
+        assert_eq!(frame.grid.get(8, 2).unwrap().style, Style::Border);
+        assert!((3..21).any(|y| frame.grid.row_text(y).contains("draft")));
+        let (x, y, _) = frame.cursor.expect("focused agent cursor");
+        assert!((9..71).contains(&x) && (3..21).contains(&y));
     }
 
     #[test]

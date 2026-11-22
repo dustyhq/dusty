@@ -169,9 +169,22 @@ impl Windows {
         if state.graph != candidate.core.graph {
             state.graph = candidate.core.graph.clone();
         }
+        let covered_shell = self.core.native.covered_shell_id();
         candidate.core.source = Some(state.window_version());
         self.core = candidate.core;
         self.accept_graph_focus();
+        if let Some(id) = covered_shell
+            && self.core.native.covered_shell_id().is_none()
+            && self.focused_terminal() == Some(id)
+            && self
+                .core
+                .graph
+                .focused()
+                .and_then(|window| self.core.graph.window(window))
+                .is_some_and(|window| window.placement == WindowPlacement::Fullscreen)
+        {
+            self.restored_agent_shell = Some(id);
+        }
         self.epoch = epoch;
         self.invalidate();
         Ok(())
@@ -545,10 +558,18 @@ impl Windows {
         state: &mut crate::editor::EditorState,
     ) -> Result<(), String> {
         self.require_projected_graph()?;
+        let sets_terminal_height = matches!(target, NativeSurfaceTarget::Terminal(id)
+            if !self.core.native.is_agent_terminal(id));
         let hiding_focused_terminal = placement == WindowPlacement::Hidden
             && matches!(target, NativeSurfaceTarget::Terminal(id) if self.focused_terminal() == Some(id));
         let mut candidate = self.candidate()?;
         let core = &mut candidate.core;
+        let covered_shell = match target {
+            NativeSurfaceTarget::Terminal(id) if placement == WindowPlacement::Hidden => {
+                core.native.take_shell_covered_by_terminal_agent(id)
+            }
+            _ => None,
+        };
         if placement == WindowPlacement::Hidden
             && let Some(current) = core
                 .native
@@ -568,11 +589,16 @@ impl Windows {
         core.graph
             .place(ids.window, placement)
             .map_err(|e| e.to_string())?;
+        if let Some(shell) = covered_shell {
+            core.graph
+                .place(shell, WindowPlacement::Fullscreen)
+                .map_err(|error| error.to_string())?;
+        }
         self.commit(candidate, state)?;
-        if hiding_focused_terminal {
+        if hiding_focused_terminal && covered_shell.is_none() {
             self.return_from_terminal();
         }
-        if matches!(target, NativeSurfaceTarget::Terminal(_)) {
+        if sets_terminal_height {
             match placement {
                 WindowPlacement::Docked {
                     edge: DockEdge::Top | DockEdge::Bottom,
@@ -730,7 +756,9 @@ impl Windows {
     ) -> Result<(), String> {
         let semantic_focus = match self.focus {
             crate::app::windows::FocusTarget::Explorer(_)
-            | crate::app::windows::FocusTarget::Terminal(_) => Some(self.focus),
+            | crate::app::windows::FocusTarget::Terminal(_)
+            | crate::app::windows::FocusTarget::ProblemsPanel
+            | crate::app::windows::FocusTarget::Agent => Some(self.focus),
             crate::app::windows::FocusTarget::Editor
             | crate::app::windows::FocusTarget::Plugin(_) => None,
         };
@@ -962,10 +990,21 @@ impl Windows {
         if !rules
             .iter()
             .any(|(content_type, _)| *content_type == "builtin.terminal")
-            && let Some(ids) = selected.and_then(|id| self.native_ids().terminal(id))
-            && let Some(window) = self.graph().window(ids.window)
+            && let Some(id) = selected
         {
-            rules.push(("builtin.terminal", window.placement));
+            let native = self.native_ids();
+            // An agent can hide a fullscreen shell in the graph without changing its rule.
+            let placement = if native.covered_shell_id() == Some(id) {
+                native.requested_terminal_placement(id)
+            } else {
+                native
+                    .terminal(id)
+                    .and_then(|ids| self.graph().window(ids.window))
+                    .map(|window| window.placement)
+            };
+            if let Some(placement) = placement {
+                rules.push(("builtin.terminal", placement));
+            }
         }
         rules
             .into_iter()
