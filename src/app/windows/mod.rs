@@ -467,7 +467,7 @@ impl App {
                 PromptKind::DirtyClose,
                 title,
                 message,
-                crate::ui::ConfirmationChoice::No,
+                crate::ui::ConfirmationChoice::Yes,
                 "Save",
                 "Discard",
             ),

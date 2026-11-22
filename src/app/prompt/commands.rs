@@ -5,6 +5,34 @@ use crate::app::commands::AppEffect;
 use crate::ui::PromptKind;
 
 impl App {
+    pub(in crate::app) fn confirmation_requires_fresh_key(&self, command: &str) -> bool {
+        let Some(prompt) = self.input.prompt() else {
+            return false;
+        };
+        // Vim lets a held y or n answer successive substitute confirmations.
+        if self.search.help_is_open() || prompt.kind == PromptKind::SubstituteConfirm {
+            return false;
+        }
+        if prompt.confirmation.is_none() && prompt.kind != PromptKind::GitReset {
+            return false;
+        }
+        match command {
+            "command_line.submit"
+            | "command_line.cancel"
+            | "surface.confirmation.select_yes"
+            | "surface.confirmation.select_no"
+            | "surface.confirmation.toggle" => true,
+            // In a button prompt these choose a button, rather than moving a caret.
+            "command_line.move_left"
+            | "command_line.move_right"
+            | "command_line.move_word_left"
+            | "command_line.move_word_right"
+            | "command_line.move_home"
+            | "command_line.move_end" => prompt.confirmation.is_some(),
+            _ => false,
+        }
+    }
+
     pub(in crate::app) fn process_prompt_effect(
         &mut self,
         effect: AppEffect,

@@ -317,102 +317,143 @@ impl InputState {
         result
     }
 
-    pub(in crate::app) fn resolve(
+    fn mapping_layers<'a>(
+        temporary: &'a [EditorKeymapLayer],
+        mode: Option<&'a NamedMode>,
+        bindings: &'a ResolvedKeymaps,
+        context: &'a str,
+    ) -> impl Iterator<Item = &'a Keymap> {
+        let editor = context.starts_with("editor.");
+        let inherit = !editor || mode.is_none_or(|mode| mode.base().is_some());
+        temporary
+            .iter()
+            .rev()
+            .filter(move |_| editor)
+            .map(|(_, layer)| layer)
+            .chain(mode.filter(|_| editor).map(NamedMode::layer))
+            .chain(bindings.layers(context).filter(move |_| inherit))
+    }
+
+    /// Find a shortcut that dispatch would actually run, without disturbing pending input.
+    pub(in crate::app) fn reachable_key(
+        &self,
+        bindings: &ResolvedKeymaps,
+        context: &str,
+        command: &str,
+    ) -> Option<String> {
+        let mode = self.named_mode.as_ref().map(|(_, _, mode)| mode);
+        let layers = || Self::mapping_layers(&self.key_layers, mode, bindings, context);
+        layers()
+            .flat_map(|layer| layer.command_sequences(command))
+            .filter(|keys| {
+                let mut sequence = KeymapSequence::default();
+                let mut result = MappingResolution::Missing;
+                for (index, key) in keys.iter().enumerate() {
+                    result = sequence.feed_layers(layers(), key.clone());
+                    if index + 1 < keys.len()
+                        && !matches!(result, MappingResolution::Pending | MappingResolution::Ambiguous)
+                    {
+                        return false;
+                    }
+                }
+                if result == MappingResolution::Ambiguous {
+                    result = sequence.flush_timeout();
+                }
+                matches!(result, MappingResolution::Ready(invocation) if invocation.id.as_str() == command)
+            })
+            .map(|keys| display_key_sequence(&keys))
+            .min()
+    }
+
+    fn resolve(
         &mut self,
         context: &str,
-        key: KeyEvent,
+        (key, kind): (KeyEvent, KeyInputKind),
         bindings: &ResolvedKeymaps,
         revision: u64,
         now: Instant,
         timeout: Duration,
-    ) -> MappingResolution {
+    ) -> (MappingResolution, MappingKeyKinds) {
         if self.pending.as_ref().is_some_and(|pending| {
             pending.context != context || pending.binding_revision != revision
         }) {
             self.cancel_mapping();
         }
-        let was_pending = self.pending.is_some();
-        let result = if context.starts_with("editor.") {
-            let mode = self.named_mode.as_ref().map(|(_, _, mode)| mode);
-            let inherit = mode.is_none_or(|mode| mode.base().is_some());
-            self.sequence.feed_layers(
-                self.key_layers
-                    .iter()
-                    .map(|(_, layer)| layer)
-                    .rev()
-                    .chain(mode.map(NamedMode::layer))
-                    .chain(bindings.layers(context).filter(|_| inherit)),
-                key,
-            )
-        } else {
-            bindings.resolve(&mut self.sequence, context, key)
-        };
-        match result {
-            MappingResolution::Pending | MappingResolution::Ambiguous => {
-                let started_at = self
-                    .pending
-                    .as_ref()
-                    .map_or(now, |pending| pending.started_at);
-                self.pending = Some(PendingKeymap {
-                    context: context.into(),
-                    prefix: display_key_sequence(self.sequence.pending_sequence()),
-                    started_at,
-                    // While typing, a key that may start a mapping (`j` of `jk`) is typed
-                    // once the wait is over, as in Vim; elsewhere a bare prefix waits.
-                    deadline: (matches!(result, MappingResolution::Ambiguous)
-                        || matches!(context, "editor.insert" | "editor.replace" | "snippet"))
-                    .then_some(now + timeout),
-                    binding_revision: revision,
-                });
+        let pending = self.pending.take();
+        let was_pending = pending.is_some();
+        let (started_at, mut key_kinds) = pending.map_or_else(
+            || (now, MappingKeyKinds::default()),
+            |p| (p.started_at, p.key_kinds),
+        );
+        key_kinds.push(kind);
+        let mode = self.named_mode.as_ref().map(|(_, _, mode)| mode);
+        let result = self.sequence.feed_layers(
+            Self::mapping_layers(&self.key_layers, mode, bindings, context),
+            key,
+        );
+        if matches!(
+            result,
+            MappingResolution::Pending | MappingResolution::Ambiguous
+        ) {
+            self.pending = Some(PendingKeymap {
+                context: context.into(),
+                prefix: display_key_sequence(self.sequence.pending_sequence()),
+                started_at,
+                // While typing, a key that may start a mapping (`j` of `jk`) is typed
+                // once the wait is over, as in Vim; elsewhere a bare prefix waits.
+                deadline: (matches!(result, MappingResolution::Ambiguous)
+                    || matches!(context, "editor.insert" | "editor.replace" | "snippet"))
+                .then_some(now + timeout),
+                binding_revision: revision,
+                key_kinds: std::mem::take(&mut key_kinds),
+            });
+            if !was_pending {
+                self.capture_changed();
             }
-            _ => self.pending = None,
-        }
-        if !was_pending && self.pending.is_some() {
-            self.capture_changed();
         }
         self.hints = None;
-        result
+        (result, key_kinds)
     }
     pub(in crate::app) fn mapping_context(&self) -> Option<&str> {
         self.pending
             .as_ref()
             .map(|pending| pending.context.as_str())
     }
-    pub(in crate::app) fn finish_mapping(
+    fn finish_mapping(
         &mut self,
         context: &str,
         revision: u64,
-    ) -> MappingResolution {
+    ) -> (MappingResolution, MappingKeyKinds) {
         let Some(pending) = self.pending.take() else {
-            return MappingResolution::Missing;
+            return (MappingResolution::Missing, MappingKeyKinds::default());
         };
         if pending.context != context || pending.binding_revision != revision {
             self.cancel_mapping();
-            return MappingResolution::Missing;
+            return (MappingResolution::Missing, MappingKeyKinds::default());
         }
         self.hints = None;
-        self.sequence.flush_timeout()
+        (self.sequence.flush_timeout(), pending.key_kinds)
     }
     pub(in crate::app) fn cancel_mapping(&mut self) {
         self.pending = None;
         self.sequence.cancel();
         self.hints = None;
     }
-    pub(in crate::app) fn flush_timeout(
+    fn flush_timeout(
         &mut self,
         context: &str,
         revision: u64,
         now: Instant,
-    ) -> MappingResolution {
+    ) -> (MappingResolution, MappingKeyKinds) {
         let Some(pending) = self.pending.as_ref() else {
-            return MappingResolution::Missing;
+            return (MappingResolution::Missing, MappingKeyKinds::default());
         };
         if pending.context != context || pending.binding_revision != revision {
             self.cancel_mapping();
-            return MappingResolution::Missing;
+            return (MappingResolution::Missing, MappingKeyKinds::default());
         }
         if pending.deadline.is_none_or(|deadline| now < deadline) {
-            return MappingResolution::Missing;
+            return (MappingResolution::Missing, MappingKeyKinds::default());
         }
         self.finish_mapping(context, revision)
     }
@@ -2256,8 +2297,10 @@ impl App {
                     KeyInputKind::Press | KeyInputKind::Repeat if self.flash.is_some() => {
                         self.handle_flash_key(&key);
                     }
-                    KeyInputKind::Press | KeyInputKind::Repeat => self.handle_configured_key(key),
-                    KeyInputKind::Release => self.handle_key_in_context("key_release", key),
+                    KeyInputKind::Press | KeyInputKind::Repeat => {
+                        self.handle_configured_key_with_kind(key, kind);
+                    }
+                    KeyInputKind::Release => self.handle_key_release(key),
                 }
             }
             UiEvent::Paste(text) => self.handle_configured_paste(text),
@@ -2927,9 +2970,9 @@ impl App {
             self.ui.expanded_diagnostic = None;
         }
         let context = context.to_owned();
-        let resolution = self.input.resolve(
+        let (resolution, key_kinds) = self.input.resolve(
             &context,
-            key.clone(),
+            (key.clone(), kind),
             self.configuration.keymaps(),
             self.configuration.binding_revision(),
             self.clock.monotonic(),
@@ -2938,13 +2981,10 @@ impl App {
         self.project_input_hints();
         match resolution {
             MappingResolution::Ready(invocation) => {
-                self.invoke_mapped(invocation);
+                self.dispatch_key_mapping(&context, Some(invocation), Vec::new(), &key_kinds);
             }
             MappingResolution::ReadyAndReplay(invocation, replay) => {
-                self.invoke_mapped(invocation);
-                for key in replay {
-                    self.handle_configured_key(key);
-                }
+                self.dispatch_key_mapping(&context, Some(invocation), replay, &key_kinds);
             }
             // A key that finishes no sequence ends it, as in Vim: `]q` must not go on to run `q`,
             // and `<leader>gz` must not start an operator. While typing, all the keys are text,
@@ -2961,20 +3001,16 @@ impl App {
                     self.input.cancel_pending();
                 } else {
                     self.type_unmapped(&context, &prefix);
-                    for key in replay {
-                        self.handle_configured_key(key);
-                    }
+                    self.dispatch_key_mapping(&context, None, replay, &key_kinds);
                 }
             }
             MappingResolution::DisabledAndReplay(replay) => {
-                for key in replay {
-                    self.handle_configured_key(key);
-                }
+                self.dispatch_key_mapping(&context, None, replay, &key_kinds);
             }
             MappingResolution::Disabled => {}
             MappingResolution::Pending | MappingResolution::Ambiguous => return,
             MappingResolution::Missing if context == "snippet" => {
-                self.handle_key_in_context("editor.insert", key);
+                self.handle_key_in_context_with_kind("editor.insert", key, kind);
                 return;
             }
             MappingResolution::Missing => {
@@ -2986,15 +3022,54 @@ impl App {
                         .unmatched_commands
                         .get(&context)
                         .cloned()
+                    && !self.is_repeated_confirmation_answer(kind, &command_id)
                 {
-                    self.invoke_mapped_command(&command_id);
+                    match command(&command_id) {
+                        Ok(invocation) => self.invoke_key_mapping(&context, invocation),
+                        Err(error) => self.show_error(error),
+                    }
                     if self.active_input_context() != context {
-                        self.handle_configured_key(key);
+                        self.handle_configured_key_with_kind(key, kind);
                     }
                 }
             }
         }
         self.ensure_cursor_visible();
+    }
+
+    fn dispatch_key_mapping(
+        &mut self,
+        context: &str,
+        invocation: Option<CommandInvocation>,
+        replay: Vec<KeyEvent>,
+        key_kinds: &MappingKeyKinds,
+    ) {
+        // Replayed keys are the suffix of the input, not part of the command's trigger.
+        let consumed = key_kinds.len - replay.len();
+        if let Some(invocation) = invocation
+            && !self.is_repeated_confirmation_answer(
+                key_kinds.kind_at(consumed - 1),
+                invocation.id.as_str(),
+            )
+        {
+            self.invoke_key_mapping(context, invocation);
+        }
+        for (offset, key) in replay.into_iter().enumerate() {
+            self.handle_configured_key_with_kind(key, key_kinds.kind_at(consumed + offset));
+        }
+    }
+
+    fn invoke_key_mapping(&mut self, context: &str, mut invocation: CommandInvocation) {
+        if matches!(context, "terminal" | "terminal_normal" | "terminal_visual")
+            && invocation.id.as_str() == "terminal.send"
+        {
+            invocation.source = InvocationSource::TerminalInput;
+        }
+        self.invoke_mapped(invocation);
+    }
+
+    fn is_repeated_confirmation_answer(&self, kind: KeyInputKind, command: &str) -> bool {
+        kind == KeyInputKind::Repeat && self.confirmation_requires_fresh_key(command)
     }
 }
 
@@ -3092,16 +3167,15 @@ impl App {
                 "editor.insert" | "editor.replace" | "snippet"
             )
         {
-            match self
+            let (resolution, key_kinds) = self
                 .input
-                .finish_mapping(&context, self.configuration.binding_revision())
-            {
-                MappingResolution::Ready(invocation) => self.invoke_mapped(invocation),
+                .finish_mapping(&context, self.configuration.binding_revision());
+            match resolution {
+                MappingResolution::Ready(invocation) => {
+                    self.dispatch_key_mapping(&context, Some(invocation), Vec::new(), &key_kinds);
+                }
                 MappingResolution::ReadyAndReplay(invocation, replay) => {
-                    self.invoke_mapped(invocation);
-                    for key in replay {
-                        self.handle_configured_key(key);
-                    }
+                    self.dispatch_key_mapping(&context, Some(invocation), replay, &key_kinds);
                 }
                 MappingResolution::Replay(prefix, replay) => {
                     self.type_unmapped(&context, &prefix);
@@ -3189,25 +3263,22 @@ impl App {
         if self.input.command_pending() || self.clipboard.waiting() {
             return;
         }
+        let now = self.clock.monotonic();
+        self.flush_key_release_mapping(now);
         let context = self.active_input_context();
-        let resolution = self.input.flush_timeout(
-            &context,
-            self.configuration.binding_revision(),
-            self.clock.monotonic(),
-        );
+        let (resolution, key_kinds) =
+            self.input
+                .flush_timeout(&context, self.configuration.binding_revision(), now);
         self.project_input_hints();
         match resolution {
-            MappingResolution::Ready(invocation) => self.invoke_mapped(invocation),
+            MappingResolution::Ready(invocation) => {
+                self.dispatch_key_mapping(&context, Some(invocation), Vec::new(), &key_kinds);
+            }
             MappingResolution::DisabledAndReplay(replay) => {
-                for key in replay {
-                    self.handle_configured_key(key);
-                }
+                self.dispatch_key_mapping(&context, None, replay, &key_kinds);
             }
             MappingResolution::ReadyAndReplay(invocation, replay) => {
-                self.invoke_mapped(invocation);
-                for key in replay {
-                    self.handle_configured_key(key);
-                }
+                self.dispatch_key_mapping(&context, Some(invocation), replay, &key_kinds);
             }
             // A lone `j` with `jk` mapped is typed once the wait is over, as in Vim.
             MappingResolution::Replay(prefix, _)

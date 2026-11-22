@@ -28,6 +28,7 @@ use crate::process::PtyId;
 use crate::ui::ContentTabDiagnostic;
 use crate::ui::ContentTabDiagnosticSeverity;
 use crate::ui::ContentTabKind;
+use crate::ui::KeyInputKind;
 use crate::ui::PtyScreen;
 use crate::ui::UiEvent;
 use crate::ui::active_pane_viewport;
@@ -3196,7 +3197,7 @@ fn dirty_buffer_close_save_discard_cancel_and_stale_ack_are_source_bound() {
     assert_eq!(prompt.kind, crate::ui::PromptKind::DirtyClose);
     assert_eq!(confirmation.positive_label, "Save");
     assert_eq!(confirmation.negative_label, "Discard");
-    assert_eq!(confirmation.selected, crate::ui::ConfirmationChoice::No);
+    assert_eq!(confirmation.selected, crate::ui::ConfirmationChoice::Yes);
     app.close_prompt();
     assert!(app.state.buffers.contains_key(buffer));
     assert_eq!(
@@ -3232,7 +3233,7 @@ fn dirty_buffer_close_save_discard_cancel_and_stale_ack_are_source_bound() {
     );
 
     app.close_active_buffer(false);
-    app.submit_prompt();
+    app.handle_configured_key(KeyEvent::character('n'));
     assert!(!app.state.buffers.contains_key(buffer));
     assert_eq!(std::fs::read_to_string(path).unwrap(), "discard me\n");
 }
@@ -3257,9 +3258,10 @@ fn dirty_close_save_waits_for_exact_vfs_ack_and_failure_preserves_arrangement() 
     app.state.set_buffer_dirty(buffer, true);
     app.reconcile_editor_windows();
     app.close_active_buffer(false);
-    app.input
-        .select_confirmation(crate::ui::ConfirmationChoice::Yes);
-    app.submit_prompt();
+    app.handle_event(UiEvent::Key {
+        key: "enter".parse().expect("Enter"),
+        kind: KeyInputKind::Press,
+    });
     assert!(app.state.buffers.contains_key(buffer));
     crate::app::tests::wait_vfs(&mut app);
     assert!(!app.state.buffers.contains_key(buffer));

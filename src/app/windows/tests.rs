@@ -1051,7 +1051,7 @@ fn exact_dirty_window_close_rejects_stale_focus_then_discards_only_its_target() 
     );
 
     app.close_graph_window(&target).unwrap();
-    app.submit_prompt();
+    app.handle_configured_key(KeyEvent::character('n'));
     assert!(app.state.buffers.contains_key(keeper));
     assert!(!app.state.buffers.contains_key(dirty));
     assert!(app.window_session.graph().window(window).is_none());
@@ -1153,7 +1153,7 @@ fn tab_close_reviews_every_last_dirty_reference_before_one_publication() {
         app.input.prompt().unwrap().kind,
         crate::ui::PromptKind::DirtyClose
     );
-    app.submit_prompt();
+    app.handle_configured_key(KeyEvent::character('n'));
     assert_eq!(app.state.editor_tabs().count(), tabs - 1);
     assert_eq!(
         std::fs::read_to_string(first_path).unwrap(),
@@ -1189,7 +1189,7 @@ fn tab_close_reviews_every_last_dirty_reference_before_one_publication() {
         app.state.views.len(),
     );
     app.apply_layout_action(crate::app::windows::LayoutAction::CloseTab);
-    app.submit_prompt();
+    app.handle_configured_key(KeyEvent::character('n'));
     assert!(
         app.input.prompt().is_some(),
         "second dirty target is reviewed"
