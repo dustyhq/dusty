@@ -558,6 +558,16 @@ pub fn continue_operation(
     repository: &Path,
     message: &str,
 ) -> Result<GitRecoveryOutcome, GitRecoveryRefusal> {
+    continue_operation_with_timeout(repository, message, OPERATION_TIMEOUT)
+}
+
+const OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
+
+fn continue_operation_with_timeout(
+    repository: &Path,
+    message: &str,
+    timeout: Duration,
+) -> Result<GitRecoveryOutcome, GitRecoveryRefusal> {
     let repo = git2::Repository::open(repository).map_err(|_| GitRecoveryRefusal::NotRepository)?;
     let operation =
         operation_name(repo.state()).ok_or(GitRecoveryRefusal::NotPaused("continue"))?;
@@ -579,7 +589,7 @@ pub fn continue_operation(
             return Err(GitRecoveryRefusal::WouldDiscard(risky.join(", ")));
         }
         let before = replay_position(&repo);
-        let result = run_operation_git(&repo, &[&operation, "--continue"]);
+        let result = run_operation_git(&repo, &[&operation, "--continue"], timeout);
         return replay_outcome(repository, operation, before, result);
     }
     if operation == "rebase" {
@@ -590,29 +600,14 @@ pub fn continue_operation(
             return Err(GitRecoveryRefusal::WouldDiscard(risky.join(", ")));
         }
         let before = replay_position(&repo);
-        let result = run_operation_git(&repo, &["rebase", "--continue"]);
+        let result = run_operation_git(&repo, &["rebase", "--continue"], timeout);
         return replay_outcome(repository, operation, before, result);
     }
-    let mut index = repo
-        .index()
-        .map_err(|error| GitRecoveryRefusal::Backend(error.message().to_owned()))?;
-    let tree_id = index
-        .write_tree()
-        .map_err(|error| GitRecoveryRefusal::Backend(error.message().to_owned()))?;
-    let tree = repo
-        .find_tree(tree_id)
-        .map_err(|error| GitRecoveryRefusal::Backend(error.message().to_owned()))?;
     let head = repo
         .head()
         .and_then(|head| head.peel_to_commit())
         .map_err(|error| GitRecoveryRefusal::Backend(error.message().to_owned()))?;
-    let merge_heads = recorded_merge_heads(&repo)?
-        .into_iter()
-        .map(|oid| {
-            repo.find_commit(oid)
-                .map_err(|_| GitRecoveryRefusal::NoRecordedStart)
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+    let merge_heads = recorded_merge_heads(&repo)?;
     // A previous attempt may have committed successfully but failed to remove MERGE_HEAD.
     // In that case retry only cleanup, never create another merge commit.
     let already_committed = head.parent_count() == merge_heads.len() + 1
@@ -620,51 +615,134 @@ pub fn continue_operation(
         && merge_heads
             .iter()
             .enumerate()
-            .all(|(index, parent)| head.parent_id(index + 1).ok() == Some(parent.id()));
-    let oid = if already_committed {
-        head.id()
+            .all(|(index, parent)| head.parent_id(index + 1).ok() == Some(*parent));
+    if already_committed {
+        let oid = head.id();
+        let cleanup = repo.cleanup_state();
+        return Ok(GitRecoveryOutcome {
+            operation,
+            commit: Some(oid),
+            restored_to: None,
+            cleanup_warning: (repo.state() == git2::RepositoryState::Merge)
+                .then(|| merge_cleanup_warning(oid)),
+            details: cleanup.err().map(|error| error.message().to_owned()),
+            stopped: None,
+        });
+    }
+
+    // Native Git owns hooks, signing, and merge cleanup. A command can still
+    // report failure after publishing the commit (e.g. a timed-out post-commit).
+    let result = if message.trim().is_empty() {
+        run_operation_git(&repo, &["commit", "--no-edit"], timeout)
     } else {
-        let signature = repo.signature().map_err(|error| {
-            GitRecoveryRefusal::Backend(format!(
-                "configure Git user.name and user.email before continuing: {}",
-                error.message()
-            ))
-        })?;
-        let message = if message.trim().is_empty() {
-            format!(
-                "Merge {}",
-                merge_heads
-                    .iter()
-                    .map(|head| head.id().to_string()[..8].to_owned())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )
-        } else {
-            message.to_owned()
-        };
-        let parents = std::iter::once(&head)
-            .chain(merge_heads.iter())
-            .collect::<Vec<_>>();
-        repo.commit(
-            Some("HEAD"),
-            &signature,
-            &signature,
-            &message,
-            &tree,
-            &parents,
-        )
-        .map_err(|error| GitRecoveryRefusal::Backend(error.message().to_owned()))?
+        run_operation_git(&repo, &["commit", "-m", message], timeout)
     };
-    let cleanup_warning = repo.cleanup_state().err().map(|error| {
-        format!("commit {oid} was created, but operation cleanup failed: {}; retry continue to clean up", error.message())
-    });
+    merge_commit_outcome(repository, head.id(), &merge_heads, result)
+}
+
+fn merge_cleanup_warning(oid: git2::Oid) -> String {
+    format!("Created commit {oid}, but the merge is still marked in progress.")
+}
+
+fn merge_commit_outcome(
+    repository: &Path,
+    before: git2::Oid,
+    merge_heads: &[git2::Oid],
+    result: Result<Option<String>, GitRecoveryRefusal>,
+) -> Result<GitRecoveryOutcome, GitRecoveryRefusal> {
+    let (capture_warning, details) = match result {
+        Ok(warning) => (warning, None),
+        Err(GitRecoveryRefusal::Backend(output)) => (None, Some(output)),
+        Err(error) => (None, Some(error.to_string())),
+    };
+    let unknown = || GitRecoveryRefusal::MergeCommit {
+        summary: "Couldn't tell whether Git created the merge commit. Check Git before retrying.",
+        details: details.clone().unwrap_or_default(),
+    };
+    let repo = git2::Repository::open(repository).map_err(|_| unknown())?;
+    let head = repo
+        .head()
+        .and_then(|head| head.peel_to_commit())
+        .map_err(|_| unknown())?;
+    let still_merging = repo.state() == git2::RepositoryState::Merge;
+    let oid = head.id();
+    let published = head.parent_id(0).ok() == Some(before)
+        && head.parent_count() > 1
+        && head
+            .parent_ids()
+            .skip(1)
+            .all(|parent| merge_heads.contains(&parent));
+    if !published {
+        if oid == before
+            && still_merging
+            && recorded_merge_heads(&repo).is_ok_and(|heads| heads.as_slice() == merge_heads)
+        {
+            return Err(GitRecoveryRefusal::MergeCommit {
+                summary: "Git didn't create a commit. You can retry the merge.",
+                details: details.unwrap_or_default(),
+            });
+        }
+        return Err(unknown());
+    }
     Ok(GitRecoveryOutcome {
-        operation,
+        operation: "merge".into(),
         commit: Some(oid),
         restored_to: None,
-        cleanup_warning,
+        cleanup_warning: still_merging
+            .then(|| merge_cleanup_warning(oid))
+            .or(capture_warning),
+        details,
         stopped: None,
     })
+}
+
+/// A polled worker for Continue in either Git UI. The worker owns the bounded native Git
+/// job so a hook or signer cannot block the UI thread.
+#[derive(Default)]
+pub struct GitContinueWorker {
+    reply: Option<std::sync::mpsc::Receiver<Result<GitRecoveryOutcome, GitRecoveryRefusal>>>,
+}
+
+impl GitContinueWorker {
+    pub fn start(&mut self, repository: PathBuf) -> Result<(), &'static str> {
+        self.start_with(move || continue_operation(&repository, ""))
+    }
+
+    fn start_with(
+        &mut self,
+        run: impl FnOnce() -> Result<GitRecoveryOutcome, GitRecoveryRefusal> + Send + 'static,
+    ) -> Result<(), &'static str> {
+        if self.is_running() {
+            return Err("Git is already continuing the operation.");
+        }
+        let (send, receive) = std::sync::mpsc::sync_channel(1);
+        std::thread::Builder::new()
+            .name("dusty-git-continue".into())
+            .spawn(move || {
+                let _ = send.send(run());
+            })
+            .map_err(|_| "Couldn't start Git. You can retry the operation.")?;
+        self.reply = Some(receive);
+        Ok(())
+    }
+
+    pub fn is_running(&self) -> bool {
+        self.reply.is_some()
+    }
+
+    pub fn poll(&mut self) -> Option<Result<GitRecoveryOutcome, GitRecoveryRefusal>> {
+        use std::sync::mpsc::TryRecvError;
+        let result = match self.reply.as_ref()?.try_recv() {
+            Ok(result) => result,
+            Err(TryRecvError::Empty) => return None,
+            Err(TryRecvError::Disconnected) => Err(GitRecoveryRefusal::MergeCommit {
+                summary: "Couldn't tell whether Git finished. Check Git before retrying.",
+                details: String::new(),
+            }),
+        };
+        self.reply = None;
+        Some(result)
+    }
 }
 
 /// Abort a paused operation without discarding unrelated user work.
@@ -697,7 +775,8 @@ pub fn abort_operation(repository: &Path) -> Result<GitRecoveryOutcome, GitRecov
         return Err(GitRecoveryRefusal::WouldDiscard(risky.join(", ")));
     }
     if matches!(operation.as_str(), "merge" | "rebase") {
-        run_operation_git(&repo, &[&operation, "--abort"])?;
+        let capture_warning =
+            run_operation_git(&repo, &[&operation, "--abort"], OPERATION_TIMEOUT)?;
         return Ok(GitRecoveryOutcome {
             operation,
             commit: None,
@@ -705,7 +784,8 @@ pub fn abort_operation(repository: &Path) -> Result<GitRecoveryOutcome, GitRecov
                 .head()
                 .map_err(|error| GitRecoveryRefusal::Backend(error.message().to_owned()))?
                 .target(),
-            cleanup_warning: None,
+            cleanup_warning: capture_warning,
+            details: None,
             stopped: None,
         });
     }
@@ -777,6 +857,13 @@ pub(super) fn rebase_action_blockers(
 
 /// Drop the commit a rebase, cherry-pick or revert is applying, never unrelated changes.
 pub fn skip_operation(repository: &Path) -> Result<GitRecoveryOutcome, GitRecoveryRefusal> {
+    skip_operation_with_timeout(repository, OPERATION_TIMEOUT)
+}
+
+pub(super) fn skip_operation_with_timeout(
+    repository: &Path,
+    timeout: Duration,
+) -> Result<GitRecoveryOutcome, GitRecoveryRefusal> {
     let repo = git2::Repository::open(repository).map_err(|_| GitRecoveryRefusal::NotRepository)?;
     let operation = operation_name(repo.state()).ok_or(GitRecoveryRefusal::NotPaused("skip"))?;
     if !skips(&operation) {
@@ -798,17 +885,8 @@ pub fn skip_operation(repository: &Path) -> Result<GitRecoveryOutcome, GitRecove
         return Err(GitRecoveryRefusal::WouldDiscard(risky.join(", ")));
     }
     let before = replay_position(&repo);
-    let result = run_operation_git(&repo, &[&operation, "--skip"]);
+    let result = run_operation_git(&repo, &[&operation, "--skip"], timeout);
     replay_outcome(repository, operation, before, result)
-}
-
-/// Stage one resolved path with Git itself (`git add`), as `s` would.
-pub(super) fn stage_resolved(repository: &Path, path: &Path) -> Result<(), GitRecoveryRefusal> {
-    let repo = git2::Repository::open(repository).map_err(|_| GitRecoveryRefusal::NotRepository)?;
-    let path = path.to_str().ok_or_else(|| {
-        GitRecoveryRefusal::Backend("the path is not UTF-8; stage it with s".into())
-    })?;
-    run_operation_git(&repo, &["--literal-pathspecs", "add", "--", path])
 }
 
 /// The replayed commit and step a rebase (or the commit a cherry-pick or revert) is paused
@@ -846,7 +924,7 @@ fn replay_outcome(
     repository: &Path,
     operation: String,
     before: (Option<git2::Oid>, Option<(usize, usize)>),
-    result: Result<(), GitRecoveryRefusal>,
+    result: Result<Option<String>, GitRecoveryRefusal>,
 ) -> Result<GitRecoveryOutcome, GitRecoveryRefusal> {
     // Git changed the repository behind this process; read it afresh.
     let repo = git2::Repository::open(repository).map_err(|_| GitRecoveryRefusal::NotRepository)?;
@@ -874,9 +952,9 @@ fn replay_outcome(
     } else {
         None
     };
-    let stopped = match (result, stopped) {
-        (Ok(()), stopped) => stopped.map(|(stop, _)| stop),
-        (Err(_), Some((stop, true))) if !stop.conflicts.is_empty() => Some(stop),
+    let (stopped, capture_warning) = match (result, stopped) {
+        (Ok(warning), stopped) => (stopped.map(|(stop, _)| stop), warning),
+        (Err(_), Some((stop, true))) if !stop.conflicts.is_empty() => (Some(stop), None),
         (Err(error), _) => return Err(error),
     };
     Ok(GitRecoveryOutcome {
@@ -886,7 +964,8 @@ fn replay_outcome(
             .map_err(|error| GitRecoveryRefusal::Backend(error.message().to_owned()))?
             .target(),
         restored_to: None,
-        cleanup_warning: None,
+        cleanup_warning: capture_warning,
+        details: None,
         stopped,
     })
 }
@@ -917,11 +996,12 @@ fn rebase_info(
 fn run_operation_git(
     repo: &git2::Repository,
     arguments: &[&str],
-) -> Result<(), GitRecoveryRefusal> {
-    use crate::process::{JobEvent, JobPolicy, JobRequest, JobSupervisor};
-    use std::time::Duration;
+    timeout: Duration,
+) -> Result<Option<String>, GitRecoveryRefusal> {
+    use crate::process::{AbandonedStreams, JobEvent, JobPolicy, JobRequest, JobSupervisor};
 
     let workdir = repo.workdir().ok_or(GitRecoveryRefusal::NotRepository)?;
+    let merge_commit = arguments.first() == Some(&"commit");
     let program = crate::process::discover_executable("git")
         .ok_or_else(|| GitRecoveryRefusal::Backend("Git is not installed or not on PATH".into()))?;
     let mut environment = super::command::environment();
@@ -942,16 +1022,25 @@ fn run_operation_git(
         policy: JobPolicy {
             maximum_output_bytes: 64 * 1024,
             maximum_line_bytes: 64 * 1024,
-            timeout: Duration::from_secs(30),
+            timeout,
             ..JobPolicy::default()
         },
     })
     .map_err(|error| GitRecoveryRefusal::Backend(error.to_string()))?;
     let mut message = Vec::new();
+    let mut abandoned = AbandonedStreams::default();
     loop {
         for event in jobs.poll() {
             match event {
-                JobEvent::Output { bytes, .. } => {
+                JobEvent::Output {
+                    bytes,
+                    stream,
+                    abandoned: was_abandoned,
+                    ..
+                } => {
+                    if was_abandoned {
+                        abandoned.insert(stream);
+                    }
                     message.extend(
                         bytes
                             .into_iter()
@@ -961,21 +1050,35 @@ fn run_operation_git(
                 JobEvent::Exited {
                     code, timed_out, ..
                 } => {
-                    if timed_out {
-                        return Err(GitRecoveryRefusal::Backend(format!(
-                            "Git {} timed out",
-                            arguments.join(" ")
-                        )));
-                    }
-                    if code != Some(0) {
-                        let message = String::from_utf8_lossy(&message).trim().to_owned();
-                        return Err(GitRecoveryRefusal::Backend(if message.is_empty() {
-                            format!("Git {} failed (exit {code:?})", arguments.join(" "))
+                    if code == Some(0) {
+                        // A helper retaining a pipe did not undo the completed Git write.
+                        return Ok(if timed_out {
+                            crate::rewrite::capture_warning(false, abandoned)
+                                .or_else(|| Some("Some Git output may be missing".into()))
                         } else {
-                            message
+                            None
+                        });
+                    }
+                    if timed_out {
+                        return Err(GitRecoveryRefusal::Backend(if merge_commit {
+                            let output = String::from_utf8_lossy(&message);
+                            format!("Git took too long.\n{}", output.trim())
+                                .trim_end()
+                                .to_owned()
+                        } else {
+                            format!("Git {} timed out", arguments.join(" "))
                         }));
                     }
-                    return Ok(());
+                    let message = String::from_utf8_lossy(&message).trim().to_owned();
+                    return Err(GitRecoveryRefusal::Backend(if message.is_empty() {
+                        if merge_commit {
+                            format!("Git commit failed (exit {code:?}).")
+                        } else {
+                            format!("Git {} failed (exit {code:?})", arguments.join(" "))
+                        }
+                    } else {
+                        message
+                    }));
                 }
                 JobEvent::Failed { message, .. } => {
                     return Err(GitRecoveryRefusal::Backend(message));
@@ -1483,70 +1586,248 @@ impl GitReplacementPlan {
     }
 }
 
-/// Build a replacement plan for the given paths. Nothing is written: every side's content is
-/// read FIRST, so a refusal leaves the repository and the files untouched.
+/// Build a replacement plan for the given paths. Nothing is written: every side's content and
+/// the bytes to be replaced are read first.
 pub fn plan_replacement(
     repository: &Path,
     paths: &[PathBuf],
     choice: GitConflictChoice,
 ) -> Result<GitReplacementPlan, GitConflictResolveError> {
-    if paths.is_empty() {
-        return Err(GitConflictResolveError::NoConflict(
-            "(no paths given)".into(),
-        ));
-    }
-    let mut files = Vec::new();
-    let repo =
-        git2::Repository::open(repository).map_err(|_| GitConflictResolveError::NotRepository)?;
-    let workdir = repo
-        .workdir()
-        .ok_or(GitConflictResolveError::NotRepository)?;
-    for path in paths {
-        let destination = workdir.join(conflict_relative_path(&repo, path)?);
-        // Replacing a symlink would replace the alias, not the selected repository file.
-        let mut parent = destination.as_path();
-        while parent != workdir {
-            if std::fs::symlink_metadata(parent).is_ok_and(|metadata| metadata.is_symlink()) {
-                return Err(GitConflictResolveError::NoConflict(
-                    path.display().to_string(),
-                ));
-            }
-            parent = parent
-                .parent()
-                .ok_or(GitConflictResolveError::NotRepository)?;
-        }
-        let (content, mode) = read_side(repository, &destination, choice)?;
-        files.push((destination, content, mode));
-    }
-    Ok(GitReplacementPlan { choice, files })
+    let review = ConflictReview::capture(repository, paths, files::DOCUMENT_BYTE_LIMIT)?;
+    let files = review.replacements(choice)?;
+    Ok(GitReplacementPlan {
+        review,
+        choice,
+        files,
+    })
 }
 
 #[derive(Debug, Error)]
-#[error("replacement failed at `{path}`: {error}; already replaced: {replaced}", path = .path.display(), replaced = .written.iter().map(|path| path.display().to_string()).collect::<Vec<_>>().join(", "))]
+#[error("{}", self.summary())]
 pub struct GitReplacementError {
     pub path: PathBuf,
     pub written: Vec<PathBuf>,
     pub error: GitConflictResolveError,
 }
 
+impl GitReplacementError {
+    fn summary(&self) -> String {
+        let published = self.error.published();
+        let mut summary = if published {
+            self.error.to_string()
+        } else {
+            format!("Couldn't replace {}: {}", self.path.display(), self.error)
+        };
+        let prior = super::command::display_paths(
+            self.written
+                .iter()
+                .map(PathBuf::as_path)
+                .filter(|path| !published || *path != self.path.as_path()),
+        );
+        if !prior.is_empty() {
+            summary.push_str(&format!(" Already replaced: {prior}."));
+        }
+        summary
+    }
+}
+
+fn record_replacement(
+    written: &mut Vec<PathBuf>,
+    path: &Path,
+    result: Result<(), GitConflictResolveError>,
+) -> Result<(), GitReplacementError> {
+    if let Err(error) = result {
+        if error.published() {
+            written.push(path.to_path_buf());
+        }
+        return Err(GitReplacementError {
+            path: path.to_path_buf(),
+            written: std::mem::take(written),
+            error,
+        });
+    }
+    written.push(path.to_path_buf());
+    Ok(())
+}
+
 /// Apply a previewed plan, reporting the paths already written if a later write fails.
 pub fn apply_replacement(plan: &GitReplacementPlan) -> Result<Vec<PathBuf>, GitReplacementError> {
-    let mut written = Vec::new();
-    for (path, content, mode) in &plan.files {
-        let result = if matches!(mode, 0o100644 | 0o100755) {
-            crate::files::atomic_write_with_executable(path, content.as_bytes(), *mode == 0o100755)
-                .map_err(|error| GitConflictResolveError::Backend(error.to_string()))
-        } else {
-            Err(GitConflictResolveError::NotText(path.display().to_string()))
-        };
-        if let Err(error) = result {
-            return Err(GitReplacementError {
-                path: path.clone(),
-                written,
-                error,
-            });
+    plan.review.apply(&plan.files)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn continuing_git_can_be_polled_while_the_job_is_blocked() {
+        use std::sync::mpsc::sync_channel;
+        use std::time::{Duration, Instant};
+
+        let limit = Duration::from_secs(5);
+        let (entered, started) = sync_channel(1);
+        let (release, blocked) = sync_channel(1);
+        let mut worker = GitContinueWorker::default();
+        worker
+            .start_with(move || {
+                entered.send(()).unwrap();
+                blocked.recv_timeout(limit).unwrap();
+                Err(GitRecoveryRefusal::NotPaused("continue"))
+            })
+            .unwrap();
+        started.recv_timeout(limit).unwrap();
+        assert!(worker.is_running());
+        assert!(worker.poll().is_none());
+        release.send(()).unwrap();
+        let deadline = Instant::now() + limit;
+        loop {
+            if let Some(result) = worker.poll() {
+                assert_eq!(result, Err(GitRecoveryRefusal::NotPaused("continue")));
+                assert!(!worker.is_running());
+                break;
+            }
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
         }
-        written.push(path.clone());
     }
-    Ok(written)
+
+    #[cfg(unix)]
+    #[test]
+    fn rebase_continue_reports_success_when_post_rewrite_holds_stderr_open() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let (before, upstream) = crate::tests::conflicted_fixture(dir.path());
+        let repo = git2::Repository::open(dir.path()).unwrap();
+        repo.cleanup_state().unwrap();
+        repo.reset(
+            &repo.find_object(before, None).unwrap(),
+            git2::ResetType::Hard,
+            None,
+        )
+        .unwrap();
+        let branch = repo.head().unwrap().name().unwrap().to_owned();
+        let hooks = dir.path().join("test-hooks");
+        std::fs::create_dir(&hooks).unwrap();
+        let mut config = repo.config().unwrap();
+        config
+            .set_str("core.hooksPath", hooks.to_str().unwrap())
+            .unwrap();
+        config.set_bool("commit.gpgsign", false).unwrap();
+        let hook = hooks.join("post-rewrite");
+        std::fs::write(&hook, "#!/bin/sh\nsleep 4 >/dev/null &\n").unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let start = run_operation_git(&repo, &["rebase", &upstream.to_string()], OPERATION_TIMEOUT);
+        assert!(matches!(start, Err(GitRecoveryRefusal::Backend(_))));
+        // Native Git wrote the conflict stages behind libgit2's cached index.
+        let repo = git2::Repository::open(dir.path()).unwrap();
+        assert!(repo.index().unwrap().has_conflicts(), "{start:?}");
+        let path = Path::new("shared.txt");
+        std::fs::write(dir.path().join(path), "resolved\n").unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(path).unwrap();
+        index.write().unwrap();
+
+        let outcome =
+            continue_operation_with_timeout(dir.path(), "", Duration::from_secs(1)).unwrap();
+        let repo = git2::Repository::open(dir.path()).unwrap();
+        let head = repo.head().unwrap();
+        let commit = head.peel_to_commit().unwrap();
+        assert_eq!(head.name(), Some(branch.as_str()));
+        assert_eq!(commit.parent_id(0).unwrap(), upstream);
+        assert_eq!(outcome.commit, Some(commit.id()));
+        assert!(outcome.stopped.is_none());
+        assert_eq!(
+            outcome.continue_warning().as_deref(),
+            Some("Some Git output may be missing (standard error)"),
+        );
+        assert!(matches!(
+            run_operation_git(&repo, &["rebase", "--continue"], OPERATION_TIMEOUT),
+            Err(GitRecoveryRefusal::Backend(_)),
+        ));
+    }
+
+    #[test]
+    fn merge_job_failure_after_publication_reports_the_created_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let (before, incoming) = crate::tests::conflicted_fixture(dir.path());
+        let repo = git2::Repository::open(dir.path()).unwrap();
+        let path = Path::new("shared.txt");
+        std::fs::write(dir.path().join(path), "resolved\n").unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(path).unwrap();
+        index.write().unwrap();
+        run_operation_git(
+            &repo,
+            &["commit", "-m", "resolved merge"],
+            OPERATION_TIMEOUT,
+        )
+        .unwrap();
+        let created = repo.head().unwrap().target().unwrap();
+
+        // Model a post-commit timeout after the native command has published the merge.
+        let output = "Git took too long.\npost-commit output";
+        let outcome = merge_commit_outcome(
+            dir.path(),
+            before,
+            &[incoming],
+            Err(GitRecoveryRefusal::Backend(output.into())),
+        )
+        .unwrap();
+        assert_eq!(outcome.commit, Some(created));
+        assert!(!repo.path().join("MERGE_HEAD").exists());
+        assert!(outcome.cleanup_warning.is_none());
+        assert_eq!(
+            outcome.continue_warning().as_deref(),
+            Some(
+                format!("Created commit {created}, but Git reported an error afterward.").as_str()
+            )
+        );
+        assert_eq!(outcome.details.as_deref(), Some(output));
+    }
+
+    #[test]
+    fn final_hunk_leaves_a_newer_save_unstaged() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::tests::conflicted_fixture(dir.path());
+        let relative = PathBuf::from("shared.txt");
+        let review =
+            ConflictReview::capture(dir.path(), std::slice::from_ref(&relative), 1024).unwrap();
+        let file = &review.files[0];
+        let resolved = b"reviewed result\n";
+        file.write(resolved, false).unwrap();
+        std::fs::write(&file.path, b"newer draft\n").unwrap();
+
+        assert_eq!(
+            review.stage_resolution(file, resolved.to_vec()),
+            Err(GitConflictResolveError::Changed)
+        );
+        let repo = git2::Repository::open(dir.path()).unwrap();
+        let index = repo.index().unwrap();
+        assert!(index.get_path(&relative, 0).is_none());
+        assert_eq!(conflict_entries(&index, &relative).unwrap(), file.entries);
+        assert_eq!(std::fs::read(&file.path).unwrap(), b"newer draft\n");
+    }
+
+    #[test]
+    fn draft_preservation_counts_the_published_replacement() {
+        let first = PathBuf::from("first.txt");
+        let path = PathBuf::from("second.txt");
+        let draft = PathBuf::from(".kept-draft");
+        let error = record_replacement(
+            &mut vec![first.clone()],
+            &path,
+            Err(GitConflictResolveError::ReplacedWithDraft {
+                path: path.clone(),
+                draft,
+            }),
+        )
+        .unwrap_err();
+        assert_eq!(error.written, vec![first, path]);
+        assert_eq!(
+            error.to_string(),
+            "Replaced second.txt, but it changed during the write. The newer draft was kept at .kept-draft. Already replaced: first.txt."
+        );
+    }
 }

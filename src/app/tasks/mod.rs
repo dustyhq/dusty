@@ -954,7 +954,10 @@ impl Tasks {
                         .into(),
                     );
                     let status = if timed_out {
-                        "timed out".into()
+                        code.map_or_else(
+                            || "timed out".into(),
+                            |code| format!("timed out (exit {code})"),
+                        )
                     } else {
                         code.map_or_else(
                             || "terminated by signal".into(),

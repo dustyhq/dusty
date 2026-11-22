@@ -296,12 +296,19 @@ impl Jobs {
                 } => {
                     if let Some(pending) = self.pending.remove(&job) {
                         let write = pending.request == Request::Write;
+                        // A write's exit status is authoritative even if a hook's
+                        // helper prevented us from collecting all its output.
+                        let completed_write = write && code == Some(0);
                         let warning = write
                             .then(|| {
                                 crate::rewrite::capture_warning(pending.clipped, pending.abandoned)
                             })
-                            .flatten();
-                        let result = if timed_out {
+                            .flatten()
+                            .or_else(|| {
+                                (timed_out && completed_write)
+                                    .then(|| "Some Git output may be missing".into())
+                            });
+                        let result = if timed_out && !completed_write {
                             Err("Git command timed out".into())
                         } else if !write && pending.abandoned.contains(JobStream::Stdout) {
                             Err(format!(

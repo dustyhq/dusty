@@ -227,6 +227,7 @@ fn execute(plan: Plan, message: String, commit_timeout: Duration) -> Result<Outc
             .collect(),
         None,
         Duration::from_secs(120),
+        GitOperation::Read,
     )?
     .required_stdout()?;
     let mut overrides = Vec::new();
@@ -266,6 +267,7 @@ fn execute(plan: Plan, message: String, commit_timeout: Duration) -> Result<Outc
                 .collect(),
             None,
             Duration::from_secs(120),
+            GitOperation::Read,
         )?
         .required_stdout()?;
         let path = path
@@ -352,7 +354,14 @@ fn execute(plan: Plan, message: String, commit_timeout: Duration) -> Result<Outc
     // Git owns pre-commit, prepare-commit-msg, commit-msg, post-commit,
     // post-rewrite and signing. Never disables verification or configured signing.
     let input = (!matches!(plan.kind, Kind::Fixup(_))).then(|| message.into_bytes());
-    let command_result = run_git(&plan.root, environment, args, input, commit_timeout);
+    let command_result = run_git(
+        &plan.root,
+        environment,
+        args,
+        input,
+        commit_timeout,
+        GitOperation::Write,
+    );
     let private_repo = Repository::open(private.path()).map_err(error)?;
     let created = private_repo
         .head()
@@ -456,7 +465,11 @@ fn execute(plan: Plan, message: String, commit_timeout: Duration) -> Result<Outc
         kind: plan.kind,
         head: created.id(),
         recovery,
-        capture_warning: capture_warning(capture.clipped, capture.abandoned),
+        capture_warning: capture_warning(capture.clipped, capture.abandoned).or_else(|| {
+            capture
+                .timed_out
+                .then(|| "Some Git output may be missing".into())
+        }),
     })
 }
 
@@ -593,6 +606,7 @@ struct GitCapture {
     clipped: bool,
     stdout_clipped: bool,
     abandoned: AbandonedStreams,
+    timed_out: bool,
 }
 
 impl GitCapture {
@@ -607,12 +621,18 @@ impl GitCapture {
     }
 }
 
+enum GitOperation {
+    Read,
+    Write,
+}
+
 fn run_git(
     root: &Path,
     environment: std::collections::BTreeMap<String, std::ffi::OsString>,
     arguments: Vec<std::ffi::OsString>,
     input: Option<Vec<u8>>,
     timeout: Duration,
+    operation: GitOperation,
 ) -> Result<GitCapture, String> {
     use crate::process::{JobEvent, JobPolicy, JobRequest, JobSupervisor};
     let mut jobs = JobSupervisor::try_new(16).map_err(error)?;
@@ -660,7 +680,9 @@ fn run_git(
                 JobEvent::Exited {
                     code, timed_out, ..
                 } => {
-                    if code == Some(0) && !timed_out {
+                    // A completed commit does not depend on its hook's output.
+                    if code == Some(0) && (!timed_out || matches!(operation, GitOperation::Write)) {
+                        capture.timed_out = timed_out;
                         return Ok(capture);
                     }
                     let status = if timed_out {

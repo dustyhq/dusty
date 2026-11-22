@@ -12,10 +12,9 @@ use std::process::Child;
 use std::process::Command;
 use std::process::Stdio;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::sync::atomic::AtomicBool;
-#[cfg(windows)]
-use std::sync::atomic::AtomicU8;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc;
@@ -138,10 +137,29 @@ pub enum JobEvent {
     },
 }
 
-struct JobSlot(Arc<AtomicUsize>);
+struct JobSlot {
+    residents: Arc<AtomicUsize>,
+    released: AtomicBool,
+}
+
+impl JobSlot {
+    fn new(residents: Arc<AtomicUsize>) -> Self {
+        Self {
+            residents,
+            released: AtomicBool::new(false),
+        }
+    }
+
+    fn release(&self) {
+        if !self.released.swap(true, Ordering::AcqRel) {
+            self.residents.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+}
+
 impl Drop for JobSlot {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::AcqRel);
+        self.release();
     }
 }
 type Preflight = Box<dyn FnOnce(&Path) -> Result<(), String> + Send>;
@@ -259,7 +277,7 @@ impl JobSupervisor {
                 (count < 256).then_some(count + 1)
             })
             .map_err(|_| JobError::Full)?;
-        let slot = Arc::new(JobSlot(self.residents.clone()));
+        let slot = Arc::new(JobSlot::new(self.residents.clone()));
         Ok(JobReservation {
             supervisor: self,
             slot,
@@ -481,24 +499,22 @@ fn deliver(
             Err(mpsc::TrySendError::Disconnected(_)) => return false,
             Err(mpsc::TrySendError::Full(value)) => event = value,
         }
-        engine.expire();
+        engine.expire(Instant::now());
         thread::sleep(Duration::from_millis(2));
     }
 }
 struct RunningJob {
     child: Child,
-    started: Instant,
-    timeout: Duration,
+    deadline: Instant,
     cancel: Arc<AtomicBool>,
     input_cancel: Arc<AtomicBool>,
     readers: Arc<AtomicUsize>,
     io_failed: Arc<AtomicBool>,
     status: Option<Option<i32>>,
     output_drain: Arc<OutputDrain>,
-    skip_pending_io: bool,
     timed_out: bool,
     killed: bool,
-    _slot: Arc<JobSlot>,
+    slot: Arc<JobSlot>,
 }
 impl RunningJob {
     fn observe_exit(&mut self, now: Instant) -> io::Result<()> {
@@ -510,53 +526,172 @@ impl RunningJob {
         }
         Ok(())
     }
+
+    fn stop_if_requested(&mut self) {
+        if !self.killed && (self.cancel.load(Ordering::Acquire) || self.timed_out) {
+            terminate_tree(&mut self.child, self.status.is_some());
+            self.killed = true;
+        }
+    }
+
+    fn capture_timed_out(&self, stream: JobStream) -> bool {
+        self.output_drain.deadline_cut[stream.index()].load(Ordering::Acquire)
+            || self.output_drain.eof_at[stream.index()]
+                .get()
+                .is_some_and(|&eof| eof > self.deadline)
+    }
 }
 #[derive(Default)]
 struct OutputDrain {
     exited_at: OnceLock<Instant>,
+    eof_at: [OnceLock<Instant>; 2],
     deadline_elapsed: AtomicBool,
+    deadline_cut: [AtomicBool; 2],
+    pending: [Mutex<PendingOutput>; 2],
+    abort: AtomicBool,
     abandoned: [AtomicBool; 2],
     overflowed_at: OnceLock<Instant>,
     #[cfg(windows)]
-    read_phase: [AtomicU8; 2],
+    read_phase: [Mutex<PipeReadPhase>; 2],
     clipped: AtomicBool,
 }
 
+// Once the event channel fills, keep reading and stage framed records here. The
+// payload still counts against the job's output cap; each record adds four bytes
+// rather than a separately allocated event. The engine forwards records in order.
+#[derive(Default)]
+struct PendingOutput {
+    bytes: Vec<u8>,
+    sent: usize,
+    closed: bool,
+}
+
+impl PendingOutput {
+    const TRUNCATED: u32 = 1 << 31;
+
+    fn is_empty(&self) -> bool {
+        self.sent == self.bytes.len()
+    }
+
+    fn close(&mut self) {
+        *self = Self {
+            closed: true,
+            ..Self::default()
+        };
+    }
+
+    fn publish(
+        &mut self,
+        job: JobId,
+        stream: JobStream,
+        sender: &SyncSender<JobEvent>,
+        mut bytes: Vec<u8>,
+        truncated: bool,
+    ) -> bool {
+        if self.closed {
+            // The reader can outlive the job, but its capture cannot.
+            return true;
+        }
+        if self.is_empty() {
+            match sender.try_send(JobEvent::Output {
+                job,
+                stream,
+                bytes,
+                truncated,
+                abandoned: false,
+            }) {
+                Ok(()) => return true,
+                Err(mpsc::TrySendError::Disconnected(_)) => return false,
+                Err(mpsc::TrySendError::Full(JobEvent::Output {
+                    bytes: returned, ..
+                })) => {
+                    bytes = returned;
+                }
+                Err(mpsc::TrySendError::Full(_)) => unreachable!("sent output"),
+            }
+        }
+        self.push(&bytes, truncated);
+        true
+    }
+
+    fn push(&mut self, bytes: &[u8], truncated: bool) {
+        let len = u32::try_from(bytes.len()).expect("bounded output record");
+        let header = if truncated {
+            len | Self::TRUNCATED
+        } else {
+            len
+        };
+        self.bytes.extend_from_slice(&header.to_le_bytes());
+        self.bytes.extend_from_slice(bytes);
+    }
+
+    fn forward(&mut self, job: JobId, stream: JobStream, sender: &SyncSender<JobEvent>) -> bool {
+        while !self.is_empty() {
+            let start = self.sent + 4;
+            let header = u32::from_le_bytes(
+                self.bytes[self.sent..start]
+                    .try_into()
+                    .expect("output header"),
+            );
+            let end = start + (header & !Self::TRUNCATED) as usize;
+            let event = JobEvent::Output {
+                job,
+                stream,
+                bytes: self.bytes[start..end].to_vec(),
+                truncated: header & Self::TRUNCATED != 0,
+                abandoned: false,
+            };
+            if sender.try_send(event).is_err() {
+                return false;
+            }
+            self.sent = end;
+        }
+        self.bytes.clear();
+        self.sent = 0;
+        true
+    }
+}
+
 #[cfg(windows)]
-#[repr(u8)]
+#[derive(Clone, Copy, Default)]
 enum PipeReadPhase {
-    BetweenReads = 0,
+    #[default]
+    BetweenReads,
     Reading,
     Finished,
     Detached,
 }
 
 impl OutputDrain {
+    fn close_pending_output(&self) {
+        for pending in &self.pending {
+            pending.lock().expect("pending output").close();
+        }
+    }
+
     #[cfg(windows)]
     fn detach_blocked_readers(&self, readers: &AtomicUsize) {
-        if !self.cutoff_elapsed() {
+        let expired = self.deadline_elapsed.load(Ordering::Acquire);
+        let abort = self.abort.load(Ordering::Acquire);
+        let cutoff = self.cutoff_elapsed();
+        if !expired && !abort && !cutoff {
             return;
         }
-        // Queue backpressure is not a blocked read. A detached worker keeps
-        // its slot until the handle unblocks, bounding resident workers.
         for stream in [JobStream::Stdout, JobStream::Stderr] {
-            if self.read_phase[stream.index()]
-                .compare_exchange(
-                    PipeReadPhase::Reading as u8,
-                    PipeReadPhase::Detached as u8,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                )
-                .is_ok()
-            {
-                self.abandoned(stream).store(true, Ordering::Release);
+            let mut phase = self.read_phase[stream.index()].lock().expect("read phase");
+            if matches!(*phase, PipeReadPhase::Reading) {
+                *phase = PipeReadPhase::Detached;
+                self.abandon(stream, expired || abort);
                 readers.fetch_sub(1, Ordering::AcqRel);
             }
         }
     }
 
-    fn abandoned(&self, stream: JobStream) -> &AtomicBool {
-        &self.abandoned[stream.index()]
+    fn abandon(&self, stream: JobStream, deadline: bool) {
+        if deadline {
+            self.deadline_cut[stream.index()].store(true, Ordering::Release);
+        }
+        self.abandoned[stream.index()].store(true, Ordering::Release);
     }
 
     #[cfg(windows)]
@@ -567,41 +702,36 @@ impl OutputDrain {
         bytes: &mut [u8],
     ) -> io::Result<usize> {
         let phase = &self.read_phase[stream.index()];
-        if phase
-            .compare_exchange(
-                PipeReadPhase::BetweenReads as u8,
-                PipeReadPhase::Reading as u8,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .is_err()
         {
-            return Ok(0);
+            let mut phase = phase.lock().expect("read phase");
+            if !matches!(*phase, PipeReadPhase::BetweenReads) {
+                return Ok(0);
+            }
+            *phase = PipeReadPhase::Reading;
         }
         let result = pipe.read(bytes);
-        if phase
-            .compare_exchange(
-                PipeReadPhase::Reading as u8,
-                PipeReadPhase::BetweenReads as u8,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .is_err()
-        {
+        let mut phase = phase.lock().expect("read phase");
+        if matches!(*phase, PipeReadPhase::Detached) {
             return Ok(0);
         }
+        if matches!(result, Ok(0)) {
+            self.record_eof(stream);
+        }
+        *phase = PipeReadPhase::BetweenReads;
         result
+    }
+
+    fn record_eof(&self, stream: JobStream) {
+        self.eof_at[stream.index()].get_or_init(Instant::now);
     }
 
     fn cutoff_elapsed(&self) -> bool {
         // Start the short grace only once both events have happened. Overflow can
         // be discovered late, for example after a backpressured record is sent.
-        self.deadline_elapsed.load(Ordering::Acquire)
-            || self
-                .exited_at
-                .get()
-                .zip(self.overflowed_at.get())
-                .is_some_and(|(exit, overflow)| exit.max(overflow).elapsed() >= OUTPUT_DRAIN_GRACE)
+        self.exited_at
+            .get()
+            .zip(self.overflowed_at.get())
+            .is_some_and(|(exit, overflow)| exit.max(overflow).elapsed() >= OUTPUT_DRAIN_GRACE)
     }
 }
 
@@ -614,27 +744,34 @@ struct JobOutputPipe<T> {
 
 impl<T: Read> Read for JobOutputPipe<T> {
     fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
-        if self.closed {
+        if self.closed || bytes.is_empty() {
             return Ok(0);
         }
         self.pipe.retry(None, |pipe| {
+            if self.drain.abort.load(Ordering::Acquire) {
+                self.closed = true;
+                self.drain.abandon(self.stream, true);
+                return Ok(0);
+            }
             #[cfg(windows)]
             let result = self.drain.read_pipe(self.stream, pipe, bytes);
             #[cfg(not(windows))]
-            let result = pipe.read(bytes);
-            match result {
-                Err(error)
-                    if error.kind() == io::ErrorKind::WouldBlock && self.drain.cutoff_elapsed() =>
-                {
-                    // A read that can still return bytes always gets a chance to do so.
-                    // Blocking Windows reads are detached by the engine instead.
-                    self.closed = true;
-                    self.drain
-                        .abandoned(self.stream)
-                        .store(true, Ordering::Release);
-                    Ok(0)
+            let result = pipe.read(bytes).inspect(|&read| {
+                if read == 0 {
+                    self.drain.record_eof(self.stream);
                 }
-                result => result,
+            });
+            let expired = self.drain.deadline_elapsed.load(Ordering::Acquire);
+            let waiting =
+                matches!(&result, Err(error) if error.kind() == io::ErrorKind::WouldBlock);
+            if (waiting && (expired || self.drain.cutoff_elapsed()))
+                || (expired && matches!(result, Ok(1..)))
+            {
+                self.closed = true;
+                self.drain.abandon(self.stream, expired);
+                Ok(0)
+            } else {
+                result
             }
         })
     }
@@ -709,7 +846,8 @@ impl JobEngine {
             check(&cwd).map_err(JobError::Preflight)?;
         }
         let mut child = command.spawn().map_err(JobError::Spawn)?;
-        // The deadline can stop inherited stdin without dropping queued output.
+        let deadline = Instant::now() + request.policy.timeout;
+        // Stop inherited stdin at the deadline even if output capture already finished.
         let input_cancel = Arc::new(AtomicBool::new(false));
         // Configure all pipes before starting I/O threads, so setup failure still owns the child.
         let pipes = (|| -> io::Result<_> {
@@ -828,7 +966,8 @@ impl JobEngine {
             Ok(())
         })();
         if let Err(error) = setup_io {
-            cancel.store(true, Ordering::Release);
+            output_drain.abort.store(true, Ordering::Release);
+            output_drain.close_pending_output();
             input_cancel.store(true, Ordering::Release);
             terminate_tree(&mut child, false);
             let _ = child.wait();
@@ -838,64 +977,65 @@ impl JobEngine {
             id,
             RunningJob {
                 child,
-                started: Instant::now(),
-                timeout: request.policy.timeout,
+                deadline,
                 cancel,
                 input_cancel,
                 readers,
                 io_failed,
                 status: None,
                 output_drain,
-                skip_pending_io: false,
                 timed_out: false,
                 killed: false,
-                _slot: slot,
+                slot,
             },
         );
         Ok(())
     }
 
-    fn expire(&mut self) {
+    fn expire(&mut self, now: Instant) {
         for running in self.jobs.values_mut() {
-            let now = Instant::now();
             let _ = running.observe_exit(now);
-            let expired = now.duration_since(running.started) >= running.timeout;
-            running.timed_out |= running.status.is_none() && expired;
-            // After exit, a full queue must not prevent buffered output from reaching EOF.
-            // Only a live leader can be stopped by the job deadline.
-            let stop_for_timeout = expired && running.status.is_none();
-            if expired || running.cancel.load(Ordering::Acquire) {
-                running.input_cancel.store(true, Ordering::Release);
-            }
-            if expired && !stop_for_timeout {
+            let expired = now >= running.deadline;
+            if expired {
+                if running.status.is_none() {
+                    running.timed_out = true;
+                    running.output_drain.abort.store(true, Ordering::Release);
+                }
                 running
                     .output_drain
                     .deadline_elapsed
                     .store(true, Ordering::Release);
             }
+            if expired || running.cancel.load(Ordering::Acquire) {
+                running.input_cancel.store(true, Ordering::Release);
+            }
             #[cfg(windows)]
-            if running.status.is_some() {
-                running
-                    .output_drain
-                    .detach_blocked_readers(&running.readers);
-            }
-            if stop_for_timeout
-                && running.readers.load(Ordering::Acquire) != 0
-                && !running.cancel.swap(true, Ordering::AcqRel)
-            {
-                running.skip_pending_io = true;
-            }
-            if !running.killed && (stop_for_timeout || running.cancel.load(Ordering::Acquire)) {
-                if running.timed_out {
-                    running.cancel.store(true, Ordering::Release);
+            running
+                .output_drain
+                .detach_blocked_readers(&running.readers);
+            // Timeout of post-exit output is not a request to kill the helpers.
+            running.stop_if_requested();
+        }
+    }
+    fn forward_pending_output(&self) {
+        for (&id, running) in &self.jobs {
+            let stop = running.cancel.load(Ordering::Acquire)
+                || running.output_drain.abort.load(Ordering::Acquire);
+            for stream in [JobStream::Stdout, JobStream::Stderr] {
+                let mut pending = running.output_drain.pending[stream.index()]
+                    .lock()
+                    .expect("pending output");
+                if stop {
+                    pending.close();
+                } else if !pending.forward(id, stream, &self.sender) {
+                    return;
                 }
-                terminate_tree(&mut running.child, running.status.is_some());
-                running.killed = true;
             }
         }
     }
+
     fn poll(&mut self) -> Vec<JobEvent> {
-        self.expire();
+        self.forward_pending_output();
         let mut events = Vec::new();
         for _ in 0..256 {
             match self.receiver.try_recv() {
@@ -903,11 +1043,18 @@ impl JobEngine {
                 Err(_) => break,
             }
         }
+        self.expire(Instant::now());
+        self.collect_finished(&mut events);
+        events
+    }
+
+    fn collect_finished(&mut self, events: &mut Vec<JobEvent>) {
         let mut done = Vec::new();
         let mut terminals = Vec::new();
         for (id, running) in &mut self.jobs {
             if let Err(error) = running.observe_exit(Instant::now()) {
-                running.cancel.store(true, Ordering::Release);
+                running.output_drain.abort.store(true, Ordering::Release);
+                running.output_drain.close_pending_output();
                 running.input_cancel.store(true, Ordering::Release);
                 terminate_tree(&mut running.child, false);
                 let _ = running.child.wait();
@@ -919,18 +1066,26 @@ impl JobEngine {
                 continue;
             }
             if let Some(code) = running.status
-                && (running.skip_pending_io || running.readers.load(Ordering::Acquire) == 0)
+                && running.readers.load(Ordering::Acquire) == 0
+                && running
+                    .output_drain
+                    .pending
+                    .iter()
+                    .all(|pending| pending.lock().expect("pending output").is_empty())
             {
-                running.cancel.store(true, Ordering::Release);
+                running.output_drain.close_pending_output();
+                running.stop_if_requested();
                 running.input_cancel.store(true, Ordering::Release);
-                // Abandoning a pipe is not cancellation of the helpers holding it.
                 let _ = running.child.wait();
+                // The expiry check can precede the last read. Once no reader
+                // remains, use the recorded EOF times, not the poll's clock.
+                let mut timed_out = running.timed_out;
                 for stream in [JobStream::Stdout, JobStream::Stderr] {
-                    if running
-                        .output_drain
-                        .abandoned(stream)
-                        .load(Ordering::Acquire)
-                    {
+                    if running.capture_timed_out(stream) {
+                        running.output_drain.abandon(stream, true);
+                        timed_out = true;
+                    }
+                    if running.output_drain.abandoned[stream.index()].load(Ordering::Acquire) {
                         terminals.push(JobEvent::Output {
                             job: *id,
                             stream,
@@ -940,7 +1095,12 @@ impl JobEngine {
                         });
                     }
                 }
-                terminals.push(if running.io_failed.load(Ordering::Acquire) {
+                if timed_out {
+                    // A detached Windows reader may still hold a lease. It no longer
+                    // owns a job slot, and its eventual drop must not release it twice.
+                    running.slot.release();
+                }
+                terminals.push(if !timed_out && running.io_failed.load(Ordering::Acquire) {
                     JobEvent::Failed {
                         job: *id,
                         message: "job input/output transfer failed".into(),
@@ -949,7 +1109,7 @@ impl JobEngine {
                     JobEvent::Exited {
                         job: *id,
                         code,
-                        timed_out: running.timed_out,
+                        timed_out,
                     }
                 });
                 done.push(*id);
@@ -969,13 +1129,13 @@ impl JobEngine {
         for id in done {
             self.jobs.remove(&id);
         }
-        events
     }
 }
 impl Drop for JobEngine {
     fn drop(&mut self) {
         for job in self.jobs.values_mut() {
-            job.cancel.store(true, Ordering::Release);
+            job.output_drain.abort.store(true, Ordering::Release);
+            job.output_drain.close_pending_output();
             job.input_cancel.store(true, Ordering::Release);
             if !job.killed {
                 terminate_tree(&mut job.child, job.status.is_some());
@@ -1012,12 +1172,15 @@ fn stream_reader(
             impl Drop for End {
                 fn drop(&mut self) {
                     #[cfg(windows)]
-                    if self.drain.read_phase[self.stream.index()]
-                        .swap(PipeReadPhase::Finished as u8, Ordering::AcqRel)
-                        == PipeReadPhase::Detached as u8
                     {
-                        // The engine already accounted for this reader at detachment.
-                        return;
+                        let mut phase = self.drain.read_phase[self.stream.index()]
+                            .lock()
+                            .expect("read phase");
+                        if matches!(*phase, PipeReadPhase::Detached) {
+                            // The engine already accounted for this reader at detachment.
+                            return;
+                        }
+                        *phase = PipeReadPhase::Finished;
                     }
                     self.readers.fetch_sub(1, Ordering::AcqRel);
                 }
@@ -1032,14 +1195,16 @@ fn stream_reader(
             let _slot = slot;
             let drain = reader.drain.clone();
             let stream = reader.stream;
+            let cancelled =
+                || cancel.load(Ordering::Acquire) || drain.abort.load(Ordering::Acquire);
             let mut reader = BufReader::new(reader);
             let mut output_limit_reported = false;
             loop {
-                if cancel.load(Ordering::Acquire) {
+                if cancelled() {
                     break;
                 }
                 if output_limit_reported && drain.cutoff_elapsed() {
-                    drain.abandoned(stream).store(true, Ordering::Release);
+                    drain.abandon(stream, drain.deadline_elapsed.load(Ordering::Acquire));
                     break;
                 }
                 let mut bytes = Vec::new();
@@ -1062,15 +1227,16 @@ fn stream_reader(
                         .read_until(b'\n', &mut bytes)
                 };
                 #[cfg(windows)]
-                if drain.read_phase[stream.index()].load(Ordering::Acquire)
-                    == PipeReadPhase::Detached as u8
-                {
+                if matches!(
+                    *drain.read_phase[stream.index()].lock().expect("read phase"),
+                    PipeReadPhase::Detached,
+                ) {
                     break;
                 }
                 let read = match result {
                     Ok(read) => read,
                     Err(_) => {
-                        if !cancel.load(Ordering::Acquire) {
+                        if !cancelled() {
                             failed.store(true, Ordering::Release);
                         }
                         break;
@@ -1100,33 +1266,19 @@ fn stream_reader(
                     // Stop can arrive while this event is waiting for queue space.
                     drain.clipped.store(true, Ordering::Release);
                 }
-                if !bytes.is_empty() || truncated {
-                    let mut event = JobEvent::Output {
-                        job: id,
-                        stream,
-                        bytes,
-                        truncated,
-                        abandoned: false,
-                    };
-                    loop {
-                        if cancel.load(Ordering::Acquire) {
-                            return;
-                        }
-                        match sender.try_send(event) {
-                            Ok(()) => break,
-                            Err(mpsc::TrySendError::Disconnected(_)) => return,
-                            Err(mpsc::TrySendError::Full(value)) => {
-                                event = value;
-                                thread::sleep(Duration::from_millis(2));
-                            }
-                        }
-                    }
+                if (!bytes.is_empty() || truncated)
+                    && !drain.pending[stream.index()]
+                        .lock()
+                        .expect("pending output")
+                        .publish(id, stream, &sender, bytes, truncated)
+                {
+                    return;
                 }
                 if discard_tail && !output_truncated {
                     // Discard the rest of this physical line without allocating for it.
                     loop {
                         if drain.cutoff_elapsed() {
-                            drain.abandoned(stream).store(true, Ordering::Release);
+                            drain.abandon(stream, drain.deadline_elapsed.load(Ordering::Acquire));
                             return;
                         }
                         match reader.fill_buf() {
@@ -1135,12 +1287,12 @@ fn stream_reader(
                                 let newline = tail.iter().position(|byte| *byte == b'\n');
                                 let consumed = newline.map_or(tail.len(), |at| at + 1);
                                 reader.consume(consumed);
-                                if newline.is_some() || cancel.load(Ordering::Acquire) {
+                                if newline.is_some() || cancelled() {
                                     break;
                                 }
                             }
                             Err(_) => {
-                                if !cancel.load(Ordering::Acquire) {
+                                if !cancelled() {
                                     failed.store(true, Ordering::Release);
                                 }
                                 return;
@@ -1200,32 +1352,39 @@ pub enum JobError {
     RootChanged,
 }
 
-#[cfg(all(test, windows))]
-mod windows_tests {
+#[cfg(all(test, any(unix, windows)))]
+mod pipe_tests {
     use super::*;
 
-    #[test]
-    fn windows_total_cap_grace_detaches_both_quiet_pipes() {
-        let (stdout, mut stdout_writer) = io::pipe().unwrap();
+    // The test owns the write handles so it can model inherited pipes without
+    // depending on a shell's background-process or handle-inheritance behavior.
+    pub(super) fn pipe_job(
+        capacity: usize,
+        maximum_output_bytes: usize,
+    ) -> (JobEngine, [io::PipeWriter; 2], Arc<AtomicUsize>) {
+        let (stdout, stdout_writer) = io::pipe().unwrap();
         let (stderr, stderr_writer) = io::pipe().unwrap();
-        let mut engine = JobEngine::new(16);
+        let mut engine = JobEngine::new(capacity);
         let id = JobId(1);
-        let system_root = PathBuf::from(std::env::var_os("SystemRoot").unwrap());
-        let child = Command::new(system_root.join("System32/cmd.exe"))
-            .args(["/D", "/C", "exit 0"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
+        #[cfg(windows)]
+        let child = Command::new(
+            PathBuf::from(std::env::var_os("SystemRoot").unwrap()).join("System32/cmd.exe"),
+        )
+        .args(["/D", "/E:ON", "/C", "exit", "/B", "0"])
+        .spawn()
+        .unwrap();
+        #[cfg(unix)]
+        let child = Command::new("sh").args(["-c", "exit 0"]).spawn().unwrap();
         let drain = Arc::new(OutputDrain::default());
         let cancel = Arc::new(AtomicBool::new(false));
         let readers = Arc::new(AtomicUsize::new(0));
-        let slot = Arc::new(JobSlot(Arc::new(AtomicUsize::new(1))));
+        let residents = Arc::new(AtomicUsize::new(1));
+        let slot = Arc::new(JobSlot::new(residents.clone()));
         let failed = Arc::new(AtomicBool::new(false));
         let timeout = Duration::from_secs(30);
+        let deadline = Instant::now() + timeout;
         let policy = JobPolicy {
-            maximum_output_bytes: 4,
+            maximum_output_bytes,
             timeout,
             ..JobPolicy::default()
         };
@@ -1251,13 +1410,162 @@ mod windows_tests {
             )
             .unwrap();
         }
+        engine.jobs.insert(
+            id,
+            RunningJob {
+                child,
+                deadline,
+                cancel,
+                input_cancel: Arc::new(AtomicBool::new(false)),
+                readers,
+                io_failed: failed,
+                status: None,
+                output_drain: drain,
+                timed_out: false,
+                killed: false,
+                slot,
+            },
+        );
+        (engine, [stdout_writer, stderr_writer], residents)
+    }
+
+    #[test]
+    fn completed_job_releases_staging_while_stderr_writer_is_open() {
+        let (mut engine, [mut stdout, mut stderr], residents) = pipe_job(1, 4096);
+        let id = JobId(1);
+        let running = engine.jobs.get_mut(&id).unwrap();
+        let drain = running.output_drain.clone();
+        for _ in 0..128 {
+            stdout.write_all(b"x\n").unwrap();
+        }
+        drop(stdout);
+        stderr.write_all(b"y\ny\n").unwrap();
+
+        let until = Instant::now() + Duration::from_secs(5);
+        while running.status.is_none()
+            || drain.eof_at[JobStream::Stdout.index()].get().is_none()
+            || drain
+                .pending
+                .iter()
+                .any(|pending| pending.lock().unwrap().is_empty())
+        {
+            running.observe_exit(Instant::now()).unwrap();
+            assert!(
+                Instant::now() < until,
+                "leader did not exit with both queues staged"
+            );
+            thread::sleep(Duration::from_millis(2));
+        }
+        #[cfg(windows)]
+        while !matches!(
+            *drain.read_phase[JobStream::Stderr.index()].lock().unwrap(),
+            PipeReadPhase::Reading,
+        ) {
+            assert!(Instant::now() < until, "stderr reader did not block");
+            thread::sleep(Duration::from_millis(2));
+        }
+        let deadline = running.deadline;
+        engine.expire(deadline);
+
+        let (mut stdout_lines, mut stderr_lines) = (0, 0);
+        let mut abandoned = AbandonedStreams::default();
+        let mut exited = false;
+        while !exited {
+            for event in engine.poll() {
+                match event {
+                    JobEvent::Output {
+                        stream,
+                        abandoned: true,
+                        ..
+                    } => abandoned.insert(stream),
+                    JobEvent::Output {
+                        stream: JobStream::Stdout,
+                        bytes,
+                        ..
+                    } => {
+                        assert_eq!(bytes, b"x\n");
+                        stdout_lines += 1;
+                    }
+                    JobEvent::Output {
+                        stream: JobStream::Stderr,
+                        bytes,
+                        ..
+                    } => {
+                        assert_eq!(bytes, b"y\n");
+                        stderr_lines += 1;
+                    }
+                    JobEvent::Exited {
+                        code, timed_out, ..
+                    } => {
+                        assert_eq!(code, Some(0));
+                        assert!(timed_out);
+                        assert_eq!((stdout_lines, stderr_lines), (128, 2));
+                        assert!(abandoned.contains(JobStream::Stderr));
+                        assert!(!abandoned.contains(JobStream::Stdout));
+                        exited = true;
+                    }
+                    other => panic!("unexpected job event: {other:?}"),
+                }
+            }
+            assert!(
+                Instant::now() < until,
+                "job did not complete with stderr open"
+            );
+            thread::sleep(Duration::from_millis(2));
+        }
+
+        assert!(engine.jobs.is_empty());
+        assert_eq!(residents.load(Ordering::Acquire), 0);
+        #[cfg(windows)]
+        assert!(
+            Arc::strong_count(&drain) > 1,
+            "blocked reader still holds the drain"
+        );
+        for stream in [JobStream::Stdout, JobStream::Stderr] {
+            let mut pending = drain.pending[stream.index()].lock().unwrap();
+            assert_eq!(pending.bytes.capacity(), 0);
+            assert!(pending.publish(id, stream, &engine.sender, b"late\n".to_vec(), false));
+            assert_eq!(
+                pending.bytes.capacity(),
+                0,
+                "retired staging must not regrow"
+            );
+        }
+        assert!(
+            engine.receiver.try_recv().is_err(),
+            "late output must not be published"
+        );
+        drop(stderr);
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+
+    #[test]
+    fn windows_total_cap_grace_detaches_both_quiet_pipes() {
+        quiet_pipes_detach(false);
+    }
+
+    #[test]
+    fn windows_timeout_releases_slot_while_both_readers_are_blocked() {
+        quiet_pipes_detach(true);
+    }
+
+    fn quiet_pipes_detach(expire: bool) {
+        let (mut engine, [mut stdout_writer, stderr_writer], residents) =
+            pipe_tests::pipe_job(16, 4);
+        let id = JobId(1);
+        let deadline = engine.jobs[&id].deadline;
+        let drain = &engine.jobs[&id].output_drain;
         stdout_writer.write_all(b"abc\ndef\n").unwrap();
         let until = Instant::now() + Duration::from_secs(5);
         while drain.overflowed_at.get().is_none()
             || drain
                 .read_phase
                 .iter()
-                .any(|phase| phase.load(Ordering::Acquire) != PipeReadPhase::Reading as u8)
+                .any(|phase| !matches!(*phase.lock().unwrap(), PipeReadPhase::Reading))
         {
             assert!(
                 Instant::now() < until,
@@ -1265,24 +1573,16 @@ mod windows_tests {
             );
             thread::sleep(Duration::from_millis(2));
         }
-        engine.jobs.insert(
-            id,
-            RunningJob {
-                child,
-                started: Instant::now(),
-                timeout,
-                cancel,
-                input_cancel: Arc::new(AtomicBool::new(false)),
-                readers,
-                io_failed: failed,
-                status: None,
-                output_drain: drain,
-                skip_pending_io: false,
-                timed_out: false,
-                killed: false,
-                _slot: slot,
-            },
-        );
+        if expire {
+            let running = engine.jobs.get_mut(&id).unwrap();
+            while running.status.is_none() {
+                running.observe_exit(Instant::now()).unwrap();
+                assert!(Instant::now() < until, "leader did not exit");
+                thread::yield_now();
+            }
+            engine.expire(deadline);
+        }
+
         let mut clipped = false;
         let mut abandoned = AbandonedStreams::default();
         let mut exited = false;
@@ -1307,7 +1607,7 @@ mod windows_tests {
                         code, timed_out, ..
                     } => {
                         assert_eq!(code, Some(0));
-                        assert!(!timed_out);
+                        assert_eq!(timed_out, expire);
                         assert!(abandoned.contains(JobStream::Stdout));
                         assert!(abandoned.contains(JobStream::Stderr));
                         exited = true;
@@ -1322,12 +1622,19 @@ mod windows_tests {
             thread::sleep(Duration::from_millis(2));
         }
         // Both writers stayed open until after the terminal arrived.
+        assert_eq!(residents.load(Ordering::Acquire), usize::from(!expire));
         drop((stdout_writer, stderr_writer));
     }
 
     #[test]
     fn exited_windows_job_drains_its_full_queue_past_deadline() {
         let root = tempfile::tempdir().unwrap();
+        // Pass an unquoted batch filename to cmd, not shell source through Rust's argv quoting.
+        std::fs::write(
+            root.path().join("emit-lines.cmd"),
+            b"@echo off\r\nfor /L %%i in (1,1,1000) do echo x\r\nexit /B 0\r\n",
+        )
+        .unwrap();
         let system_root =
             PathBuf::from(std::env::var_os("SystemRoot").expect("Windows system root"));
         let mut engine = JobEngine::new(64);
@@ -1335,7 +1642,7 @@ mod windows_tests {
         let request = JobRequest {
             program: system_root.join("System32/cmd.exe"),
             argv0: None,
-            arguments: ["/D", "/S", "/C", "for /L %i in (1,1,1000) do @echo x"]
+            arguments: ["/D", "/E:ON", "/C", "emit-lines.cmd"]
                 .into_iter()
                 .map(Into::into)
                 .collect(),
@@ -1344,7 +1651,7 @@ mod windows_tests {
             root_revision: 1,
             stdin: None,
             policy: JobPolicy {
-                timeout: Duration::from_secs(10),
+                timeout: Duration::from_secs(30),
                 ..JobPolicy::default()
             },
         };
@@ -1356,16 +1663,13 @@ mod windows_tests {
                 request,
                 cancel: Arc::new(AtomicBool::new(false)),
                 output_drain: Arc::new(OutputDrain::default()),
-                slot: Arc::new(JobSlot(Arc::new(AtomicUsize::new(1)))),
+                slot: Arc::new(JobSlot::new(Arc::new(AtomicUsize::new(1)))),
                 input: None,
             })
             .unwrap();
         let until = Instant::now() + Duration::from_secs(10);
         let running = engine.jobs.get_mut(&id).unwrap();
-        while running.status.is_none()
-            || running.output_drain.read_phase[JobStream::Stderr.index()].load(Ordering::Acquire)
-                != PipeReadPhase::Finished as u8
-        {
+        while running.status.is_none() || running.readers.load(Ordering::Acquire) != 0 {
             running.observe_exit(Instant::now()).unwrap();
             assert!(
                 Instant::now() < until,
@@ -1374,7 +1678,14 @@ mod windows_tests {
             thread::yield_now();
         }
         assert_eq!(running.status, Some(Some(0)));
-        running.started = Instant::now() - running.timeout;
+        assert!(
+            !running.output_drain.pending[JobStream::Stdout.index()]
+                .lock()
+                .unwrap()
+                .is_empty()
+        );
+        let deadline = running.deadline;
+        engine.expire(deadline);
         let mut lines = 0;
         while !engine.jobs.is_empty() {
             for event in engine.poll() {
@@ -1579,7 +1890,7 @@ mod tests {
                 request,
                 cancel: Arc::new(AtomicBool::new(false)),
                 output_drain: Arc::new(OutputDrain::default()),
-                slot: Arc::new(JobSlot(residents.clone())),
+                slot: Arc::new(JobSlot::new(residents.clone())),
             },
             residents,
         )
@@ -1603,34 +1914,73 @@ mod tests {
     #[test]
     fn completed_job_is_not_timed_out_when_polling_is_late() {
         let root = tempfile::tempdir().unwrap();
-        let (mut queued, _) = submission(root.path(), "exit 0");
-        queued.request.policy.timeout = Duration::from_millis(1);
+        let (mut queued, _) = submission(root.path(), "printf 'done\\n'");
+        queued.request.policy.timeout = Duration::from_secs(30);
         let mut engine = JobEngine::new(16);
         engine.start(queued).unwrap();
         let running = engine.jobs.get_mut(&JobId(1)).unwrap();
-        let deadline = Instant::now() + Duration::from_secs(3);
-        while job_exit_status(&mut running.child).unwrap().is_none() {
-            assert!(Instant::now() < deadline);
+        let until = Instant::now() + Duration::from_secs(3);
+        while job_exit_status(&mut running.child).unwrap().is_none()
+            || running.readers.load(Ordering::Acquire) != 0
+        {
+            assert!(Instant::now() < until);
             thread::yield_now();
         }
-        assert_eq!(job_exit_status(&mut running.child).unwrap(), Some(Some(0)));
-        running.started = Instant::now() - Duration::from_secs(1);
-        let mut exited = false;
-        while !engine.jobs.is_empty() {
-            for event in engine.poll() {
-                if let JobEvent::Exited {
-                    code, timed_out, ..
-                } = event
-                {
-                    assert_eq!(code, Some(0));
-                    assert!(!timed_out);
-                    exited = true;
-                }
-            }
-            assert!(Instant::now() < deadline);
+        let expiry = running.deadline;
+        // The leader and both readers finished without polling or emptying the queue.
+        engine.expire(expiry + Duration::from_secs(1));
+        assert!(matches!(
+            engine.poll().as_slice(),
+            [
+                JobEvent::Output { bytes, truncated: false, .. },
+                JobEvent::Exited { code: Some(0), timed_out: false, .. },
+            ] if bytes == b"done\n"
+        ));
+    }
+
+    #[test]
+    fn eof_between_expiry_check_and_publication_is_not_success() {
+        let root = tempfile::tempdir().unwrap();
+        let (mut queued, _) = submission(
+            root.path(),
+            "(i=0; while [ ! -e release ] && [ \"$i\" -lt 500 ]; do sleep 0.01; i=$((i + 1)); done) 2>/dev/null & printf 'prefix\\n'",
+        );
+        queued.request.policy.timeout = Duration::from_secs(30);
+        let mut engine = JobEngine::new(16);
+        let id = queued.id;
+        engine.start(queued).unwrap();
+        let until = Instant::now() + Duration::from_secs(3);
+        let mut events = Vec::new();
+        while engine.jobs[&id].status.is_none() {
+            events.extend(engine.poll());
+            assert!(Instant::now() < until, "leader did not exit");
             thread::yield_now();
         }
-        assert!(exited);
+        // Split the same two stages used by poll: the expiry check precedes the
+        // deadline, but we allow EOF only after it, before collecting terminals.
+        let checked_at = Instant::now();
+        engine.jobs.get_mut(&id).unwrap().deadline = checked_at + Duration::from_nanos(1);
+        engine.expire(checked_at);
+        while Instant::now() <= checked_at + Duration::from_nanos(1) {
+            thread::yield_now();
+        }
+        std::fs::write(root.path().join("release"), []).unwrap();
+        while engine.jobs[&id].readers.load(Ordering::Acquire) != 0 {
+            assert!(Instant::now() < until, "reader did not reach EOF");
+            thread::yield_now();
+        }
+        engine.collect_finished(&mut events);
+        assert!(events.iter().any(|event| matches!(event,
+            JobEvent::Output { stream: JobStream::Stdout, bytes, .. } if bytes == b"prefix\n"
+        )));
+        assert!(matches!(
+            events.last(),
+            Some(JobEvent::Exited {
+                code: Some(0),
+                timed_out: true,
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -1726,7 +2076,7 @@ mod tests {
             JobEvent::Output { .. }
         ));
         cancel.store(true, Ordering::Release);
-        engine.expire();
+        engine.expire(Instant::now());
         let deadline = Instant::now() + Duration::from_secs(5);
         while engine.jobs[&JobId(1)].readers.load(Ordering::Acquire) != 0 {
             assert!(
@@ -1740,68 +2090,78 @@ mod tests {
     #[test]
     fn job_deadline_releases_descendant_pipes_after_parent_exit() {
         let root = tempfile::tempdir().unwrap();
-        let (queued, residents) = submission(
+        let (mut queued, residents) = submission(
             root.path(),
-            "(while [ ! -e release ]; do sleep 0.05; done; printf alive > survived) >/dev/null & printf '%s\\n' \"$!\"",
+            "(while [ ! -e release ]; do sleep 0.05; done; printf alive > survived) 2>/dev/null & printf '%s\\nprefix\\n' \"$!\"",
         );
+        queued.request.policy.timeout = Duration::from_secs(30);
         let mut engine = JobEngine::new(16);
         engine.start(queued).unwrap();
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let mut helper = None;
-        while helper.is_none() || engine.jobs[&JobId(1)].status.is_none() {
-            for event in engine.poll() {
-                if let JobEvent::Output { bytes, .. } = event {
-                    let pid = std::str::from_utf8(&bytes).unwrap().trim().parse().unwrap();
-                    helper = Some(nix::unistd::Pid::from_raw(pid));
-                }
-            }
-            assert!(Instant::now() < deadline);
-            thread::sleep(Duration::from_millis(2));
-        }
+        let until = Instant::now() + Duration::from_secs(5);
         struct Helper(nix::unistd::Pid);
         impl Drop for Helper {
             fn drop(&mut self) {
                 let _ = nix::sys::signal::kill(self.0, nix::sys::signal::Signal::SIGKILL);
             }
         }
-        let _helper = Helper(helper.unwrap());
-        assert_ne!(engine.jobs[&JobId(1)].readers.load(Ordering::Acquire), 0);
-        let mut stderr_abandoned = false;
+        let id = JobId(1);
+        let mut helper = None;
+        let mut prefix = false;
+        while !prefix
+            || engine.jobs[&id].status.is_none()
+            || engine.jobs[&id].readers.load(Ordering::Acquire) != 1
+        {
+            for event in engine.poll() {
+                if let JobEvent::Output { bytes, .. } = event {
+                    if bytes == b"prefix\n" {
+                        prefix = true;
+                    } else {
+                        let pid = std::str::from_utf8(&bytes).unwrap().trim().parse().unwrap();
+                        helper = Some(Helper(nix::unistd::Pid::from_raw(pid)));
+                    }
+                }
+            }
+            assert!(Instant::now() < until);
+            thread::yield_now();
+        }
+        let _helper = helper.expect("same-group helper PID");
+        let running = &engine.jobs[&id];
+        assert_eq!(running.status, Some(Some(0)));
+        let expiry = running.deadline;
+        engine.expire(expiry);
+
+        let mut stdout_abandoned = false;
         let mut exited = false;
         while !engine.jobs.is_empty() || residents.load(Ordering::Acquire) != 0 {
             for event in engine.poll() {
                 match event {
                     JobEvent::Output {
-                        stream,
+                        stream: JobStream::Stdout,
                         abandoned: true,
                         ..
                     } => {
-                        assert_eq!(stream, JobStream::Stderr);
                         assert!(!exited);
-                        stderr_abandoned = true;
+                        stdout_abandoned = true;
                     }
                     JobEvent::Exited {
                         code, timed_out, ..
                     } => {
                         assert_eq!(code, Some(0));
-                        assert!(!timed_out);
-                        assert!(stderr_abandoned);
+                        assert!(timed_out);
+                        assert!(stdout_abandoned);
                         exited = true;
                     }
                     other => panic!("unexpected job event: {other:?}"),
                 }
             }
-            assert!(
-                Instant::now() < deadline,
-                "descendant pipes outlived the job deadline"
-            );
-            thread::sleep(Duration::from_millis(2));
+            assert!(Instant::now() < until, "descendant pipes blocked expiry");
+            thread::yield_now();
         }
-        assert!(stderr_abandoned && exited);
+        assert!(exited);
         std::fs::write(root.path().join("release"), []).unwrap();
         while !std::fs::read(root.path().join("survived")).is_ok_and(|data| data == b"alive") {
-            assert!(Instant::now() < deadline, "abandonment stopped the helper");
-            thread::sleep(Duration::from_millis(5));
+            assert!(Instant::now() < until, "abandonment stopped the helper");
+            thread::yield_now();
         }
     }
 
@@ -1970,22 +2330,30 @@ mod tests {
             root.path(),
             "i=0; while [ \"$i\" -lt 1500 ]; do printf 'x\\n'; i=$((i + 1)); done",
         );
-        queued.request.policy.timeout = Duration::from_secs(10);
+        queued.request.policy.timeout = Duration::from_secs(30);
         let mut engine = JobEngine::new(64);
         engine.start(queued).unwrap();
         let deadline = Instant::now() + Duration::from_secs(10);
         let running = engine.jobs.get_mut(&JobId(1)).unwrap();
-        while job_exit_status(&mut running.child).unwrap().is_none() {
+        while job_exit_status(&mut running.child).unwrap().is_none()
+            || running.readers.load(Ordering::Acquire) != 0
+        {
             assert!(
                 Instant::now() < deadline,
                 "leader did not exit with the queue full"
             );
             thread::yield_now();
         }
-        // Expire the job after observing its exit, without emptying the output queue.
         running.observe_exit(Instant::now()).unwrap();
         assert_eq!(running.status, Some(Some(0)));
-        running.started = Instant::now() - running.timeout;
+        assert!(
+            !running.output_drain.pending[JobStream::Stdout.index()]
+                .lock()
+                .unwrap()
+                .is_empty()
+        );
+        let expiry = running.deadline;
+        engine.expire(expiry);
 
         let mut lines = 0;
         let mut exited = false;
@@ -2013,6 +2381,95 @@ mod tests {
             thread::yield_now();
         }
         assert_eq!(lines, 1500);
+    }
+
+    #[test]
+    fn short_lines_with_late_eof_time_out_even_with_a_full_output_queue() {
+        let root = tempfile::tempdir().unwrap();
+        let (mut queued, _) = submission(
+            root.path(),
+            concat!(
+                "(i=0; while [ ! -e release ] && [ \"$i\" -lt 500 ]; do ",
+                "sleep 0.01; i=$((i + 1)); done; exec 1>&-; : > closed) 2>/dev/null & ",
+                "i=0; while [ \"$i\" -lt 1500 ]; do printf 'x\\n'; i=$((i + 1)); done",
+            ),
+        );
+        queued.request.policy.timeout = Duration::from_secs(1);
+        let id = queued.id;
+        let mut engine = JobEngine::new(64);
+        engine.start(queued).unwrap();
+        let until = Instant::now() + Duration::from_secs(5);
+        let running = engine.jobs.get_mut(&id).unwrap();
+        while running.status.is_none()
+            || running.output_drain.pending[JobStream::Stdout.index()]
+                .lock()
+                .unwrap()
+                .is_empty()
+        {
+            running.observe_exit(Instant::now()).unwrap();
+            assert!(
+                Instant::now() < until,
+                "leader did not fill the queue and exit"
+            );
+            thread::yield_now();
+        }
+        assert_eq!(running.status, Some(Some(0)));
+        assert!(
+            running.output_drain.eof_at[JobStream::Stdout.index()]
+                .get()
+                .is_none()
+        );
+        let expiry = running.deadline;
+        while Instant::now() <= expiry {
+            thread::park_timeout(expiry.saturating_duration_since(Instant::now()));
+        }
+        // Do not drain any events until after the helper closes stdout. The
+        // reader still sees EOF and records the real finish time on its own.
+        std::fs::write(root.path().join("release"), []).unwrap();
+        while running.readers.load(Ordering::Acquire) != 0 || !root.path().join("closed").exists() {
+            assert!(Instant::now() < until, "reader did not see late EOF");
+            thread::yield_now();
+        }
+        assert!(
+            running.output_drain.eof_at[JobStream::Stdout.index()]
+                .get()
+                .is_some_and(|&eof| eof > expiry)
+        );
+
+        let mut lines = 0;
+        let mut abandoned = false;
+        while !engine.jobs.is_empty() {
+            for event in engine.poll() {
+                match event {
+                    JobEvent::Output {
+                        bytes,
+                        truncated: false,
+                        ..
+                    } => {
+                        assert_eq!(bytes, b"x\n");
+                        lines += 1;
+                    }
+                    JobEvent::Output {
+                        stream: JobStream::Stdout,
+                        abandoned: true,
+                        ..
+                    } => {
+                        abandoned = true;
+                    }
+                    JobEvent::Exited {
+                        code, timed_out, ..
+                    } => {
+                        assert_eq!(code, Some(0));
+                        assert!(timed_out && abandoned);
+                        assert_eq!(lines, 1500);
+                    }
+                    other => panic!("unexpected job event: {other:?}"),
+                }
+            }
+            assert!(Instant::now() < until, "job did not finish");
+            thread::yield_now();
+        }
+        assert!(abandoned);
     }
 
     #[test]
@@ -2062,7 +2519,7 @@ mod tests {
     }
 
     #[test]
-    fn job_cancellation_releases_descendants_after_parent_exit() {
+    fn job_cancellation_at_deadline_releases_descendants_after_parent_exit() {
         let root = tempfile::tempdir().unwrap();
         let (queued, residents) = submission(root.path(), "sleep 30 & printf spawned");
         let cancel = queued.cancel.clone();
@@ -2079,7 +2536,13 @@ mod tests {
         let pid = rustix::process::Pid::from_raw(running.child.id() as i32).unwrap();
         // Observation must not reap the leader while cleanup can still signal its group.
         assert_eq!(job_exit_status(&mut running.child).unwrap(), Some(Some(0)));
+        let expiry = running.deadline;
         cancel.store(true, Ordering::Release);
+        engine.expire(expiry);
+        assert!(
+            engine.jobs[&JobId(1)].killed,
+            "Stop did not terminate the group"
+        );
         while !engine.jobs.is_empty() || residents.load(Ordering::Acquire) != 0 {
             engine.poll();
             assert!(Instant::now() < deadline, "descendant retained job readers");

@@ -2275,19 +2275,33 @@ impl GitScreen {
         Ok(())
     }
 
-    fn conflict_form(&mut self, path: PathBuf, side: &str) {
+    fn conflict_form(&mut self, path: PathBuf, side: &str) -> Result<(), String> {
+        let review = super::conflict::ConflictReview::capture(
+            &self.root,
+            std::slice::from_ref(&path),
+            crate::files::DOCUMENT_BYTE_LIMIT,
+        )
+        .map_err(|error| error.to_string())?;
         let mut choice = Field::new("Keep side (Up/Down selects)", side.into());
         choice.choices = vec!["ours".into(), "theirs".into()];
         self.notice.clear();
         self.form = Some(Form {
             title: format!("Replace {} with one side; stage separately", path.display()),
-            action: FormAction::Conflict(path),
+            action: FormAction::Conflict(Box::new(review)),
             fields: vec![choice],
             selected: 0,
             focus_moved: false,
         });
+        Ok(())
     }
     fn submit(&mut self) -> Result<(), String> {
+        self.submit_with_skip(skip_operation)
+    }
+
+    fn submit_with_skip(
+        &mut self,
+        skip: impl FnOnce(&Path) -> Result<GitRecoveryOutcome, super::GitRecoveryRefusal>,
+    ) -> Result<(), String> {
         let form = self.form.as_ref().ok_or("No open form")?;
         if matches!(
             &form.action,
@@ -2585,24 +2599,19 @@ impl GitScreen {
                         "The paused operation changed; cancel and reopen this action".into(),
                     );
                 }
+                let action = *action;
                 let outcome = match action {
-                    GitOperationAction::Continue => continue_operation(&self.root, ""),
+                    GitOperationAction::Continue => {
+                        self.continue_worker.start(self.root.clone())?;
+                        self.busy = true;
+                        self.form = None;
+                        self.notice = "Running Git…".into();
+                        return Ok(());
+                    }
                     GitOperationAction::Abort => abort_operation(&self.root),
-                    GitOperationAction::Skip => skip_operation(&self.root),
+                    GitOperationAction::Skip => skip(&self.root),
                     GitOperationAction::Resolve => {
                         return Err("Select a conflicted file to resolve".into());
-                    }
-                };
-                let done = {
-                    let mut name = operation.chars();
-                    let name = name
-                        .next()
-                        .map(|first| first.to_uppercase().chain(name).collect::<String>())
-                        .unwrap_or_default();
-                    if *action == GitOperationAction::Skip {
-                        format!("{name} commit skipped")
-                    } else {
-                        format!("{name} continued")
                     }
                 };
                 let refreshed = self.refresh();
@@ -2612,16 +2621,13 @@ impl GitScreen {
                     .ok()
                     .and_then(|state| GitOperationBar::of(&state));
                 self.refresh_conflicts();
-                // A replay that moved on and stopped on the next conflict did what was
-                // confirmed: close the sheet and say where it stopped, without an error.
-                self.receipt = outcome
-                    .stopped
-                    .as_ref()
-                    .map(|stop| (ReceiptTone::Notice, format!("{done} · {}", stop.summary())));
+                // The confirmed action succeeded. Close the sheet even if Git's
+                // capture was incomplete or refreshing the view fails.
+                self.record_replay_stop(action, &outcome);
+                self.form = None;
+                self.notice.clear();
+                self.note_write_capture(outcome.continue_warning(), true);
                 refreshed?;
-                if let Some(warning) = outcome.cleanup_warning {
-                    return Err(warning);
-                }
             }
         }
         if keep_form {
@@ -4307,6 +4313,87 @@ mod context_tests {
             std::fs::read_to_string(directory.path().join("tracked.txt")).unwrap(),
             "unstaged edit\n"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rebase_skip_with_incomplete_output_closes_the_sheet_and_warns() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let command = |args: &[&str]| {
+            crate::command::git_output(
+                root,
+                &args.iter().copied().map(OsString::from).collect::<Vec<_>>(),
+                &[],
+            )
+            .unwrap()
+        };
+        let git = |args: &[&str]| {
+            let output = command(args);
+            assert!(
+                output.status.success(),
+                "{args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout).trim().to_owned()
+        };
+        git(&["init", "-b", "main"]);
+        git(&["config", "user.name", "Rebase test"]);
+        git(&["config", "user.email", "rebase@example.invalid"]);
+        git(&["config", "commit.gpgsign", "false"]);
+        git(&["config", "core.hooksPath", ".git/hooks"]);
+        let commit_file = |path: &str, content: &str, subject: &str| {
+            std::fs::write(root.join(path), content).unwrap();
+            git(&["add", "--", path]);
+            git(&["commit", "-m", subject]);
+        };
+        commit_file("shared.txt", "base\n", "Base");
+        git(&["branch", "upstream"]);
+        commit_file("kept.txt", "kept\n", "Keep this commit");
+        let original_first = git(&["rev-parse", "HEAD"]);
+        commit_file("shared.txt", "main\n", "Conflicting commit");
+        let skipped = git(&["rev-parse", "HEAD"]);
+        git(&["switch", "upstream"]);
+        commit_file("shared.txt", "upstream\n", "Upstream edit");
+        let upstream = git(&["rev-parse", "HEAD"]);
+        git(&["switch", "main"]);
+
+        let hook = root.join(".git/hooks/post-rewrite");
+        std::fs::create_dir_all(hook.parent().unwrap()).unwrap();
+        std::fs::write(&hook, "#!/bin/sh\nsleep 5 >/dev/null &\n").unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let started = command(&["-c", "rebase.backend=merge", "rebase", "upstream"]);
+        assert!(!started.status.success());
+        assert_eq!(git(&["rev-parse", "REBASE_HEAD"]), skipped);
+        let rewritten = git(&["rev-parse", "HEAD"]);
+        assert_ne!(rewritten, original_first);
+        assert_eq!(git(&["rev-parse", "HEAD^"]), upstream);
+        assert_eq!(git(&["log", "-1", "--format=%s"]), "Keep this commit");
+
+        let mut screen = GitScreen::open(root).unwrap();
+        screen.operation_form(GitOperationAction::Skip).unwrap();
+        assert_eq!(
+            screen.form.as_ref().unwrap().title,
+            "Skip current rebase commit?"
+        );
+        let result = screen.submit_with_skip(|root| {
+            crate::conflict::skip_operation_with_timeout(root, Duration::from_secs(2))
+        });
+        assert_eq!(git(&["symbolic-ref", "HEAD"]), "refs/heads/main");
+        assert_eq!(git(&["rev-parse", "refs/heads/main"]), rewritten);
+        assert!(!root.join(".git/rebase-merge").exists());
+        result.unwrap();
+        assert!(screen.form.is_none());
+        assert!(screen.operation_bar.is_none());
+        let (message, severity) = screen
+            .write_footer
+            .as_ref()
+            .expect("missing capture warning");
+        assert_eq!(message, "Some Git output may be missing (standard error)");
+        assert!(matches!(severity, FooterSeverity::Warning));
     }
 
     fn ignored_switch_git(root: &Path, args: &[&str]) -> String {

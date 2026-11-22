@@ -18,6 +18,144 @@ use tempfile::tempdir;
 
 #[cfg(unix)]
 #[test]
+fn formatter_deadline_saves_the_original_instead_of_its_partial_output() {
+    const FORMAT_TIMEOUT_MS: u64 = 500;
+    let root = tempdir().unwrap();
+    let state_dir = tempdir().unwrap();
+    let mut loaded = crate::config::load_bundled_config();
+    loaded.config.tasks.insert(
+        "save-format".into(),
+        crate::config::TaskConfig {
+            kind: crate::config::TaskKind::Formatter,
+            executable: "/bin/sh".into(),
+            arguments: vec![
+                "-c".into(),
+                concat!(
+                    "IFS= read -r edit && IFS= read -r source && { ",
+                    "(i=0; while [ ! -e release ] && [ \"$i\" -lt 500 ]; do ",
+                    "sleep 0.02; i=$((i + 1)); done; exec 1>&-; : > closed) 2>/dev/null & ",
+                    "printf '%s\\n' \"$edit\"; }",
+                )
+                .into(),
+            ],
+            cwd: None,
+            environment: BTreeMap::new(),
+            dependencies: vec![],
+            timeout_ms: Some(FORMAT_TIMEOUT_MS),
+            stdin: true,
+            matcher: None,
+        },
+    );
+    let mut app = App::new(
+        StartupTarget::Dashboard {
+            root: root.path().into(),
+        },
+        loaded,
+        false,
+        state_dir.path().into(),
+        false,
+        false,
+        std::sync::Arc::new(crate::clock::SystemClock),
+    )
+    .unwrap();
+    let mut fixture = app.configuration.fixture_snapshot();
+    fixture.settings.lsp.format_on_save = true;
+    app.configuration.install_fixture(fixture);
+    app.documents.set_formatters(
+        "rust".into(),
+        vec![crate::app::documents::save_work::Formatter::Tool(
+            "save-format".into(),
+        )],
+    );
+    let path = app.state.workspace_root.join("formatted.rs");
+    fs::write(&path, "let x=1;\n").unwrap();
+    let (buffer, _) = app
+        .state
+        .open_text(TextBuffer::from_text("let x=1;\n"), Some(path.clone()))
+        .unwrap();
+    app.window_session.observe_size((80, 24));
+    app.set_dashboard_visibility(false);
+    app.reconcile_editor_windows();
+    prepare_trust_identity(&mut app);
+    for root in app.workspace.roots().to_vec() {
+        app.workspace.fixture_trust_identity(root.identity);
+    }
+    app.reconcile_workspace_trust();
+    app.invoke_insert_text("// edit\n".into());
+    app.process_effect(AppEffect::Save {
+        quit_after: false,
+        path: None,
+        force: false,
+    });
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !app
+        .tasks
+        .output_items("save-format")
+        .iter()
+        .any(|(row, _)| row.label == "// edit")
+    {
+        app.process_execution_preflight();
+        app.process_job_events();
+        assert!(Instant::now() < deadline, "formatter prefix did not arrive");
+        thread::yield_now();
+    }
+
+    // Keep the job worker between polls until the helper closes stdout. The prefix
+    // arrived after the formatter started, so waiting one deadline from here is enough.
+    let (paused, waiting) = std::sync::mpsc::sync_channel(0);
+    let (resume, resume_rx) = std::sync::mpsc::channel::<()>();
+    app.tasks
+        .jobs
+        .start_checked(
+            JobRequest {
+                program: "/bin/sh".into(),
+                argv0: None,
+                arguments: vec!["-c".into(), "exit 0".into()],
+                cwd: path.parent().unwrap().into(),
+                environment: BTreeMap::new(),
+                root_revision: 0,
+                stdin: None,
+                policy: JobPolicy::default(),
+            },
+            move |_| {
+                paused.send(()).map_err(|err| err.to_string())?;
+                let _ = resume_rx.recv_timeout(Duration::from_secs(5));
+                Ok(())
+            },
+        )
+        .unwrap();
+    waiting.recv_timeout(Duration::from_secs(3)).unwrap();
+    let release_at = Instant::now() + Duration::from_millis(FORMAT_TIMEOUT_MS);
+    while Instant::now() < release_at {
+        thread::yield_now();
+    }
+    let cwd = path.parent().unwrap();
+    fs::write(cwd.join("release"), []).unwrap();
+    while !cwd.join("closed").exists() {
+        assert!(Instant::now() < deadline, "helper did not close stdout");
+        thread::yield_now();
+    }
+    drop(resume);
+
+    while app.state.buffers[buffer].dirty {
+        app.process_job_events();
+        app.process_save_work();
+        app.process_vfs_results();
+        assert!(Instant::now() < deadline, "save did not finish");
+        thread::yield_now();
+    }
+    assert_eq!(fs::read_to_string(path).unwrap(), "// edit\nlet x=1;\n");
+    let output = app.tasks.output_items("save-format");
+    assert!(output.iter().any(|(row, _)| row.label == "// edit"));
+    assert!(
+        output
+            .iter()
+            .any(|(row, _)| row.label == "[save-format · timed out (exit 0)]")
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn successful_task_dependencies_publish_their_matched_diagnostics() {
     let root = tempdir().unwrap();
     let state_dir = tempdir().unwrap();
@@ -514,8 +652,12 @@ fn linter_job_and_vfs_publish_only_original_source_then_recover() {
         app.process_effect(AppEffect::LintRun("owned-lint".into()));
         let deadline = Instant::now() + Duration::from_secs(5);
         if incomplete {
-            let warning = "No lint results shown: some error output may be missing";
-            while app.ui.notification.as_deref() != Some(warning) {
+            // The leader exited, but its helper kept stderr open past the deadline.
+            let timeout_message = concat!(
+                "Task owned-lint timed out. ",
+                "No lint results shown: some error output may be missing",
+            );
+            while app.ui.notification.as_deref() != Some(timeout_message) {
                 app.process_execution_preflight();
                 app.process_job_events();
                 app.process_vfs_results();
@@ -526,7 +668,7 @@ fn linter_job_and_vfs_publish_only_original_source_then_recover() {
                 );
                 thread::sleep(Duration::from_millis(2));
             }
-            assert!(app.ui.notification_warning);
+            assert!(app.ui.notification_error);
             assert_eq!(app.tasks.linter_count(), 0);
             assert_eq!(app.diagnostics.choices().count(), 0);
             assert!(
