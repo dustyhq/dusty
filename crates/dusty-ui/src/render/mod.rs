@@ -325,9 +325,18 @@ pub struct ConfirmationState {
     pub hint: String,
 }
 
+/// The target shown above a review comment prompt.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReviewCommentTitle {
+    pub pull_request: u64,
+    pub path: String,
+    pub line: usize,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PromptState {
     pub kind: PromptKind,
+    pub review_comment_title: Option<ReviewCommentTitle>,
     pub confirmation: Option<ConfirmationState>,
     pub input: String,
     pub cursor: usize,
@@ -404,6 +413,7 @@ impl PromptState {
     pub fn new(kind: PromptKind) -> Self {
         Self {
             kind,
+            review_comment_title: None,
             confirmation: None,
             input: String::new(),
             cursor: 0,

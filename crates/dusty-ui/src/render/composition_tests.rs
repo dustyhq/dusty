@@ -2288,12 +2288,17 @@ fn key_hints_use_available_rows_and_stay_inside_a_lower_workspace() {
             x: 0,
             y: 30,
             width: 80,
-            height: 8,
+            height: 7,
         },
         crate::config::AmbiguousWidth::Narrow,
     );
-    for index in 0..8 {
-        assert!((30..37).any(|y| frame.grid.row_text(y).contains(&format!("Action {index}"))));
+    assert!(frame.grid.row_text(30).contains("Keys: space u"));
+    for index in 0..12 {
+        let entry = format!("[{index}] Action {index}");
+        assert!(
+            (30..36).any(|y| frame.grid.row_text(y).contains(&entry)),
+            "missing or clipped key hint: {entry}"
+        );
     }
     for y in (0..30).chain(36..40) {
         assert!(
@@ -2626,6 +2631,53 @@ fn the_selected_inspector_decides_the_narrow_strip_content_not_only_its_marker()
         breakpoint_rows.contains("src/main.rs:3"),
         "the breakpoints inspector shows the breakpoint: {breakpoint_rows:?}"
     );
+}
+
+#[test]
+fn a_review_comment_title_keeps_the_filename_and_line_in_the_frame() {
+    let mut state = EditorState::new(PathBuf::from("/tmp"));
+    state
+        .open_text(crate::editor::text::TextBuffer::from_text(""), None)
+        .unwrap();
+    let loaded = crate::config::load_bundled_config();
+    let mut ui = ui_with_editor_layout(&state);
+    let mut prompt = PromptState::new(PromptKind::ReviewComment);
+    prompt.review_comment_title = Some(crate::render::ReviewCommentTitle {
+        pull_request: 12,
+        path: "crates/dusty-core/src/editor/command/builtins/execute.rs".into(),
+        line: 123,
+    });
+    ui.prompt = Some(prompt);
+
+    for (width, height, expected) in [
+        (100, 30, "Review comment on #12 · …/builtins/execute.rs:123"),
+        (80, 24, "Review comment on #12 · …/builtins/execute.rs:123"),
+        (39, 24, "Review comment on execute.rs:123"),
+    ] {
+        let frame = render(
+            &state,
+            &ui,
+            &loaded.config,
+            &loaded.dashboard,
+            width,
+            height,
+        );
+        assert!(
+            drawn_at(&frame, &format!(" {expected} ")).is_some(),
+            "expected {expected:?} in the {width}×{height} prompt frame",
+        );
+    }
+
+    // In eight cells, two double-width filename characters plus the extension and ellipsis fit.
+    ui.prompt
+        .as_mut()
+        .unwrap()
+        .review_comment_title
+        .as_mut()
+        .unwrap()
+        .path = "src/界界界.rs".into();
+    let frame = render(&state, &ui, &loaded.config, &loaded.dashboard, 36, 24);
+    assert!(drawn_at(&frame, " Review comment on …界界.rs:123 ").is_some());
 }
 
 #[test]

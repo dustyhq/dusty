@@ -85,10 +85,20 @@ use crate::ui::PromptKind;
 
 impl App {
     pub(in crate::app) fn open_prompt(&mut self, kind: PromptKind, initial: String) {
+        self.open_prompt_with_review_title(kind, initial, None, None);
+    }
+
+    pub(in crate::app) fn open_prompt_with_review_title(
+        &mut self,
+        kind: PromptKind,
+        initial: String,
+        title: Option<crate::ui::render::ReviewCommentTitle>,
+        help: Option<String>,
+    ) {
         if self
             .input
             .prompt()
-            .is_some_and(|prompt| prompt.kind != kind)
+            .is_some_and(|prompt| prompt.kind != kind || prompt.kind == PromptKind::ReviewComment)
         {
             self.close_prompt();
         }
@@ -115,6 +125,12 @@ impl App {
         });
         if let Some(mode) = self.input.open_prompt(kind, initial, active) {
             self.set_mode(mode);
+        }
+        if let Some(title) = title {
+            self.input.set_review_comment_title(title);
+        }
+        if let Some(help) = help {
+            self.input.prompt_help(help);
         }
         self.project_input_hints();
         self.refresh_completions();
@@ -192,6 +208,39 @@ impl App {
 }
 
 impl App {
+    pub(in crate::app) fn open_worktree_message(
+        &mut self,
+        kind: PromptKind,
+        title: &str,
+        message: String,
+        button: &str,
+    ) {
+        self.open_prompt(kind, String::new());
+        self.cancel_input_replacement();
+        let binding = |command| {
+            self.configuration
+                .keymaps()
+                .binding_for("confirmation_prompt", command)
+        };
+        let hint = ["command_line.submit", "command_line.cancel"]
+            .into_iter()
+            .filter_map(binding)
+            .collect::<Vec<_>>()
+            .join(" / ");
+        self.input.configure_confirmation_actions(
+            title.into(),
+            message,
+            crate::ui::ConfirmationChoice::Yes,
+            button,
+            "",
+            hint,
+        );
+        self.project_input_prompt();
+        self.reconcile_editor_windows();
+    }
+}
+
+impl App {
     pub(in crate::app) fn close_prompt(&mut self) {
         self.close_prompt_with_editor_close(true);
     }
@@ -199,6 +248,17 @@ impl App {
 
 impl App {
     pub(in crate::app) fn close_prompt_with_editor_close(&mut self, cancel_editor_close: bool) {
+        if self
+            .input
+            .prompt()
+            .is_some_and(|prompt| prompt.kind == PromptKind::GitWorktreeCheck)
+            && !self.git.cancel_worktree_check()
+            && self.git.removing_worktree()
+        {
+            self.show_worktree_removing();
+            return;
+        }
+        self.save_review_comment();
         self.cancel_input_replacement();
         self.finish_text_input(None);
         if self
@@ -462,6 +522,7 @@ impl App {
                     }
                 }
                 Err(error) => {
+                    self.record_prompt_history(prompt.kind, &prompt.input);
                     self.prompt_error(error.to_string());
                 }
             },
@@ -568,10 +629,7 @@ impl App {
                     .is_some_and(|state| state.selected == crate::ui::ConfirmationChoice::Yes),
                 false,
             ),
-            PromptKind::ReviewComment => {
-                self.close_prompt();
-                self.submit_review_comment(prompt.input);
-            }
+            PromptKind::ReviewComment => self.submit_review_comment(prompt.input),
             PromptKind::ReplaceFind => {
                 self.close_prompt();
                 if !prompt.input.is_empty() {

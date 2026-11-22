@@ -4,11 +4,13 @@ use crate::CellGrid;
 use crate::Style;
 use crate::config::BorderStyle;
 use crate::config::Config;
+use crate::geometry::cell_text_width;
 use crate::geometry::text_width;
 use crate::grid::Frame;
 use crate::render::COMPLETION_DETAIL_GAP;
 use crate::render::COMPLETION_MAX_ROWS;
 use crate::render::PromptState;
+use crate::render::ReviewCommentTitle;
 use crate::render::editor::PROMPT_CURSOR;
 use crate::render::editor::cursor_style;
 
@@ -50,6 +52,67 @@ pub(super) fn prompt_viewport<'a>(
     (&input[start..], cells)
 }
 
+fn fit_review_comment_title(
+    target: &ReviewCommentTitle,
+    maximum: usize,
+    ambiguous: crate::config::AmbiguousWidth,
+) -> String {
+    const LABEL: &str = "Review comment on ";
+    const ELLIPSIS: &str = "…";
+
+    let width = |text: &str| cell_text_width(text, ambiguous);
+    let digits = target.line.to_string();
+    let line = format!(":{digits}");
+    let line_width = width(&line);
+    if line_width > maximum {
+        // On a very narrow screen omit the separator rather than clipping any digits.
+        return if width(&digits) <= maximum {
+            digits
+        } else {
+            String::new()
+        };
+    }
+
+    let file = target
+        .path
+        .rsplit(std::path::is_separator)
+        .next()
+        .unwrap_or(&target.path);
+    let pr_label = format!("{LABEL}#{} · ", target.pull_request);
+    let label: &str = if width(&pr_label) + width(file) + line_width <= maximum {
+        &pr_label
+    } else if width(LABEL) + line_width <= maximum {
+        LABEL
+    } else {
+        ""
+    };
+    let path_width = maximum - width(label) - line_width;
+    let path = if width(&target.path) <= path_width {
+        target.path.clone()
+    } else if width(file) <= path_width {
+        target
+            .path
+            .match_indices(std::path::is_separator)
+            .map(|(at, _)| &target.path[at..])
+            .find(|tail| width(ELLIPSIS) + width(tail) <= path_width)
+            .map_or_else(|| file.to_owned(), |tail| format!("{ELLIPSIS}{tail}"))
+    } else if width(ELLIPSIS) < path_width {
+        let mut start = file.len();
+        let mut used = width(ELLIPSIS);
+        for (at, grapheme) in file.grapheme_indices(true).rev() {
+            used += width(grapheme);
+            if used > path_width {
+                break;
+            }
+            start = at;
+        }
+        format!("{ELLIPSIS}{}", &file[start..])
+    } else {
+        String::new()
+    };
+    format!("{label}{path}{line}")
+}
+
 pub(super) fn render_prompt(
     frame: &mut Frame,
     prompt: &PromptState,
@@ -76,6 +139,17 @@ pub(super) fn render_prompt(
     }
     if geometry.height < 3 {
         if let Some(confirmation) = &prompt.confirmation {
+            if confirmation.positive_label.is_empty() && confirmation.negative_label.is_empty() {
+                frame.grid.put_text_clipped(
+                    geometry.left,
+                    geometry.top,
+                    &confirmation.message,
+                    Style::Default,
+                    right,
+                );
+                frame.cursor = None;
+                return;
+            }
             if !confirmation_layout
                 .as_ref()
                 .is_some_and(|layout| layout.fully_visible)
@@ -101,7 +175,9 @@ pub(super) fn render_prompt(
                 frame.grid.put_text_clipped(
                     geometry.left,
                     geometry.top.saturating_add(1),
-                    &if confirmation.selected == crate::ConfirmationChoice::Yes {
+                    &if confirmation.negative_label.is_empty() {
+                        format!("[ {} ]", confirmation.positive_label)
+                    } else if confirmation.selected == crate::ConfirmationChoice::Yes {
                         format!(
                             "[ {} ]  {}",
                             confirmation.positive_label, confirmation.negative_label
@@ -205,15 +281,25 @@ pub(super) fn render_prompt(
         );
     }
     if geometry.width > PROMPT_TITLE_MIN_WIDTH {
-        let title = format!(
-            " {} ",
-            prompt.confirmation.as_ref().map_or_else(
-                || prompt.kind.title(&config.ui.command_line.text),
-                |confirmation| confirmation.title.as_str(),
-            )
-        );
-        let title_width =
-            u16::try_from(text_width(&title, config.editor.ambiguous_width)).unwrap_or(0);
+        let ambiguous = config.editor.ambiguous_width;
+        let (title, title_width) = if let Some(target) = &prompt.review_comment_title
+            && prompt.confirmation.is_none()
+        {
+            let maximum = usize::from(geometry.width.saturating_sub(4));
+            let title = format!(" {} ", fit_review_comment_title(target, maximum, ambiguous));
+            let title_width = u16::try_from(cell_text_width(&title, ambiguous)).unwrap_or(0);
+            (title, title_width)
+        } else {
+            let title = format!(
+                " {} ",
+                prompt.confirmation.as_ref().map_or_else(
+                    || prompt.kind.title(&config.ui.command_line.text),
+                    |confirmation| confirmation.title.as_str(),
+                )
+            );
+            let title_width = u16::try_from(text_width(&title, ambiguous)).unwrap_or(0);
+            (title, title_width)
+        };
         let title_x = geometry
             .left
             .saturating_add(geometry.width.saturating_sub(title_width) / 2)
@@ -258,11 +344,18 @@ pub(super) fn render_prompt(
             frame.cursor = None;
             return;
         }
+        if confirmation.positive_label.is_empty() && confirmation.negative_label.is_empty() {
+            frame.cursor = None;
+            return;
+        }
         let positive = format!("[ {} ]", confirmation.positive_label);
-        let negative = format!("[ {} ]", confirmation.negative_label);
-        let buttons_width = text_width(&positive, config.editor.ambiguous_width)
-            .saturating_add(1)
-            .saturating_add(text_width(&negative, config.editor.ambiguous_width));
+        let negative = (!confirmation.negative_label.is_empty())
+            .then(|| format!("[ {} ]", confirmation.negative_label));
+        let buttons_width = text_width(&positive, config.editor.ambiguous_width).saturating_add(
+            negative.as_ref().map_or(0, |label| {
+                1 + text_width(label, config.editor.ambiguous_width)
+            }),
+        );
         let buttons_x = geometry.left.saturating_add(
             geometry
                 .width
@@ -274,24 +367,26 @@ pub(super) fn render_prompt(
             buttons_x,
             button_y,
             &positive,
-            if confirmation.selected == crate::ConfirmationChoice::Yes {
+            if negative.is_none() || confirmation.selected == crate::ConfirmationChoice::Yes {
                 Style::Selection
             } else {
                 Style::Default
             },
             right.saturating_sub(1),
         );
-        frame.grid.put_text_clipped(
-            no_x.saturating_add(1),
-            button_y,
-            &negative,
-            if confirmation.selected == crate::ConfirmationChoice::No {
-                Style::Selection
-            } else {
-                Style::Default
-            },
-            right.saturating_sub(1),
-        );
+        if let Some(negative) = negative {
+            frame.grid.put_text_clipped(
+                no_x.saturating_add(1),
+                button_y,
+                &negative,
+                if confirmation.selected == crate::ConfirmationChoice::No {
+                    Style::Selection
+                } else {
+                    Style::Default
+                },
+                right.saturating_sub(1),
+            );
+        }
         if !confirmation.hint.is_empty() && geometry.width > 8 {
             // The legend starts two cells in, stops two short of the right edge and has a space
             // on each side.

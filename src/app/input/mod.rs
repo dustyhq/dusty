@@ -1055,6 +1055,14 @@ impl InputState {
     pub(in crate::app) fn cancel_prompt_completions(&mut self) {
         self.completion_request_id = self.completion_request_id.saturating_add(1);
     }
+    pub(in crate::app) fn set_review_comment_title(
+        &mut self,
+        title: crate::ui::render::ReviewCommentTitle,
+    ) {
+        if let Some(prompt) = &mut self.prompt {
+            prompt.review_comment_title = Some(title);
+        }
+    }
     pub(in crate::app) fn prompt_help(&mut self, help: String) {
         if let Some(prompt) = &mut self.prompt {
             prompt.help = Some(help);
@@ -1065,9 +1073,11 @@ impl InputState {
             prompt.error = Some(error);
         }
     }
+    #[cfg(test)]
     pub(in crate::app) fn command_history(&self) -> &[String] {
         &self.command_history
     }
+    #[cfg(test)]
     pub(in crate::app) fn search_history(&self) -> &[String] {
         &self.search_history
     }

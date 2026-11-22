@@ -129,6 +129,9 @@ impl App {
                 // Preserve the native continuation: rename, search, command parsing, etc.
                 if let Some(prompt) = self.input.prompt().cloned() {
                     self.input.open_prompt(prompt.kind, text, None);
+                    if let Some(title) = prompt.review_comment_title {
+                        self.input.set_review_comment_title(title);
+                    }
                     self.project_input_prompt();
                     let previous = std::mem::replace(&mut self.effect_authority, authority);
                     self.submit_prompt();
