@@ -358,6 +358,8 @@ pub struct CommandTarget {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum InvocationSource {
     Keymap,
+    /// Text or a mapped key delivered to the terminal with keyboard focus.
+    TerminalInput,
     CommandLine,
     Macro,
     Repeat,

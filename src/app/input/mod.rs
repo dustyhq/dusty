@@ -3188,10 +3188,17 @@ impl App {
         else {
             return false;
         };
+        let source = if matches!(context, "terminal" | "terminal_normal" | "terminal_visual") {
+            InvocationSource::TerminalInput
+        } else {
+            InvocationSource::Keymap
+        };
         let mut typed = true;
         for key in keys {
             match key.text_character() {
-                Some(character) => self.invoke_text_command(&command_id, character.to_string()),
+                Some(character) => {
+                    self.invoke_text_command_from(&command_id, character.to_string(), source);
+                }
                 None => typed = false,
             }
         }
@@ -3283,7 +3290,16 @@ impl App {
 
 impl App {
     pub(in crate::app) fn invoke_text_command(&mut self, command_id: &str, text: String) {
-        match command(command_id) {
+        self.invoke_text_command_from(command_id, text, InvocationSource::Keymap);
+    }
+
+    fn invoke_text_command_from(
+        &mut self,
+        command_id: &str,
+        text: String,
+        source: InvocationSource,
+    ) {
+        match CommandInvocation::new(command_id, source) {
             Ok(invocation) => {
                 self.invoke(invocation.with_argument("text", CommandValue::String(text)))
             }

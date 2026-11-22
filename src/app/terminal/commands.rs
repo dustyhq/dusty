@@ -2,6 +2,7 @@
 
 use crate::app::App;
 use crate::app::commands::AppEffect;
+use crate::app::commands::TerminalSendTarget;
 use crate::app::picker::PickerPayload;
 use crate::app::terminal::TerminalInput;
 use crate::app::windows::NativeSurfaceTarget;
@@ -25,6 +26,8 @@ use crate::editor::ArgumentType;
 use crate::editor::CommandError;
 use crate::editor::CommandRegistry;
 use crate::editor::ContextRequirement;
+use crate::editor::InvocationSource;
+use crate::ui::PtyInputKey;
 
 pub(in crate::app) fn register_commands(
     registry: &mut CommandRegistry<AppEffect>,
@@ -181,7 +184,9 @@ pub(in crate::app) fn register_commands(
         "terminal.send",
         "Send terminal text",
         ContextRequirement::Application,
-        ArgumentSchema::default().field("text", ArgumentType::String, true),
+        ArgumentSchema::default()
+            .field("text", ArgumentType::String, true)
+            .field("id", ArgumentType::Integer, false),
         |invocation| {
             Ok(AppEffect::TerminalSend(
                 string_arg(invocation, "text")?.to_owned(),

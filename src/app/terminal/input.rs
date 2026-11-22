@@ -9,6 +9,12 @@ use crate::ui::TerminalPanelState;
 use crate::ui::TerminalTabState;
 use std::sync::Arc;
 impl Terminals {
+    pub(super) fn has_input_destination(&self, id: PtyId) -> bool {
+        self.tabs
+            .get(&id)
+            .is_some_and(|tab| !tab.exited && !tab.io_complete)
+    }
+
     pub(in crate::app) fn send(
         &self,
         id: PtyId,

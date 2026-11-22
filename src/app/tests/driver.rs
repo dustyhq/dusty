@@ -646,6 +646,7 @@ impl TestSession {
     pub(in crate::app) fn apply_candidate(&mut self, loaded: LoadedConfig) -> Result<(), String> {
         self.application
             .apply_configuration_candidate(loaded, false)
+            .map_err(|error| error.to_string())
     }
     pub(in crate::app) fn reject_stale_contribution(&mut self) -> Result<(), String> {
         let candidate = self
@@ -908,8 +909,16 @@ impl TestSession {
             .process_effect(crate::app::commands::AppEffect::TerminalUnfocus);
     }
     pub(in crate::app) fn terminal_send(&mut self, text: &str) {
-        self.application
-            .process_effect(crate::app::commands::AppEffect::TerminalSend(text.into()));
+        let id = self.application.terminal_session.selected().unwrap();
+        self.application.invoke(
+            crate::app::command("terminal.send")
+                .unwrap()
+                .with_argument(
+                    "id",
+                    crate::editor::CommandValue::Integer(id.0.try_into().unwrap()),
+                )
+                .with_argument("text", crate::editor::CommandValue::String(text.into())),
+        );
     }
     pub(in crate::app) fn clone_terminal(&mut self) {
         self.application

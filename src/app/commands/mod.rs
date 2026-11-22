@@ -337,8 +337,12 @@ pub enum AppEffect {
     TerminalFloat(Option<crate::windows::WindowRect>),
     TerminalFullscreen,
     TerminalHide,
-    TerminalSend(String),
+    TerminalSend {
+        target: TerminalSendTarget,
+        text: String,
+    },
     TerminalModeNormal,
+    TerminalEscape,
     TerminalModeInput,
     TerminalNormalMove(String),
     TerminalVisualStart(bool),
@@ -1326,6 +1330,9 @@ impl App {
             | AppEffect::LspSelectionExpand) => self.process_language_effect(effect),
             effect @ (AppEffect::Settings(..) | AppEffect::Setup(..)) => {
                 self.process_settings_effect(effect)
+            }
+            AppEffect::TerminalSend { target, text } => {
+                return self.send_terminal_command(target, &text);
             }
             effect @ (AppEffect::TerminalOpen(..)
             | AppEffect::TerminalToggle
