@@ -53,37 +53,23 @@ impl App {
 
 impl App {
     pub(in crate::app) fn finish_theme_choice(&mut self, name: &str) {
-        // The choice goes into config.toml like any other setting; once the reload lands, the
-        // configured theme replaces the applied one. Without a config file it lives in the
-        // editor state instead.
-        let saved = self.configuration.user_settings_path().is_some_and(|path| {
-            crate::config::write_user_setting(
-                &path,
-                "ui.theme",
-                Some(toml::Value::String(name.into())),
-            )
-            .and_then(|()| {
-                self.configuration
-                    .request_reload()
-                    .map_err(|error| error.to_string())
-            })
-            .map_err(|error| self.show_error(error))
-            .is_ok()
-        });
-        let saving = saved || self.configuration.settings().persistence.enabled;
+        let saving = self.configuration.settings().persistence.enabled;
         if saving {
             self.persistence.request_save();
         }
-        let message = format!(
-            "Theme {}{}",
-            crate::config::theme_display_name(name),
-            if saving { "" } else { " (not saved)" }
-        );
         if self.ui.settings.is_some() {
             self.refresh_settings();
-            self.settings_status(message, false);
-        } else {
-            self.notify_message(message, false);
+        }
+        if !saving {
+            let message = format!(
+                "Theme {} (not saved)",
+                crate::config::theme_display_name(name)
+            );
+            if self.ui.settings.is_some() {
+                self.settings_status(message, false);
+            } else {
+                self.notify_message(message, false);
+            }
         }
     }
 }

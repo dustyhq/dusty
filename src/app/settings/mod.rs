@@ -1,6 +1,6 @@
 //! The Settings page: every setting from `assets/defaults/settings.toml` with its current value.
-//! A change is written to the user's config.toml and applied by the normal configuration reload,
-//! which refreshes the page.
+//! Most changes are written to the user's config.toml and applied by the normal configuration
+//! reload. The Theme row opens the state-only theme chooser.
 
 use crate::app::App;
 use crate::app::commands::AppEffect;
@@ -100,7 +100,8 @@ impl App {
                 title: info.title(),
                 about: info.about.clone(),
                 value: setting_value(info, current.as_ref(), &theme),
-                modified: user_keys.contains(&info.key),
+                modified: user_keys.contains(&info.key)
+                    || (info.key == "ui.theme" && self.configuration.has_theme_choice()),
                 restart: info.restart,
             }));
         }
@@ -194,11 +195,13 @@ impl App {
             SettingsAction::Reset => {
                 page.edit = None;
                 if let Some(row) = page.selected_row() {
-                    if row.modified {
-                        let key = row.key.clone();
-                        let _ = self.save_setting(&key, None, false);
-                    } else {
-                        page.status = Some(("Already the default".into(), false));
+                    match &row.value {
+                        SettingsValue::Theme(_) => self.reset_settings_theme(),
+                        _ if row.modified => {
+                            let key = row.key.clone();
+                            let _ = self.save_setting(&key, None, false);
+                        }
+                        _ => page.status = Some(("Already the default".into(), false)),
                     }
                 }
             }
@@ -360,6 +363,22 @@ impl App {
                     error: None,
                 });
             }
+        }
+    }
+
+    fn reset_settings_theme(&mut self) {
+        if self.configuration.clear_theme_choice() {
+            if self.configuration.settings().persistence.enabled {
+                self.persistence.request_save();
+            }
+            if let Some(page) = self.ui.settings.as_mut() {
+                page.status = None;
+            }
+            self.refresh_settings();
+        } else if self.configuration.user_setting_keys().contains("ui.theme") {
+            let _ = self.save_setting("ui.theme", None, false);
+        } else {
+            self.settings_status("Already the default".into(), false);
         }
     }
 

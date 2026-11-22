@@ -62,7 +62,6 @@ def main() -> None:
         assert original in delta(5) and preview not in delta(5), "Escape did not restore accepted colors"
         assert "Dusty themes" not in screen(5)
         assert preview in delta(8), "Enter did not preserve the session theme"
-        assert "editor-state save requested" in screen(8)
         assert (config / "config.toml").read_text() == settings
         assert b"\x1b[?1049l" in output, "alternate screen not restored"
         state_path = root / ".dusty-state/session.json"

@@ -250,7 +250,8 @@ fn choice_geometry(
     let SettingsEdit::Choice { selected } = page.edit.as_ref()? else {
         return None;
     };
-    let SettingsValue::Choice { choices, .. } = &page.selected_row()?.value else {
+    let row = page.selected_row()?;
+    let SettingsValue::Choice { choices, .. } = &row.value else {
         return None;
     };
     let offset = settings_lines_height(page, 0..page.selected, layout, ambiguous);
@@ -263,7 +264,7 @@ fn choice_geometry(
     }
     let widest = choices
         .iter()
-        .map(|choice| width_of(choice, AmbiguousWidth::Wide))
+        .map(|choice| width_of(choice_label(&row.key, choice), AmbiguousWidth::Wide))
         .max()
         .unwrap_or(0);
     let width = widest.saturating_add(6).min(layout.list_width);
@@ -352,13 +353,24 @@ pub fn settings_hit(
     None
 }
 
-fn control_text(value: &SettingsValue) -> (String, Style) {
-    match value {
+fn choice_label<'a>(key: &str, value: &'a str) -> &'a str {
+    match (key, value) {
+        ("agents.placement", "docked") => "Docked",
+        ("agents.placement", "float") => "Floating",
+        ("agents.placement", "fullscreen") => "Fullscreen",
+        _ => value,
+    }
+}
+
+fn control_text(row: &SettingsRow) -> (String, Style) {
+    match &row.value {
         SettingsValue::Bool(true) => ("[✓] On".into(), Style::Accent),
         SettingsValue::Bool(false) => ("[ ] Off".into(), Style::Muted),
-        SettingsValue::Choice { current, .. } | SettingsValue::Theme(current) => {
+        SettingsValue::Choice { current, .. } => {
+            let current = choice_label(&row.key, current);
             (format!(" {current}  ▾ "), Style::Status)
         }
+        SettingsValue::Theme(current) => (format!(" {current}  ▾ "), Style::Status),
         SettingsValue::Number(text)
         | SettingsValue::Text(text)
         | SettingsValue::List(text)
@@ -642,7 +654,7 @@ pub(super) fn render_settings(
                             x
                         }
                         _ => {
-                            let (text, style) = control_text(&row.value);
+                            let (text, style) = control_text(row);
                             let text = ellipsized(&text, usize::from(control_limit), ambiguous);
                             let x = list_right.saturating_sub(width_of(&text, ambiguous) + 1);
                             let style = match (selected, style) {
@@ -737,9 +749,13 @@ pub(super) fn render_settings(
                         Style::Accent
                     },
                 );
-                frame
-                    .grid
-                    .put_text_clipped(box_x + 4, y, choice, style, box_x + box_width - 1);
+                frame.grid.put_text_clipped(
+                    box_x + 4,
+                    y,
+                    choice_label(&row.key, choice),
+                    style,
+                    box_x + box_width - 1,
+                );
             }
         }
     }
@@ -747,6 +763,20 @@ pub(super) fn render_settings(
     // Keys, and how the last change went.
     let footer_y = layout.top + layout.height - 2;
     // Each hint with its rank; a narrow page drops the highest ranks first, keeping hints whole.
+    let theme_can_reset = page
+        .selected_row()
+        .is_some_and(|row| row.modified && matches!(&row.value, SettingsValue::Theme(_)));
+    let settings_hints = [
+        ("↑↓ move", 4),
+        ("Tab section", 3),
+        ("Space toggle", 2),
+        ("r reset", if theme_can_reset { 0 } else { 2 }),
+        ("Enter change", 0),
+        ("/ search", 1),
+        ("m modified", 1),
+        ("o config.toml", 1),
+        ("Esc close", 0),
+    ];
     let hints: &[(&str, u8)] = match (&page.edit, page.searching) {
         (Some(SettingsEdit::Text { .. }), _) => &[("Enter save", 0), ("Esc cancel", 0)],
         (Some(SettingsEdit::Choice { .. }), _) => {
@@ -774,17 +804,7 @@ pub(super) fn render_settings(
             ("Enter done", 0),
             ("Esc clear", 0),
         ],
-        (None, false) => &[
-            ("↑↓ move", 4),
-            ("Tab section", 3),
-            ("Space toggle", 2),
-            ("Enter change", 0),
-            ("r reset", 2),
-            ("/ search", 1),
-            ("m modified", 1),
-            ("o config.toml", 1),
-            ("Esc close", 0),
-        ],
+        (None, false) => &settings_hints,
     };
     let status_width = page
         .status

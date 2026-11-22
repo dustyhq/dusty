@@ -166,6 +166,14 @@ impl Configuration {
             Some(Err(result.diagnostics.join("; ")))
         }
     }
+    pub(in crate::app) fn has_theme_choice(&self) -> bool {
+        self.themes.applied.is_some()
+    }
+    pub(in crate::app) fn clear_theme_choice(&mut self) -> bool {
+        let had_choice = self.has_theme_choice() || self.themes.restore.is_some();
+        self.themes = Themes::default();
+        had_choice
+    }
     pub(in crate::app) fn theme_state(&self) -> Result<Option<String>, String> {
         self.themes
             .applied
