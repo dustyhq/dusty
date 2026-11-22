@@ -4,6 +4,7 @@ use crate::app::commands::AppEffect;
 use crate::config::ConfigurationWorker;
 use crate::config::ConfigurationWorkerError;
 use crate::config::ConfigurationWorkerResult;
+use crate::config::InlineDiagnostics;
 use crate::config::LineNumbers;
 use crate::config::LoadedConfig;
 use crate::editor::CommandInvocation;
@@ -37,12 +38,17 @@ pub(in crate::app) use validation::keymap_entries;
 pub(in crate::app) use validation::validate_configured_commands;
 mod compile;
 pub(in crate::app) use compile::KeymapCompilation;
+pub(in crate::app) use compile::KeymapNotice;
 pub(in crate::app) use compile::compile_keymap_entries;
+#[cfg(test)]
 pub(crate) use compile::compile_keymaps;
+#[cfg(test)]
 pub(crate) use compile::compile_keymaps_with_plugin_catalog;
 pub(in crate::app) use compile::display_key_sequence;
 pub(in crate::app) use compile::literal_key_sequence;
 mod contributions;
+pub(in crate::app) use contributions::ContributionError;
+pub(in crate::app) use contributions::ContributionKeymapPolicy;
 mod themes;
 pub(in crate::app) use themes::ThemeKey;
 pub(in crate::app) use themes::ThemeRows;
@@ -71,6 +77,8 @@ pub(super) struct Configuration {
     rejected_keymaps: Option<String>,
     /// The line numbers that `<leader>ul` hid.
     hidden_line_numbers: Option<LineNumbers>,
+    /// The message setting that `<leader>ud` hid.
+    hidden_inline_diagnostics: Option<InlineDiagnostics>,
     zen: Option<ZenRestore>,
 }
 
@@ -104,7 +112,8 @@ pub(in crate::app) struct ConfigurationCandidate {
 pub(in crate::app) struct ContributionCandidate {
     stamp: Arc<()>,
     catalog: crate::plugins::PluginCatalogVersion,
-    keymaps: Option<ResolvedKeymaps>,
+    keymaps: Option<contributions::ContributionKeymaps>,
+    command_references: Option<validation::CommandReferences>,
     windows: crate::config::WindowsConfig,
     deferred: bool,
 }
@@ -139,6 +148,7 @@ impl ConfigurationCandidate {
             stamp: self.stamp.clone(),
             catalog: self.catalog.clone(),
             keymaps: None,
+            command_references: None,
             windows: self.resolved.settings.windows.clone(),
             deferred: self.resolved.deferred_plugin_keymaps,
         }
@@ -169,6 +179,7 @@ impl Configuration {
             binding_revision: 0,
             rejected_keymaps: None,
             hidden_line_numbers: None,
+            hidden_inline_diagnostics: None,
             zen: None,
         }
     }
@@ -203,8 +214,8 @@ impl Configuration {
     pub(in crate::app) fn raw_keymaps(&self) -> &crate::config::LoadedKeymaps {
         &self.accepted.raw_keymaps
     }
-    pub(in crate::app) fn base_keymaps(&self) -> &crate::config::LoadedKeymaps {
-        &self.accepted.base_keymaps
+    pub(in crate::app) fn keymap_notice(&self) -> Option<&KeymapNotice> {
+        self.accepted.keymap_notice.as_ref()
     }
     pub(in crate::app) fn raw_windows(&self) -> &crate::config::WindowsConfig {
         &self.accepted.raw_windows
@@ -277,36 +288,22 @@ impl Configuration {
         loaded: LoadedConfig,
         commands: &CommandRegistry<AppEffect>,
         catalog: &PluginContributionCatalog,
-    ) -> Result<ConfigurationCandidate, String> {
+        pending_owners: &BTreeSet<String>,
+    ) -> Result<ConfigurationCandidate, crate::config::ConfigurationCandidateError> {
         loaded.config.validate()?;
-        validation::validate_command_references(
+        let (resolved, _) = resolve::resolve_configuration_with_catalog(
             commands,
-            &loaded.config,
-            &loaded.dashboard,
-            &BTreeSet::new(),
+            loaded,
+            true,
+            Some((catalog, self.keymaps())),
+            Some(pending_owners),
         )?;
-        let mut resolved = match resolve_configuration(commands, loaded, true)? {
-            (resolved, None) => resolved,
-            (_, Some(error)) => return Err(error),
-        };
         if resolved.settings.plugins != self.accepted.settings.plugins {
             return Err(
                 "live plugin topology reload is not yet staged; previous configuration retained"
                     .into(),
             );
         }
-        resolved.settings.windows = Self::resolve_plugin_window_rules(
-            &resolved.raw_windows,
-            &resolved.expected_plugin_indexes,
-            catalog,
-        )?;
-        resolved.keymaps = compile_keymaps_with_plugin_catalog(
-            commands,
-            &resolved.raw_keymaps,
-            catalog,
-            &resolved.settings.input.keymaps,
-        )
-        .map_err(|errors| errors.join("; "))?;
         Ok(ConfigurationCandidate {
             resolved,
             catalog: catalog.version(),
@@ -362,6 +359,7 @@ impl Configuration {
             editor.indent_guides.enabled = false;
         }
         self.hidden_line_numbers = None;
+        self.hidden_inline_diagnostics = None;
         self.themes.reset(keep_theme, &self.accepted.theme.name);
         self.stamp = Arc::new(());
         self.binding_revision = self.binding_revision.saturating_add(1);
@@ -453,6 +451,23 @@ impl Configuration {
         self.stamp = Arc::new(());
         self.accepted.settings.lsp.inlay_hints = !self.accepted.settings.lsp.inlay_hints;
         self.accepted.settings.lsp.inlay_hints
+    }
+    pub(in crate::app) fn toggle_inline_diagnostics(&mut self) -> bool {
+        self.stamp = Arc::new(());
+        let mode = &mut self.accepted.settings.lsp.inline_diagnostics;
+        if *mode == InlineDiagnostics::Off {
+            *mode = self.hidden_inline_diagnostics.take().unwrap_or_default();
+            true
+        } else {
+            self.hidden_inline_diagnostics = Some(*mode);
+            *mode = InlineDiagnostics::Off;
+            false
+        }
+    }
+    pub(in crate::app) fn toggle_auto_completion(&mut self) -> bool {
+        self.stamp = Arc::new(());
+        self.accepted.settings.lsp.auto_completion = !self.accepted.settings.lsp.auto_completion;
+        self.accepted.settings.lsp.auto_completion
     }
 }
 

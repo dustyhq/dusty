@@ -319,8 +319,8 @@ pub fn run_interactive(
         application.edit_path(path);
     }
     if !application.workspace.safe_mode() {
-        application.load_configured_plugins();
         application.extension.start_packages();
+        application.load_configured_plugins();
     }
     application.health.record(
         LogLevel::Info,

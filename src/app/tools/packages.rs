@@ -145,12 +145,14 @@ impl App {
 
 impl App {
     pub(in crate::app) fn process_package_events(&mut self) {
+        let pending = self.pending_keymap_providers();
         let updates = self.extension.poll_packages(
             self.plugin_limits(),
             &self.configuration.settings().plugins,
             self.workspace.safe_mode(),
         );
         self.apply_extension_updates(updates);
+        self.report_settled_keymap_providers(&pending);
     }
 }
 
@@ -166,6 +168,21 @@ impl App {
                     self.remove_plugin_contributions(&plugin, load)
                 }
                 ExtensionUpdate::Error(error) => self.show_error(error),
+                ExtensionUpdate::PublishPackage(plugin, load, package) => {
+                    self.publish_package(plugin, load, package)
+                }
+                ExtensionUpdate::PackageProblem {
+                    message,
+                    diagnostic,
+                } => {
+                    self.health.record(
+                        LogLevel::Error,
+                        "packages",
+                        "package-failed",
+                        BTreeMap::from([("error".into(), diagnostic)]),
+                    );
+                    self.show_error(message);
+                }
                 ExtensionUpdate::Conflict(plugin) => {
                     self.show_error(self.message("package_plugin_conflict", &[("plugin", plugin)]))
                 }

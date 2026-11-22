@@ -3,6 +3,7 @@
 use crate::app::commands::AppEffect;
 use crate::config::LoadedConfig;
 use crate::editor::CommandError;
+use crate::editor::CommandId;
 use crate::editor::CommandInvocation;
 use crate::editor::CommandRegistry;
 use crate::editor::CommandValue;
@@ -12,6 +13,7 @@ use std::collections::BTreeSet;
 pub(in crate::app) fn validate_configured_commands(
     commands: &CommandRegistry<AppEffect>,
     loaded: &LoadedConfig,
+    allow_unavailable_plugin_labels: bool,
 ) -> Result<(), String> {
     let mut errors = Vec::new();
     let command_ids = commands
@@ -33,8 +35,10 @@ pub(in crate::app) fn validate_configured_commands(
     let enabled_plugins = crate::app::configuration::resolve::enabled_plugin_owners(loaded);
     for extra in loaded.config.command_labels.keys().filter(|id| {
         !command_ids.contains(*id)
-            && !crate::app::configuration::plugin_owner_from_id(id)
-                .is_some_and(|owner| enabled_plugins.contains(owner))
+            && !(CommandId::new(id.as_str()).is_ok()
+                && plugin_command_owner(id).is_some_and(|owner| {
+                    allow_unavailable_plugin_labels || enabled_plugins.contains(owner)
+                }))
     }) {
         errors.push(format!(
             "command label references unknown command `{extra}`"
@@ -83,69 +87,147 @@ pub(in crate::app) fn validate_configured_commands(
     }
 }
 
-pub(super) fn validate_command_references(
+fn validate_command_references(
     commands: &CommandRegistry<AppEffect>,
     config: &crate::config::Config,
     dashboard: &crate::config::DashboardConfig,
     deferred_plugins: &BTreeSet<String>,
 ) -> Result<(), String> {
-    let mut errors = Vec::new();
-    let registered = commands
-        .specs()
-        .map(|spec| spec.id.as_str())
-        .collect::<BTreeSet<_>>();
-    let deferred = |id: &str| {
-        !registered.contains(id)
-            && crate::app::configuration::plugin_owner_from_id(id)
-                .is_some_and(|owner| deferred_plugins.contains(owner))
-    };
-    for (alias, command_id) in &config.input.command_aliases {
-        if alias.is_empty() || alias.chars().any(char::is_whitespace) || alias.contains('.') {
-            errors.push(format!("invalid command alias `{alias}`"));
-            continue;
+    CommandReferences::new(config, dashboard)
+        .resolve(
+            commands,
+            &config.command_labels,
+            deferred_plugins,
+            CommandReferencePolicy::Check,
+        )
+        .map(|_| ())
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum CommandReferencePolicy {
+    Check,
+    Runtime,
+}
+
+pub(super) fn plugin_command_owner(id: &str) -> Option<&str> {
+    let owner = super::plugin_owner_from_id(id)?;
+    (id.split('.').count() >= 3).then_some(owner)
+}
+
+#[derive(Clone)]
+pub(super) struct CommandReferences {
+    pub(super) aliases: std::collections::BTreeMap<String, String>,
+    pub(super) dashboard: crate::config::DashboardConfig,
+}
+
+impl CommandReferences {
+    pub(super) fn new(
+        config: &crate::config::Config,
+        dashboard: &crate::config::DashboardConfig,
+    ) -> Self {
+        Self {
+            aliases: config.input.command_aliases.clone(),
+            dashboard: dashboard.clone(),
         }
-        if !config.command_labels.get(command_id).is_some_and(|label| {
-            !label.is_empty() && !label.contains('\u{1b}') && label.len() <= 1_024
-        }) {
-            errors.push(format!(
-                "command alias `{alias}` requires a valid command label for `{command_id}`"
-            ));
-        }
-        if let Err(error) = CommandInvocation::new(command_id, InvocationSource::Startup) {
-            errors.push(format!("command alias `{alias}`: {error}"));
-        } else if !registered.contains(command_id.as_str()) && !deferred(command_id) {
+    }
+
+    pub(super) fn resolve(
+        &self,
+        commands: &CommandRegistry<AppEffect>,
+        labels: &std::collections::BTreeMap<String, String>,
+        pending: &BTreeSet<String>,
+        policy: CommandReferencePolicy,
+    ) -> Result<(Self, Vec<String>), String> {
+        let mut errors = Vec::new();
+        let mut notices = Vec::new();
+        let mut effective = self.clone();
+        let registered = commands
+            .specs()
+            .map(|spec| spec.id.as_str())
+            .collect::<BTreeSet<_>>();
+        let keep_pending = policy == CommandReferencePolicy::Check;
+
+        effective.aliases.retain(|alias, command_id| {
+            if alias.is_empty() || alias.chars().any(char::is_whitespace) || alias.contains('.') {
+                errors.push(format!("invalid command alias `{alias}`"));
+                return false;
+            }
+            let valid_label = labels.get(command_id.as_str()).is_some_and(|label| {
+                !label.is_empty() && !label.contains('\u{1b}') && label.len() <= 1_024
+            });
+            if !valid_label {
+                errors.push(format!(
+                    "command alias `{alias}` requires a valid command label for `{command_id}`"
+                ));
+            }
+            if let Err(error) = CommandId::new(command_id.as_str()) {
+                errors.push(format!("command alias `{alias}`: {error}"));
+                return false;
+            }
+            if registered.contains(command_id.as_str()) {
+                return valid_label;
+            }
+            if let Some(owner) = plugin_command_owner(command_id) {
+                if pending.contains(owner) {
+                    return keep_pending && valid_label;
+                }
+                if policy == CommandReferencePolicy::Runtime {
+                    notices.push(format!(
+                        "Command alias \"{alias}\" refers to unknown command \"{command_id}\"."
+                    ));
+                    return false;
+                }
+            }
             errors.push(format!(
                 "command alias `{alias}` references unknown command `{command_id}`"
             ));
-        }
-    }
-    for action in &dashboard.action {
-        let invocation = CommandInvocation::new(&action.command, InvocationSource::Startup)
-            .and_then(|mut invocation| {
-                for (name, value) in &action.arguments {
-                    let value = configuration_value(value).map_err(|()| {
-                        CommandError::InvalidArguments(format!(
-                            "dashboard argument `{name}` has unsupported type"
-                        ))
-                    })?;
-                    invocation.arguments.insert(name.clone(), value);
+            false
+        });
+
+        effective.dashboard.action.retain(|action| {
+            let invocation = CommandInvocation::new(&action.command, InvocationSource::Startup)
+                .and_then(|mut invocation| {
+                    for (name, value) in &action.arguments {
+                        let value = configuration_value(value).map_err(|()| {
+                            CommandError::InvalidArguments(format!(
+                                "dashboard argument `{name}` has unsupported type"
+                            ))
+                        })?;
+                        invocation.arguments.insert(name.clone(), value);
+                    }
+                    Ok(invocation)
+                });
+            // Classify absence after constructing the invocation. A known
+            // command with invalid arguments must not take the missing-target path.
+            let validation =
+                invocation.and_then(|invocation| commands.validate_invocation_shape(&invocation));
+            match validation {
+                Ok(()) => true,
+                Err(error) => {
+                    if let CommandError::Unknown(id) = &error
+                        && let Some(owner) = plugin_command_owner(id.as_str())
+                    {
+                        if pending.contains(owner) {
+                            return keep_pending;
+                        }
+                        if policy == CommandReferencePolicy::Runtime {
+                            notices.push(format!(
+                                "Skipped dashboard action \"{}\": unknown command \"{id}\".",
+                                action.label,
+                            ));
+                            return false;
+                        }
+                    }
+                    errors.push(format!("dashboard action `{}`: {error}", action.label));
+                    false
                 }
-                Ok(invocation)
-            });
-        if let Err(error) = invocation.and_then(|invocation| {
-            if deferred(invocation.id.as_str()) {
-                Ok(())
-            } else {
-                commands.validate_invocation_shape(&invocation)
             }
-        }) {
-            errors.push(format!("dashboard action `{}`: {error}", action.label));
+        });
+        if errors.is_empty() {
+            Ok((effective, notices))
+        } else {
+            Err(errors.join("; "))
         }
-    }
-    if errors.is_empty() {
-        Ok(())
-    } else {
-        Err(errors.join("; "))
     }
 }
 

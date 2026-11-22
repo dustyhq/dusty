@@ -189,6 +189,56 @@ mod tests {
     }
 
     #[test]
+    fn invalid_leader_keeps_the_bundled_command_prompt_binding() {
+        let root = tempdir().unwrap();
+        let settings_path = root.path().join("config.toml");
+        fs::write(
+            &settings_path,
+            "[input.keymaps]\nleader = 'nonsense'\n[editor]\nwrap = true\n",
+        )
+        .unwrap();
+        let settings = crate::config::load_config(&settings_path);
+        assert!(settings.diagnostic.is_none(), "{:?}", settings.diagnostic);
+        let mut loaded = crate::config::load_bundled_config();
+        loaded.path = settings_path.clone();
+        loaded.config = settings.config;
+        loaded.keymap_policy_lines = settings.keymap_policy_lines;
+        loaded.keymaps.path = root.path().join("keymaps.toml");
+
+        let app = crate::app::App::new(
+            StartupTarget::Dashboard {
+                root: root.path().into(),
+            },
+            loaded,
+            false,
+            root.path().join("state"),
+            false,
+            false,
+            std::sync::Arc::new(crate::clock::SystemClock),
+        )
+        .unwrap();
+
+        let keys = app.configuration.keymaps();
+        let mut sequence = crate::editor::input::KeymapSequence::default();
+        assert!(matches!(
+            keys.resolve(
+                &mut sequence,
+                "editor.normal",
+                crate::editor::input::KeyEvent::character(':'),
+            ),
+            crate::editor::input::MappingResolution::Ready(invocation)
+                if invocation.id.as_str() == "command_line.open"
+        ));
+        assert!(app.configuration.settings().editor.wrap);
+        let notice = app.ui.config_diagnostic.as_deref().unwrap();
+        assert!(
+            notice.starts_with("Using default keys. config.toml, line 2: "),
+            "{notice}"
+        );
+        assert!(notice.contains("nonsense"), "{notice}");
+    }
+
+    #[test]
     fn startup_description_escapes_path_controls() {
         let root = std::path::PathBuf::from("/workspace\x1b]0;title\x07");
         let dashboard = StartupTarget::Dashboard { root: root.clone() };
@@ -311,6 +361,7 @@ pub enum ApplicationError {
 use crate::app::App;
 use crate::app::InteractiveError;
 use crate::app::configuration::Configuration;
+use crate::app::configuration::resolve::resolve_startup_configuration;
 use crate::app::configuration::resolve_configuration;
 use crate::app::debugger::Debugger;
 use crate::app::diagnostics::MAXIMUM_DIAGNOSTICS;
@@ -361,7 +412,7 @@ impl App {
         let source_fingerprint = loaded_config.source_fingerprint.clone();
         let config_warning = loaded_config.warning.clone();
         let (configuration, config_diagnostic) =
-            match resolve_configuration(&commands, loaded_config, false) {
+            match resolve_startup_configuration(&commands, loaded_config, safe_mode) {
                 Ok(resolved) => resolved,
                 Err(diagnostic) => {
                     let bundled = crate::config::load_bundled_config();
@@ -533,8 +584,12 @@ impl App {
         };
         application.project_configuration();
         application.project_window_activation();
-        if let Some(warning) = config_warning.filter(|_| application.ui.config_diagnostic.is_none())
-        {
+        if let Some(notice) = application.configuration.keymap_notice() {
+            for entry in notice.new_history_entries(None) {
+                application.notices.record_history(entry.clone(), false);
+            }
+        }
+        if let Some(warning) = config_warning {
             application.notify_warning(warning);
         }
         Ok(application)

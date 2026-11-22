@@ -3,18 +3,19 @@
 use crate::app::commands::AppEffect;
 use crate::app::commands::register_app_commands;
 use crate::app::configuration::KeymapCompilation;
+use crate::app::configuration::compile::KeymapNotice;
 use crate::app::configuration::compile::expanded_key_sequence;
+use crate::app::configuration::compile::{compile_catalog_keymaps, compile_startup_fallback};
 use crate::app::configuration::compile_keymap_entries;
-use crate::app::configuration::compile_keymaps;
 use crate::app::configuration::configured_context;
-use crate::app::configuration::keymap_entries;
 use crate::app::configuration::literal_key_sequence;
 use crate::app::configuration::plugin_owner_from_id;
 use crate::app::configuration::validate_configured_commands;
-use crate::config::LoadedConfig;
+use crate::config::{ConfigurationCandidateError, LoadedConfig};
 use crate::editor::CommandRegistry;
 use crate::editor::input::InputContexts;
 use crate::editor::register_builtin_commands;
+use crate::plugins::PluginContributionCatalog;
 use crate::ui::DashboardAction;
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -63,10 +64,17 @@ pub(in crate::app) fn base_safe_keymaps(
         .any(|id| plugin_owner_from_id(id).is_some_and(|owner| enabled.contains(owner)));
     let mut deferred_entries = Vec::new();
     for (offset, entry) in base.entries[base.bundled_count..].iter().enumerate() {
-        let owner = plugin_owner_from_id(&entry.id)
-            .or_else(|| entry.command.as_deref().and_then(plugin_owner_from_id))
-            .or_else(|| entry.context.as_deref().and_then(plugin_owner_from_id));
-        if owner.is_some_and(|owner| enabled.contains(owner)) {
+        let dependencies = [
+            entry.disable.then_some(entry.id.as_str()),
+            entry.command.as_deref(),
+            entry.context.as_deref(),
+        ];
+        if dependencies
+            .into_iter()
+            .flatten()
+            .filter_map(plugin_owner_from_id)
+            .any(|owner| enabled.contains(owner))
+        {
             deferred = true;
             deferred_entries.push(entry);
         } else {
@@ -85,8 +93,14 @@ pub(in crate::app) fn base_safe_keymaps(
     let mut groups = base.groups[..base.bundled_group_count].to_vec();
     let mut group_spans = Vec::new();
     for (offset, group) in base.groups[base.bundled_group_count..].iter().enumerate() {
-        let owner = plugin_owner_from_id(&group.id)
-            .or_else(|| group.context.as_deref().and_then(plugin_owner_from_id));
+        let depends_on_plugin = [
+            group.disable.then_some(group.id.as_str()),
+            group.context.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .filter_map(plugin_owner_from_id)
+        .any(|owner| enabled.contains(owner));
         let deferred_continuation = leaders.as_ref().is_ok_and(|(leader, local_leader)| {
             let Some(prefix) = group
                 .prefix
@@ -112,7 +126,7 @@ pub(in crate::app) fn base_safe_keymaps(
                 })
             })
         });
-        if owner.is_some_and(|owner| enabled.contains(owner)) || deferred_continuation {
+        if depends_on_plugin || deferred_continuation {
             deferred = true;
         } else {
             groups.push(group.clone());
@@ -130,9 +144,38 @@ pub(in crate::app) fn base_safe_keymaps(
 
 pub(in crate::app) fn resolve_configuration(
     commands: &CommandRegistry<AppEffect>,
-    mut loaded: LoadedConfig,
+    loaded: LoadedConfig,
     strict_sources: bool,
 ) -> Result<(ResolvedConfiguration, Option<String>), String> {
+    resolve_configuration_with_catalog(commands, loaded, strict_sources, None, None)
+        .map_err(|error| error.to_string())
+}
+
+pub(in crate::app) fn resolve_startup_configuration(
+    commands: &CommandRegistry<AppEffect>,
+    loaded: LoadedConfig,
+    safe_mode: bool,
+) -> Result<(ResolvedConfiguration, Option<String>), String> {
+    let no_pending_owners = BTreeSet::new();
+    resolve_configuration_with_catalog(
+        commands,
+        loaded,
+        false,
+        None,
+        safe_mode.then_some(&no_pending_owners),
+    )
+    .map_err(|error| error.to_string())
+}
+
+pub(super) fn resolve_configuration_with_catalog(
+    commands: &CommandRegistry<AppEffect>,
+    mut loaded: LoadedConfig,
+    strict_sources: bool,
+    live: Option<(&PluginContributionCatalog, &ResolvedKeymaps)>,
+    pending_owners: Option<&BTreeSet<String>>,
+) -> Result<(ResolvedConfiguration, Option<String>), ConfigurationCandidateError> {
+    let (catalog, retained) = live.unzip();
+    let resolve_references = !strict_sources || catalog.is_some();
     if loaded.user_configuration {
         loaded.installed_plugins = crate::tools::installed_plugins(
             &crate::config::user_state_directory().join("packages"),
@@ -140,61 +183,152 @@ pub(in crate::app) fn resolve_configuration(
     }
     let mut diagnostics = Vec::new();
     diagnostics.extend(loaded.diagnostic.iter().cloned());
-    diagnostics.extend(loaded.keymaps.diagnostic.iter().cloned());
-    if let Err(error) = validate_configured_commands(commands, &loaded) {
-        diagnostics.push(error);
-        return Err(diagnostics.join("; "));
+    if strict_sources {
+        if !diagnostics.is_empty() {
+            diagnostics.extend(loaded.keymaps.diagnostic.iter().cloned());
+            return Err(diagnostics.join("; ").into());
+        }
+        if let Some(detail) = &loaded.keymaps.diagnostic {
+            return Err(if catalog.is_some() {
+                ConfigurationCandidateError::keymap_source(&loaded.keymaps.path, detail)
+            } else {
+                ConfigurationCandidateError::Keymaps(detail.clone())
+            });
+        }
     }
-    // The loader has already replaced unreadable or malformed sources independently.
-    // Startup can use those replacements; config checks and reloads reject the errors.
-    if strict_sources && !diagnostics.is_empty() {
-        return Err(diagnostics.join("; "));
-    }
+    let raw_command_references =
+        super::validation::CommandReferences::new(&loaded.config, &loaded.dashboard);
     let (base_keymaps, expected_plugin_indexes, mut deferred_plugin_keymaps) =
         base_safe_keymaps(&loaded);
-    let keymaps = if strict_sources {
-        let (entries, bundled_count, groups, bundled_group_count) = keymap_entries(&base_keymaps);
+    let mut skipped = Vec::new();
+    if resolve_references {
+        use super::validation::CommandReferencePolicy;
+        let pending = pending_owners.unwrap_or(&expected_plugin_indexes);
+        let (references, notices) = raw_command_references.resolve(
+            commands,
+            &loaded.config.command_labels,
+            pending,
+            CommandReferencePolicy::Runtime,
+        )?;
+        loaded.config.input.command_aliases = references.aliases;
+        loaded.dashboard = references.dashboard;
+        skipped.extend(notices);
+    }
+    if let Err(error) = validate_configured_commands(commands, &loaded, resolve_references) {
+        diagnostics.push(error);
+        return Err(diagnostics.join("; ").into());
+    }
+    let mut keymap_notice = loaded
+        .keymaps
+        .diagnostic
+        .as_deref()
+        .map(|error| KeymapNotice::from_read_error(&loaded.keymaps.path, error));
+    let mut startup_keymap_fallback = keymap_notice
+        .clone()
+        .map(StartupKeymapFallback::UntilReload);
+    let source = KeymapCompilation::new(&loaded.keymaps, &loaded.config.input.keymaps);
+    let describe = |errors: &super::compile::KeymapErrors| {
+        if catalog.is_some() {
+            errors.describe_short(
+                &loaded.keymaps.path,
+                &loaded.path,
+                &loaded.keymap_policy_lines,
+            )
+        } else {
+            errors.describe(
+                &loaded.keymaps.path,
+                &loaded.path,
+                &loaded.keymap_policy_lines,
+            )
+        }
+    };
+    let mut keymaps = if strict_sources && catalog.is_none() {
+        // --check-config has no runtime catalog; keep its base-only validation.
         compile_keymap_entries(
             commands,
-            KeymapCompilation {
-                entries,
-                bundled_count,
-                groups,
-                bundled_group_count,
-                user_path: &base_keymaps.path,
-                user_spans: &base_keymaps.user_spans,
-                user_group_spans: &base_keymaps.user_group_spans,
-                policy: &loaded.config.input.keymaps,
-            },
+            KeymapCompilation::new(&base_keymaps, &loaded.config.input.keymaps),
         )
-        .map_err(|errors| errors.join("; "))?
+        .map_err(|errors| ConfigurationCandidateError::Keymaps(describe(&errors)))?
     } else {
-        // A user keymap that won't compile costs only the user's keys.
-        let (keymaps, diagnostic) =
-            compile_keymaps(commands, &base_keymaps, &loaded.config.input.keymaps);
-        diagnostics.extend(diagnostic);
-        keymaps
+        let empty_catalog = PluginContributionCatalog::default();
+        // At startup, enabled providers haven't had a chance to index yet.
+        let pending_owners = pending_owners.unwrap_or(&expected_plugin_indexes);
+        match compile_catalog_keymaps(
+            commands,
+            source,
+            catalog.unwrap_or(&empty_catalog),
+            pending_owners,
+            retained,
+        ) {
+            Ok((keys, notice)) => {
+                keymap_notice = keymap_notice.or(notice);
+                keys
+            }
+            Err(errors) if strict_sources => {
+                return Err(ConfigurationCandidateError::Keymaps(describe(&errors)));
+            }
+            Err(errors) => {
+                let (keys, fallback) = compile_startup_fallback(commands, source, errors)
+                    .map_err(|errors| ConfigurationCandidateError::Keymaps(describe(&errors)))?;
+                let notice = fallback.diagnostics.fallback_notice(
+                    &loaded.keymaps.path,
+                    &loaded.path,
+                    &loaded.keymap_policy_lines,
+                );
+                startup_keymap_fallback = Some(if fallback.policy.is_some() {
+                    StartupKeymapFallback::UntilReload(notice.clone())
+                } else {
+                    StartupKeymapFallback::Retryable(notice.clone())
+                });
+                if let Some(policy) = fallback.policy {
+                    loaded.config.input.keymaps = policy;
+                    for key in ["input.keymaps.leader", "input.keymaps.local_leader"] {
+                        loaded.user_setting_keys.remove(key);
+                        loaded.user_setting_spans.remove(key);
+                    }
+                }
+                keymap_notice = Some(notice);
+                keys
+            }
+        }
     };
     let mut settings = loaded.config;
     let raw_windows = settings.windows.clone();
-    if let Some(rule) = settings.windows.rules.iter().find(|rule| {
+    if resolve_references {
+        let empty_catalog = PluginContributionCatalog::default();
+        let (windows, notices) = super::Configuration::filter_plugin_window_rules(
+            &raw_windows,
+            catalog.unwrap_or(&empty_catalog),
+            pending_owners.unwrap_or(&expected_plugin_indexes),
+        )?;
+        settings.windows = windows;
+        skipped.extend(notices);
+    } else if let Some(rule) = settings.windows.rules.iter().find(|rule| {
         plugin_owner_from_id(&rule.content_type)
             .is_some_and(|owner| !expected_plugin_indexes.contains(owner))
     }) {
         return Err(format!(
             "plugin window selector `{}` does not name an enabled plugin",
             rule.content_type
-        ));
+        )
+        .into());
     }
-    if settings.windows.rules.iter().any(|rule| {
+    if raw_windows.rules.iter().any(|rule| {
         plugin_owner_from_id(&rule.content_type)
             .is_some_and(|owner| expected_plugin_indexes.contains(owner))
     }) {
         deferred_plugin_keymaps = true;
-        settings
-            .windows
-            .rules
-            .retain(|rule| !rule.content_type.starts_with("plugin."));
+        if !resolve_references {
+            settings
+                .windows
+                .rules
+                .retain(|rule| !rule.content_type.starts_with("plugin."));
+        }
+    }
+    keymap_notice = KeymapNotice::combine(keymap_notice, KeymapNotice::skipped(skipped));
+    if let Some(notice) = &keymap_notice {
+        diagnostics.insert(0, notice.summary.clone());
+        keymaps.conflicts.push(notice.detail.clone());
     }
     let keymap_source = if loaded.keymaps.bundled_count > 0
         && loaded.keymaps.entries.len() == loaded.keymaps.bundled_count
@@ -210,9 +344,12 @@ pub(in crate::app) fn resolve_configuration(
         raw_keymaps: loaded.keymaps,
         base_keymaps,
         raw_windows,
+        raw_command_references,
         deferred_plugin_keymaps,
         expected_plugin_indexes,
         keymaps,
+        keymap_notice,
+        startup_keymap_fallback,
         sources: ConfigurationSources {
             settings: loaded.path,
             keymaps: keymap_source,
@@ -307,6 +444,14 @@ pub(in crate::app) struct ConfigurationSources {
 }
 
 #[derive(Clone)]
+pub(super) enum StartupKeymapFallback {
+    /// The parsed keys failed validation, which may change when a plugin joins.
+    Retryable(KeymapNotice),
+    /// The source could not be read, or startup replaced the invalid leader policy.
+    UntilReload(KeymapNotice),
+}
+
+#[derive(Clone)]
 pub(crate) struct ResolvedConfiguration {
     pub settings: crate::config::Config,
     pub dashboard: crate::config::DashboardConfig,
@@ -314,9 +459,14 @@ pub(crate) struct ResolvedConfiguration {
     pub raw_keymaps: crate::config::LoadedKeymaps,
     pub base_keymaps: crate::config::LoadedKeymaps,
     pub raw_windows: crate::config::WindowsConfig,
+    pub(super) raw_command_references: super::validation::CommandReferences,
     pub deferred_plugin_keymaps: bool,
     pub expected_plugin_indexes: BTreeSet<String>,
     pub keymaps: ResolvedKeymaps,
+    /// Active fallback, not the status of the parsed declarations.
+    pub(super) keymap_notice: Option<KeymapNotice>,
+    /// Cleared when the original user keymaps are accepted, never entered by a plugin change.
+    pub(super) startup_keymap_fallback: Option<StartupKeymapFallback>,
     pub(in crate::app) sources: ConfigurationSources,
     pub user_setting_keys: BTreeSet<String>,
     pub user_setting_spans: BTreeMap<String, std::ops::Range<usize>>,

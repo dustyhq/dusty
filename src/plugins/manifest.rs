@@ -317,6 +317,8 @@ impl Eq for PluginCatalogVersion {}
 #[derive(Clone, Debug, Default)]
 pub struct PluginContributionCatalog {
     indexes: BTreeMap<String, PluginContributionIndex>,
+    // A user group may reach a plugin's default shortcut without naming the plugin.
+    inactive_keymaps: BTreeMap<String, Vec<PluginKeymapContribution>>,
     version: PluginCatalogVersion,
 }
 
@@ -337,6 +339,7 @@ impl PluginContributionCatalog {
                 return Err(PluginError::ContributionConflict);
             }
         }
+        self.inactive_keymaps.remove(&index.owner);
         self.indexes.insert(index.owner.clone(), index);
         self.version = PluginCatalogVersion::default();
         Ok(())
@@ -346,14 +349,15 @@ impl PluginContributionCatalog {
         if self
             .indexes
             .get(owner)
-            .is_some_and(|index| index.plugin_load == plugin_load)
+            .is_none_or(|index| index.plugin_load != plugin_load)
         {
-            self.indexes.remove(owner);
-            self.version = PluginCatalogVersion::default();
-            true
-        } else {
-            false
+            return false;
         }
+        if let Some(index) = self.indexes.remove(owner) {
+            self.inactive_keymaps.insert(index.owner, index.keymaps);
+        }
+        self.version = PluginCatalogVersion::default();
+        true
     }
 
     #[must_use]
@@ -366,7 +370,29 @@ impl PluginContributionCatalog {
         self.indexes.values()
     }
 
+    pub(crate) fn inactive_keymaps(
+        &self,
+    ) -> impl Iterator<Item = (&str, &PluginKeymapContribution)> {
+        self.inactive_keymaps
+            .iter()
+            .flat_map(|(owner, entries)| entries.iter().map(move |entry| (owner.as_str(), entry)))
+    }
+
+    pub(crate) fn clear_active(&mut self) {
+        for (owner, index) in std::mem::take(&mut self.indexes) {
+            self.inactive_keymaps.insert(owner, index.keymaps);
+        }
+        self.version = PluginCatalogVersion::default();
+    }
+
     pub fn context_snapshot(&self) -> Result<crate::editor::input::InputContexts, PluginError> {
+        self.context_snapshot_with_source()
+            .map_err(|(_, error)| error)
+    }
+
+    pub(crate) fn context_snapshot_with_source(
+        &self,
+    ) -> Result<crate::editor::input::InputContexts, (&str, PluginError)> {
         let mut contexts = crate::editor::input::InputContexts::bundled();
         for index in self.indexes.values() {
             let namespace = format!("plugin.{}.", index.owner);
@@ -374,7 +400,7 @@ impl PluginContributionCatalog {
                 let local = context
                     .id
                     .strip_prefix(&namespace)
-                    .ok_or(PluginError::InvalidManifest)?;
+                    .ok_or((index.source.as_str(), PluginError::InvalidManifest))?;
                 contexts
                     .register_plugin(
                         &index.owner,
@@ -384,7 +410,7 @@ impl PluginContributionCatalog {
                         index.plugin_load,
                         index.source.clone(),
                     )
-                    .map_err(|_| PluginError::InvalidManifest)?;
+                    .map_err(|_| (index.source.as_str(), PluginError::InvalidManifest))?;
             }
         }
         Ok(contexts)

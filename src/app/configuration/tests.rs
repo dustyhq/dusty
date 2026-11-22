@@ -142,6 +142,7 @@ pub(in crate::app) fn delayed_persistence_preserves_newer_runtime_breakpoint_and
     state.breakpoints = [1, 2, 3]
         .into_iter()
         .map(|line| PersistedBreakpoint {
+            id: None,
             path: path.clone(),
             line,
             disabled: false,
@@ -255,6 +256,281 @@ pub(in crate::app) fn theme_picker_replaces_the_current_choice_with_its_installe
     };
     assert_eq!(app.configuration.apply_theme(&key).unwrap(), installed.name);
     assert_eq!(app.configuration.theme(), &installed);
+}
+
+#[test]
+fn accepting_themes_saves_editor_state_without_editing_user_config() {
+    const CONFIG: &[u8] =
+        b"# Keep this comment and formatting\n[ui]\ntheme='tokyo-night'\n[config_watch]\nenabled=false\n";
+    // Isolate the config and state paths from the other tests.
+    if std::env::var_os("DUSTY_TEST_THEME_STATE_ONLY").is_none() {
+        let root = tempdir().unwrap();
+        fs::write(root.path().join("config.toml"), CONFIG).unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                concat!(
+                    "app::configuration::tests::",
+                    "accepting_themes_saves_editor_state_without_editing_user_config"
+                ),
+            ])
+            .env("DUSTY_TEST_THEME_STATE_ONLY", "1")
+            .env("DUSTY_CONFIG_HOME", root.path())
+            .env("DUSTY_STATE_HOME", root.path().join("state"))
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success()
+                && String::from_utf8_lossy(&output.stdout).contains("test result: ok. 1 passed;"),
+            "{output:?}"
+        );
+        return;
+    }
+
+    let config_path = crate::config::user_config_path();
+    let state_dir = crate::config::user_state_directory();
+    let loaded = crate::config::load_user_config();
+    assert!(loaded.user_configuration);
+    let mut app = App::new(
+        StartupTarget::Dashboard {
+            root: config_path.parent().unwrap().into(),
+        },
+        loaded,
+        false,
+        state_dir.clone(),
+        false,
+        false,
+        Arc::new(crate::clock::SystemClock),
+    )
+    .unwrap();
+    assert_eq!(app.configuration.theme().name, "tokyo-night");
+
+    for (name, effect) in [
+        ("nord", AppEffect::SelectTheme),
+        ("rose-pine", AppEffect::SetTheme("rose-pine".into())),
+    ] {
+        let by_name = matches!(&effect, AppEffect::SetTheme(_));
+        app.process_effect(effect);
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while app.ui.picker.as_ref().is_some_and(|picker| picker.loading) {
+            app.process_theme_results();
+            assert!(Instant::now() < deadline, "theme discovery did not finish");
+            thread::yield_now();
+        }
+        if !by_name {
+            for key in name.chars() {
+                app.handle_configured_key(KeyEvent::character(key));
+            }
+            app.accept_picker();
+        }
+        assert!(app.ui.picker.is_none());
+        assert_eq!(app.configuration.theme().name, name);
+        assert_eq!(fs::read(&config_path).unwrap(), CONFIG);
+
+        app.process_persistence_events();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while app.persistence.pending() {
+            app.process_persistence_events();
+            assert!(Instant::now() < deadline, "theme state was not saved");
+            thread::yield_now();
+        }
+        let state: PersistedState =
+            serde_json::from_slice(&fs::read(state_dir.join("session.json")).unwrap()).unwrap();
+        let snapshot: serde_json::Value =
+            serde_json::from_str(&state.metadata["ui.theme.snapshot"]).unwrap();
+        assert_eq!(snapshot["name"].as_str(), Some(name));
+    }
+}
+
+#[test]
+fn resetting_settings_theme_clears_the_saved_choice_without_editing_config() {
+    use crate::app::commands::SettingsAction;
+    use crate::ui::SettingsValue;
+
+    // Use the real config and state paths without changing the parent test's environment.
+    if std::env::var_os("DUSTY_TEST_THEME_RESET").is_none() {
+        let root = tempdir().unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                concat!(
+                    "app::configuration::tests::",
+                    "resetting_settings_theme_clears_the_saved_choice_without_editing_config"
+                ),
+            ])
+            .env("DUSTY_TEST_THEME_RESET", "1")
+            .env("DUSTY_CONFIG_HOME", root.path())
+            .env("DUSTY_STATE_HOME", root.path().join("state"))
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success()
+                && String::from_utf8_lossy(&output.stdout).contains("test result: ok. 1 passed;"),
+            "{output:?}"
+        );
+        return;
+    }
+
+    let config_path = crate::config::user_config_path();
+    let state_dir = crate::config::user_state_directory();
+    let save_theme_state = |app: &mut App| {
+        app.process_persistence_events();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while app.persistence.pending() {
+            app.process_persistence_events();
+            assert!(Instant::now() < deadline, "theme state was not saved");
+            thread::yield_now();
+        }
+        let state: PersistedState =
+            serde_json::from_slice(&fs::read(state_dir.join("session.json")).unwrap()).unwrap();
+        state.metadata.contains_key("ui.theme.snapshot")
+    };
+
+    for (user_theme, expected) in [
+        ("", "dusty"),
+        ("[ui]\ntheme='tokyo-night'\n", "tokyo-night"),
+    ] {
+        let config = format!(
+            "# Keep this comment and formatting\n{user_theme}[config_watch]\nenabled=false\n"
+        );
+        fs::write(&config_path, &config).unwrap();
+        let loaded = crate::config::load_user_config();
+        assert!(loaded.user_configuration);
+        let mut app = App::new(
+            StartupTarget::Dashboard {
+                root: config_path.parent().unwrap().into(),
+            },
+            loaded,
+            false,
+            state_dir.clone(),
+            false,
+            false,
+            Arc::new(crate::clock::SystemClock),
+        )
+        .unwrap();
+
+        app.process_effect(AppEffect::Settings(SettingsAction::Open));
+        app.process_effect(AppEffect::Settings(SettingsAction::Search));
+        app.process_effect(AppEffect::Settings(SettingsAction::Insert(
+            "ui.theme".into(),
+        )));
+        app.process_effect(AppEffect::Settings(SettingsAction::Activate));
+        let page = app.ui.settings.as_ref().unwrap();
+        assert_eq!(page.selected_row().unwrap().key, "ui.theme");
+        app.process_effect(AppEffect::Settings(SettingsAction::Activate));
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while app.ui.picker.as_ref().unwrap().loading {
+            app.process_theme_results();
+            assert!(Instant::now() < deadline, "theme discovery did not finish");
+            thread::yield_now();
+        }
+        for key in "nord".chars() {
+            app.handle_configured_key(KeyEvent::character(key));
+        }
+        app.accept_picker();
+        assert_eq!(app.configuration.theme().name, "nord");
+        assert!(save_theme_state(&mut app), "the chosen theme was not saved");
+
+        app.handle_configured_key(KeyEvent::character('r'));
+        assert_eq!(app.configuration.theme().name, expected);
+        assert_eq!(app.configuration.theme_state().unwrap(), None);
+        assert!(
+            !save_theme_state(&mut app),
+            "the saved choice survived reset"
+        );
+        assert_eq!(fs::read(&config_path).unwrap(), config.as_bytes());
+        assert_eq!(
+            app.ui
+                .settings
+                .as_ref()
+                .unwrap()
+                .selected_row()
+                .unwrap()
+                .value,
+            SettingsValue::Theme(crate::config::theme_display_name(expected))
+        );
+    }
+}
+
+#[test]
+fn resetting_settings_theme_without_a_choice_removes_the_config_override() {
+    use crate::app::commands::SettingsAction;
+    use crate::ui::SettingsValue;
+
+    if std::env::var_os("DUSTY_TEST_CONFIG_THEME_RESET").is_none() {
+        let root = tempdir().unwrap();
+        fs::write(
+            root.path().join("config.toml"),
+            "# Keep this comment\n[ui]\ntheme='tokyo-night'\ncolor_mode='true_color'\n[config_watch]\nenabled=false\n",
+        )
+        .unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                concat!(
+                    "app::configuration::tests::",
+                    "resetting_settings_theme_without_a_choice_removes_the_config_override"
+                ),
+            ])
+            .env("DUSTY_TEST_CONFIG_THEME_RESET", "1")
+            .env("DUSTY_CONFIG_HOME", root.path())
+            .env("DUSTY_STATE_HOME", root.path().join("state"))
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success()
+                && String::from_utf8_lossy(&output.stdout).contains("test result: ok. 1 passed;"),
+            "{output:?}"
+        );
+        return;
+    }
+
+    let config_path = crate::config::user_config_path();
+    let loaded = crate::config::load_user_config();
+    assert!(loaded.user_configuration);
+    let mut app = App::new(
+        StartupTarget::Dashboard {
+            root: config_path.parent().unwrap().into(),
+        },
+        loaded,
+        false,
+        crate::config::user_state_directory(),
+        false,
+        false,
+        Arc::new(crate::clock::SystemClock),
+    )
+    .unwrap();
+    assert_eq!(app.configuration.theme().name, "tokyo-night");
+    assert_eq!(app.configuration.theme_state().unwrap(), None);
+
+    app.process_effect(AppEffect::Settings(SettingsAction::Open));
+    app.process_effect(AppEffect::Settings(SettingsAction::Search));
+    app.process_effect(AppEffect::Settings(SettingsAction::Insert(
+        "ui.theme".into(),
+    )));
+    app.process_effect(AppEffect::Settings(SettingsAction::Activate));
+    let row = app.ui.settings.as_ref().unwrap().selected_row().unwrap();
+    assert_eq!(row.key, "ui.theme");
+    assert!(row.modified);
+
+    let reload_id = app.configuration.reload_id();
+    app.handle_configured_key(KeyEvent::character('r'));
+    let source = fs::read_to_string(&config_path).unwrap();
+    let config: toml::Value = toml::from_str(&source).unwrap();
+    assert!(config["ui"].get("theme").is_none());
+    assert_eq!(config["ui"]["color_mode"].as_str(), Some("true_color"));
+    assert!(source.starts_with("# Keep this comment\n"));
+
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while app.configuration.reload_id() == reload_id {
+        app.process_configuration_result();
+        assert!(Instant::now() < deadline, "theme reset was not reloaded");
+        thread::yield_now();
+    }
+    assert_eq!(app.configuration.theme().name, "dusty");
+    let row = app.ui.settings.as_ref().unwrap().selected_row().unwrap();
+    assert_eq!(row.value, SettingsValue::Theme("Dusty".into()));
+    assert!(!row.modified);
 }
 
 #[test]
@@ -894,7 +1170,8 @@ pub(in crate::app) fn invalid_leader_policy_rejects_the_complete_configuration_t
         candidate.config.input.keymaps.leader = invalid_leader.into();
         let error = app
             .apply_configuration_candidate(candidate, false)
-            .expect_err("invalid leader must reject the whole candidate");
+            .expect_err("invalid leader must reject the whole candidate")
+            .to_string();
         assert!(error.contains("input.keymaps.leader"), "{error}");
         assert_eq!(app.configuration.settings().input.keymaps, original_policy);
         assert_eq!(
@@ -1094,7 +1371,8 @@ pub(in crate::app) fn malformed_keymap_identity_rejects_the_configuration_transa
         });
         let error = app
             .apply_configuration_candidate(candidate, false)
-            .expect_err("invalid identity must reject candidate");
+            .expect_err("invalid identity must reject candidate")
+            .to_string();
         assert!(error.contains("invalid id"), "{error}");
         assert_eq!(
             app.configuration
@@ -1148,7 +1426,9 @@ pub(in crate::app) fn invalid_user_keymap_set_is_rejected_transactionally() {
         &app.configuration.settings().input.keymaps,
     );
     assert!(keymaps.has_bindings());
-    assert!(diagnostic.is_some_and(|message| message.contains("so the default keys are on")));
+    assert!(
+        diagnostic.is_some_and(|message| message.starts_with("Using default keys. keymaps.toml: "))
+    );
 
     let before = app.configuration.keymaps().clone();
     let revision = app.configuration.binding_revision();
@@ -1156,7 +1436,8 @@ pub(in crate::app) fn invalid_user_keymap_set_is_rejected_transactionally() {
     candidate.keymaps = loaded;
     let diagnostic = app
         .apply_configuration_candidate(candidate, false)
-        .unwrap_err();
+        .unwrap_err()
+        .to_string();
     assert!(diagnostic.contains("unknown.command"), "{diagnostic}");
     assert_eq!(app.configuration.binding_revision(), revision);
     let reloaded = app.configuration.keymaps();
@@ -1910,12 +2191,19 @@ fn startup_keeps_the_valid_file_when_the_other_file_cannot_be_parsed() {
             .as_str(),
         "explorer.panel.toggle"
     );
-    assert_eq!(app.ui.config_diagnostic.as_deref(), Some(error.as_str()));
+    let notice = app.ui.config_diagnostic.as_deref().unwrap();
+    assert!(
+        notice.starts_with("Using default keys. keymaps.toml, line 1: "),
+        "{notice}"
+    );
     assert_eq!(
         error.matches(&keymaps_path.display().to_string()).count(),
         1
     );
-    assert!(error.contains("line 1"), "{error}");
+    assert!(
+        error.starts_with(&format!("{}, line 1: ", keymaps_path.display())),
+        "{error}"
+    );
     drop(app);
 
     fs::write(&settings_path, "[editor\n").unwrap();
@@ -1956,7 +2244,7 @@ fn startup_keeps_the_valid_file_when_the_other_file_cannot_be_parsed() {
     );
     let shown = app.ui.config_diagnostic.as_deref().unwrap();
     assert!(
-        shown.contains("couldn't be used, so the default keys are on"),
+        shown.starts_with("Using default keys. keymaps.toml, line 1: "),
         "{shown}"
     );
     assert!(shown.contains("no.such.command"), "{shown} / {error}");
@@ -2352,23 +2640,44 @@ pub(in crate::app) fn plugin_alias_reload_requires_a_safe_label_before_command_c
         .input
         .command_aliases
         .insert("Demo".into(), "plugin.demo.run".into());
-    for label in [None, Some(""), Some("\u{1b}bad")] {
-        if let Some(label) = label {
-            loaded
-                .config
-                .command_labels
-                .insert("plugin.demo.run".into(), label.into());
-        }
-        let error = app
-            .apply_configuration_candidate(loaded.clone(), false)
-            .unwrap_err();
-        assert!(error.contains("label"), "{error}");
-    }
+    let command = "plugin.demo.run";
     loaded
         .config
         .command_labels
-        .insert("plugin.demo.run".into(), "Run demo".into());
-    app.apply_configuration_candidate(loaded, false).unwrap();
+        .insert(command.into(), "Run demo".into());
+    app.apply_configuration_candidate(loaded.clone(), false)
+        .unwrap();
+    let width = app.configuration.settings().editor.tab_width;
+
+    for label in [None, Some(""), Some("\u{1b}bad")] {
+        let mut invalid = loaded.clone();
+        invalid.config.editor.tab_width = width + 1;
+        if let Some(label) = label {
+            invalid
+                .config
+                .command_labels
+                .insert(command.into(), label.into());
+        } else {
+            invalid.config.command_labels.remove(command);
+        }
+        let error = app
+            .apply_configuration_candidate(invalid, false)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("label") && error.contains(command),
+            "{error}"
+        );
+        assert_eq!(app.configuration.settings().editor.tab_width, width);
+        assert_eq!(
+            app.configuration.settings().input.command_aliases["Demo"],
+            command
+        );
+        assert_eq!(
+            app.configuration.settings().command_labels[command],
+            "Run demo"
+        );
+    }
     app.open_prompt(crate::ui::PromptKind::Command, "Demo".into());
     assert!(
         app.ui
@@ -2435,24 +2744,65 @@ pub(in crate::app) fn plugin_aliases_and_dashboard_actions_wait_for_indexed_decl
         .insert("plugin.demo.missing".into(), "Missing".into());
     let (undeclared_alias, _) =
         super::resolve_configuration(&app.commands, undeclared_alias, true).unwrap();
-    app.configuration.install_fixture(resolved.clone());
+    app.configuration.install_fixture(resolved);
+    app.recompile_plugin_contributions().unwrap();
     assert!(
-        app.recompile_plugin_contributions().is_err(),
-        "unindexed declarations cannot be accepted"
+        !app.configuration
+            .settings()
+            .input
+            .command_aliases
+            .contains_key("Demo")
+    );
+    assert!(
+        !app.configuration
+            .dashboard()
+            .action
+            .iter()
+            .any(|action| action.command == "plugin.demo.drive")
     );
     app.register_indexed_plugin_commands(&index).unwrap();
     app.extension.fixture_contribution(index).unwrap();
     app.recompile_plugin_contributions().unwrap();
-    for invalid in [invalid_arguments, undeclared_alias] {
-        app.configuration.install_fixture(invalid);
-        assert!(app.recompile_plugin_contributions().is_err());
-    }
-    app.configuration.install_fixture(resolved);
+    app.configuration.install_fixture(invalid_arguments);
+    assert!(
+        app.recompile_plugin_contributions()
+            .unwrap_err()
+            .contains("wrong type")
+    );
+    app.configuration.install_fixture(undeclared_alias);
+    app.recompile_plugin_contributions().unwrap();
+    assert!(
+        app.ui
+            .config_diagnostic
+            .as_deref()
+            .is_some_and(|notice| notice.contains("Unknown"))
+    );
+
+    app.apply_configuration_candidate(loaded.clone(), false)
+        .unwrap();
+    let width = app.configuration.settings().editor.tab_width;
     let mut invalid = loaded.clone();
+    invalid.config.editor.tab_width = width + 1;
     invalid.dashboard.action[0]
         .arguments
         .insert("text".into(), toml::Value::Boolean(true));
-    assert!(app.apply_configuration_candidate(invalid, false).is_err());
+    let error = app
+        .apply_configuration_candidate(invalid, false)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("argument `text` has the wrong type"),
+        "{error}"
+    );
+    assert_eq!(app.configuration.settings().editor.tab_width, width);
+    assert_eq!(
+        app.configuration.dashboard().action[0].command,
+        "plugin.demo.drive"
+    );
+    assert_eq!(
+        app.configuration.dashboard().action[0].arguments["text"].as_str(),
+        Some("hello")
+    );
     let mut missing = loaded.clone();
     missing
         .config
@@ -2463,11 +2813,40 @@ pub(in crate::app) fn plugin_aliases_and_dashboard_actions_wait_for_indexed_decl
         .config
         .command_labels
         .insert("plugin.demo.missing".into(), "Missing".into());
-    assert!(app.apply_configuration_candidate(missing, false).is_err());
+    app.apply_configuration_candidate(missing, false).unwrap();
+    assert!(
+        !app.configuration
+            .settings()
+            .input
+            .command_aliases
+            .contains_key("Unknown")
+    );
+    assert!(
+        app.configuration
+            .settings()
+            .input
+            .command_aliases
+            .contains_key("Demo")
+    );
+    let mut missing_command = loaded.clone();
+    missing_command.dashboard.action[0].command = "plugin.demo.missing".into();
+    app.apply_configuration_candidate(missing_command, false)
+        .unwrap();
+    assert!(app.ui.config_diagnostic.as_deref().is_some_and(|notice| {
+        notice.contains("Skipped dashboard action") && notice.contains("plugin.demo.missing")
+    }));
+    assert!(
+        !app.configuration
+            .dashboard()
+            .action
+            .iter()
+            .any(|action| action.command == "plugin.demo.missing")
+    );
+
     loaded.dashboard.action[0].arguments.clear();
     assert!(
         app.apply_configuration_candidate(loaded, false).is_err(),
-        "required arguments are checked after indexing"
+        "missing required arguments must reject reload"
     );
 }
 
@@ -2633,6 +3012,22 @@ pub(in crate::app) fn reload_preserves_plugin_window_rules() {
     app.apply_configuration_candidate(loaded.clone(), false)
         .unwrap();
     assert_eq!(app.configuration.settings().windows, loaded.config.windows);
+
+    let width = app.configuration.settings().editor.tab_width;
+    let mut invalid = loaded.clone();
+    invalid.config.editor.tab_width = width + 1;
+    invalid.config.windows.rules[0].placement = crate::config::WindowPlacementConfig::Fullscreen;
+    let error = app
+        .apply_configuration_candidate(invalid, false)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("plugin.demo.panel") && error.contains("disallowed placement"),
+        "{error}"
+    );
+    assert_eq!(app.configuration.settings().editor.tab_width, width);
+    assert_eq!(app.configuration.settings().windows, loaded.config.windows);
+
     app.process_effect(AppEffect::NewBuffer);
     app.reconcile_editor_windows();
     let opened = app.apply_plugin_ui_request(
@@ -2733,9 +3128,23 @@ fn global_explorer_identity_can_be_disabled_without_disabling_just_one_surface()
         PathBuf::from("keymaps.toml"),
     );
     assert!(user.diagnostic.is_none());
-    assert_eq!(user.entries.len(), 7);
-    assert!(user.entries.iter().all(|entry| entry.disable));
     let mut loaded = load_bundled_config();
+    let builtin_ids = loaded
+        .keymaps
+        .entries
+        .iter()
+        .map(|entry| entry.id.as_str())
+        .filter(|id| id.starts_with("builtin.global.explorer."))
+        .collect::<std::collections::BTreeSet<_>>();
+    let disabled_ids = user
+        .entries
+        .iter()
+        .map(|entry| entry.id.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(disabled_ids, builtin_ids);
+    assert_eq!(user.entries.len(), builtin_ids.len());
+    assert!(disabled_ids.contains("builtin.global.explorer.problems-panel"));
+    assert!(user.entries.iter().all(|entry| entry.disable));
     loaded.keymaps.entries.extend(user.entries);
     loaded.keymaps.user_spans = user.user_spans;
     let mut commands = crate::editor::CommandRegistry::default();

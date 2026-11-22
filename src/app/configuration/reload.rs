@@ -1,7 +1,7 @@
 //! Configuration reload validation, publication and application updates.
 
 use crate::app::App;
-use crate::config::LoadedConfig;
+use crate::config::{ConfigurationCandidateError, ConfigurationWorkerResult, LoadedConfig};
 use crate::editor::text::TextBuffer;
 use crate::ui::render::TERMINAL_PANEL_MAXIMUM_HEIGHT;
 use crate::ui::render::TERMINAL_PANEL_MINIMUM_HEIGHT;
@@ -17,6 +17,13 @@ impl App {
                 return;
             }
         };
+        self.finish_configuration_reload(result);
+    }
+
+    pub(in crate::app) fn finish_configuration_reload(
+        &mut self,
+        result: ConfigurationWorkerResult,
+    ) {
         let automatic = result.automatic;
         let outcome = match result.candidate {
             Ok(loaded) => self.apply_configuration_candidate(loaded, automatic),
@@ -26,15 +33,26 @@ impl App {
             Ok(()) => self.configuration.note_rejected_keymaps(None),
             Err(diagnostic) => {
                 self.retain_configuration_watch();
-                self.configuration.note_rejected_keymaps(
-                    diagnostic.contains("keymap").then(|| diagnostic.clone()),
-                );
-                let message = if automatic {
-                    "auto_reload_rejected"
-                } else {
-                    "reload_rejected"
+                let message = match diagnostic {
+                    ConfigurationCandidateError::Keymaps(detail) => {
+                        // Keep the source and line visible even when the message is clipped.
+                        let message = format!(
+                            "{}. Kept previous settings and keys.",
+                            detail.trim_end_matches('.')
+                        );
+                        self.configuration.note_rejected_keymaps(Some(detail));
+                        message
+                    }
+                    ConfigurationCandidateError::Other(detail) => {
+                        self.configuration.note_rejected_keymaps(None);
+                        let template = if automatic {
+                            "auto_reload_rejected"
+                        } else {
+                            "reload_rejected"
+                        };
+                        self.message(template, &[("diagnostic", detail)])
+                    }
                 };
-                let message = self.message(message, &[("diagnostic", diagnostic)]);
                 self.settings_status(message.clone(), true);
                 self.show_error(message);
             }
@@ -53,11 +71,15 @@ impl App {
         &mut self,
         loaded: LoadedConfig,
         automatic: bool,
-    ) -> Result<(), String> {
+    ) -> Result<(), ConfigurationCandidateError> {
+        let previous_keymap_notice = self.configuration.keymap_notice().cloned();
         let mut warning = loaded.warning.clone();
-        let candidate =
-            self.configuration
-                .prepare(loaded, &self.commands, self.extension.contributions())?;
+        let candidate = self.configuration.prepare(
+            loaded,
+            &self.commands,
+            self.extension.contributions(),
+            &self.pending_keymap_providers(),
+        )?;
         let window_candidate = (candidate.view().settings.windows
             != self.configuration.settings().windows)
             .then(|| self.prepare_configured_window_rules(&candidate.view().settings.windows))
@@ -163,7 +185,15 @@ impl App {
             let category = menu.category.clone();
             self.rebuild_tool_menu(&category, None);
         }
-        self.ui.config_diagnostic = None;
+        self.ui.config_diagnostic = self
+            .configuration
+            .keymap_notice()
+            .map(|notice| notice.summary.clone());
+        if let Some(notice) = self.configuration.keymap_notice() {
+            for entry in notice.new_history_entries(previous_keymap_notice.as_ref()) {
+                self.notices.record_history(entry.clone(), false);
+            }
+        }
         if let Some(warning) = warning {
             self.notify_warning(warning);
             if self.ui.settings.is_some() {

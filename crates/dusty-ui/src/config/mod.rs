@@ -21,6 +21,7 @@ pub use catalog::default_setting;
 pub use catalog::settings_catalog;
 pub use catalog::setup_catalog;
 pub use catalog::write_user_setting;
+pub use load::ConfigurationCandidateError;
 pub use load::ConfigurationWorker;
 pub use load::ConfigurationWorkerError;
 pub use load::ConfigurationWorkerResult;
@@ -352,6 +353,8 @@ pub struct LoadedKeymaps {
     pub groups: Vec<KeyGroupEntry>,
     pub user_spans: Vec<std::ops::Range<usize>>,
     pub user_group_spans: Vec<std::ops::Range<usize>>,
+    /// Source lines by the starting byte of each declaration span.
+    pub user_lines: BTreeMap<usize, usize>,
     pub bundled_count: usize,
     pub bundled_group_count: usize,
     pub path: PathBuf,
@@ -365,6 +368,8 @@ pub struct LoadedConfig {
     pub user_configuration: bool,
     pub user_setting_keys: BTreeSet<String>,
     pub user_setting_spans: BTreeMap<String, std::ops::Range<usize>>,
+    /// Source lines for explicitly set keymap policy fields.
+    pub keymap_policy_lines: BTreeMap<String, usize>,
     pub config: Config,
     pub path: PathBuf,
     pub diagnostic: Option<String>,

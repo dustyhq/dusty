@@ -289,31 +289,39 @@ impl PackageStore {
         }
         Ok(plugin)
     }
-    fn activations_for_lock(
-        &self,
-        lock: &PackageLock,
-    ) -> Result<Vec<(PluginManifest, PathBuf, Arc<fs::File>)>, PackageError> {
-        let mut output = Vec::new();
+    fn activations_for_lock(&self, lock: &PackageLock) -> Vec<PackageDiscovery> {
         let mut config = wasmtime::Config::new();
         // Startup checks discard compiled code too; optimization belongs to the runtime loader.
         config
             .wasm_component_model(true)
             .cranelift_opt_level(wasmtime::OptLevel::None);
-        let engine = wasmtime::Engine::new(&config).map_err(|_| PackageError::InvalidManifest)?;
-        for package in &lock.packages {
-            let plugin = self.activation_manifest(package)?;
-            let object = self.root.join("store").join(&package.content_sha256);
-            let component = read_bounded_regular(&object, self.maximum_object_bytes as u64)?;
-            let object_lock = protect_object(&object)?;
-            let actual = format!("{:x}", Sha256::digest(&component));
-            if !actual.eq_ignore_ascii_case(&package.content_sha256) {
-                return Err(PackageError::ChecksumMismatch);
-            }
-            wasmtime::component::Component::from_binary(&engine, &component)
-                .map_err(|_| PackageError::InvalidManifest)?;
-            output.push((plugin, object, object_lock));
-        }
-        Ok(output)
+        let engine = wasmtime::Engine::new(&config);
+        lock.packages
+            .iter()
+            .map(|package| {
+                let mut plugin = None;
+                let object = (|| {
+                    plugin = Some(self.activation_manifest(package)?);
+                    let object = self.root.join("store").join(&package.content_sha256);
+                    let component =
+                        read_bounded_regular(&object, self.maximum_object_bytes as u64)?;
+                    let object_lock = protect_object(&object)?;
+                    let actual = format!("{:x}", Sha256::digest(&component));
+                    if !actual.eq_ignore_ascii_case(&package.content_sha256) {
+                        return Err(PackageError::ChecksumMismatch);
+                    }
+                    let engine = engine.as_ref().map_err(|_| PackageError::InvalidManifest)?;
+                    wasmtime::component::Component::from_binary(engine, &component)
+                        .map_err(|_| PackageError::InvalidManifest)?;
+                    Ok((object, object_lock))
+                })();
+                PackageDiscovery {
+                    package: package.clone(),
+                    plugin,
+                    object,
+                }
+            })
+            .collect()
     }
     pub fn activations(
         &self,
@@ -321,6 +329,13 @@ impl PackageStore {
         let _transaction = self.transaction()?;
         let lock = self.read_lock()?;
         self.activations_for_lock(&lock)
+            .into_iter()
+            .map(|discovery| {
+                let (object, lock) = discovery.object?;
+                let plugin = discovery.plugin.ok_or(PackageError::InvalidManifest)?;
+                Ok((plugin, object, lock))
+            })
+            .collect()
     }
     pub fn remove(&self, name: &str) -> Result<PackageLock, PackageError> {
         let _transaction = self.transaction()?;
@@ -352,7 +367,9 @@ impl PackageStore {
         if lock.version != 1 {
             return Err(PackageError::InvalidManifest);
         }
-        self.activations_for_lock(&lock)?;
+        for discovery in self.activations_for_lock(&lock) {
+            discovery.object?;
+        }
         self.replace_lock(&lock)?;
         Ok(lock)
     }
@@ -488,7 +505,15 @@ fn protect_object(object: &Path) -> Result<Arc<fs::File>, PackageError> {
     }
     Ok(Arc::new(file))
 }
-#[derive(Clone, Debug)]
+/// Discovery of one installed package, including its identity if the object failed validation.
+#[derive(Debug)]
+pub struct PackageDiscovery {
+    pub package: LockedPackage,
+    pub plugin: Option<PluginManifest>,
+    pub object: Result<(PathBuf, Arc<fs::File>), PackageError>,
+}
+
+#[derive(Debug)]
 pub struct PackageOperationResult {
     pub id: u64,
     pub operation: String,
@@ -496,7 +521,7 @@ pub struct PackageOperationResult {
     pub verified: Option<usize>,
     pub removed: Option<usize>,
     pub prepared: Option<PreparedPackage>,
-    pub activations: Vec<(PluginManifest, PathBuf, Arc<fs::File>)>,
+    pub activations: Option<Vec<PackageDiscovery>>,
     pub cleanup_error: Option<String>,
 }
 impl PackageOperationResult {
@@ -513,6 +538,7 @@ pub enum PackageEvent {
     Failed {
         id: u64,
         operation: String,
+        package: Option<String>,
         error: PackageError,
     },
 }
@@ -570,6 +596,12 @@ impl PackageWorker {
                         PackageOperation::GarbageCollect { .. } => "gc",
                     }
                     .to_owned();
+                    let mut package_name = match &operation {
+                        PackageOperation::PrepareRegistry { metadata, .. } => {
+                            Some(metadata.package.name.clone())
+                        }
+                        _ => None,
+                    };
                     let result = (|| {
                         let manager = PackageStore::new(
                             root.clone(),
@@ -583,7 +615,7 @@ impl PackageWorker {
                             verified: None,
                             removed: None,
                             prepared: None,
-                            activations: Vec::new(),
+                            activations: None,
                             cleanup_error: None,
                         };
                         match operation {
@@ -601,25 +633,29 @@ impl PackageWorker {
                                 }
                                 let package_manifest = crate::files::canonicalize(package_manifest)
                                     .map_err(PackageError::Io)?;
+                                if !roots.iter().any(|root| package_manifest.starts_with(root)) {
+                                    return Err(PackageError::OutsideScope);
+                                }
+                                let package_bytes =
+                                    read_bounded_regular(&package_manifest, 1024 * 1024)?;
+                                let package: PackageManifest =
+                                    serde_json::from_slice(&package_bytes)
+                                        .map_err(PackageError::Json)?;
+                                package_name = Some(package.name.clone());
                                 let plugin_manifest = crate::files::canonicalize(plugin_manifest)
                                     .map_err(PackageError::Io)?;
                                 let component = crate::files::canonicalize(component)
                                     .map_err(PackageError::Io)?;
-                                if [&package_manifest, &plugin_manifest, &component]
+                                if [&plugin_manifest, &component]
                                     .into_iter()
                                     .any(|path| !roots.iter().any(|root| path.starts_with(root)))
                                 {
                                     return Err(PackageError::OutsideScope);
                                 }
-                                let package_bytes =
-                                    read_bounded_regular(&package_manifest, 1024 * 1024)?;
                                 let plugin_bytes =
                                     read_bounded_regular(&plugin_manifest, 1024 * 1024)?;
                                 let component_bytes =
                                     read_bounded_regular(&component, maximum_object_bytes as u64)?;
-                                let package: PackageManifest =
-                                    serde_json::from_slice(&package_bytes)
-                                        .map_err(PackageError::Json)?;
                                 let plugin: PluginManifest = toml::from_str(
                                     std::str::from_utf8(&plugin_bytes)
                                         .map_err(|_| PackageError::InvalidManifest)?,
@@ -722,7 +758,9 @@ impl PackageWorker {
                                 output.removed = Some(manager.gc(256)?);
                             }
                             PackageOperation::Activations => {
-                                output.activations = manager.activations()?
+                                let _transaction = manager.transaction()?;
+                                output.activations =
+                                    Some(manager.activations_for_lock(&manager.read_lock()?));
                             }
                             PackageOperation::List => output.lock = Some(manager.read_lock()?),
                             PackageOperation::Verify => output.verified = Some(manager.verify()?),
@@ -730,13 +768,17 @@ impl PackageWorker {
                                 if !prepared.is_empty() {
                                     return Err(PackageError::Busy);
                                 }
-                                output.lock = Some(manager.rollback()?);
+                                let lock = manager.rollback()?;
+                                output.activations = Some(manager.activations_for_lock(&lock));
+                                output.lock = Some(lock);
                             }
                             PackageOperation::Remove(package) => {
                                 if !prepared.is_empty() {
                                     return Err(PackageError::Busy);
                                 }
-                                output.lock = Some(manager.remove(&package)?);
+                                let lock = manager.remove(&package)?;
+                                output.activations = Some(manager.activations_for_lock(&lock));
+                                output.lock = Some(lock);
                                 output.collect_garbage(&manager);
                             }
                             PackageOperation::GarbageCollect { maximum } => {
@@ -749,6 +791,7 @@ impl PackageWorker {
                         |error| PackageEvent::Failed {
                             id,
                             operation: name,
+                            package: package_name,
                             error,
                         },
                         |result| PackageEvent::Completed(Box::new(result)),
@@ -865,7 +908,7 @@ mod tests {
             verified: None,
             removed: None,
             prepared: None,
-            activations: Vec::new(),
+            activations: None,
             cleanup_error: None,
         };
         result.collect_garbage(&manager);

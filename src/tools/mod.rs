@@ -91,6 +91,7 @@ mod install_prepare;
 mod runtimes;
 pub use install::ToolInstallerError;
 mod packages;
+pub use packages::PackageDiscovery;
 pub use packages::PackageEvent;
 pub use packages::PackageOperation;
 pub use packages::PackageOperationResult;

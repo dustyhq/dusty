@@ -382,6 +382,7 @@ impl App {
     }
 
     pub(super) fn disable_browser_plugin(&mut self, id: &str) {
+        let pending = self.pending_keymap_providers();
         let load = self.extension.load_id(id);
         if let Err(error) = self.extension.disable(id) {
             self.show_error(error);
@@ -392,6 +393,7 @@ impl App {
             self.remove_plugin_contributions(id, load);
         }
         self.commands.unregister_plugin(id);
+        self.report_settled_keymap_providers(&pending);
     }
 }
 

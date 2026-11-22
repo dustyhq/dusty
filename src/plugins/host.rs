@@ -210,10 +210,6 @@ impl PluginInvocation<'_> {
         })
     }
 }
-pub(super) struct RuntimeSlot {
-    load: PluginLoadId,
-    runtime: ActiveRuntime,
-}
 pub(super) struct IndexedCandidate {
     store: PathBuf,
     component_path: PathBuf,
@@ -228,6 +224,7 @@ pub struct PluginHost {
     pub(super) receiver: Receiver<WorkerEvent>,
     pub statuses: BTreeMap<String, PluginStatus>,
     pub(super) loads: BTreeMap<String, PluginLoadId>,
+    pub(super) staged: BTreeMap<String, (PluginLoadId, PluginStatus)>,
     pub(super) next_load: u64,
     pub(super) pending_disables: VecDeque<(String, PluginLoadId)>,
     pub(super) maximum_loads: usize,
@@ -246,7 +243,7 @@ impl PluginHost {
         thread::Builder::new()
             .name("dusty-components".into())
             .spawn(move || {
-                let mut runtimes: BTreeMap<String, RuntimeSlot> = BTreeMap::new();
+                let mut runtimes: BTreeMap<(String, PluginLoadId), ActiveRuntime> = BTreeMap::new();
                 let mut indexed: BTreeMap<(String, PluginLoadId), IndexedCandidate> =
                     BTreeMap::new();
                 while let Ok(request) = rx.recv() {
@@ -313,13 +310,7 @@ impl PluginHost {
                                     &candidate.limits,
                                 ) {
                                     Ok(outcome) => {
-                                        runtimes.insert(
-                                            plugin,
-                                            RuntimeSlot {
-                                                load,
-                                                runtime: outcome.runtime,
-                                            },
-                                        );
+                                        runtimes.insert((plugin, load), outcome.runtime);
                                         WorkerEvent::Loaded {
                                             load,
                                             component: outcome.loaded,
@@ -408,13 +399,7 @@ impl PluginHost {
                             &limits,
                         ) {
                             Ok(outcome) if outcome.loaded.manifest.id == expected_plugin => {
-                                runtimes.insert(
-                                    expected_plugin,
-                                    RuntimeSlot {
-                                        load,
-                                        runtime: outcome.runtime,
-                                    },
-                                );
+                                runtimes.insert((expected_plugin, load), outcome.runtime);
                                 WorkerEvent::Loaded {
                                     load,
                                     component: outcome.loaded,
@@ -437,12 +422,13 @@ impl PluginHost {
                             invocation,
                         } => {
                             let plugin = invocation.plugin.clone();
-                            match runtimes.get_mut(&plugin).filter(|slot| slot.load == load) {
-                                Some(slot) => execute_component(*invocation, &mut slot.runtime)
+                            let key = (plugin.clone(), load);
+                            match runtimes.get_mut(&key) {
+                                Some(runtime) => execute_component(*invocation, runtime)
                                     .map_or_else(
                                         |error| {
                                             if matches!(error, PluginError::Execution(_)) {
-                                                runtimes.remove(&plugin);
+                                                runtimes.remove(&key);
                                                 WorkerEvent::Failed {
                                                     load,
                                                     plugin,
@@ -471,10 +457,9 @@ impl PluginHost {
                         }
 
                         Request::Disable { load, plugin } => {
-                            if runtimes.get(&plugin).is_some_and(|slot| slot.load == load) {
-                                runtimes.remove(&plugin);
-                            }
-                            indexed.remove(&(plugin, load));
+                            let key = (plugin, load);
+                            runtimes.remove(&key);
+                            indexed.remove(&key);
                             continue;
                         }
                     };
@@ -496,6 +481,7 @@ impl PluginHost {
             receiver: erx,
             statuses: BTreeMap::new(),
             loads: BTreeMap::new(),
+            staged: BTreeMap::new(),
             next_load: 1,
             pending_disables: VecDeque::new(),
             maximum_loads: capacity,
@@ -600,10 +586,17 @@ impl PluginHost {
         limits: PluginLimits,
     ) -> Result<PluginLoadId, PluginError> {
         self.require_disable_order()?;
-        if self.loads.contains_key(&expected_plugin) {
+        if self.loads.contains_key(&expected_plugin) || self.staged.contains_key(&expected_plugin) {
             return Err(PluginError::AlreadyActive);
         }
-        if self.loads.len() >= self.maximum_loads {
+        if self.loads.len()
+            + self
+                .staged
+                .keys()
+                .filter(|id| !self.loads.contains_key(*id))
+                .count()
+            >= self.maximum_loads
+        {
             return Err(PluginError::LoadLimit);
         }
         let load = self.allocate_load()?;
@@ -626,8 +619,11 @@ impl PluginHost {
         load: PluginLoadId,
         checksum: String,
     ) -> Result<(), PluginError> {
-        if self.loads.get(plugin) != Some(&load)
-            || !matches!(self.statuses.get(plugin), Some(PluginStatus::Indexed))
+        let staged =
+            matches!(self.staged.get(plugin), Some((id, PluginStatus::Indexed)) if *id == load);
+        if !staged
+            && (self.loads.get(plugin) != Some(&load)
+                || !matches!(self.statuses.get(plugin), Some(PluginStatus::Indexed)))
         {
             return Err(PluginError::IndexNotAccepted);
         }
@@ -636,7 +632,12 @@ impl PluginHost {
             plugin: plugin.into(),
             checksum,
         })?;
-        self.statuses.insert(plugin.into(), PluginStatus::Loading);
+        if staged {
+            self.staged
+                .insert(plugin.into(), (load, PluginStatus::Loading));
+        } else {
+            self.statuses.insert(plugin.into(), PluginStatus::Loading);
+        }
         Ok(())
     }
 
@@ -649,10 +650,17 @@ impl PluginHost {
         limits: PluginLimits,
     ) -> Result<PluginLoadId, PluginError> {
         self.require_disable_order()?;
-        if self.loads.contains_key(&expected_plugin) {
+        if self.loads.contains_key(&expected_plugin) || self.staged.contains_key(&expected_plugin) {
             return Err(PluginError::AlreadyActive);
         }
-        if self.loads.len() >= self.maximum_loads {
+        if self.loads.len()
+            + self
+                .staged
+                .keys()
+                .filter(|id| !self.loads.contains_key(*id))
+                .count()
+            >= self.maximum_loads
+        {
             return Err(PluginError::LoadLimit);
         }
         let load = self.allocate_load()?;
@@ -685,13 +693,37 @@ impl PluginHost {
         limits: PluginLimits,
         object_lock: Option<Arc<fs::File>>,
     ) -> Result<PluginLoadId, PluginError> {
+        let plugin = manifest.id.clone();
+        if self.loads.contains_key(&plugin) || self.staged.contains_key(&plugin) {
+            return Err(PluginError::AlreadyActive);
+        }
+        let load = self.stage_load(store, path, manifest, limits, object_lock)?;
+        self.staged.remove(&plugin);
+        self.loads.insert(plugin.clone(), load);
+        self.statuses.insert(plugin, PluginStatus::Loading);
+        Ok(load)
+    }
+    /// Load a candidate without making it callable or replacing the current runtime.
+    pub(crate) fn stage_load(
+        &mut self,
+        store: PathBuf,
+        path: PathBuf,
+        manifest: PluginManifest,
+        limits: PluginLimits,
+        object_lock: Option<Arc<fs::File>>,
+    ) -> Result<PluginLoadId, PluginError> {
         validate_manifest(&manifest, &limits)?;
         let plugin = manifest.id.clone();
         self.require_disable_order()?;
-        if self.loads.contains_key(&plugin) {
+        if self.staged.contains_key(&plugin) {
             return Err(PluginError::AlreadyActive);
         }
-        if self.loads.len() >= self.maximum_loads {
+        let new_slots = self
+            .staged
+            .keys()
+            .filter(|id| !self.loads.contains_key(*id))
+            .count();
+        if !self.loads.contains_key(&plugin) && self.loads.len() + new_slots >= self.maximum_loads {
             return Err(PluginError::LoadLimit);
         }
         let load = self.allocate_load()?;
@@ -703,9 +735,29 @@ impl PluginHost {
             limits,
             object_lock,
         })?;
-        self.loads.insert(plugin.clone(), load);
-        self.statuses.insert(plugin, PluginStatus::Loading);
+        self.staged.insert(plugin, (load, PluginStatus::Loading));
         Ok(load)
+    }
+    /// Publish an already activated candidate without another fallible worker request.
+    pub(crate) fn publish_staged(
+        &mut self,
+        plugin: &str,
+        load: PluginLoadId,
+    ) -> Result<Option<PluginLoadId>, PluginError> {
+        if !matches!(self.staged.get(plugin), Some((id, PluginStatus::Active(_) | PluginStatus::Instantiated)) if *id == load)
+        {
+            return Err(PluginError::NotActive);
+        }
+        let Some((_, status)) = self.staged.remove(plugin) else {
+            return Err(PluginError::NotActive);
+        };
+        let previous = self.loads.insert(plugin.into(), load);
+        self.statuses.insert(plugin.into(), status);
+        if let Some(previous) = previous {
+            self.queue_disable(plugin.into(), previous);
+            self.flush_pending_disables();
+        }
+        Ok(previous)
     }
     pub(crate) fn validate_invocation(
         invocation: &PluginExecutionRequest,
@@ -775,6 +827,7 @@ impl PluginHost {
     fn fail_stopped_loads(&mut self) {
         let ids = self.loads.keys().cloned().collect::<Vec<_>>();
         self.loads.clear();
+        self.staged.clear();
         self.pending_disables.clear();
         for id in ids {
             self.statuses
@@ -805,82 +858,104 @@ impl PluginHost {
         let mut events = Vec::new();
         loop {
             match self.receiver.try_recv() {
-                Ok(event) => {
-                    match event {
-                        WorkerEvent::CommandFailed {
-                            load,
-                            plugin,
-                            error,
-                        } => {
-                            if self.loads.get(&plugin) == Some(&load) {
-                                events.push(OwnedPluginEvent::Other(PluginEvent::CommandFailed {
-                                    load,
-                                    plugin,
-                                    error,
-                                }));
-                            }
-                        }
-                        WorkerEvent::Indexed {
-                            load,
-                            plugin,
-                            index,
-                        } => {
-                            if self.loads.get(&plugin) != Some(&load) {
-                                self.queue_disable(plugin, load);
-                                self.flush_pending_disables();
-                                continue;
-                            }
-                            self.statuses.insert(plugin.clone(), PluginStatus::Indexed);
-                            events.push(OwnedPluginEvent::Other(PluginEvent::Indexed {
-                                load,
-                                plugin,
-                                index,
-                            }));
-                        }
-                        WorkerEvent::Loaded { load, component } => {
-                            let plugin = component.manifest.id.clone();
-                            if self.loads.get(&plugin) != Some(&load) {
-                                self.queue_disable(plugin, load);
-                                self.flush_pending_disables();
-                                continue;
-                            }
-                            self.statuses.insert(plugin,if !component.activated_commands.is_empty(){PluginStatus::Active(component.activated_commands.clone())}else if component.instantiated{PluginStatus::Instantiated}else{PluginStatus::ValidatedUntilHost(component.unavailable_host.clone().unwrap_or_else(||"component imports require unavailable host bindings".into()))});
-                            events.push(OwnedPluginEvent::Other(PluginEvent::Loaded {
-                                load,
-                                component,
-                            }))
-                        }
-                        WorkerEvent::Executed {
-                            load,
-                            origin,
-                            execution,
-                        } => {
-                            if self.loads.get(&execution.plugin) == Some(&load) {
-                                events.push(OwnedPluginEvent::Executed(PluginExecutionReply {
-                                    origin,
-                                    execution,
-                                }));
-                            }
-                        }
-                        WorkerEvent::Failed {
-                            load,
-                            plugin,
-                            error,
-                        } => {
-                            if self.loads.get(&plugin) != Some(&load) {
-                                continue;
-                            }
-                            self.loads.remove(&plugin);
-                            self.statuses
-                                .insert(plugin.clone(), PluginStatus::Failed(error.to_string()));
-                            events.push(OwnedPluginEvent::Other(PluginEvent::Failed {
+                Ok(event) => match event {
+                    WorkerEvent::CommandFailed {
+                        load,
+                        plugin,
+                        error,
+                    } => {
+                        if self.loads.get(&plugin) == Some(&load) {
+                            events.push(OwnedPluginEvent::Other(PluginEvent::CommandFailed {
                                 load,
                                 plugin,
                                 error,
                             }));
                         }
                     }
-                }
+                    WorkerEvent::Indexed {
+                        load,
+                        plugin,
+                        index,
+                    } => {
+                        if let Some((_, status)) =
+                            self.staged.get_mut(&plugin).filter(|(id, _)| *id == load)
+                        {
+                            *status = PluginStatus::Indexed;
+                        } else if self.loads.get(&plugin) == Some(&load) {
+                            self.statuses.insert(plugin.clone(), PluginStatus::Indexed);
+                        } else {
+                            self.queue_disable(plugin, load);
+                            self.flush_pending_disables();
+                            continue;
+                        }
+                        events.push(OwnedPluginEvent::Other(PluginEvent::Indexed {
+                            load,
+                            plugin,
+                            index,
+                        }));
+                    }
+                    WorkerEvent::Loaded { load, component } => {
+                        let plugin = component.manifest.id.clone();
+                        let status = if !component.activated_commands.is_empty() {
+                            PluginStatus::Active(component.activated_commands.clone())
+                        } else if component.instantiated {
+                            PluginStatus::Instantiated
+                        } else {
+                            PluginStatus::ValidatedUntilHost(
+                                component.unavailable_host.clone().unwrap_or_else(|| {
+                                    "component imports require unavailable host bindings".into()
+                                }),
+                            )
+                        };
+                        if let Some((_, current)) =
+                            self.staged.get_mut(&plugin).filter(|(id, _)| *id == load)
+                        {
+                            *current = status;
+                        } else if self.loads.get(&plugin) == Some(&load) {
+                            self.statuses.insert(plugin, status);
+                        } else {
+                            self.queue_disable(plugin, load);
+                            self.flush_pending_disables();
+                            continue;
+                        }
+                        events.push(OwnedPluginEvent::Other(PluginEvent::Loaded {
+                            load,
+                            component,
+                        }))
+                    }
+                    WorkerEvent::Executed {
+                        load,
+                        origin,
+                        execution,
+                    } => {
+                        if self.loads.get(&execution.plugin) == Some(&load) {
+                            events.push(OwnedPluginEvent::Executed(PluginExecutionReply {
+                                origin,
+                                execution,
+                            }));
+                        }
+                    }
+                    WorkerEvent::Failed {
+                        load,
+                        plugin,
+                        error,
+                    } => {
+                        if self.staged.get(&plugin).is_some_and(|(id, _)| *id == load) {
+                            self.staged.remove(&plugin);
+                        } else if self.loads.get(&plugin) == Some(&load) {
+                            self.loads.remove(&plugin);
+                            self.statuses
+                                .insert(plugin.clone(), PluginStatus::Failed(error.to_string()));
+                        } else {
+                            continue;
+                        }
+                        events.push(OwnedPluginEvent::Other(PluginEvent::Failed {
+                            load,
+                            plugin,
+                            error,
+                        }));
+                    }
+                },
                 Err(TryRecvError::Empty) => {
                     self.flush_pending_disables();
                     return Ok(events);
@@ -902,11 +977,18 @@ impl PluginHost {
             && matches!(self.statuses.get(id), Some(PluginStatus::Active(_)))
     }
     pub fn unload_load(&mut self, id: &str, load: PluginLoadId) -> Result<(), PluginError> {
-        if self.loads.get(id) != Some(&load) {
+        if self
+            .staged
+            .get(id)
+            .is_some_and(|(candidate, _)| *candidate == load)
+        {
+            self.staged.remove(id);
+        } else if self.loads.get(id) == Some(&load) {
+            self.loads.remove(id);
+            self.statuses.remove(id);
+        } else {
             return Ok(());
         }
-        self.loads.remove(id);
-        self.statuses.remove(id);
         self.queue_disable(id.into(), load);
         self.flush_pending_disables();
         Ok(())

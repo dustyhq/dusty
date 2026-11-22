@@ -701,7 +701,7 @@ pub(in crate::app) fn key_groups_require_a_command_not_an_orphan_pass_through() 
     let diagnostic = diagnostic.expect("orphan group must be rejected");
     assert!(
         diagnostic.contains("user.test.orphan-group")
-            && diagnostic.contains("reaches no resolved binding"),
+            && diagnostic.contains("no shortcut starts with"),
         "{diagnostic}"
     );
 }
@@ -912,7 +912,7 @@ pub(in crate::app) fn invalid_key_groups_reject_compilation_and_reload_transacti
                 order: 0,
                 disable: false,
             },
-            "reaches no resolved binding",
+            "no shortcut starts with",
         ),
         (
             crate::config::KeyGroupEntry {

@@ -93,14 +93,11 @@ pub(super) struct Plugins {
     package_preparing: BTreeSet<u64>,
     package_aborts: BTreeSet<u64>,
     package_refresh: bool,
-    package_prepared: HashMap<String, (PluginLoadId, u64)>,
+    package_candidates: HashMap<String, integration::PackageCandidate>,
     package_commits: HashMap<u64, (String, PluginLoadId)>,
-    package_startup_pending: HashMap<String, PluginLoadId>,
-    package_managed_plugins: HashMap<String, PluginLoadId>,
+    package_managed_plugins: HashMap<String, (PluginLoadId, crate::tools::LockedPackage)>,
     disabled_plugins: BTreeSet<String>,
     package_startup_request: Option<u64>,
-    package_startup_rollback: Option<u64>,
-    package_startup_rollback_attempted: bool,
     plugin_worker_reported: bool,
     package_store: PathBuf,
     manager: PluginHost,
@@ -142,14 +139,11 @@ impl Plugins {
             package_preparing: BTreeSet::new(),
             package_aborts: BTreeSet::new(),
             package_refresh: false,
-            package_prepared: HashMap::new(),
+            package_candidates: HashMap::new(),
             package_commits: HashMap::new(),
-            package_startup_pending: HashMap::new(),
             package_managed_plugins: HashMap::new(),
             disabled_plugins: BTreeSet::new(),
             package_startup_request: None,
-            package_startup_rollback: None,
-            package_startup_rollback_attempted: false,
             plugin_worker_reported: false,
             registry,
             package_store: package_root.join("store"),
@@ -185,17 +179,9 @@ impl Plugins {
             .index_from_store(plugin, store, manifest, component, limits)
     }
     pub(in crate::app) fn disable(&mut self, plugin: &str) -> Result<(), PluginError> {
-        let load = self.manager.load_id(plugin);
         self.manager.disable(plugin)?;
         self.disabled_plugins.insert(plugin.into());
-        // The manager discards late events for disabled loads, so they cannot
-        // finish a pending activation or release its prepared package token.
-        if let Some(load) = load {
-            if self.package_startup_pending.get(plugin) == Some(&load) {
-                self.package_startup_pending.remove(plugin);
-            }
-            self.abort_prepared(plugin, load);
-        }
+        self.cancel_package_candidate(plugin);
         Ok(())
     }
     pub(in crate::app) fn disable_load(

@@ -2495,7 +2495,10 @@ fn enabled_plugin_references_are_deferred_but_unknown_namespaces_still_reject() 
     let error = running
         .apply_configuration_candidate(changed, false)
         .expect_err("plugin topology reload must stage before mutation");
-    assert!(error.contains("plugin topology"));
+    assert!(
+        matches!(&error, crate::config::ConfigurationCandidateError::Other(detail) if detail.contains("plugin topology")),
+        "{error}"
+    );
     assert_eq!(running.configuration.settings().plugins, previous);
 }
 
@@ -3192,41 +3195,6 @@ fn deferred_activation_queue_failure_aborts_unsubmitted_siblings() {
         "{:?}",
         app.ui.notification
     );
-}
-
-#[test]
-fn rejected_package_commands_schedule_the_installed_version_for_reload() {
-    let (_app_dirs, mut app) = app();
-    let (manager, fixture) = crate::plugins::ExecutionFixture::new(4);
-    app.extension.fixture_manager(manager);
-    let manifest = plugin_manifest("demo", "plugin.demo.test", "x y");
-    app.extension
-        .fixture_contribution(
-            crate::plugins::index_manifest_contributions(&manifest, 1, "test".into()).unwrap(),
-        )
-        .unwrap();
-    app.extension.fixture_prepared("demo", PluginLoadId(1), 41);
-    fixture.loaded(
-        PluginLoadId(1),
-        crate::plugins::LoadedComponent {
-            canonical_path: "replacement.wasm".into(),
-            bytes: Vec::new(),
-            manifest,
-            instantiated: true,
-            unavailable_host: None,
-            activated_commands: Vec::new(),
-        },
-    );
-    app.process_plugin_events();
-    app.process_package_events();
-    assert!(app.extension.fixture_package_reload_pending());
-    assert!(
-        app.extension
-            .take_prepared("demo", PluginLoadId(1))
-            .is_none()
-    );
-    assert!(!app.extension.is_active_load("demo", PluginLoadId(1)));
-    assert!(app.extension.contributions().get("demo").is_none());
 }
 
 #[test]

@@ -22,6 +22,7 @@ fn manager(sender: SyncSender<QueuedRequest>, receiver: Receiver<WorkerEvent>) -
         receiver,
         statuses: BTreeMap::new(),
         loads: BTreeMap::new(),
+        staged: BTreeMap::new(),
         next_load: 1,
         pending_disables: VecDeque::new(),
         maximum_loads: 4,
@@ -1482,11 +1483,16 @@ impl ExecutionFixture {
             })
             .unwrap();
     }
-    pub(crate) fn loaded(&self, load: PluginLoadId, component: LoadedComponent) {
+    pub(crate) fn load_failed(&self, plugin: &str, load: PluginLoadId, error: PluginError) {
         self.events
-            .try_send(WorkerEvent::Loaded { load, component })
+            .try_send(WorkerEvent::Failed {
+                load,
+                plugin: plugin.into(),
+                error,
+            })
             .unwrap();
     }
+
     pub(crate) fn reply(&self, captured: &CapturedExecution, proposals: Vec<PluginEditProposal>) {
         self.reply_with(captured, |execution| execution.proposals = proposals);
     }

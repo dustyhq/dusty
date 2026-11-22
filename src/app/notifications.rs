@@ -67,6 +67,21 @@ impl Notifications {
         }
     }
 
+    pub(in crate::app) fn record_history(&mut self, message: String, error: bool) {
+        if self
+            .history
+            .back()
+            .is_none_or(|(previous_error, previous)| {
+                *previous_error != error || previous != &message
+            })
+        {
+            self.history.push_back((error, message));
+            if self.history.len() > 200 {
+                self.history.pop_front();
+            }
+        }
+    }
+
     pub(in crate::app) fn notify(
         &mut self,
         message: String,
@@ -83,18 +98,7 @@ impl Notifications {
                 *previous_error != error || previous != &message
             })
         {
-            if self
-                .history
-                .back()
-                .is_none_or(|(previous_error, previous)| {
-                    *previous_error != error || previous != &message
-                })
-            {
-                self.history.push_back((error, message.clone()));
-                if self.history.len() > 200 {
-                    self.history.pop_front();
-                }
-            }
+            self.record_history(message.clone(), error);
             self.deadline = (!timeout.is_zero()).then_some(now + timeout);
         }
         self.present(&message, error, false, authority);
