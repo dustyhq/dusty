@@ -1824,9 +1824,6 @@ impl Workspace {
                         )
                     };
                 }
-                if let Some(key) = self.writing_draft.take() {
-                    self.drafts.remove(&key);
-                }
                 self.queue.retain(|request| {
                     matches!(
                         request.key,
@@ -1889,6 +1886,16 @@ impl Workspace {
                         headline
                     }
                 };
+                if let Some(WritingDraft::BrowserPr { page, .. }) = draft
+                    && has_draft
+                    && same_target
+                    && self.page == page
+                    && self.ready_form.is_none()
+                    && let Ok(Some(form)) = self.web_pr_form()
+                {
+                    self.compose.web_pr_error = Some(self.notice.clone());
+                    self.ready_form = Some(form);
+                }
             }
         }
     }

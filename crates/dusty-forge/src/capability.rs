@@ -113,7 +113,7 @@ impl Capabilities {
             viewed_files: Cap::Yes,
             merge_methods: vec![MergeMethod::Merge, MergeMethod::Squash, MergeMethod::Rebase],
             merge_pinned_head: Cap::Yes,
-            delete_branch_on_merge: Cap::Yes,
+            delete_branch_on_merge: Cap::No("GitHub uses the repository's branch deletion setting"),
             auto_merge: Cap::Yes,
             draft_pr: Cap::Yes,
             create_pr_cross_fork: Cap::Yes,

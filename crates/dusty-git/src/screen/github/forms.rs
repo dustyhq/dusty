@@ -312,7 +312,7 @@ pub(super) fn paint(
                 rule(frame, x, right, y);
                 y += 1;
             }
-            "Method" | "Source branch" => {
+            "Method" | SourceBranch::LABEL => {
                 let at = label(frame, x, y, right, &format!("{:<14}", field.label), focused);
                 let options: Vec<(&str, GitChip, GitRole)> = if field.label == "Method" {
                     vec![
@@ -322,12 +322,8 @@ pub(super) fn paint(
                     ]
                 } else {
                     vec![
-                        ("Keep it", GitChip::Focus, GitRole::Focus),
-                        (
-                            "Delete it after the merge",
-                            GitChip::Removed,
-                            GitRole::Removed,
-                        ),
+                        (SourceBranch::KEEP, GitChip::Focus, GitRole::Focus),
+                        (SourceBranch::DELETE, GitChip::Removed, GitRole::Removed),
                     ]
                 };
                 let refusal = [
@@ -550,13 +546,9 @@ pub(super) fn paint(
     // A review's verdict is the radio row above, so the strip names only where it goes and
     // what it carries; a merge's chip is its only statement of the method.
     let mut at = if merge {
-        let at =
-            frame
-                .grid
-                .put_text_clipped(x, y + 1, &chip, bold(role, GitSurface::Chip(hue)), right);
         frame
             .grid
-            .put_text_clipped(at, y + 1, " · ", st(GitRole::Border, PANE), right)
+            .put_text_clipped(x, y + 1, &chip, bold(role, GitSurface::Chip(hue)), right)
     } else {
         let _ = (chip, hue, role);
         frame.grid.put_text_clipped(
@@ -568,7 +560,7 @@ pub(super) fn paint(
         )
     };
     let detail = if merge {
-        let delete = form
+        let source_branch = form
             .fields
             .iter()
             .find(|field| field.label == SourceBranch::LABEL)

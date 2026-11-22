@@ -278,29 +278,31 @@ fn load_from(directory: &std::path::Path) -> Drafts {
                 return None;
             }
             let number = path.file_stem()?.to_str()?.parse::<u64>().ok()?;
-            let text = std::fs::read_to_string(&path).ok()?;
-            let drafts = decode(&serde_json::from_str(&text).ok()?);
+            let drafts = load_file(&path).ok()?;
             (!drafts.is_empty()).then_some((number, drafts))
         })
         .collect()
 }
 
-fn save(
-    host: &str,
-    repo: &str,
-    number: u64,
-    drafts: &[(InlineDraft, String)],
-) -> Result<(), String> {
-    match directory(host, repo) {
-        Some(directory) => save_in(&directory, number, drafts),
-        None => Ok(()),
-    }
+fn load_file(file: &std::path::Path) -> Result<Vec<PendingDraft>, String> {
+    let text = match std::fs::read_to_string(file) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.to_string()),
+    };
+    let value = serde_json::from_str(&text).map_err(|error| error.to_string())?;
+    let source = file
+        .parent()
+        .and_then(std::path::Path::file_name)
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    Ok(decode(&value, source))
 }
 
 fn save_in(
     directory: &std::path::Path,
     number: u64,
-    drafts: &[(InlineDraft, String)],
+    drafts: &[PendingDraft],
 ) -> Result<(), String> {
     let file = directory.join(format!("{number}.json"));
     if drafts.is_empty() {
@@ -317,6 +319,109 @@ fn save_in(
     temporary
         .persist(&file)
         .map_err(|error| error.error.to_string())?;
+    Ok(())
+}
+
+/// Keep drafts in their original files, putting only new ones in the preferred directory.
+fn flush_scope(
+    directories: impl FnOnce() -> Vec<PathBuf>,
+    drafts: &mut Drafts,
+    saved: &mut SavedDrafts,
+) -> Option<SaveIssue> {
+    drafts.retain(|_, drafts| !drafts.is_empty());
+    if saved.matches(drafts) {
+        return None;
+    }
+    let paths = directories();
+    let Some(primary) = paths.first() else {
+        return Some(SaveIssue::NoDirectory);
+    };
+    let mut by_directory = BTreeMap::<PathBuf, Drafts>::new();
+    for (&number, comments) in drafts.iter() {
+        for draft in comments {
+            let source = saved.0.iter().find_map(|(directory, saved)| {
+                saved
+                    .get(&number)?
+                    .iter()
+                    .any(|comment| comment.id == draft.id)
+                    .then_some(directory)
+            });
+            by_directory
+                .entry(source.unwrap_or(primary).clone())
+                .or_default()
+                .entry(number)
+                .or_default()
+                .push(draft.clone());
+        }
+    }
+    let mut issue = None;
+    for directory in saved.0.keys() {
+        by_directory.entry(directory.clone()).or_default();
+    }
+    for (directory, drafts) in by_directory {
+        let baseline = saved.0.entry(directory.clone()).or_default();
+        if let Some(failure) = flush_directory(&directory, &drafts, baseline) {
+            issue.get_or_insert(failure);
+        }
+    }
+    saved.0.retain(|_, drafts| !drafts.is_empty());
+    issue
+}
+
+/// Advance the snapshot only for entries written or removed successfully.
+fn flush_directory(
+    directory: &std::path::Path,
+    drafts: &Drafts,
+    saved: &mut Drafts,
+) -> Option<SaveIssue> {
+    let numbers = drafts
+        .keys()
+        .chain(saved.keys())
+        .copied()
+        .collect::<BTreeSet<_>>();
+    let mut issue = None;
+    for number in numbers {
+        let now = drafts.get(&number);
+        if saved.get(&number) == now {
+            continue;
+        }
+        if save_in(
+            directory,
+            number,
+            now.map(Vec::as_slice).unwrap_or_default(),
+        )
+        .is_err()
+        {
+            issue = Some(SaveIssue::Failed);
+        } else if let Some(now) = now {
+            saved.insert(number, now.clone());
+        } else {
+            saved.remove(&number);
+        }
+    }
+    issue
+}
+
+fn retire_ids(drafts: &mut Drafts, number: u64, sent: &BTreeSet<String>) {
+    if let Some(slot) = drafts.get_mut(&number) {
+        slot.retain(|draft| !sent.contains(&draft.id));
+        if slot.is_empty() {
+            drafts.remove(&number);
+        }
+    }
+}
+
+fn retire_in(
+    directory: &std::path::Path,
+    number: u64,
+    sent: &BTreeSet<String>,
+) -> Result<(), String> {
+    let mut drafts = load_file(&directory.join(format!("{number}.json")))?;
+    let before = drafts.len();
+    drafts.retain(|draft| !sent.contains(&draft.id));
+    if drafts.len() != before {
+        save_in(directory, number, &drafts)?;
+    }
     Ok(())
 }
 
@@ -768,7 +873,7 @@ impl Workspace {
                 )))
             }
             Action::Draft(number, index) => {
-                let (draft, _) = self
+                let draft = self
                     .review_drafts(*number)
                     .get(*index)
                     .ok_or("That draft was already sent or deleted")?

@@ -3213,6 +3213,7 @@ pub fn capabilities(graphql_batching: bool) -> Capabilities {
         review_request_changes: Cap::Probe,
         batched_review: Cap::Probe,
         merge_methods: vec![MergeMethod::Merge, MergeMethod::Squash, MergeMethod::Rebase],
+        delete_branch_on_merge: Cap::Yes,
         update_branch: Cap::No("GitLab rebases via the merge sheet"),
         issue_not_planned: Cap::No("GitLab closes issues without a reason"),
         projects: Cap::No("GitLab issue boards are not part of the forge tabs"),

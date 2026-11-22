@@ -2223,7 +2223,7 @@ impl GitHub {
                 head,
                 title,
                 message,
-                ..
+                delete_branch: _, // GitHub applies the repository's setting, not a merge flag.
             } => {
                 let mut payload = json!({
                     "sha": head,

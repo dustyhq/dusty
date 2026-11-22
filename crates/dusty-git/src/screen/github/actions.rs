@@ -669,11 +669,7 @@ impl Workspace {
                 title = &title_owned;
                 fields = vec![choice("Method", first, &methods)];
                 if caps.delete_branch_on_merge.allowed() {
-                    fields.push(choice(
-                        "Source branch",
-                        "Keep it",
-                        &["Keep it", "Delete it after the merge"],
-                    ));
+                    fields.push(SourceBranch::field());
                 }
                 fields.push(field(
                     "Commit title",
@@ -1037,8 +1033,10 @@ impl Workspace {
                 assignees: list(&values[3]),
             },
             Action::ConfirmPullRequest(request) => {
-                self.writing_draft = Some(self.draft_key(&Action::CreatePullRequest));
-                let op = Op::Write(
+                self.writing_draft = Some(WritingDraft::Form(
+                    self.draft_key(&Action::CreatePullRequest),
+                ));
+                let op = self.write_op(
                     ForgeTarget::repository(&request.host, &request.base_repository),
                     Write::CreatePullRequest((**request).clone()),
                 );
@@ -1181,7 +1179,9 @@ impl Workspace {
                             .into(),
                     );
                 }
-                Write::SubmitReview {
+                let drafts = self.review_drafts(*id);
+                let sent = drafts.iter().map(|draft| draft.id.clone()).collect();
+                let write = Write::SubmitReview {
                     number: *id,
                     verdict: match values[0].as_str() {
                         "Approve" => Verdict::Approve,
@@ -1189,40 +1189,47 @@ impl Workspace {
                         _ => Verdict::Comment,
                     },
                     body: values[1].clone(),
-                    drafts: self
-                        .inline_drafts
-                        .get(id)
-                        .map(|drafts| drafts.iter().map(|(draft, _)| draft.clone()).collect())
-                        .unwrap_or_default(),
-                    head: self
-                        .inline_drafts
-                        .get(id)
-                        .and_then(|drafts| drafts.first())
-                        .map(|(_, head)| head.clone()),
-                }
+                    drafts: drafts.iter().map(|draft| draft.comment.clone()).collect(),
+                    head,
+                };
+                self.sent_review = Some(drafts::SentReview {
+                    ids: sent,
+                    account: self.account.clone(),
+                    repo: self.repo.clone(),
+                });
+                write
             }
             Action::Merge(id, head) => {
                 if head.is_empty() {
                     return Err("Refresh the pull request before merging".into());
                 }
-                let method = match values[0].as_str() {
+                let supports_delete = self.capabilities().delete_branch_on_merge.allowed();
+                // Method, optional Source branch choice, title: the merge sheet's field order.
+                let (method, source_branch, title) = match values.as_slice() {
+                    [method, branch, title] if supports_delete => (
+                        method,
+                        Some(
+                            SourceBranch::parse(branch)
+                                .ok_or("Choose a valid Source branch with Up/Down")?,
+                        ),
+                        title,
+                    ),
+                    [method, title] if !supports_delete => (method, None, title),
+                    _ => return Err("Reopen the merge form and try again.".into()),
+                };
+                let method = match method.as_str() {
                     "Merge" => MergeMethod::Merge,
                     "Rebase" => MergeMethod::Rebase,
                     _ => MergeMethod::Squash,
                 };
-                let delete_branch = values
-                    .iter()
-                    .any(|value| value == "Delete it after the merge");
-                let title = values
-                    .last()
-                    .filter(|_| values.len() > 1 && method != MergeMethod::Rebase)
-                    .map(|title| title.trim().to_owned())
-                    .filter(|title| !title.is_empty());
+                let title = title.trim();
+                let title =
+                    (method != MergeMethod::Rebase && !title.is_empty()).then(|| title.to_owned());
                 Write::Merge {
                     number: *id,
                     method,
                     head: head.clone(),
-                    delete_branch,
+                    delete_branch: source_branch == Some(SourceBranch::Delete),
                     title,
                     message: None,
                 }
@@ -1231,9 +1238,9 @@ impl Workspace {
             Action::Worktree(id) => {
                 self.queue.push_back(Request {
                     key: Key::WorktreeWrite(*id),
-                    op: Op::Write(self.target(), Write::Worktree { number: *id }),
+                    op: self.write_op(target, Write::Worktree { number: *id }),
                 });
-                self.writing_draft = Some(self.draft_key(&action));
+                self.writing_draft = Some(WritingDraft::Form(draft_key));
                 return Ok(());
             }
             Action::Inline {
@@ -1420,12 +1427,79 @@ impl Workspace {
             }
             None => write,
         };
-        self.writing_draft = Some(self.draft_key(&action));
-        self.cache.remove(&Key::Write);
-        self.optimistic(&write);
-        self.enqueue(Key::Write, Op::Write(self.target(), write), false);
+        self.writing_draft = Some(WritingDraft::Form(draft_key));
+        self.enqueue_write(self.write_op(target, write));
         self.notice_error = false;
         self.notice = format!("Sending to {}…", self.forge_name());
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_the_source_branch_choice_can_request_deletion() {
+        for (host, has_choice) in [
+            ("github.com", false),
+            ("gitea.com", true),
+            ("gitlab.com", true),
+        ] {
+            for delete in [false, true] {
+                if delete && !has_choice {
+                    continue;
+                }
+                let mut ws = Workspace::new(PathBuf::new());
+                ws.host = host.into();
+                ws.repo = "team/project".into();
+                ws.page = 2;
+                ws.opened = Some((2, 7));
+                let action = Action::Merge(7, "a".repeat(40));
+                let form = ws.activate(action.clone()).unwrap().unwrap();
+                let mut values = Vec::new();
+                let mut saw_choice = false;
+                for field in form.fields {
+                    let value = match field.label.as_str() {
+                        SourceBranch::LABEL => {
+                            saw_choice = true;
+                            assert_eq!(field.input.input, SourceBranch::KEEP);
+                            if delete {
+                                SourceBranch::DELETE.into()
+                            } else {
+                                field.input.input
+                            }
+                        }
+                        "Commit title" => SourceBranch::DELETE.into(),
+                        _ => field.input.input,
+                    };
+                    values.push(value);
+                }
+                assert_eq!(saw_choice, has_choice);
+                let FormAction::Github(draft_action) = form.action else {
+                    panic!("expected a forge merge form");
+                };
+                ws.save_draft(&draft_action, values.clone());
+                let restored = ws.activate(action).unwrap().unwrap();
+                let FormAction::Github(submit_action) = restored.action else {
+                    panic!("expected a restored merge form");
+                };
+                let restored_values = restored
+                    .fields
+                    .into_iter()
+                    .map(|field| field.input.input)
+                    .collect::<Vec<_>>();
+                assert_eq!(restored_values, values);
+                ws.submit(submit_action, restored_values).unwrap();
+                assert!(
+                    ws.queue.iter().any(|request| matches!(
+                        &request.op,
+                        Op::Write(_, Write::Merge { delete_branch, title: Some(title), .. }, _)
+                            if *delete_branch == delete && title == SourceBranch::DELETE
+                    )),
+                    "{host}: expected a merge with delete_branch={delete}"
+                );
+            }
+        }
     }
 }

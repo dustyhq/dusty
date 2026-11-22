@@ -8,6 +8,12 @@ use crate::forge::provider::ProviderKind;
 
 /// The longest body a prefilled web address carries; longer text is cut with a note.
 const WEB_BODY: usize = 4000;
+const SHORTENED_WEB_BODY: &str =
+    "The browser gets a shortened description. Your full draft stays here.";
+
+fn web_body_shortened(body: &str) -> bool {
+    body.len() > WEB_BODY
+}
 
 #[derive(Default)]
 pub(super) struct Compose {
@@ -18,6 +24,8 @@ pub(super) struct Compose {
     /// The open sheet's fields it does not show (same-repository targets, the head branch
     /// the note names, a publish choice an up-to-date branch does not need).
     hidden: Vec<(String, String)>,
+    /// The launch failure to show when the restored browser form is installed.
+    pub(super) web_pr_error: Option<String>,
 }
 
 /// The Create sheet's values in the order `review_pr` reads them; a Template picker, when
@@ -176,7 +184,7 @@ pub(super) struct WebRequest {
 /// Forgejo's compare view. The body is cut to a size every browser accepts.
 pub(super) fn web_url(kind: ProviderKind, request: &WebRequest) -> String {
     let mut body = request.body.clone();
-    if body.len() > WEB_BODY {
+    if web_body_shortened(&body) {
         let mut cut = WEB_BODY;
         while !body.is_char_boundary(cut) {
             cut -= 1;
@@ -470,6 +478,7 @@ impl Workspace {
     /// When this account cannot create pull requests: the same fields, sent to the forge's
     /// own form in the browser.
     pub(super) fn web_pr_form(&mut self) -> Result<Option<Form>, String> {
+        self.compose.web_pr_error = None;
         if self.repo.is_empty() {
             return Err("The repository is not loaded yet".into());
         }
@@ -519,6 +528,10 @@ impl Workspace {
         )))
     }
 
+    pub(in crate::screen) fn take_web_pr_error(&mut self) -> Option<String> {
+        self.compose.web_pr_error.take()
+    }
+
     pub(super) fn submit_web_pr(&mut self, values: &[String]) -> Result<(), String> {
         let [title, body, base, head] = values else {
             return Err("Invalid pull request form".into());
@@ -557,21 +570,19 @@ impl Workspace {
             body: body.clone(),
         };
         let url = web_url(self.pull_kind(), &request);
-        self.drafts
-            .remove(&self.draft_key(&Action::CreatePullRequestWeb));
-        self.cache.remove(&Key::Write);
-        self.enqueue(
-            Key::Write,
-            Op::Write(
-                self.target(),
-                Write::OpenInBrowser {
-                    kind: crate::forge::model::ItemKind::PullRequest,
-                    number: 0,
-                    url: Some(url),
-                },
-            ),
-            false,
-        );
+        self.writing_draft = Some(WritingDraft::BrowserPr {
+            key: self.draft_key(&Action::CreatePullRequestWeb),
+            shortened: web_body_shortened(body),
+            page: self.page,
+        });
+        self.enqueue_write(self.write_op(
+            self.target(),
+            Write::OpenInBrowser {
+                kind: crate::forge::model::ItemKind::PullRequest,
+                number: 0,
+                url: Some(url),
+            },
+        ));
         self.notice_error = false;
         self.notice = "Opening the browser…".into();
         Ok(())

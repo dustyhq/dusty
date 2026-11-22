@@ -1061,11 +1061,22 @@ impl GitScreen {
         if let Some(page) = self.github.take_link_page() {
             self.page = page;
         }
-        if self.form.is_none()
+        let web_pr_error = if self.form.is_none()
             && let Some(form) = self.github.take_form()
         {
+            let error = if matches!(
+                &form.action,
+                FormAction::Github(github::Action::CreatePullRequestWeb)
+            ) {
+                self.github.take_web_pr_error()
+            } else {
+                None
+            };
             self.form = Some(form);
-        }
+            error
+        } else {
+            None
+        };
         let mut changed = false;
         let mut reload_preview = false;
         let history_was_loading = self.history_loading;
@@ -1436,6 +1447,10 @@ impl GitScreen {
             false
         };
         self.restore_rewrite_diagnostic();
+        if let Some(error) = web_pr_error {
+            self.notice = error;
+            changed = true;
+        }
         changed || github_changed || tutor_changed
     }
     fn clamp(&mut self) {
