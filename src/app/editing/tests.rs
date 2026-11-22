@@ -1867,6 +1867,32 @@ pub(in crate::app) fn press_keys(app: &mut App, keys: &[&str]) {
 }
 
 #[test]
+fn visual_line_delete_keeps_the_body_of_a_closed_fold() {
+    let (_dirs, mut app) = app();
+    app.set_dashboard_visibility(false);
+    let (buffer, view) = app
+        .state
+        .open_text(
+            TextBuffer::from_text("before\nhead\nbody\nend\nafter"),
+            None,
+        )
+        .unwrap();
+    app.ui.syntax_folds.push(UiFold {
+        view,
+        start_line: 1,
+        end_line: 3,
+        collapsed: true,
+    });
+
+    // Vim's `Vjd` from above a closed fold deletes the header but keeps its body.
+    press_keys(&mut app, &["V", "j", "d"]);
+    assert_eq!(
+        app.state.buffers[buffer].text.to_string(),
+        "body\nend\nafter"
+    );
+}
+
+#[test]
 fn upper_d_c_and_y_act_to_the_end_of_the_line_as_in_neovim() {
     let (_app_dirs, mut app) = app();
     app.set_dashboard_visibility(false);
@@ -2918,6 +2944,164 @@ pub(in crate::app) fn wait_syntax(app: &mut App, buffer: crate::editor::BufferId
 }
 
 #[test]
+fn parsed_multiline_string_does_not_change_pairs_outside_it() {
+    let (_dirs, mut app) = app();
+    app.set_dashboard_visibility(false);
+    // The quote closing the multiline literal is on the same line as the stray comment quote.
+    let source = "fn main() {\n    call(first,\n        \"prefix\nlast\", // (\" is shown in the output\n        42);\n}";
+    let path = app.state.workspace_root.join("outside.rs");
+    let (buffer, view) = app
+        .state
+        .open_text(TextBuffer::from_text(source), Some(path))
+        .unwrap();
+    wait_syntax(&mut app, buffer);
+    assert!(
+        app.state.buffers[buffer]
+            .current_syntax_objects()
+            .iter()
+            .any(|object| object.kind == crate::editor::SyntaxObjectKind::MultilineString)
+    );
+
+    let open = ByteOffset(source.find("call(").unwrap() + "call".len());
+    let close = ByteOffset(source.find("42)").unwrap() + "42".len());
+    app.state.views[view].cursor = close;
+    press(&mut app, "%");
+    assert_eq!(app.state.views[view].cursor, open);
+    press(&mut app, "%");
+    assert_eq!(app.state.views[view].cursor, close);
+    press_keys(&mut app, &["d", "%"]);
+    assert_eq!(
+        app.state.buffers[buffer].text.to_string(),
+        "fn main() {\n    call;\n}"
+    );
+}
+
+#[test]
+fn parsed_multiline_string_finds_its_next_delimiter_from_text() {
+    let (_dirs, mut app) = app();
+    app.set_dashboard_visibility(false);
+    let source = "fn main() {\n    f(\"prefix\ntext (ok)\");\n}";
+    let path = app.state.workspace_root.join("inside.rs");
+    let (buffer, view) = app
+        .state
+        .open_text(TextBuffer::from_text(source), Some(path))
+        .unwrap();
+    wait_syntax(&mut app, buffer);
+
+    let start = ByteOffset(source.find("text").unwrap());
+    app.state.views[view].cursor = start;
+    press(&mut app, "%");
+    assert_eq!(
+        app.state.views[view].cursor,
+        ByteOffset(source.find("(ok)").unwrap() + "(ok".len())
+    );
+    app.state.views[view].cursor = start;
+    press_keys(&mut app, &["d", "%"]);
+    assert_eq!(
+        app.state.buffers[buffer].text.to_string(),
+        "fn main() {\n    f(\"prefix\n\");\n}"
+    );
+}
+
+#[test]
+fn closing_quote_of_parsed_multiline_string_uses_normal_pair_lookahead() {
+    assert_closing_quote_matches_call("fn main() {\n    println!(\"hello\nworld\");\n}\n");
+}
+
+#[test]
+fn closing_quote_of_parsed_multiline_string_skips_inner_delimiters() {
+    assert_closing_quote_matches_call("fn main() {\n    println!(\"expected (\ntry again\");\n}\n");
+}
+
+fn assert_closing_quote_matches_call(source: &str) {
+    let (_dirs, mut app) = app();
+    app.set_dashboard_visibility(false);
+    let path = app.state.workspace_root.join("closing_quote.rs");
+    let (buffer, view) = app
+        .state
+        .open_text(TextBuffer::from_text(source), Some(path))
+        .unwrap();
+    wait_syntax(&mut app, buffer);
+
+    let quote = ByteOffset(source.rfind('"').unwrap());
+    assert!(
+        app.state.buffers[buffer]
+            .current_syntax_objects()
+            .iter()
+            .any(
+                |object| object.kind == crate::editor::SyntaxObjectKind::MultilineString
+                    && object.outer.1 == quote.get() + 1
+            )
+    );
+    // Vim and Neovim look ahead to the call's closing parenthesis, then jump back.
+    app.state.views[view].cursor = quote;
+    press(&mut app, "%");
+    assert_eq!(
+        app.state.views[view].cursor,
+        ByteOffset(source.find("println!(").unwrap() + "println!".len())
+    );
+    app.state.views[view].cursor = quote;
+    press_keys(&mut app, &["d", "%"]);
+    assert_eq!(
+        app.state.buffers[buffer].text.to_string(),
+        "fn main() {\n    println!);\n}\n"
+    );
+}
+
+#[test]
+fn matching_pair_uses_only_current_enabled_syntax_after_a_string_moves() {
+    let (_dirs, mut app) = app();
+    app.set_dashboard_visibility(false);
+    let source = "fn main() {\n    f(\"(\ntext\");\n}";
+    let path = app.state.workspace_root.join("moving.rs");
+    let (buffer, view) = app
+        .state
+        .open_text(TextBuffer::from_text(source), Some(path))
+        .unwrap();
+    wait_syntax(&mut app, buffer);
+
+    let start = source.find("\"(").unwrap() + 1;
+    app.state.views[view].cursor = ByteOffset(start);
+    press(&mut app, "%");
+    assert_eq!(app.state.views[view].cursor, ByteOffset(start));
+    press_keys(&mut app, &["d", "%"]);
+    assert_eq!(app.state.buffers[buffer].text.to_string(), source);
+
+    // Move the string by editing the source, before the next parse can be used.
+    press_keys(&mut app, &["g", "g", "0", "i", "space", "escape"]);
+    let moved = format!(" {source}");
+    assert_eq!(app.state.buffers[buffer].text.to_string(), moved);
+    let start = ByteOffset(start + 1);
+    let close = ByteOffset(moved.find("\");").unwrap() + 1);
+    let fallback = " fn main() {\n    f(\";\n}";
+    app.state.views[view].cursor = start;
+    press(&mut app, "%");
+    assert_eq!(app.state.views[view].cursor, close);
+    app.state.views[view].cursor = start;
+    press_keys(&mut app, &["d", "%"]);
+    assert_eq!(app.state.buffers[buffer].text.to_string(), fallback);
+    press(&mut app, "u");
+    assert_eq!(app.state.buffers[buffer].text.to_string(), moved);
+    wait_syntax(&mut app, buffer);
+    app.state.views[view].cursor = start;
+    press(&mut app, "%");
+    assert_eq!(app.state.views[view].cursor, start);
+
+    let mut config = crate::config::load_bundled_config();
+    config.config.syntax.enabled = false;
+    app.apply_configuration_candidate(config, false).unwrap();
+    app.process_syntax();
+    assert!(app.state.buffers[buffer].syntax_objects.is_none());
+    assert_eq!(app.state.buffers[buffer].text.to_string(), moved);
+    app.state.views[view].cursor = start;
+    press(&mut app, "%");
+    assert_eq!(app.state.views[view].cursor, close);
+    app.state.views[view].cursor = start;
+    press_keys(&mut app, &["d", "%"]);
+    assert_eq!(app.state.buffers[buffer].text.to_string(), fallback);
+}
+
+#[test]
 fn syntax_selection_grows_shrinks_and_resets_after_motion() {
     let (_dirs, mut app) = app();
     app.set_dashboard_visibility(false);
@@ -3191,6 +3375,11 @@ fn syntax_objects_refresh_when_only_the_document_language_changes() {
             .iter()
             .any(|object| object.kind == crate::editor::SyntaxObjectKind::Function)
     );
+
+    app.state.buffers[buffer].path = Some(app.state.workspace_root.join("hello.txt"));
+    app.process_syntax();
+    assert_eq!(app.state.buffers[buffer].text.revision(), revision);
+    assert!(app.state.buffers[buffer].syntax_objects.is_none());
 }
 
 #[test]
@@ -3960,6 +4149,23 @@ fn operator_arrow_motions_are_linewise_like_j_and_k() {
             "{motion}"
         );
     }
+}
+
+#[test]
+fn change_up_cancels_in_an_empty_buffer() {
+    let (_app_dirs, mut app) = app();
+    let (buffer, view) = app
+        .state
+        .open_text(TextBuffer::from_text(""), None)
+        .unwrap();
+    app.set_dashboard_visibility(false);
+    // Vim cancels `ck` in an empty buffer: no edit, and no Insert mode.
+    press_keys(&mut app, &["c", "k"]);
+    assert_eq!(
+        app.state.views[view].mode,
+        crate::editor::EditorMode::Normal
+    );
+    assert_eq!(app.state.buffers[buffer].text.to_string(), "");
 }
 
 #[test]

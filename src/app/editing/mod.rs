@@ -43,6 +43,11 @@ use crate::ui::snap_display_column_forward;
 
 use crate::app::syntax::nth_non_blank;
 
+pub(in crate::app) enum FoldCursorSelection {
+    Preserve,
+    Clear,
+}
+
 impl App {
     pub(in crate::app) fn process_grammar_input(
         &mut self,
@@ -217,6 +222,7 @@ impl App {
     }
 }
 
+#[cfg(test)]
 impl App {
     pub(in crate::app) fn apply_authoritative_editor_transaction(
         &mut self,
@@ -265,6 +271,8 @@ impl App {
             && candidate.window_version() == self.state.window_version()
         {
             *self.state = candidate.accept(&current)?;
+            self.debugger_session
+                .sync_breakpoint_locations(&mut self.state);
             return Ok(());
         }
 
@@ -740,7 +748,11 @@ impl App {
     }
 
     /// Closing a fold must put its cursor on the header, not leave it hidden.
-    pub(in crate::app) fn place_cursor_at_fold_header(&mut self, view_id: ViewId) {
+    pub(in crate::app) fn place_cursor_at_fold_header(
+        &mut self,
+        view_id: ViewId,
+        selection: FoldCursorSelection,
+    ) {
         let view = &self.state.views[view_id];
         let text = &self.state.buffers[view.buffer].text;
         let Ok(line) = text.byte_to_line(view.cursor) else {
@@ -750,12 +762,34 @@ impl App {
         if header != line
             && let Ok(position) = text.line_to_byte(header)
         {
-            let transaction = EditorTransaction::new(self.transaction_id())
-                .with_operation(EditorOperation::SetCursor {
-                    view: view_id,
-                    position,
-                })
-                .with_undo_policy(UndoPolicy::Ignore);
+            let selection_operation = match selection {
+                FoldCursorSelection::Clear
+                    if matches!(
+                        view.mode,
+                        EditorMode::VisualChar | EditorMode::VisualLine | EditorMode::VisualBlock
+                    ) =>
+                {
+                    Some(EditorOperation::SetMode {
+                        view: view_id,
+                        mode: EditorMode::Normal,
+                    })
+                }
+                FoldCursorSelection::Clear if view.selection.is_some() => {
+                    Some(EditorOperation::SetSelection {
+                        view: view_id,
+                        selection: None,
+                    })
+                }
+                _ => None,
+            };
+            let mut transaction =
+                EditorTransaction::new(self.transaction_id()).with_undo_policy(UndoPolicy::Ignore);
+            // Leave Visual before moving so `gv` can recall the original selection.
+            transaction.operations.extend(selection_operation);
+            transaction.operations.push(EditorOperation::SetCursor {
+                view: view_id,
+                position,
+            });
             if let Err(error) = self.state.apply_transaction(&transaction) {
                 self.show_error(error);
             }

@@ -2,6 +2,7 @@
 
 use unicode_segmentation::UnicodeSegmentation;
 
+use crate::editor::state::Buffer;
 use crate::editor::state::EditingPolicy;
 use crate::editor::state::FoldedLines;
 
@@ -43,7 +44,7 @@ use crate::editor::command::builtins::transaction::string_argument;
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn motion_target(
-    text: &TextBuffer,
+    buffer: &Buffer,
     cursor: ByteOffset,
     motion: &str,
     count: usize,
@@ -52,6 +53,7 @@ pub(super) fn motion_target(
     wanted_column: Option<usize>,
     folds: &FoldedLines,
 ) -> Result<ByteOffset, CommandError> {
+    let text = &buffer.text;
     let mut target = cursor;
     match motion {
         "find_forward"
@@ -156,7 +158,7 @@ pub(super) fn motion_target(
                 }
             }
         }
-        "matching_pair" => target = matching_pair(text, target)?,
+        "matching_pair" => target = matching_pair(buffer, target)?,
         "document_start" => target = first_nonblank(text, 0)?,
         "percentage" => {
             if !(1..=100).contains(&count) {
@@ -442,8 +444,7 @@ pub fn visual_ranges(
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn operator_range(
-    text: &TextBuffer,
-    objects: &[crate::editor::SyntaxObject],
+    buffer: &Buffer,
     cursor: ByteOffset,
     motion: &str,
     count: usize,
@@ -453,6 +454,8 @@ pub(super) fn operator_range(
     policy: EditingPolicy,
     folds: &FoldedLines,
 ) -> Result<ByteRange, CommandError> {
+    let text = &buffer.text;
+    let objects = buffer.current_syntax_objects();
     if let Some(range) = text_object(text, objects, cursor, motion, count)? {
         return Ok(range);
     }
@@ -468,8 +471,9 @@ pub(super) fn operator_range(
         let (line, last) = if motion == "line" {
             (cursor_line, cursor_line + count.saturating_sub(1))
         } else {
-            let target =
-                motion_target(text, cursor, motion, count, character, policy, None, folds)?;
+            let target = motion_target(
+                buffer, cursor, motion, count, character, policy, None, folds,
+            )?;
             let target_line = text.byte_to_line(target).map_err(failed)?;
             let last = cursor_line.max(target_line);
             (
@@ -519,7 +523,7 @@ pub(super) fn operator_range(
             word_end(&text.to_string(), cursor)
         };
         motion_target(
-            text,
+            buffer,
             first,
             motion,
             count.saturating_sub(1),
@@ -529,7 +533,9 @@ pub(super) fn operator_range(
             folds,
         )?
     } else {
-        motion_target(text, cursor, motion, count, character, policy, None, folds)?
+        motion_target(
+            buffer, cursor, motion, count, character, policy, None, folds,
+        )?
     };
     // `dw`/`dW` stop at the end of the last word's line, even when whitespace-only
     // lines follow it. Counted motions spanning whole lines keep those lines whole.
@@ -542,7 +548,7 @@ pub(super) fn operator_range(
             .map_err(failed)?;
         if target_line > cursor_line && prefix.trim().is_empty() {
             let last_step = motion_target(
-                text,
+                buffer,
                 cursor,
                 motion,
                 count.saturating_sub(1),
@@ -829,17 +835,26 @@ fn big_word_end(source: &str, cursor: ByteOffset) -> ByteOffset {
     ByteOffset(end)
 }
 
-pub(super) fn matching_pair(
-    text: &TextBuffer,
-    cursor: ByteOffset,
-) -> Result<ByteOffset, CommandError> {
+fn matching_pair(buffer: &Buffer, cursor: ByteOffset) -> Result<ByteOffset, CommandError> {
+    let text = &buffer.text;
     let source = text.to_string();
     let line = text.byte_to_line(cursor).map_err(failed)?;
     let line_end = line_content_end(text, line)?.get();
     let anchor = source[cursor.get()..]
         .starts_with(is_pair_delimiter)
         .then_some(cursor.get());
-    let delimiters = pair_delimiters(&source, anchor);
+    let literal = buffer
+        .current_syntax_objects()
+        .iter()
+        .filter(|object| object.kind == crate::editor::SyntaxObjectKind::MultilineString)
+        .map(|object| object.outer)
+        .find(|&(start, end)| {
+            (start..end).contains(&cursor.get()) && source.get(start..end).is_some()
+        });
+    // The closing ASCII quote uses normal lookahead, but its literal is not code.
+    let closing_quote_literal = literal.filter(|&(_, end)| cursor.get() == end - 1);
+    let string_scope = literal.filter(|_| closing_quote_literal.is_none());
+    let delimiters = pair_delimiters(&source, anchor, string_scope);
     let mut following = delimiters.clone();
     let (at, character, scope) = following
         .by_ref()
@@ -876,9 +891,13 @@ pub(super) fn matching_pair(
         }
     } else {
         // Two forward passes preserve quote handling without storing every delimiter.
-        let prefix = delimiters
-            .take_while(|(index, _, _)| *index < at)
-            .filter(|(_, _, candidate_scope)| *candidate_scope == scope);
+        let prefix = delimiters.take_while(|(index, _, _)| *index < at).filter(
+            |(index, _, candidate_scope)| {
+                *candidate_scope == scope
+                    && !closing_quote_literal
+                        .is_some_and(|(start, end)| (start..end).contains(index))
+            },
+        );
         let change = |candidate| {
             if candidate == mate {
                 1_isize
@@ -911,13 +930,17 @@ fn is_pair_delimiter(character: char) -> bool {
     "()[]{}".contains(character)
 }
 
-/// Skip complete, same-line quoted strings, except the one containing the anchor.
-/// The closing quote's offset identifies that string's delimiters.
+/// With no string scope, retain the same-line quote scan over the whole buffer.
 fn pair_delimiters(
     source: &str,
     anchor: Option<usize>,
+    string_scope: Option<(usize, usize)>,
 ) -> impl Iterator<Item = (usize, char, Option<usize>)> + Clone + '_ {
-    let mut characters = source.char_indices().peekable();
+    let (start, end) = string_scope.unwrap_or((0, source.len()));
+    let mut characters = source[start..end]
+        .char_indices()
+        .map(move |(index, character)| (start + index, character))
+        .peekable();
     let mut quote_end = None;
     std::iter::from_fn(move || {
         while let Some((index, character)) = characters.next() {
@@ -925,7 +948,8 @@ fn pair_delimiters(
                 quote_end = None;
             } else if character == '\\' {
                 characters.next();
-            } else if quote_end.is_none()
+            } else if string_scope.is_none()
+                && quote_end.is_none()
                 && matches!(character, '\'' | '"' | '`')
                 && !(character == '\''
                     && source[..index]
@@ -958,7 +982,11 @@ fn pair_delimiters(
                     }
                 }
             } else if is_pair_delimiter(character) {
-                return Some((index, character, quote_end));
+                return Some((
+                    index,
+                    character,
+                    string_scope.map(|(_, end)| end).or(quote_end),
+                ));
             }
         }
         None

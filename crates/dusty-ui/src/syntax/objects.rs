@@ -27,7 +27,12 @@ static KINDS: LazyLock<Kinds> = LazyLock::new(|| {
 
 use crate::editor::{SyntaxObject, SyntaxObjectKind};
 
-pub(super) fn collect(tree: &tree_sitter::Tree, source: &str, limit: usize) -> Vec<SyntaxObject> {
+pub(super) fn collect(
+    tree: &tree_sitter::Tree,
+    source: &str,
+    limit: usize,
+    multiline_string_kind: Option<&str>,
+) -> Vec<SyntaxObject> {
     let mut objects = Vec::new();
     let mut cursor = tree.walk();
     'walk: loop {
@@ -56,6 +61,17 @@ pub(super) fn collect(tree: &tree_sitter::Tree, source: &str, limit: usize) -> V
             arguments(node, &mut objects, remaining);
         } else if node.is_named() && KINDS.comments.iter().any(|name| name == kind) {
             objects.push(comment(node, source));
+        } else if multiline_string_kind == Some(kind)
+            && !node.has_error()
+            && node.start_position().row < node.end_position().row
+        {
+            let range = (node.start_byte(), node.end_byte());
+            objects.push(SyntaxObject {
+                kind: SyntaxObjectKind::MultilineString,
+                outer: range,
+                inner: range,
+                parent: None,
+            });
         } else if node.is_named()
             && KINDS.tags.iter().any(|name| name == kind)
             && let Some(object) = tag(node)
@@ -273,7 +289,7 @@ mod tests {
             .set_language(&tree_sitter_rust::LANGUAGE.into())
             .unwrap();
         let tree = parser.parse(source, None).unwrap();
-        collect(&tree, source, 100)
+        collect(&tree, source, 100, Some("string_literal"))
     }
 
     #[test]
@@ -439,7 +455,7 @@ mod tests {
             "{}",
             tree.root_node().to_sexp()
         );
-        collect(&tree, source, 100)
+        collect(&tree, source, 100, None)
     }
     #[test]
     fn html_xml_and_jsx_elements_are_tag_objects() {
@@ -607,7 +623,7 @@ mod tests {
             .unwrap();
         let tree = parser.parse(&source, None).unwrap();
         for limit in [0, 1, 2, 10, 1001, 2000] {
-            let found = collect(&tree, &source, limit);
+            let found = collect(&tree, &source, limit, None);
             assert!(found.len() <= limit);
             assert_eq!(
                 found

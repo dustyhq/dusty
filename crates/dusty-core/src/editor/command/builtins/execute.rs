@@ -249,7 +249,7 @@ pub(super) fn execute_builtin<E>(
             ) {
                 Some(target) => target?,
                 None => motion_target(
-                    &buffer.text,
+                    buffer,
                     view.cursor,
                     motion,
                     count,
@@ -438,7 +438,7 @@ pub(super) fn execute_builtin<E>(
             &mut transaction,
             view_id,
             view,
-            &buffer.text,
+            buffer,
             string_argument(invocation, "motion")?,
             count,
             state.policy,
@@ -907,8 +907,7 @@ pub(super) fn execute_builtin<E>(
                     visual_ranges(&buffer.text, view, state.policy)?
                 } else {
                     let range = operator_range(
-                        &buffer.text,
-                        buffer.current_syntax_objects(),
+                        buffer,
                         view.cursor,
                         motion,
                         count,

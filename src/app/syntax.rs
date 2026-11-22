@@ -880,20 +880,28 @@ impl App {
             self.clock.monotonic(),
             &too_large,
         );
-        for (buffer, result) in self.syntax.results() {
+        // Old colours may remain visible after an edit, but motions need an eligible parse
+        // of the exact text. This also clears objects after disabling syntax or switching languages.
+        let mut objects_changed = false;
+        for (buffer, target) in &mut self.state.value.buffers {
+            let current = self
+                .syntax
+                .result(buffer)
+                .filter(|_| self.syntax.source(buffer) == Some(&target.text.source_version()));
+            let Some(result) = current else {
+                objects_changed |= target.syntax_objects.take().is_some();
+                continue;
+            };
             let revision = BufferRevision(result.revision);
-            let stale = self.state.buffers.get(*buffer).is_some_and(|target| {
-                self.syntax.source(*buffer) == Some(&target.text.source_version())
-                    && !self.syntax_spans_source.0.contains(&(
-                        *buffer,
-                        result.request_id,
-                        result.revision,
-                    ))
-            });
-            if stale {
-                self.state.buffers[*buffer].syntax_objects =
-                    Some((revision, result.objects.clone()));
+            if target.syntax_objects.as_ref().is_none_or(|(at, objects)| {
+                *at != revision || !std::sync::Arc::ptr_eq(objects, &result.objects)
+            }) {
+                target.syntax_objects = Some((revision, result.objects.clone()));
+                objects_changed = true;
             }
+        }
+        if objects_changed {
+            self.state.revision = self.state.revision.wrapping_add(1);
         }
         // Folds and spans are rebuilt only when a parse result or the views changed, not on
         // every tick.
@@ -1134,7 +1142,10 @@ impl App {
                             }
                         }
                     }
-                    self.place_cursor_at_fold_header(view);
+                    self.place_cursor_at_fold_header(
+                        view,
+                        crate::app::editing::FoldCursorSelection::Preserve,
+                    );
                 }
             }
             AppEffect::SyntaxIndentLine => self.apply_syntax_indent_line(),

@@ -9,6 +9,8 @@ pub enum SyntaxObjectKind {
     /// An element with an opening and a closing tag (HTML, XML, JSX): `it` and `at`.
     Tag,
     Node,
+    /// A complete multiline string literal recognized by the syntax parser.
+    MultilineString,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

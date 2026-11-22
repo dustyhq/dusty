@@ -1620,7 +1620,15 @@ fn parse(request: Request) -> SyntaxEvent {
         ),
         Err(error) => return failed(&request, format!("indent query: {error}")),
     };
-    let objects = Arc::new(objects::collect(&tree, &request.source, 50_000));
+    // Only opt in grammars whose literal node is known to be a single, non-interpolated string.
+    let multiline_string_kind =
+        (request.language == SyntaxLanguage::Rust).then_some("string_literal");
+    let objects = Arc::new(objects::collect(
+        &tree,
+        &request.source,
+        50_000,
+        multiline_string_kind,
+    ));
     SyntaxEvent::Parsed(SyntaxResult {
         tree: Arc::new(tree),
         source: request.source.into(),
@@ -2102,6 +2110,19 @@ mod tests {
             panic!("{event:?}")
         };
         result
+    }
+
+    #[test]
+    fn rust_syntax_projects_multiline_string_literals() {
+        let source = "fn main() {\n    // \"prose\n    f(\"(\ntext\");\n}";
+        let result = parse_with_policy(SyntaxLanguage::Rust, source, SyntaxPolicy::default());
+        let strings: Vec<_> = result
+            .objects
+            .iter()
+            .filter(|object| object.kind == crate::editor::SyntaxObjectKind::MultilineString)
+            .map(|object| &source[object.outer.0..object.outer.1])
+            .collect();
+        assert_eq!(strings, ["\"(\ntext\""]);
     }
 
     #[test]

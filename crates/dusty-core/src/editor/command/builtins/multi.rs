@@ -5,6 +5,7 @@ use unicode_segmentation::UnicodeSegmentation;
 
 use crate::editor::ViewId;
 
+use crate::editor::state::Buffer;
 use crate::editor::state::EditingPolicy;
 
 use crate::editor::state::EditorMode;
@@ -401,11 +402,12 @@ pub(super) fn move_all(
     transaction: &mut EditorTransaction,
     view_id: ViewId,
     view: &View,
-    text: &TextBuffer,
+    buffer: &Buffer,
     motion: &str,
     count: usize,
     policy: EditingPolicy,
 ) -> Result<(), CommandError> {
+    let text = &buffer.text;
     let index = current(&view.multi_marks, view.cursor);
     let mut cursor = None;
     let mut marks = Vec::with_capacity(view.multi_marks.len());
@@ -419,7 +421,7 @@ pub(super) fn move_all(
             None
         };
         let mut target = motion_target(
-            text,
+            buffer,
             mark.start,
             motion,
             count,

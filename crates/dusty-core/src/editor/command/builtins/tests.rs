@@ -921,6 +921,67 @@ fn delete_matching_pair_uses_the_delimiter_under_the_cursor() {
 }
 
 #[test]
+fn delete_matching_pair_keeps_bare_quotes_on_their_own_line() {
+    // As in Vim, d% from g's closing paren leaves the preceding lines intact.
+    for (line, end) in [
+        (r#"    # " starts a string."#, ")"),
+        (r#"    // " starts a string."#, ");"),
+        (r#"    A sentence with one stray " in prose."#, ")"),
+    ] {
+        let source = format!("f(\n{line}\n    g(\"value\"),\n{end}");
+        let (mut state, buffer, _) = editing(&source, source.find("),").unwrap());
+        apply(
+            &mut state,
+            "edit.operator",
+            &[
+                ("operator", "delete"),
+                ("motion", "matching_pair"),
+                ("linewise", "false"),
+            ],
+            0,
+        );
+        assert_eq!(
+            state.buffers[buffer].text.to_string(),
+            format!("f(\n{line}\n    g,\n{end}")
+        );
+    }
+}
+
+#[test]
+fn matching_pair_motion_stays_inside_a_multiline_string() {
+    // Vim's syntax-aware searchpairpos finds no mate within rustString. Its stock `%`
+    // crosses the string boundary here; Dusty deliberately keeps both commands in scope.
+    let source = "f(\"(\ntext\");";
+    let (mut state, buffer, _) = editing(source, 3);
+    let text = &mut state.buffers[buffer];
+    text.syntax_objects = Some((
+        text.text.revision(),
+        std::sync::Arc::new(vec![crate::editor::SyntaxObject {
+            kind: crate::editor::SyntaxObjectKind::MultilineString,
+            outer: (2, 10),
+            inner: (2, 10),
+            parent: None,
+        }]),
+    ));
+    let mut registry = CommandRegistry::<()>::default();
+    register_builtin_commands(&mut registry).unwrap();
+    let move_pair = CommandInvocation::new("view.cursor.move", InvocationSource::Test)
+        .unwrap()
+        .with_argument("motion", CommandValue::String("matching_pair".into()));
+    let delete_pair = CommandInvocation::new("edit.operator", InvocationSource::Test)
+        .unwrap()
+        .with_argument("operator", CommandValue::String("delete".into()))
+        .with_argument("motion", CommandValue::String("matching_pair".into()))
+        .with_argument("linewise", CommandValue::Bool(false));
+    for invocation in [move_pair, delete_pair] {
+        assert!(matches!(
+            registry.execute(&state, &invocation),
+            Err(crate::editor::CommandError::Unavailable(_))
+        ));
+    }
+}
+
+#[test]
 fn matching_pairs_handle_unbalanced_prefixes_and_rust_lifetimes() {
     for source in [")(()", "fn f<'a, 'b>(x: &'a str)"] {
         let opening = source.rfind('(').unwrap();
