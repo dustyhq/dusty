@@ -60,7 +60,22 @@ fn settle(screen: &mut GitScreen, what: &str) -> String {
 fn no_forge_screen_shows_a_placeholder_viewer() {
     let Ok(name) = std::env::var(CHILD) else {
         for forge in ALL {
-            let world = World::new(forge);
+            let world = if forge == Forge::Gitea {
+                // The recording contains the first commit's patch, but the wide reader
+                // opens the last commit in the list. Give that request a local patch too.
+                World::with_state(
+                    forge,
+                    serde_json::json!({
+                        "answers": {
+                            "GET repos/orbit/orbit/git/commits/99ec0bac7b05942826ca78f08cb4f962063ee007.diff": {
+                                "body": "diff --git a/viewer.rs b/viewer.rs\n--- a/viewer.rs\n+++ b/viewer.rs\n@@ -1 +1 @@\n-old viewer fixture\n+commit patch fixture\n"
+                            }
+                        }
+                    }),
+                )
+            } else {
+                World::new(forge)
+            };
             let mut command = Command::new(std::env::current_exe().unwrap());
             command
                 .args([
@@ -75,12 +90,20 @@ fn no_forge_screen_shows_a_placeholder_viewer() {
             world.configure(&mut command);
             let output = command.output().unwrap();
             let stdout = String::from_utf8_lossy(&output.stdout);
-            assert!(
-                output.status.success() && stdout.contains("1 passed"),
-                "{} child:\n{stdout}\n{}",
-                forge.name(),
-                String::from_utf8_lossy(&output.stderr)
-            );
+            if !output.status.success() || !stdout.contains("1 passed") {
+                let requests = world.requests();
+                let recent: Vec<_> = requests
+                    .iter()
+                    .rev()
+                    .take(12)
+                    .map(|request| (request["method"].as_str(), request["path"].as_str()))
+                    .collect();
+                panic!(
+                    "{} child:\n{stdout}\n{}\nRecent requests (newest first): {recent:?}",
+                    forge.name(),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
         }
         return;
     };
@@ -98,7 +121,11 @@ fn no_forge_screen_shows_a_placeholder_viewer() {
     seen.push(settle(&mut screen, "the pull request"));
     for tab in ["Commits", "Checks", "Files changed"] {
         key(&mut screen, KeyCode::Char('L'));
-        seen.push(settle(&mut screen, tab));
+        let frame = settle(&mut screen, tab);
+        if forge == Forge::Gitea && tab == "Commits" {
+            assert!(frame.contains("commit patch fixture"), "{frame}");
+        }
+        seen.push(frame);
     }
     key(&mut screen, KeyCode::Char('L'));
     settle(&mut screen, "Conversation");
