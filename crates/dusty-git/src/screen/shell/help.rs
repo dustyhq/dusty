@@ -405,25 +405,31 @@ fn context(app: &GitScreen) -> (&'static str, Vec<Group>) {
                         vec![("- s", "Toggle pointer · stage it"), ("u", "Init · update")],
                     ),
                 ),
-                0 => (
-                    "Changes",
-                    (
-                        "Act",
-                        vec![
-                            ("s u -", "Stage · unstage · toggle"),
-                            ("a", "Stage all · unstage all"),
-                            ("x", "Mark file"),
-                            ("V", "Mark a range"),
-                            ("d", "Discard (confirm)"),
-                            ("D", "Discard marked (confirm)"),
-                            ("c", "Commit staged"),
-                            ("A W F", "Amend · reword · fixup"),
-                            ("t", "Flat · tree"),
-                            ("F", "Changed · all files"),
-                            ("v", "Open in reader"),
-                        ],
-                    ),
-                ),
+                0 => {
+                    let mut keys = vec![("s u -", "Stage · unstage · toggle")];
+                    if !app.all_files {
+                        keys.push((
+                            "a",
+                            if app.filters[0].active() {
+                                "Stage or unstage shown files"
+                            } else {
+                                "Stage all · unstage all"
+                            },
+                        ));
+                    }
+                    keys.extend([
+                        ("x", "Mark file"),
+                        ("V", "Mark a range"),
+                        ("d", "Discard (confirm)"),
+                        ("D", "Discard marked (confirm)"),
+                        ("c", "Commit staged"),
+                        ("A W F", "Amend · reword · fixup"),
+                        ("t", "Flat · tree"),
+                        ("F", "Changed · all files"),
+                        ("v", "Open in reader"),
+                    ]);
+                    ("Changes", ("Act", keys))
+                }
                 1 if app.subview == 2 => (
                     "Remotes",
                     (

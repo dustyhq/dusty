@@ -67,6 +67,9 @@ fn append(
             }
         } else {
             let code = node.code.as_deref().unwrap_or_default();
+            // A file may have been replaced by a directory (or vice versa). Emit
+            // both changes without a second row with the same path as the file.
+            let child_prefix = (!node.children.is_empty()).then(|| path.clone());
             rows.push(Row {
                 label: format!(
                     "{}{}{label}",

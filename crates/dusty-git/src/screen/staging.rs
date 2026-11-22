@@ -1,11 +1,16 @@
 //! Native Git selections use the existing checked mutation and bounded command workers.
 use super::*;
+use crate::mutation::{MARKED_DIRECTORY_SCOPE, indexed_file_ancestors};
+
+#[cfg(test)]
+mod tests;
 
 const CHECK_STAGE: &str = "Couldn't check what is staged";
 const STAGE_CHANGED: &str = "Files changed while you were deciding. Try staging again.";
 
 #[derive(Clone)]
 pub(super) struct BulkStage {
+    scope: StageScope,
     paths: BTreeSet<PathBuf>,
     replacing: BTreeSet<PathBuf>,
     index: GitIndexFingerprint,
@@ -122,7 +127,7 @@ impl GitScreen {
         if paths.is_empty() {
             return Err("This directory has no changed descendants".into());
         }
-        self.stage_paths(&paths)
+        self.stage_bulk(&paths, StageScope::Directory)
     }
 
     pub(super) fn stage_all(&mut self) -> Result<(), String> {
@@ -148,20 +153,21 @@ impl GitScreen {
         if paths.is_empty() {
             return Ok(());
         }
-        self.stage_bulk(&paths, true)
+        self.stage_bulk(&paths, StageScope::All)
     }
 
     /// Directory and marked-file staging share the same exact-path safeguards as `a`.
     pub(super) fn stage_paths(&mut self, selection: &BTreeSet<PathBuf>) -> Result<(), String> {
-        self.stage_bulk(selection, false)
+        self.stage_bulk(selection, StageScope::Marked)
     }
 
     fn stage_bulk(
         &mut self,
         selection: &BTreeSet<PathBuf>,
-        toggle_all: bool,
+        scope: StageScope,
     ) -> Result<(), String> {
         self.allow_write()?;
+        let toggle_all = matches!(scope, StageScope::All);
         let snapshot = self.snapshot.as_ref().ok_or("Status is loading")?;
         let mut entries = selection
             .iter()
@@ -259,6 +265,7 @@ impl GitScreen {
             return self.write_stage_paths(paths, true, head.is_some(), notice);
         }
 
+        self.check_stage_paths(&repository, &index, &paths, scope)?;
         let replacing =
             staged_only_paths(&repository, &index, &paths, head).map_err(|_| CHECK_STAGE)?;
         self.check_bulk_stage_state(index_before, head)?;
@@ -275,6 +282,7 @@ impl GitScreen {
             self.form(
                 "Replace staged changes?",
                 FormAction::StageAnyway(Box::new(BulkStage {
+                    scope,
                     paths,
                     replacing,
                     index: index_before,
@@ -317,18 +325,19 @@ impl GitScreen {
     pub(super) fn stage_anyway(&mut self, plan: BulkStage) -> Result<(), String> {
         self.check_bulk_stage_state(plan.index, plan.head)?;
         let (repository, index) = self.stage_index()?;
-        self.check_stage_paths(&index, &plan.paths, false)?;
+        self.check_stage_paths(&repository, &index, &plan.paths, plan.scope)?;
         let replacing = staged_only_paths(&repository, &index, &plan.paths, plan.head)
             .map_err(|_| CHECK_STAGE)?;
         if !replacing.is_subset(&plan.replacing) {
             return Err(STAGE_CHANGED.into());
         }
         self.check_bulk_stage_state(plan.index, plan.head)?;
-        self.write_stage_paths(plan.paths, false, plan.head.is_some(), plan.notice)
+        self.write_stage_paths(plan.paths, plan.notice)
     }
 
     fn check_stage_paths(
         &self,
+        repo: &git2::Repository,
         index: &git2::Index,
         paths: &BTreeSet<PathBuf>,
         unstage: bool,
@@ -357,7 +366,23 @@ impl GitScreen {
                 );
             }
         }
+        Ok(())
+    }
 
+    pub(super) fn unstage_paths(
+        &mut self,
+        paths: BTreeSet<PathBuf>,
+        index: GitIndexFingerprint,
+        head: Option<GitHeadId>,
+        notice: Option<String>,
+    ) -> Result<(), String> {
+        self.allow_write()?;
+        self.mutation
+            .start_unstage_paths(self.root.clone(), paths, index, head)
+            .map_err(|error| error.to_string())?;
+        self.stage_notice = notice;
+        self.busy = true;
+        self.notice = "Running Git…".into();
         Ok(())
     }
 
@@ -407,7 +432,7 @@ impl GitScreen {
         if std::fs::symlink_metadata(&file)
             .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
         {
-            return Ok(None);
+            return self.apply_stage_file(plan);
         }
         let (hash, bytes) =
             worktree_hash(&file).map_err(|_| "Couldn't check for conflict markers")?;

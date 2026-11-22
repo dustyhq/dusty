@@ -1125,7 +1125,7 @@ impl GitScreen {
                     self.preview = "Loading…".into();
                     "Working tree updated · index unchanged".into()
                 } else {
-                    String::new()
+                    self.stage_notice.take().unwrap_or_default()
                 };
                 let result = self.refresh();
                 self.refreshing_after_write = result.is_ok();
@@ -1134,6 +1134,7 @@ impl GitScreen {
             }
             Err(e) => {
                 self.busy = false;
+                self.stage_notice = None;
                 self.notice = e.to_string();
                 changed = true;
             }

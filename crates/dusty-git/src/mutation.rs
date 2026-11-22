@@ -36,14 +36,26 @@ use crate::status::GitUnsavedDocument;
 
 use crate::status::unsaved_document_revision;
 
+pub(super) const MARKED_DIRECTORY_SCOPE: &str =
+    "Mark the replaced file and all its changed contents before staging.";
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct GitIndexFingerprint(pub [u8; 32]);
 pub fn git_index_fingerprint(repository: &Path) -> Result<GitIndexFingerprint, GitMutationError> {
-    use sha2::Digest;
-    use sha2::Sha256;
     let repo = git2::Repository::open(repository).map_err(|_| GitMutationError::Backend)?;
     let index = repo.index().map_err(|_| GitMutationError::Backend)?;
-    let mut entries = index.iter().collect::<Vec<_>>();
+    Ok(index_fingerprint(&index))
+}
+
+fn index_fingerprint(index: &git2::Index) -> GitIndexFingerprint {
+    index_entries_fingerprint(index.iter())
+}
+
+fn index_entries_fingerprint(
+    entries: impl Iterator<Item = git2::IndexEntry>,
+) -> GitIndexFingerprint {
+    use sha2::{Digest, Sha256};
+    let mut entries = entries.collect::<Vec<_>>();
     entries.sort_by(|a, b| a.path.cmp(&b.path).then_with(|| a.flags.cmp(&b.flags)));
     let mut hash = Sha256::new();
     for e in entries {
@@ -245,12 +257,20 @@ pub enum GitMutationError {
     OutsideScope,
     #[error("Git mutation path type is unsupported")]
     UnsupportedPath,
+    #[error("{}", MARKED_DIRECTORY_SCOPE)]
+    FileDirectoryReplacement,
     #[error("Git mutation was cancelled")]
     Cancelled,
     #[error("Git mutation worker stopped")]
     Stopped,
     #[error("Git mutation backend failed")]
     Backend,
+    #[error("Couldn't unstage the selected files")]
+    BulkUnstage,
+    #[error("Select both the file and the changed files in the directory, then try again.")]
+    PartialUnstageReplacement,
+    #[error("Couldn't save the staged changes for Undo")]
+    SaveUnstage,
     #[error("Git mutation postcondition failed after apply")]
     Postcondition,
 }
@@ -1115,6 +1135,41 @@ fn captured_hunk_patch(
             p.kind == GitMutationKind::UnstageLines,
         )?,
     })
+}
+
+/// Indexed files that Git would remove when adding a descendant.
+pub(super) fn indexed_file_ancestors<'a>(
+    index: &'a git2::Index,
+    path: &'a Path,
+) -> impl Iterator<Item = &'a Path> {
+    path.ancestors()
+        .skip(1)
+        .take_while(|parent| !parent.as_os_str().is_empty())
+        .filter(move |parent| index.get_path(parent, 0).is_some())
+}
+
+fn check_stage_path(index: &git2::Index, repo_path: &Path) -> Result<(), GitMutationError> {
+    // libgit2's index insertion can remove an indexed parent even if only the child was selected.
+    if indexed_file_ancestors(index, repo_path).next().is_some() {
+        return Err(GitMutationError::FileDirectoryReplacement);
+    }
+    Ok(())
+}
+
+fn apply_index_patch(
+    repo: &git2::Repository,
+    repo_path: &Path,
+    patch: &[u8],
+    layer: GitDiffLayer,
+) -> Result<(), GitMutationError> {
+    let diff = git2::Diff::from_buffer(patch).map_err(|_| GitMutationError::Backend)?;
+    verify_patch_paths(&diff, repo_path)?;
+    if layer == GitDiffLayer::Unstaged {
+        let index = repo.index().map_err(|_| GitMutationError::Backend)?;
+        check_stage_path(&index, repo_path)?;
+    }
+    repo.apply(&diff, git2::ApplyLocation::Index, None)
+        .map_err(|_| GitMutationError::Backend)
 }
 
 fn stage_whole_file(
