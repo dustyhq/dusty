@@ -3,13 +3,14 @@
 forge-search.keys).
 
 FORGE_CACHED_PHASE picks the run:
-  prime   an ordinary first session; fills DUSTY_FORGE_CACHE_DIR.
+  prime   an ordinary first session; fills the scratch cache.
   cached  an hour later: the cache is aged by an hour, the forge answers after 1.2 s and has
           changed meanwhile (a new issue, a renamed one, one closed), so the first frame is the
           cache and the merge lands later.
   search  the forge answers after 1.5 s and knows two issues the cache has never seen.
-DUSTY_FORGE_CACHE_DIR must name a directory kept between the runs. DUSTY_GIT_BINARY is the
-built `dusty-git`. Nothing here reaches a real forge.
+FORGE_CACHED_DIR must name a dedicated scratch directory kept between the runs. The cache
+lives in its forge-fixture-cache subdirectory. DUSTY_GIT_BINARY is the built `dusty-git`.
+Nothing here reaches a real forge.
 """
 import json
 import os
@@ -20,13 +21,16 @@ import sys
 import tempfile
 import time
 
+from forge_env import fixture_env
+
 ROOT = pathlib.Path(__file__).resolve().parent.parent.parent
 FIXTURES = ROOT / "tests/fixtures/forge"
 PHASE = os.environ.get("FORGE_CACHED_PHASE", "prime")
 BINARY = os.environ.get("DUSTY_GIT_BINARY", str(ROOT / "target/release/dusty-git"))
-CACHE = os.environ.get("DUSTY_FORGE_CACHE_DIR")
-if not CACHE:
-    sys.exit("DUSTY_FORGE_CACHE_DIR must name a directory kept between the runs")
+scratch = os.environ.get("FORGE_CACHED_DIR")
+if not scratch:
+    sys.exit("FORGE_CACHED_DIR must name a dedicated scratch directory kept between the runs")
+CACHE = pathlib.Path(scratch).resolve() / "forge-fixture-cache"
 
 
 def issue(number, title, **extra):
@@ -51,7 +55,7 @@ if PHASE == "cached":
         if entry["number"] == 48 else entry
         for entry in ISSUES if entry["number"] != 44]
     world["delay_ms"] = 1200
-    for path in pathlib.Path(CACHE).rglob("*.json"):
+    for path in CACHE.rglob("*.json"):
         if path.name == "index.json":
             continue
         try:
@@ -86,14 +90,13 @@ shutil.copy(FIXTURES / "fake_gh.py", bin_dir / "gh")
 (bin_dir / "gh").chmod(0o755)
 (bin_dir / "fake_gh.json").write_text(json.dumps({"server": url}))
 
-env = {key: value for key, value in os.environ.items()
-       if not key.startswith(("GH_", "GITHUB_", "GITLAB_", "GITEA_", "FORGEJO_", "DUSTY_FORGE_", "GL_"))}
-env.update(
+env = fixture_env(
+    work,
     PATH=str(bin_dir),
     DUSTY_FORGE_API_BASE=f"{url}/{{host}}/api/v3",
     DUSTY_FORGE_ORIGIN=f"{url}/{{host}}",
     DUSTY_FORGE_STATE_DIR=str(work / "forge-state"),
-    DUSTY_FORGE_CACHE_DIR=CACHE,
+    DUSTY_FORGE_CACHE_DIR=str(CACHE),
 )
 try:
     code = subprocess.call([BINARY, *sys.argv[1:]], env=env)

@@ -282,20 +282,29 @@ impl DetectInputs {
     }
 }
 
-/// `$DUSTY_FORGE_STATE_DIR/hosts.json`, else `$XDG_STATE_HOME/dusty/forge/hosts.json`.
-pub fn hosts_path(env: &Env) -> Option<PathBuf> {
+/// Prefer the forge override and the existing XDG/HOME locations. Otherwise use Dusty's
+/// platform state root (e.g. LOCALAPPDATA on Windows), but never consult ambient state
+/// from an explicit test environment or the practice forge.
+pub(crate) fn forge_state_directory(env: &Env) -> Option<PathBuf> {
     if let Some(directory) = env.get("DUSTY_FORGE_STATE_DIR") {
-        return Some(PathBuf::from(directory).join("hosts.json"));
+        return Some(PathBuf::from(directory));
     }
-    let state = env
-        .get("XDG_STATE_HOME")
+    env.get("XDG_STATE_HOME")
         .map(PathBuf::from)
         .filter(|path| path.is_absolute())
         .or_else(|| {
             env.get("HOME")
                 .map(|home| PathBuf::from(home).join(".local/state"))
-        })?;
-    Some(state.join("dusty/forge/hosts.json"))
+        })
+        .map(|state| state.join("dusty/forge"))
+        .or_else(|| {
+            (env.is_process() && !crate::sandbox::active())
+                .then(|| dusty_core::paths::user_state_directory().join("forge"))
+        })
+}
+
+pub fn hosts_path(env: &Env) -> Option<PathBuf> {
+    Some(forge_state_directory(env)?.join("hosts.json"))
 }
 
 /// Where probes and derived (non-GitHub) API bases go: `https://H`, or `DUSTY_FORGE_ORIGIN`

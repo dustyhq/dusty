@@ -1,8 +1,7 @@
 # F3 caching and freshness: the Issues tab paints from the disk cache at
 # once, then the background check merges what changed without moving the cursor.
 #   scripts/ui-scenarios/make-orbit-fixture.sh /tmp/orbit
-#   export DUSTY_FORGE_CACHE_DIR=/tmp/forge-cache DUSTY_GIT_BINARY=$PWD/target/release/dusty-git
-#   rm -rf $DUSTY_FORGE_CACHE_DIR
+#   export FORGE_CACHED_DIR=$(mktemp -d) DUSTY_GIT_BINARY=$PWD/target/release/dusty-git
 #   FORGE_CACHED_PHASE=prime scripts/ui-shot scripts/ui-scenarios/forge-cached.keys \
 #     --binary scripts/ui-scenarios/forge-cached-launch --cwd /tmp/orbit --out target/ui-shots/forge-prime
 #   FORGE_CACHED_PHASE=cached scripts/ui-shot scripts/ui-scenarios/forge-cached.keys \

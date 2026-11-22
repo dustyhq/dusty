@@ -224,6 +224,8 @@ def main():
             directory = scratch / variable.lower()
             directory.mkdir()
             fresh[f"XDG_{variable}_HOME"] = str(directory)
+        fresh["DUSTY_CONFIG_HOME"] = fresh["XDG_CONFIG_HOME"]
+        fresh["DUSTY_STATE_HOME"] = fresh["XDG_STATE_HOME"]
         dusty = str(pathlib.Path(arguments.dusty).resolve())
         measure("dusty", [dusty], fresh, workspace, path, arguments.runs, arguments.keys)
         other = shlex.split(arguments.other)

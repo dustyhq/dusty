@@ -16,6 +16,8 @@ import subprocess
 import sys
 import tempfile
 
+from forge_env import fixture_env
+
 ROOT = pathlib.Path(__file__).resolve().parent.parent.parent
 FIXTURES = ROOT / "tests/fixtures/forge"
 BINARY = os.environ.get("DUSTY_GIT_BINARY", str(ROOT / "target/release/dusty-git"))
@@ -43,9 +45,8 @@ shutil.copy(FIXTURES / "fake_glab.py", bin_dir / "glab")
 (bin_dir / "glab").chmod(0o755)
 (bin_dir / "fake_glab.json").write_text(json.dumps({"server": url}))
 
-env = {key: value for key, value in os.environ.items()
-       if not key.startswith(("GH_", "GITHUB_", "GITLAB_", "GITEA_", "FORGEJO_", "DUSTY_FORGE_", "GL_"))}
-env.update(
+env = fixture_env(
+    work,
     PATH=str(bin_dir),
     GITLAB_TOKEN=FAKE_TOKEN,
     DUSTY_FORGE_ORIGIN=f"{url}/{{host}}",

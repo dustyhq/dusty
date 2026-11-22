@@ -117,6 +117,8 @@ class Terminal:
             path = workdir / name.lower()
             path.mkdir(exist_ok=True)
             env[f"XDG_{name}_HOME"] = str(path)
+        env["DUSTY_CONFIG_HOME"] = env["XDG_CONFIG_HOME"]
+        env["DUSTY_STATE_HOME"] = env["XDG_STATE_HOME"]
         self.kitty = subprocess.Popen(
             [
                 "kitty",
