@@ -360,6 +360,191 @@ fn leaving_a_worktree_closes_every_clean_buffer_from_it() {
 }
 
 #[test]
+fn explorer_plus_switches_git_columns_with_one_background_refresh() {
+    let (_app_dirs, mut app) = app();
+    let root = &app.state.workspace_root;
+    let repo = git2::Repository::init(root).unwrap();
+    let path = root.join("tracked.txt");
+    fs::write(&path, "old\n").unwrap();
+    let mut index = repo.index().unwrap();
+    let tracked = std::path::Path::new("tracked.txt");
+    index.add_path(tracked).unwrap();
+    index.write().unwrap();
+    let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+    let sig = git2::Signature::now("Dusty", "dusty@example.invalid").unwrap();
+    repo.commit(Some("HEAD"), &sig, &sig, "fixture", &tree, &[])
+        .unwrap();
+    fs::write(&path, "staged\n").unwrap();
+    index.add_path(tracked).unwrap();
+    index.write().unwrap();
+    fs::write(&path, "staged\nworktree\n").unwrap();
+
+    let wait_status = |app: &mut App| {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while app.git.status_pending() {
+            app.process_git_status_events();
+            assert!(Instant::now() < deadline, "Git status did not finish");
+            thread::yield_now();
+        }
+    };
+    let column = |app: &App| {
+        let row = app
+            .ui
+            .explorer
+            .as_ref()
+            .unwrap()
+            .rows
+            .iter()
+            .find(|row| {
+                row.segments
+                    .last()
+                    .is_some_and(|name| name.text == "tracked.txt")
+            })
+            .expect("tracked file row");
+        assert_eq!(
+            row.segments.last().unwrap().role,
+            ExplorerSegmentRole::GitModified
+        );
+        let segments = if row.git_line_count_segments.is_empty() {
+            &row.right_segments
+        } else {
+            &row.git_line_count_segments
+        };
+        segments
+            .iter()
+            .map(|segment| segment.text.as_str())
+            .collect::<String>()
+    };
+
+    app.open_explorer();
+    wait_explorer(&mut app);
+    wait_status(&mut app);
+    let request = app.git.status_request_id();
+    assert_eq!(column(&app), "MM");
+    assert!(app.git.status().unwrap().line_counts.is_empty());
+
+    app.handle_configured_key(KeyEvent::character('+'));
+    assert_eq!(app.git.status_request_id(), request + 1);
+    wait_status(&mut app);
+    assert_eq!(column(&app), "+2 −1");
+
+    app.handle_configured_key(KeyEvent::character('+'));
+    assert_eq!(column(&app), "MM");
+    assert_eq!(app.git.status_request_id(), request + 1);
+}
+
+#[test]
+fn explorer_git_color_modes_project_names_letters_and_counts() {
+    use crate::config::ExplorerGitColors::{Kind, Off, Single};
+    use ExplorerSegmentRole::{File, Git, GitAdded, GitDim, GitModified, GitStaged};
+
+    let (_app_dirs, mut app) = app();
+    let root = &app.state.workspace_root;
+    let repo = git2::Repository::init(root).unwrap();
+    fs::write(root.join("staged.txt"), "staged\n").unwrap();
+    fs::write(root.join("mixed.txt"), "staged\n").unwrap();
+    let mut index = repo.index().unwrap();
+    for name in ["staged.txt", "mixed.txt"] {
+        index.add_path(std::path::Path::new(name)).unwrap();
+    }
+    index.write().unwrap();
+    fs::write(root.join("mixed.txt"), "staged\nworktree\n").unwrap();
+    fs::write(root.join("new.txt"), "untracked\n").unwrap();
+
+    app.open_explorer();
+    wait_explorer(&mut app);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while app.git.status_pending() {
+        app.process_git_status_events();
+        assert!(Instant::now() < deadline, "Git status did not finish");
+        thread::yield_now();
+    }
+
+    let mut config = app.configuration.settings().ui.explorer.clone();
+    let body = crate::windows::WindowRect {
+        x: 0,
+        y: 3,
+        width: 40,
+        height: 20,
+    };
+    let project = |app: &mut App, config: &crate::config::ExplorerConfig| {
+        app.explorer
+            .projection(config, body, &app.git, "Files".into(), "root")
+    };
+    let assert_row = |projection: &crate::ui::ExplorerUiState,
+                      name,
+                      role,
+                      expected: &[(&str, ExplorerSegmentRole)]| {
+        let row = projection
+            .rows
+            .iter()
+            .find(|row| {
+                row.segments
+                    .last()
+                    .is_some_and(|segment| segment.text == name)
+            })
+            .expect("changed row");
+        assert_eq!(row.segments.last().unwrap().role, role, "{name}");
+        assert_eq!(
+            row.right_segments
+                .iter()
+                .map(|segment| (segment.text.as_str(), segment.role))
+                .collect::<Vec<_>>(),
+            expected,
+            "{name}",
+        );
+    };
+
+    assert_eq!(config.git_colors, Kind);
+    let projection = project(&mut app, &config);
+    assert_row(
+        &projection,
+        "mixed.txt",
+        GitModified,
+        &[("A", GitStaged), ("M", GitModified)],
+    );
+    assert_row(&projection, "staged.txt", GitAdded, &[("A", GitStaged)]);
+    assert_row(&projection, "new.txt", GitAdded, &[("?", GitAdded)]);
+    assert_row(&projection, "root", GitModified, &[("M", GitModified)]);
+
+    config.git_colors = Single;
+    assert_row(&project(&mut app, &config), "mixed.txt", Git, &[("M", Git)]);
+
+    config.git_colors = Off;
+    assert_row(
+        &project(&mut app, &config),
+        "mixed.txt",
+        File,
+        &[("M", GitDim)],
+    );
+
+    app.handle_configured_key(KeyEvent::character('+'));
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while app.git.status_pending() {
+        app.process_git_status_events();
+        assert!(Instant::now() < deadline, "Git line counts did not finish");
+        thread::yield_now();
+    }
+    let projection = project(&mut app, &config);
+    let untracked = projection
+        .rows
+        .iter()
+        .find(|row| {
+            row.segments
+                .last()
+                .is_some_and(|name| name.text == "new.txt")
+        })
+        .unwrap();
+    assert_eq!(
+        untracked.git_line_count_segments,
+        vec![crate::ui::ExplorerUiSegment {
+            text: "+1".into(),
+            role: GitDim
+        }]
+    );
+}
+
+#[test]
 fn explorer_auto_git_status_colors_names_opens_picker_and_idles() {
     let (_app_dirs, mut app) = app();
     let repo = git2::Repository::init(&app.state.workspace_root).unwrap();
@@ -409,7 +594,7 @@ fn explorer_auto_git_status_colors_names_opens_picker_and_idles() {
         tracked_row
             .segments
             .iter()
-            .any(|segment| segment.role == ExplorerSegmentRole::Git)
+            .any(|segment| segment.role == ExplorerSegmentRole::GitModified)
     );
     assert!(
         tracked_row

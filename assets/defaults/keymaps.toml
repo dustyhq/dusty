@@ -21,28 +21,56 @@ context = "editor"
 mode = "normal"
 keys = "j"
 command = "input.motion"
-arguments = { motion = "down", linewise = false }
+arguments = { motion = "down", linewise = false, screen_when_uncounted = true }
 [[keymap]]
 id = "builtin.editor.normal.input-motion.down"
 context = "editor"
 mode = "normal"
 keys = "down"
 command = "input.motion"
-arguments = { motion = "down", linewise = false }
+arguments = { motion = "down", linewise = false, screen_when_uncounted = true }
 [[keymap]]
 id = "builtin.editor.normal.input-motion.k"
 context = "editor"
 mode = "normal"
 keys = "k"
 command = "input.motion"
-arguments = { motion = "up", linewise = false }
+arguments = { motion = "up", linewise = false, screen_when_uncounted = true }
+[[keymap]]
+id = "builtin.editor.normal.input-motion.g-j"
+context = "editor"
+mode = "normal"
+keys = "g j"
+command = "input.motion"
+arguments = { motion = "screen_down", linewise = false }
+[[keymap]]
+id = "builtin.editor.normal.input-motion.g-k"
+context = "editor"
+mode = "normal"
+keys = "g k"
+command = "input.motion"
+arguments = { motion = "screen_up", linewise = false }
+[[keymap]]
+id = "builtin.editor.normal.input-motion.g-down"
+context = "editor"
+mode = "normal"
+keys = "g down"
+command = "input.motion"
+arguments = { motion = "screen_down", linewise = false }
+[[keymap]]
+id = "builtin.editor.normal.input-motion.g-up"
+context = "editor"
+mode = "normal"
+keys = "g up"
+command = "input.motion"
+arguments = { motion = "screen_up", linewise = false }
 [[keymap]]
 id = "builtin.editor.normal.input-motion.up"
 context = "editor"
 mode = "normal"
 keys = "up"
 command = "input.motion"
-arguments = { motion = "up", linewise = false }
+arguments = { motion = "up", linewise = false, screen_when_uncounted = true }
 [[keymap]]
 id = "builtin.editor.normal.input-motion.l"
 context = "editor"
@@ -833,14 +861,42 @@ context = "editor"
 mode = "visual_char"
 keys = "j"
 command = "input.motion"
-arguments = { motion = "down", linewise = false }
+arguments = { motion = "down", linewise = false, screen_when_uncounted = true }
 [[keymap]]
 id = "builtin.editor.visual-char.input-motion.k"
 context = "editor"
 mode = "visual_char"
 keys = "k"
 command = "input.motion"
-arguments = { motion = "up", linewise = false }
+arguments = { motion = "up", linewise = false, screen_when_uncounted = true }
+[[keymap]]
+id = "builtin.editor.visual-char.input-motion.g-j"
+context = "editor"
+mode = "visual_char"
+keys = "g j"
+command = "input.motion"
+arguments = { motion = "screen_down", linewise = false }
+[[keymap]]
+id = "builtin.editor.visual-char.input-motion.g-k"
+context = "editor"
+mode = "visual_char"
+keys = "g k"
+command = "input.motion"
+arguments = { motion = "screen_up", linewise = false }
+[[keymap]]
+id = "builtin.editor.visual-char.input-motion.g-down"
+context = "editor"
+mode = "visual_char"
+keys = "g down"
+command = "input.motion"
+arguments = { motion = "screen_down", linewise = false }
+[[keymap]]
+id = "builtin.editor.visual-char.input-motion.g-up"
+context = "editor"
+mode = "visual_char"
+keys = "g up"
+command = "input.motion"
+arguments = { motion = "screen_up", linewise = false }
 [[keymap]]
 id = "builtin.editor.visual-char.input-motion.l"
 context = "editor"
@@ -861,14 +917,42 @@ context = "editor"
 mode = "visual_line"
 keys = "j"
 command = "input.motion"
-arguments = { motion = "down", linewise = false }
+arguments = { motion = "down", linewise = false, screen_when_uncounted = true }
 [[keymap]]
 id = "builtin.editor.visual-line.input-motion.k"
 context = "editor"
 mode = "visual_line"
 keys = "k"
 command = "input.motion"
-arguments = { motion = "up", linewise = false }
+arguments = { motion = "up", linewise = false, screen_when_uncounted = true }
+[[keymap]]
+id = "builtin.editor.visual-line.input-motion.g-j"
+context = "editor"
+mode = "visual_line"
+keys = "g j"
+command = "input.motion"
+arguments = { motion = "screen_down", linewise = false }
+[[keymap]]
+id = "builtin.editor.visual-line.input-motion.g-k"
+context = "editor"
+mode = "visual_line"
+keys = "g k"
+command = "input.motion"
+arguments = { motion = "screen_up", linewise = false }
+[[keymap]]
+id = "builtin.editor.visual-line.input-motion.g-down"
+context = "editor"
+mode = "visual_line"
+keys = "g down"
+command = "input.motion"
+arguments = { motion = "screen_down", linewise = false }
+[[keymap]]
+id = "builtin.editor.visual-line.input-motion.g-up"
+context = "editor"
+mode = "visual_line"
+keys = "g up"
+command = "input.motion"
+arguments = { motion = "screen_up", linewise = false }
 [[keymap]]
 id = "builtin.editor.visual-line.input-motion.l"
 context = "editor"
@@ -891,6 +975,34 @@ mode = "operator_pending"
 keys = "k"
 command = "input.motion"
 arguments = { motion = "up", linewise = true }
+[[keymap]]
+id = "builtin.editor.operator-pending.input-motion.g-j"
+context = "editor"
+mode = "operator_pending"
+keys = "g j"
+command = "input.motion"
+arguments = { motion = "screen_down", linewise = false }
+[[keymap]]
+id = "builtin.editor.operator-pending.input-motion.g-k"
+context = "editor"
+mode = "operator_pending"
+keys = "g k"
+command = "input.motion"
+arguments = { motion = "screen_up", linewise = false }
+[[keymap]]
+id = "builtin.editor.operator-pending.input-motion.g-down"
+context = "editor"
+mode = "operator_pending"
+keys = "g down"
+command = "input.motion"
+arguments = { motion = "screen_down", linewise = false }
+[[keymap]]
+id = "builtin.editor.operator-pending.input-motion.g-up"
+context = "editor"
+mode = "operator_pending"
+keys = "g up"
+command = "input.motion"
+arguments = { motion = "screen_up", linewise = false }
 [[keymap]]
 id = "builtin.editor.operator-pending.input-motion.upper-g"
 context = "editor"
@@ -2140,6 +2252,16 @@ context = "explorer"
 keys = "k"
 command = "explorer.previous"
 [[keymap]]
+id = "builtin.explorer.surface.explorer-first.g-g"
+context = "explorer"
+keys = "g g"
+command = "explorer.first"
+[[keymap]]
+id = "builtin.explorer.surface.explorer-last.shift-g"
+context = "explorer"
+keys = "G"
+command = "explorer.last"
+[[keymap]]
 id = "builtin.explorer.surface.explorer-parent.h"
 context = "explorer"
 keys = "h"
@@ -2174,6 +2296,12 @@ id = "builtin.explorer.surface.explorer-ignored-toggle.upper-i"
 context = "explorer"
 keys = "I"
 command = "explorer.ignored.toggle"
+[[keymap]]
+id = "builtin.explorer.surface.git-line-counts-toggle.plus"
+context = "explorer"
+keys = "+"
+command = "explorer.git_line_counts.toggle"
+desc = "Show changed line counts"
 [[keymap]]
 id = "builtin.explorer.surface.explorer-create.a"
 context = "explorer"
@@ -2442,14 +2570,14 @@ context = "editor"
 mode = "visual_char"
 keys = "up"
 command = "input.motion"
-arguments = { motion = "up", linewise = false }
+arguments = { motion = "up", linewise = false, screen_when_uncounted = true }
 [[keymap]]
 id = "builtin.editor.visual-char.input-motion.down"
 context = "editor"
 mode = "visual_char"
 keys = "down"
 command = "input.motion"
-arguments = { motion = "down", linewise = false }
+arguments = { motion = "down", linewise = false, screen_when_uncounted = true }
 [[keymap]]
 id = "builtin.editor.visual-char.input-motion.home"
 context = "editor"
@@ -2547,14 +2675,14 @@ context = "editor"
 mode = "visual_line"
 keys = "up"
 command = "input.motion"
-arguments = { motion = "up", linewise = false }
+arguments = { motion = "up", linewise = false, screen_when_uncounted = true }
 [[keymap]]
 id = "builtin.editor.visual-line.input-motion.down"
 context = "editor"
 mode = "visual_line"
 keys = "down"
 command = "input.motion"
-arguments = { motion = "down", linewise = false }
+arguments = { motion = "down", linewise = false, screen_when_uncounted = true }
 [[keymap]]
 id = "builtin.editor.visual-line.input-motion.home"
 context = "editor"
@@ -2826,14 +2954,42 @@ context = "editor"
 mode = "visual_block"
 keys = "j"
 command = "input.motion"
-arguments = { motion = "down", linewise = false }
+arguments = { motion = "down", linewise = false, screen_when_uncounted = true }
 [[keymap]]
 id = "builtin.editor.visual-block.input-motion.k"
 context = "editor"
 mode = "visual_block"
 keys = "k"
 command = "input.motion"
-arguments = { motion = "up", linewise = false }
+arguments = { motion = "up", linewise = false, screen_when_uncounted = true }
+[[keymap]]
+id = "builtin.editor.visual-block.input-motion.g-j"
+context = "editor"
+mode = "visual_block"
+keys = "g j"
+command = "input.motion"
+arguments = { motion = "screen_down", linewise = false }
+[[keymap]]
+id = "builtin.editor.visual-block.input-motion.g-k"
+context = "editor"
+mode = "visual_block"
+keys = "g k"
+command = "input.motion"
+arguments = { motion = "screen_up", linewise = false }
+[[keymap]]
+id = "builtin.editor.visual-block.input-motion.g-down"
+context = "editor"
+mode = "visual_block"
+keys = "g down"
+command = "input.motion"
+arguments = { motion = "screen_down", linewise = false }
+[[keymap]]
+id = "builtin.editor.visual-block.input-motion.g-up"
+context = "editor"
+mode = "visual_block"
+keys = "g up"
+command = "input.motion"
+arguments = { motion = "screen_up", linewise = false }
 [[keymap]]
 id = "builtin.editor.visual-block.input-motion.l"
 context = "editor"
@@ -2854,14 +3010,14 @@ context = "editor"
 mode = "visual_block"
 keys = "down"
 command = "input.motion"
-arguments = { motion = "down", linewise = false }
+arguments = { motion = "down", linewise = false, screen_when_uncounted = true }
 [[keymap]]
 id = "builtin.editor.visual-block.input-motion.up"
 context = "editor"
 mode = "visual_block"
 keys = "up"
 command = "input.motion"
-arguments = { motion = "up", linewise = false }
+arguments = { motion = "up", linewise = false, screen_when_uncounted = true }
 [[keymap]]
 id = "builtin.editor.visual-block.input-motion.right"
 context = "editor"
@@ -4989,7 +5145,14 @@ id = "builtin.global.search-diagnostics"
 context = "global"
 keys = "<leader> s d"
 command = "diagnostic.open"
-desc = "Diagnostics"
+desc = "Problems"
+
+[[keymap]]
+id = "builtin.global.search-diagnostics-file"
+context = "global"
+keys = "<leader> s D"
+command = "diagnostic.open_buffer"
+desc = "Problems (this file)"
 
 [[keymap]]
 id = "builtin.global.search-jumps"
@@ -5058,100 +5221,15 @@ desc = "Tools"
 id = "builtin.global.diagnostics"
 context = "global"
 keys = "<leader> x x"
-command = "diagnostic.panel.toggle"
-desc = "Problems panel"
+command = "diagnostic.open"
+desc = "Problems"
 
 [[keymap]]
 id = "builtin.global.diagnostics-file"
 context = "global"
 keys = "<leader> x X"
-command = "diagnostic.panel.buffer"
+command = "diagnostic.open_buffer"
 desc = "Problems (this file)"
-
-# Problems panel controls.
-[[keymap]]
-id = "builtin.problems.next-j"
-context = "problems_panel"
-keys = "j"
-command = "diagnostic.panel.next"
-
-[[keymap]]
-id = "builtin.problems.next-down"
-context = "problems_panel"
-keys = "down"
-command = "diagnostic.panel.next"
-
-[[keymap]]
-id = "builtin.problems.previous-k"
-context = "problems_panel"
-keys = "k"
-command = "diagnostic.panel.previous"
-
-[[keymap]]
-id = "builtin.problems.previous-up"
-context = "problems_panel"
-keys = "up"
-command = "diagnostic.panel.previous"
-
-[[keymap]]
-id = "builtin.problems.open"
-context = "problems_panel"
-keys = "enter"
-command = "diagnostic.panel.jump"
-
-[[keymap]]
-id = "builtin.problems.open-close"
-context = "problems_panel"
-keys = "o"
-command = "diagnostic.panel.jump_close"
-
-[[keymap]]
-id = "builtin.problems.close-q"
-context = "problems_panel"
-keys = "q"
-command = "diagnostic.panel.close"
-
-[[keymap]]
-id = "builtin.problems.close-escape"
-context = "problems_panel"
-keys = "escape"
-command = "diagnostic.panel.close"
-
-[[keymap]]
-id = "builtin.problems.focus-left"
-context = "problems_panel"
-keys = "ctrl-h"
-command = "surface.focus.left"
-
-[[keymap]]
-id = "builtin.problems.focus-down"
-context = "problems_panel"
-keys = "ctrl-j"
-command = "surface.focus.down"
-
-[[keymap]]
-id = "builtin.problems.focus-up"
-context = "problems_panel"
-keys = "ctrl-k"
-command = "surface.focus.up"
-
-[[keymap]]
-id = "builtin.problems.focus-right"
-context = "problems_panel"
-keys = "ctrl-l"
-command = "surface.focus.right"
-
-[[keymap]]
-id = "builtin.problems.overflow-left"
-context = "problems_panel"
-keys = "h"
-command = "surface.focus.left"
-
-[[keymap]]
-id = "builtin.problems.overflow-right"
-context = "problems_panel"
-keys = "l"
-command = "surface.focus.right"
 
 [[keymap]]
 id = "builtin.global.debug-breakpoint"

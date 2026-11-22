@@ -136,11 +136,13 @@ fn diagnostic_navigation_filters_severity_wraps_and_expands_the_landed_line() {
     let rows = &app.ui.picker.as_ref().unwrap().rows;
     assert!(
         rows.iter()
-            .any(|row| row.label.ends_with("diagnostic.rs:2") && row.detail == "error")
+            .any(|row| row.label.contains("diagnostic.rs:2:") && row.detail == "error"),
+        "{rows:?}"
     );
     assert!(
         rows.iter()
-            .any(|row| row.label.ends_with("diagnostic.rs:3") && row.detail == "warning")
+            .any(|row| row.label.contains("diagnostic.rs:3:") && row.detail == "warning"),
+        "{rows:?}"
     );
     let before = app.state.views[view].cursor;
     let replacement = crate::workspace::DiagnosticProducer::new(
@@ -598,7 +600,7 @@ fn a_failed_test_is_listed_in_problems_and_jumps_to_its_line() {
     app.open_builtin_picker(PickerKind::Diagnostics);
     let rows = &app.ui.picker.as_ref().unwrap().rows;
     assert_eq!(rows.len(), 1, "{rows:?}");
-    assert_eq!(rows[0].label, "a.txt:3");
+    assert_eq!(rows[0].label, "a.txt:3:2");
     assert_eq!(rows[0].detail, "adds: wrong sum");
     app.accept_picker();
     wait_vfs(&mut app);
@@ -628,7 +630,7 @@ fn a_failed_test_is_listed_in_problems_and_jumps_to_its_line() {
     app.open_builtin_picker(PickerKind::Diagnostics);
     let rows = &app.ui.picker.as_ref().unwrap().rows;
     assert_eq!(rows.len(), 1, "{rows:?}");
-    assert_eq!(rows[0].label, "a.txt:3");
+    assert_eq!(rows[0].label, "a.txt:3:2");
     assert_eq!(rows[0].detail, "adds: wrong sum");
 }
 

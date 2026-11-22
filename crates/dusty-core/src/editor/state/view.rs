@@ -54,6 +54,47 @@ pub struct InsertRepeat {
     pub new_line: bool,
 }
 
+/// The cell a screen-row motion aims for, even across shorter rows.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ScreenColumn {
+    Cell(usize),
+    EndOfRow,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ScreenDirection {
+    Up,
+    Down,
+}
+
+impl ScreenDirection {
+    #[must_use]
+    pub fn from_motion(motion: &str) -> Option<Self> {
+        match motion {
+            "screen_up" => Some(Self::Up),
+            "screen_down" => Some(Self::Down),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn file_motion(self) -> &'static str {
+        match self {
+            Self::Up => "up",
+            Self::Down => "down",
+        }
+    }
+}
+
+/// The app projects a motion through the target pane's current layout.
+#[derive(Clone, Copy, Debug)]
+pub struct ScreenMotionProjection {
+    pub direction: ScreenDirection,
+    pub count: usize,
+    pub target: ByteOffset,
+    pub column: ScreenColumn,
+}
+
 /// A view's collapsed source lines, shared by motions and visual-row layout.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct FoldedLines(Vec<(usize, usize)>);
@@ -170,6 +211,9 @@ pub struct View {
     pub scroll_wrap_row: usize,
     pub scroll_column: usize,
     pub preferred_column: Option<usize>,
+    pub preferred_screen_column: Option<ScreenColumn>,
+    /// Available only while the app dispatches the command.
+    pub screen_motion: Option<ScreenMotionProjection>,
     /// Runtime motion projection supplied by the app before command dispatch.
     pub folded_lines: FoldedLines,
     pub mode: EditorMode,
@@ -190,6 +234,15 @@ pub struct View {
 }
 
 impl View {
+    pub(crate) fn projected_screen_motion(
+        &self,
+        direction: ScreenDirection,
+        count: usize,
+    ) -> Option<ScreenMotionProjection> {
+        self.screen_motion
+            .filter(|projection| projection.direction == direction && projection.count == count)
+    }
+
     pub(crate) fn begin_multi_insert(&mut self, view: ViewId, source: TextVersion) {
         self.multi_insert_session = Some(MultiInsertSession {
             view,
@@ -338,6 +391,7 @@ impl View {
         self.multi_whole_word = true;
         self.multi_preferred_columns.clear();
         self.preferred_column = None;
+        self.preferred_screen_column = None;
     }
 
     #[must_use]
@@ -351,6 +405,8 @@ impl View {
             scroll_wrap_row: 0,
             scroll_column: 0,
             preferred_column: None,
+            preferred_screen_column: None,
+            screen_motion: None,
             folded_lines: FoldedLines::default(),
             mode: EditorMode::Normal,
             replace_history: Vec::new(),

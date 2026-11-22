@@ -384,7 +384,7 @@ pub enum AppEffect {
     ExplorerOpen,
     ExplorerClose,
     ExplorerPanelToggle,
-    ExplorerMove(i8),
+    ExplorerMove(isize),
     ExplorerPage(isize),
     ExplorerParent,
     ExplorerChild,
@@ -393,6 +393,7 @@ pub enum AppEffect {
     ExplorerFollow,
     ExplorerToggleHidden,
     ExplorerToggleIgnored,
+    ExplorerToggleGitLineCounts,
     ExplorerSearch,
     ExplorerSearchInsert(String),
     ExplorerSearchDelete,
@@ -485,7 +486,6 @@ pub enum AppEffect {
     SnippetCancel,
     LspFoldToggle,
     LspSelectionExpand,
-    ProblemsPanel(crate::app::diagnostics::problems::PanelCommand),
     DiagnosticNavigate {
         direction: i8,
         filter: DiagnosticFilter,
@@ -543,6 +543,7 @@ impl DiagnosticFilter {
 #[derive(Clone, Copy, Debug)]
 pub enum PickerKind {
     Diagnostics,
+    DiagnosticsBuffer,
     Buffers,
     Commands,
     Roots,
@@ -842,11 +843,16 @@ pub(in crate::app) fn register_grammar_commands(
         ContextRequirement::View,
         ArgumentSchema::default()
             .field("motion", ArgumentType::String, true)
-            .field("linewise", ArgumentType::Bool, true),
+            .field("linewise", ArgumentType::Bool, true)
+            .field("screen_when_uncounted", ArgumentType::Bool, false),
         |invocation| {
             Ok(AppEffect::Grammar(GrammarInput::Motion {
                 motion: string_arg(invocation, "motion")?.into(),
                 linewise: bool_arg(invocation, "linewise")?,
+                screen_when_uncounted: matches!(
+                    invocation.arguments.get("screen_when_uncounted"),
+                    Some(CommandValue::Bool(true))
+                ),
             }))
         },
     )?;
@@ -1121,7 +1127,7 @@ impl App {
             effect @ (AppEffect::LspDocumentationScroll(..) | AppEffect::LspDocumentationClose) => {
                 self.process_documentation_effect(effect)
             }
-            effect @ (AppEffect::DiagnosticNavigate { .. } | AppEffect::ProblemsPanel(_)) => {
+            effect @ AppEffect::DiagnosticNavigate { .. } => {
                 self.process_diagnostics_effect(effect)
             }
             effect @ (AppEffect::HelpForForm
@@ -1154,6 +1160,7 @@ impl App {
             | AppEffect::ExplorerFollow
             | AppEffect::ExplorerToggleHidden
             | AppEffect::ExplorerToggleIgnored
+            | AppEffect::ExplorerToggleGitLineCounts
             | AppEffect::ExplorerFileOpen { .. }
             | AppEffect::ExplorerCreate(..)
             | AppEffect::ExplorerRename(..)
@@ -1617,10 +1624,13 @@ impl App {
         {
             self.language.note_typed(text);
         }
-        self.project_motion_folds(&invocation);
+        let projection = self.project_vertical_motion(&invocation);
         let outcome = self
             .commands
             .execute_with_authority(&self.state, &invocation, authority);
+        if let Some(view) = projection {
+            self.state.views[view].screen_motion = None;
+        }
         self.finish_command(
             PendingInvocation {
                 invocation,
@@ -1650,10 +1660,16 @@ impl App {
         action: CommandWrapperAction<AppEffect>,
     ) -> bool {
         let invocation = self.input.pending_invocation(pending);
-        if let Some(invocation) = &invocation {
-            self.project_motion_folds(&invocation.invocation);
-        }
+        let projection = match &action {
+            CommandWrapperAction::CallNext(next) => self.project_vertical_motion(next),
+            _ => invocation
+                .as_ref()
+                .and_then(|invocation| self.project_vertical_motion(&invocation.invocation)),
+        };
         let outcome = self.commands.resume(&self.state, pending, owner, action);
+        if let Some(view) = projection {
+            self.state.views[view].screen_motion = None;
+        }
         // An unrelated caller cannot consume the real wrapper's continuation.
         if matches!(outcome, Err(CommandError::WrongWrapper)) {
             self.show_error(CommandError::WrongWrapper);

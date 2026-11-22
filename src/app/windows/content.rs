@@ -162,6 +162,19 @@ impl Windows {
             {
                 line.builds += 1;
             }
+            // A built-in surface shown as a popup is not a tab; it gets one only
+            // when a window rule or a move places it in the layout.
+            let placed = |content: crate::windows::ContentId| {
+                graph.windows().any(|window| {
+                    !matches!(
+                        window.placement,
+                        crate::windows::WindowPlacement::Overlay(_)
+                            | crate::windows::WindowPlacement::Hidden
+                    ) && graph
+                        .view(window.view)
+                        .is_some_and(|view| view.content == content)
+                })
+            };
             let snapshots = graph
                 .content_snapshots()
                 .into_iter()
@@ -181,7 +194,8 @@ impl Windows {
                                 | "builtin.output"
                                 | "builtin.logs"
                                 | "builtin.debug"
-                        ) && content.active)
+                        ) && content.active
+                            && placed(content.id))
                 })
                 // The agent panel has its own tab line.
                 .filter(|content| {
@@ -250,17 +264,11 @@ impl Windows {
                             } else if state.is_virtual_read_only() {
                                 VIRTUAL_ICON.to_owned()
                             } else if let Some(path) = &state.path {
-                                path.extension()
-                                    .and_then(|value| value.to_str())
-                                    .map(str::to_ascii_lowercase)
-                                    .and_then(|extension| {
-                                        config
-                                            .ui
-                                            .buffer_line
-                                            .extension_icons
-                                            .get(&extension)
-                                            .cloned()
-                                    })
+                                config
+                                    .ui
+                                    .buffer_line
+                                    .file_icon_override(path)
+                                    .map(str::to_owned)
                                     .or_else(|| {
                                         let name = path.file_name()?.to_str()?;
                                         crate::files::file_icon(name)

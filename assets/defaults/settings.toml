@@ -121,6 +121,8 @@ settings = [
   { key = "ui.explorer.icon_mode", title = "File Icons", about = "nerd_font needs a Nerd Font; unicode and ascii work with any font.", choices = ["nerd_font", "unicode", "ascii"] },
   { key = "ui.explorer.side", title = "Side", about = "The side the file explorer docks on.", choices = ["left", "right"] },
   { key = "ui.explorer.width", about = "Columns the explorer opens with." },
+  { key = "ui.explorer.git_colors", title = "Git Colors", about = 'How changed files are coloured: "kind" (by change, with staged changes in green), "single" (one colour) or "off".', choices = ["kind", "single", "off"] },
+  { key = "ui.explorer.git_line_counts", title = "Changed Line Counts", about = "Show added/removed line counts instead of git status letters (toggle with + in the explorer)." },
 ]
 
 [[section]]

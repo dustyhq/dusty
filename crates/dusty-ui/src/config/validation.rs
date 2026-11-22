@@ -330,13 +330,12 @@ impl Config {
         {
             return Err("workspace.search.exclude_globs contains an invalid glob".into());
         }
-        if self.ui.buffer_line.extension_icons.len() > 64
-            || self
-                .ui
-                .buffer_line
-                .extension_icons
-                .iter()
-                .any(|(extension, glyph)| {
+        for (field, icons) in [(
+            "ui.buffer_line.extension_icons",
+            &self.ui.buffer_line.extension_icons,
+        )] {
+            if icons.len() > 64
+                || icons.iter().any(|(extension, glyph)| {
                     extension.is_empty()
                         || extension.len() > 16
                         || !extension
@@ -345,8 +344,9 @@ impl Config {
                         || UnicodeWidthStr::width(glyph.as_str()) != 1
                         || glyph.chars().any(char::is_control)
                 })
-        {
-            return Err("ui.buffer_line.extension_icons is invalid".into());
+            {
+                return Err(format!("{field} is invalid"));
+            }
         }
         if !crate::config::themes::valid_theme_name(&self.ui.theme) {
             return Err("ui.theme must be a safe lowercase theme identifier".into());
@@ -533,6 +533,7 @@ impl Config {
             "picker_symbols_title",
             "picker_symbol_kind",
             "picker_code_actions_title",
+            "picker_buffer_diagnostics_title",
             "picker_diagnostics_title",
             "picker_buffers_title",
             "picker_commands_title",

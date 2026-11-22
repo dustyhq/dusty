@@ -4819,6 +4819,239 @@ fn word_search_keeps_combining_marks_and_search_selection_keeps_word_boundaries(
     assert_eq!(app.state.buffers[buffer].text.to_string(), "foo foobar X");
 }
 
+fn open_screen_motion_buffer(
+    app: &mut App,
+    source: &str,
+    wrap: bool,
+) -> (crate::editor::BufferId, crate::editor::ViewId) {
+    app.window_session.observe_size((40, 12));
+    let mut fixture = app.configuration.fixture_snapshot();
+    fixture.settings.editor.wrap = wrap;
+    fixture.settings.editor.line_numbers = crate::config::LineNumbers::Off;
+    fixture.settings.ui.status_line.enabled = false;
+    app.configuration.install_fixture(fixture);
+    let ids = app
+        .state
+        .open_text(TextBuffer::from_text(source), None)
+        .unwrap();
+    app.set_dashboard_visibility(false);
+    app.reconcile_editor_windows();
+    ids
+}
+
+fn screen_motion_words() -> String {
+    (0..30)
+        .map(|word| format!("w{word:03}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+#[test]
+fn gj_and_gk_follow_wrapped_rows_at_the_screen_column() {
+    let (_dirs, mut app) = app();
+    let words = screen_motion_words();
+    let source = format!("short one\n{words}\nshort three\ntiny");
+    let (buffer, view) = open_screen_motion_buffer(&mut app, &source, true);
+    let at = |app: &App, line: usize, column: usize| {
+        let start = app.state.buffers[buffer]
+            .text
+            .line_to_byte(line - 1)
+            .unwrap();
+        assert_eq!(
+            app.state.views[view].cursor,
+            ByteOffset(start.get() + column - 1)
+        );
+    };
+
+    for column in [1, 41, 81] {
+        press_keys(&mut app, &["g", "j"]);
+        at(&app, 2, column);
+    }
+    press_keys(&mut app, &["g", "g", "2", "g", "j"]);
+    at(&app, 2, 41);
+
+    press_keys(&mut app, &["g", "g", "w", "w", "w"]);
+    at(&app, 2, 6);
+    for column in [46, 86, 126] {
+        press_keys(&mut app, &["g", "j"]);
+        at(&app, 2, column);
+    }
+    press_keys(&mut app, &["g", "g", "j", "1", "0", "w"]);
+    at(&app, 2, 51);
+    press_keys(&mut app, &["g", "k"]);
+    at(&app, 2, 11);
+
+    press_keys(&mut app, &["g", "g", "j", "l", "l", "l"]);
+    for column in [44, 84, 124] {
+        press_keys(&mut app, &["g", "j"]);
+        at(&app, 2, column);
+    }
+    press_keys(&mut app, &["g", "k"]);
+    at(&app, 2, 84);
+    press_keys(&mut app, &["g", "g", "$", "g", "j"]);
+    at(&app, 2, 40);
+
+    press_keys(&mut app, &["g", "g", "2", "g", "j", "y", "g", "k"]);
+    let yank = app.state.registers.get('"').unwrap();
+    assert_eq!(yank.shape, crate::editor::RegisterShape::Character);
+    assert_eq!(yank.text, words[..40]);
+    press_keys(&mut app, &["g", "g", "j", "d", "g", "j"]);
+    assert_eq!(
+        app.state.buffers[buffer].text.to_string(),
+        format!("short one\n{}\nshort three\ntiny", &words[40..]),
+    );
+}
+
+#[test]
+fn default_j_and_k_use_screen_rows_only_without_a_count() {
+    let (_dirs, mut app) = app();
+    let (buffer, view) = open_screen_motion_buffer(
+        &mut app,
+        &format!("{}\nsecond\nthird", screen_motion_words()),
+        true,
+    );
+    press_keys(&mut app, &["j", "down"]);
+    assert_eq!(app.state.views[view].cursor, ByteOffset(80));
+    press_keys(&mut app, &["k"]);
+    assert_eq!(app.state.views[view].cursor, ByteOffset(40));
+    press_keys(&mut app, &["up"]);
+    assert_eq!(app.state.views[view].cursor, ByteOffset(0));
+    press_keys(&mut app, &["1", "j"]);
+    assert_eq!(
+        app.state.views[view].cursor,
+        app.state.buffers[buffer].text.line_to_byte(1).unwrap(),
+    );
+    press_keys(&mut app, &["g", "g", "2", "j"]);
+    assert_eq!(
+        app.state.views[view].cursor,
+        app.state.buffers[buffer].text.line_to_byte(2).unwrap(),
+    );
+}
+
+#[test]
+fn dj_remains_linewise_when_the_line_wraps() {
+    let (_dirs, mut app) = app();
+    let source = format!("{}\nsecond\nthird", screen_motion_words());
+    let (buffer, _) = open_screen_motion_buffer(&mut app, &source, true);
+    press_keys(&mut app, &["d", "j"]);
+    assert_eq!(app.state.buffers[buffer].text.to_string(), "third");
+    let deleted = app.state.registers.get('"').unwrap();
+    assert_eq!(deleted.shape, crate::editor::RegisterShape::Line);
+}
+
+#[test]
+fn gj_and_gk_share_the_file_motion_column_when_wrap_is_off() {
+    let (_dirs, mut app) = app();
+    let source = format!("{}\nx\n123456789\n", screen_motion_words());
+    let (buffer, view) = open_screen_motion_buffer(&mut app, &source, false);
+    let text = &app.state.buffers[buffer].text;
+    let first = ByteOffset(5);
+    let short = text.line_to_byte(1).unwrap();
+    let third = ByteOffset(text.line_to_byte(2).unwrap().get() + 5);
+
+    press_keys(&mut app, &["5", "l", "j"]);
+    assert_eq!(app.state.views[view].cursor, short);
+    press_keys(&mut app, &["g", "j"]);
+    assert_eq!(app.state.views[view].cursor, third);
+    press_keys(&mut app, &["k"]);
+    assert_eq!(app.state.views[view].cursor, short);
+    press_keys(&mut app, &["g", "k"]);
+    assert_eq!(app.state.views[view].cursor, first);
+}
+
+#[test]
+fn screen_motions_extend_each_kind_of_visual_selection() {
+    use crate::editor::SelectionKind;
+
+    let (_dirs, mut app) = app();
+    let source = format!("{}\nsecond\nthird", screen_motion_words());
+    let (buffer, view) = open_screen_motion_buffer(&mut app, &source, true);
+    let third = app.state.buffers[buffer].text.line_to_byte(2).unwrap();
+    for (key, kind) in [
+        ("v", SelectionKind::Character),
+        ("V", SelectionKind::Line),
+        ("ctrl-v", SelectionKind::Block),
+    ] {
+        press_keys(&mut app, &["g", "g", key, "j", "g", "down"]);
+        let selection = app.state.views[view].selection.unwrap();
+        assert_eq!(selection.kind, kind);
+        assert_eq!(selection.anchor, ByteOffset(0));
+        assert_eq!(selection.head, ByteOffset(80));
+
+        press_keys(&mut app, &["g", "up", "k"]);
+        assert_eq!(app.state.views[view].selection.unwrap().head, ByteOffset(0));
+        press_keys(&mut app, &["2", "down"]);
+        assert_eq!(app.state.views[view].selection.unwrap().head, third);
+        press_keys(&mut app, &["escape"]);
+    }
+}
+
+#[test]
+fn a_closed_fold_with_a_long_header_is_one_screen_row() {
+    let (_dirs, mut app) = app();
+    let source = format!("before\n{}\nhidden\nafter", screen_motion_words());
+    let (buffer, view) = open_screen_motion_buffer(&mut app, &source, true);
+    let header = app.state.buffers[buffer].text.line_to_byte(1).unwrap();
+    let after = app.state.buffers[buffer].text.line_to_byte(3).unwrap();
+    app.ui.syntax_folds.push(UiFold {
+        view,
+        start_line: 1,
+        end_line: 2,
+        collapsed: true,
+    });
+    press_keys(&mut app, &["g", "j"]);
+    assert_eq!(app.state.views[view].cursor, header);
+    press_keys(&mut app, &["g", "j"]);
+    assert_eq!(app.state.views[view].cursor, after);
+    press_keys(&mut app, &["g", "k"]);
+    assert_eq!(app.state.views[view].cursor, header);
+}
+
+#[test]
+fn gj_counts_cells_after_gutter_tabs_wide_text_and_inlays() {
+    let (_dirs, mut app) = app();
+    let (buffer, view) = open_screen_motion_buffer(&mut app, "\t界abcde\nend", true);
+    // 11 columns minus the line number, separator and padding leaves eight text cells.
+    app.window_session.observe_size((11, 8));
+    let mut fixture = app.configuration.fixture_snapshot();
+    fixture.settings.editor.line_numbers = crate::config::LineNumbers::Absolute;
+    fixture.settings.editor.git_signs.enabled = false;
+    fixture.settings.editor.tab_width = 4;
+    app.configuration.install_fixture(fixture);
+    app.ui.lsp_inlay_hints.push(crate::ui::UiInlayHint {
+        buffer,
+        revision: app.state.buffers[buffer].text.revision(),
+        position: ByteOffset("\t界".len()),
+        label: "++".into(),
+    });
+    // The four-cell tab and wide glyph leave two cells, so the inlay plus 'a' wraps.
+    // The glyph's cell (4) lines up with 'c' after the two-cell inlay.
+    press_keys(&mut app, &["l", "g", "j"]);
+    assert_eq!(app.state.views[view].cursor, ByteOffset("\t界ab".len()));
+    press_keys(&mut app, &["g", "k"]);
+    assert_eq!(app.state.views[view].cursor, ByteOffset(1));
+}
+
+#[test]
+fn dot_and_macro_replay_resolve_screen_rows_at_the_current_width() {
+    let (_dirs, mut app) = app();
+    let words = screen_motion_words();
+    let (buffer, view) = open_screen_motion_buffer(&mut app, &format!("{words}\n{words}"), true);
+    press_keys(&mut app, &["2", "d", "g", "j"]);
+    app.window_session.observe_size((30, 12));
+    press_keys(&mut app, &["1", "j", "."]);
+    assert_eq!(
+        app.state.buffers[buffer].text.to_string(),
+        format!("{}\n{}", &words[80..], &words[60..]),
+    );
+
+    press_keys(&mut app, &["g", "g", "q", "a", "g", "j", "q"]);
+    app.window_session.observe_size((35, 12));
+    press_keys(&mut app, &["1", "j", "0", "@", "a"]);
+    let second = app.state.buffers[buffer].text.line_to_byte(1).unwrap();
+    assert_eq!(app.state.views[view].cursor, ByteOffset(second.get() + 35));
+}
+
 #[test]
 fn operator_arrow_motions_are_linewise_like_j_and_k() {
     for (motion, cursor) in [("down", 1), ("up", 5)] {

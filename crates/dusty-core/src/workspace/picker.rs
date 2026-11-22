@@ -73,6 +73,7 @@ pub struct PickerState {
     selected: Option<usize>,
     scroll: usize,
     maximum_items: usize,
+    preserve_order: bool,
     loading: bool,
 }
 
@@ -88,6 +89,7 @@ impl PickerState {
             selected: None,
             scroll: 0,
             maximum_items: maximum_items.clamp(1, ABSOLUTE_PICKER_ITEM_LIMIT),
+            preserve_order: false,
             loading: true,
         }
     }
@@ -95,6 +97,11 @@ impl PickerState {
     #[must_use]
     pub const fn stream_id(&self) -> u64 {
         self.stream_id
+    }
+
+    /// Filter without re-ranking results that already have a meaningful order.
+    pub fn preserve_item_order(&mut self) {
+        self.preserve_order = true;
     }
 
     pub fn append(
@@ -335,19 +342,22 @@ impl PickerState {
                     .map(|score| (section, index, score))
             })
             .collect::<Vec<_>>();
-        scored.sort_by(
-            |(left_section, left_index, left_score), (right_section, right_index, right_score)| {
-                left_section
-                    .cmp(right_section)
-                    .then_with(|| right_score.cmp(left_score))
-                    .then_with(|| {
-                        self.items[*left_index]
-                            .label
-                            .cmp(&self.items[*right_index].label)
-                    })
-                    .then(left_index.cmp(right_index))
-            },
-        );
+        if !self.preserve_order {
+            scored.sort_by(
+                |(left_section, left_index, left_score),
+                 (right_section, right_index, right_score)| {
+                    left_section
+                        .cmp(right_section)
+                        .then_with(|| right_score.cmp(left_score))
+                        .then_with(|| {
+                            self.items[*left_index]
+                                .label
+                                .cmp(&self.items[*right_index].label)
+                        })
+                        .then(left_index.cmp(right_index))
+                },
+            );
+        }
         let selected_id = self.selected_item().map(|item| item.id.clone());
         self.visible.clear();
         let mut previous_section = None;

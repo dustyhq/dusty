@@ -40,7 +40,7 @@ opening the editor.
 
 ## Diagnostics
 
-The [Problems panel](user-guide-linux.md#diagnostics-and-lsp) works on both systems, even with messages beside code off. Use `Space x x` to toggle it, `Space x X` for the current file, and `Space s d` to search problems in the floating picker.
+`Space x x` (or `Space s d`) opens **Problems**: every diagnostic and failed test in the workspace, errors first. `Space x X` (or `Space s D`) shows only the current file. Type to filter, `Enter` jumps to the problem, `Esc` closes. The list updates while you edit, even when messages beside code are off. The status line and each tab show the error or warning count for that file.
 
 ## Shells and external tools
 

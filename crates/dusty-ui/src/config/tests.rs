@@ -513,6 +513,19 @@ fn malformed_or_invalid_config_is_nonfatal() {
 }
 
 #[test]
+fn explorer_git_colors_defaults_to_kind_and_rejects_unknown_values() {
+    use crate::config::{ExplorerGitColors, load::settings_from_source};
+
+    let (defaults, ..) = settings_from_source("").expect("bundled settings");
+    assert_eq!(defaults.ui.explorer.git_colors, ExplorerGitColors::Kind);
+
+    let error = settings_from_source("[ui.explorer]\ngit_colors = 'rainbow'\n")
+        .expect_err("unknown explorer Git color mode");
+    assert!(error.contains("unknown variant `rainbow`"), "{error}");
+    assert!(error.contains("ui.explorer.git_colors"), "{error}");
+}
+
+#[test]
 fn keymap_policy_is_typed_bounded_and_rejects_recursive_leaders() {
     let root = tempdir().expect("tempdir");
     let path = root.path().join("config.toml");
@@ -1354,7 +1367,6 @@ label = "Files"
     let surfaces = [
         ("editor-normal", "editor", "normal"),
         ("explorer", "explorer", ""),
-        ("problems-panel", "problems_panel", ""),
         ("dashboard", "dashboard", ""),
         ("terminal-normal", "terminal_normal", ""),
         ("tool-manager", "tool_manager", ""),

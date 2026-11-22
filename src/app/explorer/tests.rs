@@ -124,6 +124,64 @@ fn explorer_prefilled_rename_keeps_original_target_and_dirty_split_views() {
     assert!(app.input.search_history().is_empty());
 }
 
+#[cfg(unix)]
+#[test]
+fn explorer_operations_keep_the_real_paths_of_lossy_names() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    let (_dirs, mut app) = app();
+    let root = app.state.workspace_root.clone();
+    let source = root.join(OsStr::from_bytes(b"a\nb\x1b-\xff.rs"));
+    let delete = root.join(OsStr::from_bytes(b"delete-\xff.rs"));
+    let target = root.join("renamed.rs");
+    // Some filesystems (macOS, or Linux with utf8only) refuse names that aren't UTF-8.
+    if fs::write(&source, "original").is_err() {
+        return;
+    }
+    fs::write(&delete, "delete me").unwrap();
+    app.open_explorer();
+    wait_explorer(&mut app);
+
+    let select = |app: &mut App, path: &std::path::Path| {
+        app.explorer
+            .select(app.explorer.tree().id_for_path(path).unwrap());
+        app.set_explorer_focus(true);
+        app.sync_explorer_ui();
+    };
+    select(&mut app, &source);
+    app.handle_configured_key(KeyEvent::plain(crate::editor::input::KeyCode::Enter));
+    wait_vfs(&mut app);
+    let buffer = app.state.active_buffer_id().unwrap();
+    assert_eq!(
+        app.state.buffers[buffer].path.as_deref(),
+        Some(source.as_path())
+    );
+
+    select(&mut app, &source);
+    app.handle_configured_key(KeyEvent::character('r'));
+    assert_eq!(app.input.prompt().unwrap().input, "a�b�-�.rs");
+    wait_vfs(&mut app);
+    for _ in "a�b�-�.rs".chars() {
+        app.prompt_backspace();
+    }
+    app.prompt_insert("renamed.rs");
+    app.submit_prompt();
+    wait_vfs(&mut app);
+    assert!(!source.exists());
+    assert_eq!(fs::read_to_string(&target).unwrap(), "original");
+
+    wait_explorer(&mut app);
+    select(&mut app, &delete);
+    app.handle_configured_key(KeyEvent::character('d'));
+    wait_vfs(&mut app);
+    assert!(app.input.prompt().unwrap().confirmation.is_some());
+    app.handle_configured_key(KeyEvent::character('y'));
+    app.handle_configured_key(KeyEvent::plain(crate::editor::input::KeyCode::Enter));
+    wait_vfs(&mut app);
+    assert!(!delete.exists());
+}
+
 #[test]
 fn explorer_rename_prompt_refuses_replaced_files_and_stale_or_cancelled_requests() {
     let (_app_dirs, mut app) = app();
@@ -1006,6 +1064,45 @@ fn explorer_watch_batches_reload_through_directory_service_and_preserve_identity
 }
 
 #[test]
+fn explorer_gg_and_g_jump_to_the_first_and_last_rows() {
+    let (_dirs, mut app) = app();
+    app.window_session.observe_size((80, 8));
+    let root = app.state.workspace_root.clone();
+    for index in 0..8 {
+        fs::write(root.join(format!("file{index}.txt")), "fixture").unwrap();
+    }
+    app.open_explorer();
+    wait_explorer(&mut app);
+    let first = app.explorer.tree().id_for_path(&root).unwrap();
+    let last = app
+        .explorer
+        .tree()
+        .id_for_path(&root.join("file7.txt"))
+        .unwrap();
+
+    for _ in 0..2 {
+        app.handle_configured_key(KeyEvent::character('G'));
+        assert_eq!(app.explorer.tree().selected_id(), Some(last));
+        assert!(
+            app.ui
+                .explorer
+                .as_ref()
+                .unwrap()
+                .rows
+                .last()
+                .unwrap()
+                .selected
+        );
+    }
+    for _ in 0..2 {
+        app.handle_configured_key(KeyEvent::character('g'));
+        app.handle_configured_key(KeyEvent::character('g'));
+        assert_eq!(app.explorer.tree().selected_id(), Some(first));
+        assert!(app.ui.explorer.as_ref().unwrap().rows[0].selected);
+    }
+}
+
+#[test]
 fn explorer_projection_formats_only_the_terminal_viewport() {
     let (_app_dirs, mut app) = app();
     app.window_session
@@ -1021,7 +1118,7 @@ fn explorer_projection_formats_only_the_terminal_viewport() {
     wait_explorer(&mut app);
     let explorer = app.ui.explorer.as_ref().expect("explorer projection");
     assert_eq!(explorer.total, 41);
-    assert_eq!(explorer.rows.len(), 7);
+    assert_eq!(explorer.rows.len(), 6);
     assert!(explorer.rows.len() < explorer.total);
     assert_eq!(explorer.rows.iter().filter(|row| row.selected).count(), 1);
     let first_child = app.explorer.tree().selected_id().expect("first child");
@@ -1042,7 +1139,7 @@ fn explorer_projection_formats_only_the_terminal_viewport() {
 
     app.handle_event(crate::ui::UiEvent::Resize(80, 20));
     let explorer = app.ui.explorer.as_ref().expect("grown projection");
-    assert_eq!(explorer.rows.len(), 17);
+    assert_eq!(explorer.rows.len(), 16);
     assert_eq!(explorer.rows.iter().filter(|row| row.selected).count(), 1);
     assert_eq!(
         app.explorer.tree().projection_revision(),
@@ -1050,7 +1147,7 @@ fn explorer_projection_formats_only_the_terminal_viewport() {
     );
     app.handle_event(crate::ui::UiEvent::Resize(80, 8));
     let explorer = app.ui.explorer.as_ref().expect("shrunk projection");
-    assert_eq!(explorer.rows.len(), 5);
+    assert_eq!(explorer.rows.len(), 4);
     assert_eq!(explorer.rows.iter().filter(|row| row.selected).count(), 1);
     assert_eq!(
         app.explorer.tree().projection_revision(),
@@ -1059,7 +1156,7 @@ fn explorer_projection_formats_only_the_terminal_viewport() {
 
     app.move_explorer_selection(30);
     let explorer = app.ui.explorer.as_ref().expect("scrolled projection");
-    assert_eq!(explorer.rows.len(), 5);
+    assert_eq!(explorer.rows.len(), 4);
     assert!(explorer.scroll > 0);
     assert!(explorer.rows.iter().any(|row| row.selected));
     let before_page = app
@@ -1152,7 +1249,7 @@ fn explorer_projection_formats_only_the_terminal_viewport() {
     app.apply_configuration_candidate(valid, false)
         .expect("valid explorer reload");
     let explorer = app.ui.explorer.as_ref().expect("reconfigured projection");
-    assert_eq!(explorer.rows.len(), 5);
+    assert_eq!(explorer.rows.len(), 4);
     assert_eq!(explorer.rows.iter().filter(|row| row.selected).count(), 1);
     assert!(explorer.rows.iter().all(|row| {
         row.segments.iter().any(|segment| {
@@ -1519,6 +1616,7 @@ pub(in crate::app) fn fixture(root: &std::path::Path) -> (Explorer, WorkspaceVer
         crate::app::workspace::Workspace::new(state, root.join("trust.json"), 1, false, false, 1);
     let mut owner = Explorer::new(
         ExplorerWatchWorker::start(crate::files::ExplorerWatchPolicy::default()).unwrap(),
+        false,
     );
     owner.reset_roots(workspace.roots(), workspace.root_revision());
     (owner, workspace.version())
@@ -2165,7 +2263,7 @@ fn expanded_empty_folders_are_labeled_without_adding_fake_tree_rows() {
     let projection = owner.projection(
         &config.config.ui.explorer,
         body,
-        &BTreeMap::new(),
+        &Git::default(),
         "Files".into(),
         "root",
     );
@@ -2179,11 +2277,19 @@ fn expanded_empty_folders_are_labeled_without_adding_fake_tree_rows() {
     let projection = owner.projection(
         &config.config.ui.explorer,
         body,
-        &BTreeMap::new(),
+        &Git::default(),
         "Files".into(),
         "root",
     );
     assert_eq!(projection.rows[0].segments.last().unwrap().text, "root");
+}
+
+#[test]
+fn changed_line_counts_use_short_numbers() {
+    assert_eq!(short_line_count(999), "999");
+    assert_eq!(short_line_count(1_200), "1.2k");
+    assert_eq!(short_line_count(15_000), "15k");
+    assert_eq!(short_line_count(1_200_000), "1.2M");
 }
 
 #[test]
@@ -2198,7 +2304,7 @@ fn explorer_owner_cost_probe() {
     owner.load(node, source.clone(), 1, 100).unwrap();
     drain(&mut owner, source);
     let config = crate::config::load_bundled_config();
-    let git = BTreeMap::new();
+    let git = Git::default();
     let body = crate::windows::WindowRect {
         x: 0,
         y: 3,

@@ -31,10 +31,6 @@ pub const BUFFER_PIN_MARKER: &str = "P";
 
 pub const BUFFER_CLOSE_MARKER: &str = "x";
 
-pub const BUFFER_ERROR_MARKER: &str = "E";
-
-pub const BUFFER_WARNING_MARKER: &str = "W";
-
 pub const BUFFER_OVERFLOW_LEFT: &str = "‹ ";
 
 pub const BUFFER_OVERFLOW_RIGHT: &str = " ›";
@@ -339,14 +335,21 @@ pub fn builtin_content_tab_segments(
         push("dirty", dirty, Style::BufferLineDirty);
     }
     if let Some(diagnostic) = entry.diagnostic {
-        let marker = match diagnostic.severity {
-            ContentTabDiagnosticSeverity::Error => BUFFER_ERROR_MARKER,
-            ContentTabDiagnosticSeverity::Warning => BUFFER_WARNING_MARKER,
+        let severity = match diagnostic.severity {
+            ContentTabDiagnosticSeverity::Error => crate::workspace::DiagnosticSeverity::Error,
+            ContentTabDiagnosticSeverity::Warning => crate::workspace::DiagnosticSeverity::Warning,
+        };
+        let mode = config.ui.explorer.icon_mode;
+        let marker = super::severity_glyph(severity, mode);
+        let separator = if mode == crate::config::ExplorerIconMode::NerdFont {
+            " "
+        } else {
+            ""
         };
         push(
             "diagnostics",
-            format!(" {marker}{}", diagnostic.count),
-            Style::BufferLineDiagnostic,
+            format!(" {marker}{separator}{}", diagnostic.count),
+            Style::BufferLineDiagnostic(diagnostic.severity, entry.active),
         );
     }
     if entry.closeable {

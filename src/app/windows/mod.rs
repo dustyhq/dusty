@@ -193,9 +193,7 @@ impl Windows {
         &self,
         tab: WorkspaceTabId,
     ) -> Option<crate::windows::CompositorSnapshot> {
-        let mut snapshot = self.graph().compositor_snapshot(tab)?;
-        self.native_ids().fit_problems_projection(&mut snapshot);
-        Some(snapshot)
+        self.graph().compositor_snapshot(tab)
     }
 
     pub(in crate::app) fn project(&mut self, request: ProjectionRequest) {
@@ -332,7 +330,6 @@ use crate::windows::PANE_MINIMUM_WIDTH;
 
 use crate::ui::EditorWindowBinding as UiEditorWindowBinding;
 use crate::ui::EditorWindowLayoutState;
-use crate::ui::PickerSurfaceKind;
 use crate::ui::explorer_panel_width;
 use crate::ui::render::TERMINAL_PANEL_RESIZE_STEP;
 use crate::ui::screen_foot_rows;
@@ -626,7 +623,6 @@ impl App {
     pub(in crate::app) fn project_window_geometry(&mut self) {
         self.project_window_activation();
         self.ui.compositor_layout = self.window_session.layout().cloned();
-        self.sync_problems_viewport();
         self.refresh_window_content();
         self.follow_agent_pane();
     }
@@ -1023,9 +1019,6 @@ impl App {
                     .explorer_views
                     .retain(|candidate| candidate.view != view);
             }
-            CommandEffect::ClosedPicker(PickerSurfaceKind::ProblemsPanel) => {
-                self.close_problems_panel()
-            }
             CommandEffect::ClosedPicker(kind) => {
                 if self.ui.picker.as_ref().is_some_and(|p| p.surface == kind) {
                     self.close_picker();
@@ -1128,12 +1121,6 @@ impl App {
             dashboard_visible: self.window_session.dashboard_visible()
                 || self.state.active_view().is_none(),
             picker_rect,
-            problems_panel: self.problems_panel.is_some(),
-            problems_top_inset: self.problems_panel.as_ref().map_or(0, |_| {
-                workspace_top_rows(&self.state, &self.ui, self.configuration.settings())
-            }),
-            problems_panel_focused: self.problems_panel.is_some()
-                && self.window_session.focus() == FocusTarget::ProblemsPanel,
             picker_surface: self
                 .ui
                 .picker
@@ -1339,21 +1326,11 @@ impl App {
                             }),
                             dashboard: surfaces.dashboard().map(|ids| ids.window),
                             picker: surfaces.picker().map(|ids| ids.window),
-                            problems_panel: surfaces.problems_panel().map(|ids| ids.window),
                         },
                     })
                 });
                 if let Some(projection) = projection {
                     self.window_session.project(projection);
-                }
-                // Layout-only insets (e.g. the debug inspector) can reduce dock capacity
-                // after native reconciliation. Never route keys to an unprojected panel.
-                if self.window_session.focus() == FocusTarget::ProblemsPanel
-                    && self.problems_panel_rect().is_none()
-                {
-                    self.window_session.focus_editor_from_problems();
-                    self.reconcile_editor_windows();
-                    return;
                 }
                 self.project_window_geometry();
                 self.sync_explorer_ui();

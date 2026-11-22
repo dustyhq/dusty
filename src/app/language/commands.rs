@@ -622,13 +622,11 @@ impl App {
             AppEffect::LspInlineDiagnosticsToggle => {
                 let message = if self.configuration.toggle_inline_diagnostics() {
                     "Messages beside code: on".to_owned()
-                } else if self.problems_panel.is_none()
-                    && let Some(key) = self.input.reachable_key(
-                        self.configuration.keymaps(),
-                        &self.active_input_context(),
-                        "diagnostic.panel.toggle",
-                    )
-                {
+                } else if let Some(key) = self.input.reachable_key(
+                    self.configuration.keymaps(),
+                    &self.active_input_context(),
+                    "diagnostic.open",
+                ) {
                     let key = key
                         .split_whitespace()
                         .map(|key| if key == "space" { "Space" } else { key })

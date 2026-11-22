@@ -76,33 +76,19 @@ pub(super) struct DiagnosticKey {
     index: usize,
 }
 impl DiagnosticKey {
+    pub(super) fn picker_id(&self) -> crate::workspace::PickerItemId {
+        crate::workspace::PickerItemId(format!(
+            "diagnostic:{:p}:{}",
+            Arc::as_ptr(&self.epoch),
+            self.index
+        ))
+    }
+
     pub(in crate::app) fn same(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.epoch, &other.epoch) && self.index == other.index
     }
 }
 pub(super) type DiskPoints = BTreeMap<ByteOffset, (usize, usize)>;
-
-#[derive(Clone, Debug)]
-pub(super) struct DiagnosticAnchor {
-    document: DiagnosticDocument,
-    revision: BufferRevision,
-}
-
-impl DiagnosticAnchor {
-    pub(super) fn map_range(&self, editor: &EditorState, range: ByteRange) -> Option<ByteRange> {
-        let buffer = editor.buffers.get(self.document.id)?;
-        if !self.document.editor.same_editor(&editor.window_version())
-            || self.document.path != buffer.path
-            || !buffer
-                .text
-                .source_version()
-                .same_instance(&self.document.text)
-        {
-            return None;
-        }
-        map_diagnostic_range(&buffer.text, self.revision, range)
-    }
-}
 
 fn map_diagnostic_range(
     text: &crate::editor::text::TextBuffer,
@@ -350,15 +336,22 @@ impl Diagnostics {
             .collect();
         self.counts.clear();
         for row in &self.rows {
-            if let Some(path) = crate::language::lsp::path_from_file_uri(&row.problem.uri) {
-                let count = self.counts.entry(path).or_insert(ContentTabDiagnostic {
-                    severity: ContentTabDiagnosticSeverity::Warning,
-                    count: 0,
-                });
+            let severity = match row.problem.severity {
+                DiagnosticSeverity::Error => ContentTabDiagnosticSeverity::Error,
+                DiagnosticSeverity::Warning => ContentTabDiagnosticSeverity::Warning,
+                DiagnosticSeverity::Information | DiagnosticSeverity::Hint => continue,
+            };
+            let Some(path) = crate::language::lsp::path_from_file_uri(&row.problem.uri) else {
+                continue;
+            };
+            let count = self
+                .counts
+                .entry(path)
+                .or_insert(ContentTabDiagnostic { severity, count: 0 });
+            if count.severity == severity {
                 count.count = count.count.saturating_add(1);
-                if row.problem.severity == DiagnosticSeverity::Error {
-                    count.severity = ContentTabDiagnosticSeverity::Error;
-                }
+            } else if severity == ContentTabDiagnosticSeverity::Error {
+                *count = ContentTabDiagnostic { severity, count: 1 };
             }
         }
         self.batches.retain(|key, _| indices.contains_key(key));
@@ -403,14 +396,6 @@ impl Diagnostics {
         }
         Some(&row.problem)
     }
-    pub(super) fn anchor(&self, row: &ProblemRow) -> Option<DiagnosticAnchor> {
-        let batch = self.batches.get(&(row.owner.clone(), row.uri.clone()))?;
-        Some(DiagnosticAnchor {
-            document: batch.document.clone()?,
-            revision: batch.revision?,
-        })
-    }
-
     pub(in crate::app) fn point(
         &self,
         row: &ProblemRow,
@@ -590,7 +575,7 @@ impl Diagnostics {
     }
 }
 
-/// Store only reported locations, not disk text, so the panel never has to read files.
+/// Store only reported locations, not disk text, so Problems never has to read files.
 pub(super) fn disk_points(
     items: &[Diagnostic],
     text: &crate::editor::text::TextBuffer,
@@ -624,7 +609,7 @@ impl App {
         if let Some(candidate) = self.diagnostics.projection(&self.state) {
             self.ui.diagnostics = candidate;
             self.window_session.diagnostics_changed();
-            self.refresh_problems_panel();
+            self.refresh_problems_picker();
         }
         self.ui.expanded_diagnostic = self.diagnostics.expanded(&self.state);
     }
@@ -648,6 +633,11 @@ pub(in crate::app) fn register_commands(
             "diagnostic.open",
             "Open workspace problems",
             PickerKind::Diagnostics,
+        ),
+        (
+            "diagnostic.open_buffer",
+            "Problems (this file)",
+            PickerKind::DiagnosticsBuffer,
         ),
         (
             "buffer.picker.open",
@@ -682,7 +672,6 @@ pub(in crate::app) fn register_commands(
             move |_| AppEffect::OpenPicker(kind),
         )?;
     }
-    problems::register_commands(registry)?;
     for (id, title, direction, filter) in [
         (
             "diagnostic.next",
@@ -743,7 +732,6 @@ impl App {
         effect: AppEffect,
     ) -> Result<(), AppEffect> {
         match effect {
-            AppEffect::ProblemsPanel(command) => self.handle_problems_command(command),
             AppEffect::DiagnosticNavigate {
                 direction,
                 filter,

@@ -345,9 +345,8 @@ impl App {
             self.show_error(error);
         } else {
             self.diagnostics
-                .expand(key.clone(), filter.severities(), &self.state);
+                .expand(key, filter.severities(), &self.state);
             self.sync_ui_diagnostics();
-            self.select_panel_diagnostic(&key);
             self.clear_notice();
             self.ensure_cursor_visible();
         }

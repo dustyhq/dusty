@@ -198,7 +198,9 @@ pub struct ThemeStyles {
     pub buffer_line_dirty: ThemeStyle,
     pub buffer_line_icon: ThemeStyle,
     pub buffer_line_pin: ThemeStyle,
-    pub buffer_line_diagnostic: ThemeStyle,
+    // Accept the old theme key without applying the former filled badge style.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub buffer_line_diagnostic: Option<ThemeStyle>,
     pub buffer_line_close: ThemeStyle,
     pub buffer_line_separator: ThemeStyle,
     pub key_hint_background: ThemeStyle,
@@ -223,6 +225,16 @@ pub struct ThemeStyles {
     pub explorer_file: ThemeStyle,
     pub explorer_symlink: ThemeStyle,
     pub explorer_git: ThemeStyle,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub explorer_git_modified: Option<ThemeStyle>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub explorer_git_added: Option<ThemeStyle>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub explorer_git_renamed: Option<ThemeStyle>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub explorer_git_conflict: Option<ThemeStyle>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub explorer_git_staged: Option<ThemeStyle>,
     pub explorer_diagnostic: ThemeStyle,
     pub explorer_decoration: ThemeStyle,
     pub explorer_selection: ThemeStyle,
@@ -604,10 +616,6 @@ impl ThemeConfig {
             ("buffer_line_dirty", &self.styles.buffer_line_dirty),
             ("buffer_line_icon", &self.styles.buffer_line_icon),
             ("buffer_line_pin", &self.styles.buffer_line_pin),
-            (
-                "buffer_line_diagnostic",
-                &self.styles.buffer_line_diagnostic,
-            ),
             ("buffer_line_close", &self.styles.buffer_line_close),
             ("buffer_line_separator", &self.styles.buffer_line_separator),
             ("key_hint_background", &self.styles.key_hint_background),
@@ -649,7 +657,33 @@ impl ThemeConfig {
             ),
             ("terminal_text", &self.styles.terminal_text),
         ];
-        for (name, style) in styles {
+        let explorer_git_styles = [
+            (
+                "explorer_git_modified",
+                self.styles.explorer_git_modified.as_ref(),
+            ),
+            (
+                "explorer_git_added",
+                self.styles.explorer_git_added.as_ref(),
+            ),
+            (
+                "explorer_git_renamed",
+                self.styles.explorer_git_renamed.as_ref(),
+            ),
+            (
+                "explorer_git_conflict",
+                self.styles.explorer_git_conflict.as_ref(),
+            ),
+            (
+                "explorer_git_staged",
+                self.styles.explorer_git_staged.as_ref(),
+            ),
+        ];
+        for (name, style) in styles.into_iter().chain(
+            explorer_git_styles
+                .into_iter()
+                .filter_map(|(name, style)| style.map(|style| (name, style))),
+        ) {
             if style.foreground == style.background && style.foreground != ThemeColor::Reset {
                 return Err(format!(
                     "theme style `{name}` has identical foreground and background"

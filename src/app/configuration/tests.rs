@@ -3122,43 +3122,28 @@ use crate::config::load_config;
 use crate::config::load_keymaps;
 
 #[test]
-fn global_explorer_identity_can_be_disabled_without_disabling_just_one_surface() {
+fn retired_problems_shortcuts_compile_as_popup_commands() {
     let user = crate::config::parse_keymaps(
-        "[[keymap]]\nid='builtin.global.explorer'\ndisable=true\n",
+        "[[keymap]]\nid='user.test.old-problems'\ncontext='global'\nkeys='f6'\ncommand='diagnostic.panel.toggle'\n\n[[keymap]]\nid='user.test.old-file-problems'\ncontext='global'\nkeys='f7'\ncommand='diagnostic.panel.buffer'\n",
         PathBuf::from("keymaps.toml"),
     );
     assert!(user.diagnostic.is_none());
     let mut loaded = load_bundled_config();
-    let builtin_ids = loaded
-        .keymaps
-        .entries
-        .iter()
-        .map(|entry| entry.id.as_str())
-        .filter(|id| id.starts_with("builtin.global.explorer."))
-        .collect::<std::collections::BTreeSet<_>>();
-    let disabled_ids = user
-        .entries
-        .iter()
-        .map(|entry| entry.id.as_str())
-        .collect::<std::collections::BTreeSet<_>>();
-    assert_eq!(disabled_ids, builtin_ids);
-    assert_eq!(user.entries.len(), builtin_ids.len());
-    assert!(disabled_ids.contains("builtin.global.explorer.problems-panel"));
-    assert!(user.entries.iter().all(|entry| entry.disable));
     loaded.keymaps.entries.extend(user.entries);
     loaded.keymaps.user_spans = user.user_spans;
-    let mut commands = crate::editor::CommandRegistry::default();
-    crate::editor::register_builtin_commands(&mut commands).unwrap();
-    crate::app::register_app_commands(&mut commands).unwrap();
-    let (_, diagnostic) = compile_keymaps(&commands, &loaded.keymaps, &loaded.config.input.keymaps);
-    assert!(diagnostic.is_none(), "{diagnostic:?}");
-
-    let surface = crate::config::parse_keymaps(
-        "[[keymap]]\nid='builtin.global.explorer.explorer'\ndisable=true\n",
-        PathBuf::from("keymaps.toml"),
+    let mut session = crate::app::tests::driver::TestSession::new(loaded);
+    session.new_buffer();
+    assert!(session.application().ui.config_diagnostic.is_none());
+    session.key("f6");
+    let app = session.application();
+    assert_eq!(app.ui.picker.as_ref().unwrap().title, "Problems");
+    session.key("escape");
+    session.key("escape");
+    session.key("f7");
+    assert_eq!(
+        session.application().ui.picker.as_ref().unwrap().title,
+        "Problems in [scratch]"
     );
-    assert_eq!(surface.entries.len(), 1);
-    assert_eq!(surface.entries[0].id, "builtin.global.explorer.explorer");
 }
 
 // The guide's terminal profile names a Unix shell.

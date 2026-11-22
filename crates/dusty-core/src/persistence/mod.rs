@@ -141,6 +141,14 @@ pub struct PersistedSession {
     pub pinned: Vec<PathBuf>,
 }
 impl PersistedSession {
+    /// Ignore the retired native Problems dock; it has no restorable content.
+    pub fn discard_legacy_problems_panel(&mut self) {
+        const PANEL: &str = "builtin.problems.panel";
+        self.window_rules.retain(|rule| rule.content_type != PANEL);
+        self.content_descriptors
+            .retain(|descriptor| descriptor.content_type != PANEL);
+    }
+
     #[must_use]
     pub fn unavailable_virtual_descriptors(&self) -> BTreeSet<String> {
         self.content_descriptors
@@ -947,6 +955,9 @@ fn read_state(path: &Path, policy: &PersistencePolicy) -> Result<PersistedState,
     }
     let mut state: PersistedState =
         serde_json::from_slice(&bytes).map_err(PersistenceError::Json)?;
+    if let Some(session) = &mut state.session {
+        session.discard_legacy_problems_panel();
+    }
     state.validate(policy)?;
     // Two instances reading the same legacy snapshot must derive the same IDs.
     // Include an occurrence number so even identical legacy rows have distinct identities.

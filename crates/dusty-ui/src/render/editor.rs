@@ -1324,18 +1324,17 @@ pub(super) fn render_status_line(
         .get(mode_key)
         .expect("resolved configuration validates mode labels");
     let (mode_style, mode_edge) = status_mode_styles(mode_key);
-    let icons = config.ui.explorer.icon_mode == ExplorerIconMode::NerdFont;
-    let (end_edge, start_edge, branch_icon, error_icon, warning_icon) = if icons {
-        (
-            "\u{e0b0}",
-            "\u{e0b2}",
-            "\u{e0a0} ",
-            "\u{f057} ",
-            "\u{f071} ",
-        )
+    use crate::workspace::DiagnosticSeverity::{Error, Warning};
+    let icon_mode = config.ui.explorer.icon_mode;
+    let icons = icon_mode == ExplorerIconMode::NerdFont;
+    let (end_edge, start_edge, branch_icon) = if icons {
+        ("\u{e0b0}", "\u{e0b2}", "\u{e0a0} ")
     } else {
-        (" ", " ", "", "E", "W")
+        (" ", " ", "")
     };
+    let error_icon = super::severity_glyph(Error, icon_mode);
+    let warning_icon = super::severity_glyph(Warning, icon_mode);
+    let separator = if icons { " " } else { "" };
     let mode = if shown("mode") {
         format!("{STATUS_MODE_PADDING}{mode_label}{STATUS_MODE_PADDING}")
     } else {
@@ -1409,14 +1408,14 @@ pub(super) fn render_status_line(
                 if errors > 0 {
                     left_fields.push((
                         component.as_str(),
-                        format!("{error_icon}{errors}"),
+                        format!("{error_icon}{separator}{errors}"),
                         Style::StatusError,
                     ));
                 }
                 if warnings > 0 {
                     left_fields.push((
                         component.as_str(),
-                        format!("{warning_icon}{warnings}"),
+                        format!("{warning_icon}{separator}{warnings}"),
                         Style::StatusWarning,
                     ));
                 }

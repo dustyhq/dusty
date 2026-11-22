@@ -44,6 +44,7 @@ use crate::editor::EditorState;
 use crate::editor::RegisterShape;
 
 use crate::editor::RegisterValue;
+use crate::editor::ScreenColumn;
 
 use crate::editor::Selection;
 
@@ -88,6 +89,10 @@ pub enum EditorOperation {
     SetPreferredColumn {
         view: ViewId,
         column: usize,
+    },
+    SetPreferredScreenColumn {
+        view: ViewId,
+        column: ScreenColumn,
     },
     SetScroll {
         view: ViewId,
@@ -478,6 +483,7 @@ fn apply_operation(
                 });
                 view.syntax_selections.clear();
                 view.cursor = delta.map_offset(view.cursor, Affinity::After);
+                view.preferred_screen_column = None;
                 if let Some(selection) = &mut view.selection {
                     selection.anchor = delta.map_offset(selection.anchor, Affinity::Before);
                     selection.head = delta.map_offset(selection.head, Affinity::After);
@@ -542,6 +548,7 @@ fn apply_operation(
             target.syntax_selections.clear();
             target.cursor = *position;
             target.preferred_column = None;
+            target.preferred_screen_column = None;
             target.multi_preferred_columns.clear();
             if let Some(selection) = &mut target.selection {
                 selection.head = *position;
@@ -553,6 +560,13 @@ fn apply_operation(
                 .get_mut(*view)
                 .ok_or(TransactionError::MissingView)?
                 .preferred_column = Some(*column);
+        }
+        EditorOperation::SetPreferredScreenColumn { view, column } => {
+            state
+                .views
+                .get_mut(*view)
+                .ok_or(TransactionError::MissingView)?
+                .preferred_screen_column = Some(*column);
         }
         EditorOperation::SetScroll { view, first_line } => {
             let target = state
@@ -849,6 +863,7 @@ fn apply_operation(
                     view.multi_marks.sort_by_key(|mark| mark.start);
                     view.multi_marks.dedup();
                     view.multi_preferred_columns.clear();
+                    view.preferred_screen_column = None;
                     view.replace_history.clear();
                     view.insert_repeat = None;
                 }
@@ -864,6 +879,7 @@ fn apply_operation(
             {
                 view.cursor = first.min(ByteOffset(state.buffers[*buffer].text.len_bytes()));
                 view.preferred_column = None;
+                view.preferred_screen_column = None;
             }
         }
         EditorOperation::SplitPane { axis, ratio } => {
@@ -1059,6 +1075,7 @@ impl EditorDraft {
             if view.cursor >= end && end > start {
                 view.cursor = crate::editor::text::previous_grapheme_boundary(text, end);
                 view.preferred_column = None;
+                view.preferred_screen_column = None;
             }
         }
         record_view_changes(&mut self.state, &views);

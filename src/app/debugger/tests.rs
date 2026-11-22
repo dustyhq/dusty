@@ -327,6 +327,12 @@ fn problems_logs_output_and_debug_keep_distinct_graph_surface_identities() {
         "builtin.problems"
     );
 
+    let popup = app.window_session.graph().window(problems.window).unwrap();
+    assert!(matches!(
+        popup.placement,
+        crate::windows::WindowPlacement::Overlay(_)
+    ));
+
     app.show_output_picker("missing-task");
     app.reconcile_editor_windows();
     let output = app

@@ -141,6 +141,15 @@ pub struct BufferLineConfig {
     pub hide_when_single: bool,
 }
 
+impl BufferLineConfig {
+    /// The `extension_icons` override for a file, shared by tabs and the Problems popup.
+    #[must_use]
+    pub fn file_icon_override(&self, path: &std::path::Path) -> Option<&str> {
+        let extension = path.extension()?.to_str()?.to_ascii_lowercase();
+        self.extension_icons.get(&extension).map(String::as_str)
+    }
+}
+
 impl Default for BufferLineConfig {
     fn default() -> Self {
         Self {
@@ -202,6 +211,16 @@ pub enum ExplorerIconMode {
     Ascii,
 }
 
+/// How Git changes are colored in the file explorer.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExplorerGitColors {
+    #[default]
+    Kind,
+    Single,
+    Off,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ExplorerGlyphSet {
@@ -232,6 +251,11 @@ pub struct ExplorerConfig {
     #[serde(default)]
     pub side: PanelSide,
     pub icon_mode: ExplorerIconMode,
+    #[serde(default)]
+    pub git_colors: ExplorerGitColors,
+    /// Show line counts instead of git status letters in the file explorer.
+    #[serde(default)]
+    pub git_line_counts: bool,
     pub glyphs: ExplorerGlyphs,
 }
 
@@ -264,6 +288,8 @@ impl Default for ExplorerConfig {
             width: 40,
             side: PanelSide::Left,
             icon_mode: ExplorerIconMode::NerdFont,
+            git_colors: ExplorerGitColors::Kind,
+            git_line_counts: false,
             glyphs: ExplorerGlyphs {
                 nerd_font: ExplorerGlyphSet {
                     directory: "\u{f024b}".into(),

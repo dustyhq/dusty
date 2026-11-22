@@ -1427,6 +1427,12 @@ fn keymap_invocation(
     command_id: &str,
     arguments: &BTreeMap<String, toml::Value>,
 ) -> Result<CommandInvocation, KeymapInvocationError> {
+    // Old user shortcuts keep working without exposing obsolete commands in the palette.
+    let command_id = match command_id {
+        "diagnostic.panel.toggle" => "diagnostic.open",
+        "diagnostic.panel.buffer" => "diagnostic.open_buffer",
+        _ => command_id,
+    };
     let mut invocation = CommandInvocation::new(command_id, InvocationSource::Keymap)
         .map_err(|error| KeymapInvocationError::Invalid(error.to_string()))?;
     for (name, value) in arguments {

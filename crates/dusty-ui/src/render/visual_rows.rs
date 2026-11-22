@@ -510,7 +510,7 @@ impl<'a> VisualRowModel<'a> {
                 })
                 .collect();
         }
-        if !self.wrap {
+        if !self.wrap || self.folds.end(line) != line {
             return vec![VisualRowSlice {
                 byte_start: 0,
                 byte_end: content.len(),
@@ -944,6 +944,41 @@ impl<'a> VisualRowModel<'a> {
             anchor = previous;
         }
         anchor
+    }
+
+    /// Move among rows that own source text. Diagnostic-only rows have no caret position.
+    #[must_use]
+    pub fn move_cursor_rows(
+        &self,
+        cursor: ByteOffset,
+        start: VisualRowAnchor,
+        column: crate::editor::ScreenColumn,
+        direction: crate::editor::ScreenDirection,
+        count: usize,
+    ) -> ByteOffset {
+        let mut anchor = start;
+        let last = self.text.visible_lines().saturating_sub(1);
+        for _ in 0..count {
+            let next = match direction {
+                crate::editor::ScreenDirection::Up => self.previous(anchor),
+                crate::editor::ScreenDirection::Down => self.next(anchor),
+            };
+            // Rendering may show the final newline, but it isn't an editable empty line.
+            if next == anchor || next.line > last {
+                break;
+            }
+            anchor = next;
+        }
+        if anchor == start {
+            return cursor;
+        }
+        let last_cell = self.content_width.saturating_sub(1);
+        let cell = match column {
+            crate::editor::ScreenColumn::Cell(cell) => cell.min(last_cell),
+            crate::editor::ScreenColumn::EndOfRow => last_cell,
+        };
+        let line_start = self.text.line_to_byte(anchor.line).unwrap_or(ByteOffset(0));
+        ByteOffset(line_start.get() + self.byte_at_cell(anchor, cell))
     }
 
     #[must_use]

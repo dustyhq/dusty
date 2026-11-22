@@ -229,12 +229,12 @@ fn successful_task_dependencies_publish_their_matched_diagnostics() {
     assert_eq!(rows.len(), 2);
     assert!(
         rows.iter()
-            .any(|row| row.label == "a.txt" && row.detail == "dependency warning"),
+            .any(|row| row.label == "a.txt:1:2" && row.detail == "dependency warning"),
         "{rows:?}"
     );
     assert!(
         rows.iter()
-            .any(|row| row.label == "a.txt" && row.detail == "parent warning"),
+            .any(|row| row.label == "a.txt:1:2" && row.detail == "parent warning"),
         "{rows:?}"
     );
 }
@@ -1448,7 +1448,6 @@ fn problems_uses_workspace_paths_and_drops_failed_tests_after_config_reload() {
     use crate::app::diagnostics::{DiagnosticBatch, DiagnosticDocument, DiagnosticValidity};
     use crate::app::tests::driver::TestSession;
     use crate::editor::text::{ByteRange, PositionEncoding};
-    use crate::ui::render::problems::ProblemsRow;
     use crate::workspace::{Diagnostic, DiagnosticSeverity};
 
     let mut loaded = crate::config::load_bundled_config();
@@ -1552,12 +1551,17 @@ fn problems_uses_workspace_paths_and_drops_failed_tests_after_config_reload() {
         session.key(key);
     }
     let app = session.application();
-    let panel = app.ui.problems_panel.as_ref().unwrap();
-    assert!(matches!(&*panel.rows, [ProblemsRow::File { count: 2, .. },
-        ProblemsRow::Problem { message, location, .. },
-        ProblemsRow::Problem { message: warning, location: diagnostic_location, .. }]
-        if message == "test: failure" && warning == "nearby warning"
-            && location == "1:2" && diagnostic_location == location));
+    let rows = &app.ui.picker.as_ref().unwrap().rows;
+    let location = format!("src{0}a.rs:1:2", std::path::MAIN_SEPARATOR);
+    assert_eq!(rows.len(), 2);
+    assert_eq!(
+        (rows[0].label.as_str(), rows[0].detail.as_str()),
+        (location.as_str(), "test: failure")
+    );
+    assert_eq!(
+        (rows[1].label.as_str(), rows[1].detail.as_str()),
+        (location.as_str(), "nearby warning")
+    );
     session.key("enter");
     assert_eq!(
         session.application().state.views[view].cursor,
@@ -1568,7 +1572,10 @@ fn problems_uses_workspace_paths_and_drops_failed_tests_after_config_reload() {
         .unwrap();
     let app = session.application();
     assert!(app.tasks.resolve_test(&test_key).is_none());
-    let panel = app.ui.problems_panel.as_ref().unwrap();
-    assert!(matches!(&*panel.rows, [ProblemsRow::File { count: 1, .. },
-        ProblemsRow::Problem { message, .. }] if message == "nearby warning"));
+    for key in ["space", "x", "X"] {
+        session.key(key);
+    }
+    let rows = &session.application().ui.picker.as_ref().unwrap().rows;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].detail, "nearby warning");
 }

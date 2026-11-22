@@ -2305,9 +2305,6 @@ fn session_restore_removes_plugin_windows_before_replacing_their_tabs() {
                     picker_rect: None,
                     picker_surface: None,
                     picker_title: "Picker".into(),
-                    problems_panel: false,
-                    problems_top_inset: 0,
-                    problems_panel_focused: false,
                     protected_prompt_height: 0,
                     configuration_reload_id: 0,
                     screen_bottom: 0,
@@ -2409,9 +2406,6 @@ fn failed_explorer_reconstruction_does_not_publish_a_partial_graph_or_resources(
         picker_rect: None,
         picker_surface: None,
         picker_title: "Picker".into(),
-        problems_panel: false,
-        problems_top_inset: 0,
-        problems_panel_focused: false,
         protected_prompt_height: 0,
         configuration_reload_id: 0,
         screen_bottom: 0,
@@ -2755,7 +2749,6 @@ fn accepted_projection_rejects_old_source_graph_size_and_invalidation() {
             terminal: None,
             dashboard: None,
             picker: None,
-            problems_panel: None,
         },
         protected: Some(WindowRect {
             x: 20,
@@ -2773,7 +2766,7 @@ fn accepted_projection_rejects_old_source_graph_size_and_invalidation() {
         1
     );
     let body = windows.content().explorer.unwrap();
-    assert_eq!((body.y, body.height), (3, 27));
+    assert_eq!((body.y, body.height), (3, 26));
     assert_eq!(
         windows.content().documentation_rows,
         crate::ui::render::documentation::documentation_page_rows(&config, 75, 30)
@@ -3159,9 +3152,6 @@ fn startup_document_and_dashboard_publish_together_only_for_the_accepted_proposa
             picker_rect: None,
             picker_surface: None,
             picker_title: "Picker".into(),
-            problems_panel: false,
-            problems_top_inset: 0,
-            problems_panel_focused: false,
             protected_prompt_height: 0,
             configuration_reload_id: 0,
             screen_bottom: 0,
@@ -3236,7 +3226,6 @@ fn native_command_plans_are_source_bound_before_any_candidate_copy() {
             terminal: None,
             dashboard: None,
             picker: None,
-            problems_panel: None,
         },
         protected: None,
     });
@@ -3297,7 +3286,6 @@ fn native_command_plans_are_source_bound_before_any_candidate_copy() {
             terminal: None,
             dashboard: None,
             picker: None,
-            problems_panel: None,
         },
         protected: None,
     });
@@ -3351,7 +3339,6 @@ fn native_command_plans_are_source_bound_before_any_candidate_copy() {
             terminal: None,
             dashboard: None,
             picker: None,
-            problems_panel: None,
         },
         protected: None,
     });

@@ -1916,13 +1916,7 @@ impl App {
             transaction_id,
             extend_selection,
         );
-        let focus_editor = !extend_selection
-            && self.window_session.focus() == crate::app::windows::FocusTarget::ProblemsPanel;
         let Some(plan) = plan else {
-            // A press below EOF still targets the pane, just not a cursor position.
-            if focus_editor {
-                self.focus_mouse_pane();
-            }
             return;
         };
         self.diagnostics.dismiss_expansion();
@@ -1935,24 +1929,7 @@ impl App {
                 return;
             }
         };
-        // The mouse transaction already selects the pane. If Problems owns keyboard
-        // focus, commit that gesture with an explicit editor focus target as well.
-        let focus = if focus_editor {
-            match self.window_session.plan_focus(
-                pane_id,
-                &self.state.window_version(),
-                self.extension.contributions().version(),
-            ) {
-                Ok(plan) => Some(plan),
-                Err(error) => {
-                    self.show_error(error);
-                    return;
-                }
-            }
-        } else {
-            None
-        };
-        if let Err(error) = self.commit_editor_transaction(transaction, focus) {
+        if let Err(error) = self.commit_editor_transaction(transaction, None) {
             self.show_error(error);
         } else {
             let source = self.state.window_version();
@@ -2035,7 +2012,7 @@ impl App {
                 };
                 let axis_position = DockDrag::axis_position(edge, column, row);
                 if axis_position == drag.axis_position {
-                    // Motion along the border is not a resize, even if Problems clips the dock.
+                    // Motion along the border is not a resize.
                     return true;
                 }
                 self.dock_drag = Some(DockDrag {
@@ -2200,12 +2177,7 @@ impl App {
                     .set_split_ratio_between(first, second, u16::try_from(ratio).unwrap_or(900))
                     .is_ok()
                 {
-                    if self.problems_panel.is_some() {
-                        self.resize_active_terminal_to_panel();
-                        self.sync_terminal_panel();
-                    } else {
-                        self.reconcile_editor_windows();
-                    }
+                    self.reconcile_editor_windows();
                 }
                 true
             }
@@ -2581,9 +2553,6 @@ impl App {
                         _ => {}
                     }
                 }
-                if self.handle_problems_mouse(&key, column, row) {
-                    return;
-                }
                 let over_floating = self.compositor_projection().is_some_and(|projection| {
                     projection
                         .hit_test(column, row)
@@ -2929,9 +2898,6 @@ impl App {
                     TerminalPanelMode::Visual => "terminal_visual",
                 })
                 .into();
-        }
-        if self.window_session.focus() == crate::app::windows::FocusTarget::ProblemsPanel {
-            return "problems_panel".into();
         }
         if self.ui.language_completion.is_some() {
             return "completion".into();

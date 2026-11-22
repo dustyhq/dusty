@@ -214,7 +214,6 @@ struct App {
     extension: crate::app::plugins::Plugins,
     workspace: crate::app::workspace::Workspace,
     diagnostics: crate::app::diagnostics::Diagnostics,
-    problems_panel: Option<diagnostics::problems::ProblemsPanel>,
     workspace_edits: crate::app::workspace::edits::WorkspaceEdits,
     commands: CommandRegistry<AppEffect>,
     effect_authority: crate::editor::CommandAuthority,

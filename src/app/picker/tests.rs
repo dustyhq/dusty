@@ -527,7 +527,7 @@ fn live_logs_and_output_refresh_preserve_picker_normal_without_leaking_it_to_new
 }
 
 #[test]
-fn closed_picker_surfaces_leave_the_content_line_but_keep_their_graph_identity() {
+fn picker_popups_stay_off_the_content_line_and_keep_their_graph_identity() {
     let (_app_dirs, mut app) = app();
     app.state
         .open_text(TextBuffer::from_text("editor"), None)
@@ -542,10 +542,11 @@ fn closed_picker_surfaces_leave_the_content_line_but_keep_their_graph_identity()
         app.reconcile_editor_windows();
         let ids = app.window_session.native_ids().picker_for(kind).unwrap();
         assert!(
-            app.ui
+            !app.ui
                 .content_tabs
                 .iter()
-                .any(|entry| entry.identity.0 == ids.content)
+                .any(|entry| entry.identity.0 == ids.content),
+            "a popup is not a tab"
         );
         app.close_picker();
         app.reconcile_editor_windows();
@@ -627,65 +628,260 @@ fn workspace_review_refresh_keeps_the_query_and_selected_file_but_new_proposals_
     assert!(!app.search.owns_picker_epoch(&epoch));
 }
 
-#[test]
-fn diagnostic_picker_keeps_the_path_separate_from_the_message_for_fitting() {
+fn publish_problems(
+    app: &mut App,
+    file: &str,
+    diagnostics: &[(usize, crate::workspace::DiagnosticSeverity, &str)],
+) {
     use crate::app::diagnostics::{DiagnosticBatch, DiagnosticDocument, DiagnosticValidity};
     use crate::editor::text::{ByteOffset, ByteRange};
-    use crate::workspace::{Diagnostic, DiagnosticOwner, DiagnosticProducer, DiagnosticSeverity};
-    let (_dirs, mut app) = app();
-    let path = app
-        .state
-        .workspace_root
-        .join("packages/deeply/nested/critical_invoice_handler.rs");
+    use crate::workspace::{Diagnostic, DiagnosticOwner, DiagnosticProducer};
+
+    let path = app.state.workspace_root.join(file);
     let (buffer, _) = app
         .state
         .open_text(
-            TextBuffer::from_text("let needle = 42;"),
+            TextBuffer::from_text("let n = 1;\nlet m = n;"),
             Some(path.clone()),
         )
         .unwrap();
     let uri = crate::language::lsp::file_uri(&path);
-    let producer = DiagnosticProducer::new(DiagnosticOwner::new("picker-test").unwrap());
+    let producer =
+        DiagnosticProducer::new(DiagnosticOwner::new(format!("picker-test:{file}")).unwrap());
     app.diagnostics.activate(producer.clone());
     app.diagnostics
         .publish(
             DiagnosticBatch {
-                disk_points: Default::default(),
                 producer,
                 uri: uri.clone(),
                 document: DiagnosticDocument::capture(&app.state, buffer),
                 validity: DiagnosticValidity::RequestedSnapshot,
-                items: vec![Diagnostic {
-                    uri,
-                    version: None,
-                    range: ByteRange::new(ByteOffset(4), ByteOffset(10)).unwrap(),
-                    severity: DiagnosticSeverity::Error,
-                    source: "test".into(),
-                    code: None,
-                    message: "Check invoice\n  calculation".into(),
-                    related: Vec::new(),
-                    tags: Vec::new(),
-                    fixes: Vec::new(),
-                    data: None,
-                    timestamp: std::time::SystemTime::UNIX_EPOCH,
-                }],
+                disk_points: Default::default(),
+                items: diagnostics
+                    .iter()
+                    .map(|&(offset, severity, message)| Diagnostic {
+                        uri: uri.clone(),
+                        version: None,
+                        range: ByteRange::empty(ByteOffset(offset)),
+                        severity,
+                        source: "rustc".into(),
+                        code: Some(if severity == crate::workspace::DiagnosticSeverity::Error {
+                            "E0308".into()
+                        } else {
+                            serde_json::json!(7)
+                        }),
+                        message: message.into(),
+                        related: Vec::new(),
+                        tags: Vec::new(),
+                        fixes: Vec::new(),
+                        data: None,
+                        timestamp: std::time::SystemTime::UNIX_EPOCH,
+                    })
+                    .collect(),
             },
             &app.state,
         )
         .unwrap();
-    app.open_builtin_picker(PickerKind::Diagnostics);
-    let row = &app.ui.picker.as_ref().unwrap().rows[0];
+}
+
+#[test]
+fn problems_rows_are_sorted_and_show_severity_file_location_message_and_source() {
+    use crate::app::tests::driver::TestSession;
+    use crate::config::ExplorerIconMode::{Ascii, NerdFont};
+    use crate::workspace::DiagnosticSeverity::{Error, Hint, Information, Warning};
+    let rust = crate::files::file_icon("a.rs").unwrap().glyph;
+    for (mode, glyphs, file, custom) in [
+        (
+            NerdFont,
+            ["\u{f057}", "\u{f071}", "\u{f05a}", "\u{f0eb}"],
+            rust,
+            "*",
+        ),
+        (Ascii, ["E", "W", "I", "H"], ".", "."),
+    ] {
+        let mut loaded = crate::config::load_bundled_config();
+        loaded.config.ui.explorer.icon_mode = mode;
+        loaded
+            .config
+            .ui
+            .buffer_line
+            .extension_icons
+            .insert("toml".into(), "*".into());
+        let mut session = TestSession::new(loaded);
+        let app = session.application_mut();
+        publish_problems(
+            app,
+            "a.rs",
+            &[
+                (0, Hint, "expected due to this"),
+                (1, Warning, "unused variable"),
+                (11, Error, "later line"),
+                (2, Error, "later column"),
+                (0, Error, "mismatched types\nnot visible"),
+            ],
+        );
+        publish_problems(
+            app,
+            "b.toml",
+            &[(0, Information, "type details"), (0, Error, "other file")],
+        );
+        app.set_dashboard_visibility(false);
+        session.resize(120, 40);
+        for key in ["space", "s", "d"] {
+            session.key(key);
+        }
+        let rows = &session.application().ui.picker.as_ref().unwrap().rows;
+        assert_eq!(
+            rows.iter()
+                .map(|row| (row.label.as_str(), row.detail.as_str(), row.source.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                ("a.rs:1:1", "mismatched types", "rustc E0308"),
+                ("a.rs:1:3", "later column", "rustc E0308"),
+                ("a.rs:2:1", "later line", "rustc E0308"),
+                ("b.toml:1:1", "other file", "rustc E0308"),
+                ("a.rs:1:2", "unused variable", "rustc 7"),
+                ("b.toml:1:1", "type details", "rustc 7"),
+                ("a.rs:1:1", "expected due to this", "rustc 7"),
+            ]
+        );
+        let frame = session.frame();
+        let (error, warning, info, hint) = (glyphs[0], glyphs[1], glyphs[2], glyphs[3]);
+        for (glyph, file, location, detail, source) in [
+            (error, file, "a.rs:1:1", "mismatched types", "rustc E0308"),
+            (warning, file, "a.rs:1:2", "unused variable", "rustc 7"),
+            (info, custom, "b.toml:1:1", "type details", "rustc 7"),
+            (hint, file, "a.rs:1:1", "expected due to this", "rustc 7"),
+        ] {
+            let left = format!("{glyph} {file} {location}  {detail}");
+            assert!(
+                (0..frame.grid.height())
+                    .map(|y| frame.grid.row_text(y))
+                    .any(|line| {
+                        line.split_once(&left).is_some_and(|(_, rest)| {
+                            rest.starts_with(' ') && rest.trim_start().starts_with(source)
+                        })
+                    }),
+                "{left} with {source}"
+            );
+        }
+    }
+}
+
+#[test]
+fn problems_in_this_file_filters_by_buffer_and_refreshes_the_open_popup() {
+    use crate::app::tests::driver::TestSession;
+    use crate::workspace::DiagnosticSeverity::{Error, Hint};
+    let mut loaded = crate::config::load_bundled_config();
+    loaded.config.lsp.inline_diagnostics = crate::config::InlineDiagnostics::Off;
+    let mut session = TestSession::new(loaded);
+    let app = session.application_mut();
+    publish_problems(app, "other.rs", &[(0, Error, "other file")]);
+    publish_problems(app, "main.rs", &[(0, Hint, "local hint")]);
+    app.set_dashboard_visibility(false);
+    for key in ["space", "s", "D"] {
+        session.key(key);
+    }
+    let picker = session.application().ui.picker.as_ref().unwrap();
+    assert_eq!(picker.title, "Problems in main.rs");
+    assert_eq!(picker.rows.len(), 1);
+    assert_eq!(picker.rows[0].detail, "local hint");
+    let app = session.application_mut();
+    publish_problems(app, "main.rs", &[(0, Error, "new local error")]);
+    app.sync_ui_diagnostics();
+    let picker = app.ui.picker.as_ref().unwrap();
+    assert_eq!(picker.rows.len(), 1);
+    assert_eq!(picker.rows[0].detail, "new local error");
+}
+
+#[test]
+fn leader_x_x_opens_a_popup_without_taking_editor_rows() {
+    use crate::app::tests::driver::TestSession;
+    let mut session = TestSession::new(crate::config::load_bundled_config());
+    let app = session.application_mut();
+    app.state
+        .open_text(TextBuffer::from_text("editor\n"), None)
+        .unwrap();
+    app.set_dashboard_visibility(false);
+    app.reconcile_editor_windows();
+    let before = session.application().workspace_bounds().unwrap();
+    for key in ["space", "x", "x"] {
+        session.key(key);
+    }
+    let app = session.application();
     assert_eq!(
-        row.label,
-        format!(
-            "packages{0}deeply{0}nested{0}critical_invoice_handler.rs:1",
-            std::path::MAIN_SEPARATOR
+        app.ui.picker.as_ref().unwrap().surface,
+        PickerSurfaceKind::Problems
+    );
+    assert!(
+        app.ui
+            .content_tabs
+            .iter()
+            .all(|tab| tab.title != "Problems"),
+        "the popup must not add a tab: {:?}",
+        app.ui
+            .content_tabs
+            .iter()
+            .map(|tab| &tab.title)
+            .collect::<Vec<_>>()
+    );
+    let popup = app.window_session.native_ids().picker().unwrap();
+    assert!(matches!(
+        app.window_session
+            .graph()
+            .window(popup.window)
+            .unwrap()
+            .placement,
+        crate::windows::WindowPlacement::Overlay(_)
+    ));
+    assert_eq!(app.workspace_bounds(), Some(before));
+    session.key("escape");
+    assert_eq!(session.context(), "picker_normal");
+    session.key("escape");
+    assert!(session.application().ui.picker.is_none());
+}
+
+#[test]
+fn tab_problem_badge_uses_error_count_not_warning_or_related_hints() {
+    use crate::app::tests::driver::TestSession;
+    use crate::workspace::DiagnosticSeverity::{Error, Hint, Information, Warning};
+    let mut session = TestSession::new(crate::config::load_bundled_config());
+    let app = session.application_mut();
+    publish_problems(
+        app,
+        "main.rs",
+        &[
+            (0, Error, "mismatched types"),
+            (1, Hint, "expected due to this"),
+            (2, Hint, "type fixed here"),
+            (3, Information, "context"),
+            (4, Warning, "unused item"),
+        ],
+    );
+    app.set_dashboard_visibility(false);
+    app.sync_ui_diagnostics();
+    app.reconcile_editor_windows();
+    let tab = app
+        .ui
+        .content_tabs
+        .iter()
+        .find(|tab| tab.title == "main.rs")
+        .unwrap();
+    let segment = crate::ui::render::overlays::builtin_content_tab_segments(
+        tab,
+        app.configuration.settings(),
+    )
+    .into_iter()
+    .find(|segment| segment.name == "diagnostics")
+    .unwrap();
+    assert_eq!(segment.text, " \u{f057} 1");
+    assert_eq!(
+        segment.style,
+        crate::ui::Style::BufferLineDiagnostic(
+            crate::ui::ContentTabDiagnosticSeverity::Error,
+            tab.active
         )
     );
-    assert_eq!(row.detail, "Check invoice calculation");
-    assert_eq!(row.source, "test");
-    app.picker_insert("invoice calculation");
-    assert_eq!(app.ui.picker.as_ref().unwrap().rows.len(), 1);
 }
 
 #[test]

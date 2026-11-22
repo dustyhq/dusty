@@ -55,6 +55,13 @@ Dusty uses Vim-style Normal, Insert, Visual, and command-line modes.
 | File picker | `Space Space` |
 | Workspace grep | `Space /` or `Space s g` |
 
+With `[editor] wrap = true`, `j`/`k` and `Down`/`Up` move one screen row in Normal
+and Visual modes. Add a count, as in `2j`, to move by file lines instead. `gj`/`gk`
+(also `g Down`/`g Up`) count screen rows even with a count. After an operator, `dj`
+and `dk` still act on whole file lines; `dgj` and `dgk` delete up to, but not
+including, the end of the motion's range. To keep plain Vim movement in a custom
+`input.motion` binding for `j` or `k`, leave out `screen_when_uncounted`.
+
 Yank and paste share the system clipboard, as in LazyVim (`clipboard = "unnamedplus"` under
 `[editor.registers]`; set `"off"` to keep them internal). Dusty uses `wl-copy`/`wl-paste`,
 `xclip` or `xsel`; without them, yanks reach the terminal clipboard through OSC 52.
@@ -103,6 +110,7 @@ Open the explorer with `e` on the dashboard, `Space e` in Normal mode, or `:expl
 | Action | Key |
 |---|---|
 | Move | `j` / `k` |
+| First / last row | `gg` / `G` |
 | Parent / open child | `h` / `l` |
 | Open / split-open | `Enter` / `s` |
 | Add file | `a`, enter `name.ext` |
@@ -114,11 +122,18 @@ Open the explorer with `e` on the dashboard, `Space e` in Normal mode, or `:expl
 | Yank absolute path | `y` |
 | Refresh | `R` |
 | Toggle hidden / ignored | `.` / `I` |
+| Show changed line counts | `+` |
 | Open command menu | `:` |
 | Show explorer key help | `?` |
 | Close explorer | `Escape` |
 
-Rename opens the shared **Rename path** prompt, prefilled relative to its displayed workspace root. Edit the path and press Enter; Escape cancels before application. A collision keeps the entered name available for correction. Source inspection is asynchronous; wait for it to finish before submitting. Names are literal (not shell or command-line text), limited to 4096 UTF-8 bytes without controls or `..` traversal. Open dirty buffers and their split views retain their text after rename. `:explorer.rename target=...` remains the direct selected-path command with parent-relative target semantics.
+The tree shifts sideways as you select deeply nested entries. Long names keep their beginning and end. If the tree is shifted or the selected name is shortened, the bottom border shows its path relative to the project root.
+
+Press `+` to switch between Git status letters and added/removed line counts in the explorer. Folder counts include changes inside folded folders. Use `ui.explorer.git_line_counts` to make counts the default.
+
+By default, the explorer colors changed names by change type and shows staged letters in green. A file with both staged and unstaged edits shows two letters, index first. Set `ui.explorer.git_colors` to `single` for one color, or `off` to leave names unchanged and dim the status marks.
+
+Rename opens the shared **Rename path** prompt, prefilled relative to its displayed workspace root. Edit the path and press Enter; Escape cancels before application. A collision keeps the entered name available for correction. Source inspection is asynchronous; wait for it to finish before submitting. New names are literal (not shell or command-line text), limited to 4096 UTF-8 bytes without controls or `..` traversal. Existing names with control characters or invalid UTF-8 show replacement characters. Open dirty buffers and their split views retain their text after rename. `:explorer.rename target=...` remains the direct selected-path command with parent-relative target semantics.
 
 Explorer deletion opens the shared protected **Delete this path?** dialog with **No** selected. Left/Right, Tab, Y/N choose an answer; Enter submits it; Escape cancels without answering. Dusty disables positive confirmation until the complete escaped target is visible, so resize a too-small terminal before choosing **Yes**. Deletion requires confirmation; pressing `d` alone never deletes the path.
 
@@ -162,7 +177,7 @@ Text-entry modes keep `?` as text, and the editor/dashboard retain their existin
 
 Diagnostic messages appear beside the affected source line by default. Navigating to a diagnostic expands every matching message for that line below it.
 
-**Turning things off:** `Space u d` toggles messages beside code for now. To set a default, use **Settings → Messages Beside Code**, or set `inline_diagnostics = "off"` (or `"errors"`) under `[lsp]`. Underlines and gutter marks stay visible, and `Space x x` still lists problems. `Space u c` toggles completion while typing; to set a default, use **Settings → Completion While Typing** or set `auto_completion = false` under `[lsp]`. `Ctrl-Space` still opens completion. Both toggles reset to their configured values whenever Dusty reloads its config, even on an automatic reload. `Space u h` toggles inlay hints; set `inlay_hints = false` under `[lsp]` to turn them off by default.
+**Turning things off:** `Space u d` toggles messages beside code for now. To set a default, use **Settings → Messages Beside Code**, or set `inline_diagnostics = "off"` (or `"errors"`) under `[lsp]`. Underlines and gutter marks stay visible, and `Space x x` still opens Problems. `Space u c` toggles completion while typing; to set a default, use **Settings → Completion While Typing** or set `auto_completion = false` under `[lsp]`. `Ctrl-Space` still opens completion. Both toggles reset to their configured values whenever Dusty reloads its config, even on an automatic reload. `Space u h` toggles inlay hints; set `inlay_hints = false` under `[lsp]` to turn them off by default.
 
 | Action | Next | Previous |
 |---|---|---|
@@ -171,7 +186,7 @@ Diagnostic messages appear beside the affected source line by default. Navigatin
 | Error or warning | `]d` | `[d` |
 | Git hunk | `]h` | `[h` |
 
-`Space x x` toggles the **Problems panel** below the editor; `Space x X` opens it for just the current file. It groups diagnostics and failed tests by file and updates while you edit, even when messages beside code are off. Use `j`/`k` or the arrows to move, `Enter` (or double-click) to jump and keep the panel open, `o` to jump and close it, and `q` or `Esc` to close it. `Ctrl-k` moves focus up. `]d` and `[d` also select the problem you jump to in the panel. Use `Space s d` for the floating, searchable Problems picker. The status line shows error/warning counts for the active buffer.
+`Space x x` (or `Space s d`) opens **Problems**: every diagnostic and failed test in the workspace, errors first. `Space x X` (or `Space s D`) shows only the current file. Type to filter, `Enter` jumps to the problem, `Esc` closes. The list updates while you edit, even when messages beside code are off. The status line and each tab show the error or warning count for that file.
 
 For an existing named file, LSP synchronization uses every in-memory buffer revision. Saving is **not** required for diagnostics, completion, hover, semantic data, or inlay hints to update. Server startup still requires a named file inside a recognized project and a trusted workspace.
 

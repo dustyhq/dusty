@@ -219,6 +219,16 @@ fn fitted_grep_cells(
     fitted
 }
 
+fn problem_cell_width(cell: &super::PickerCell, config: &Config) -> u16 {
+    u16::try_from(text_width(&cell.text, config.editor.ambiguous_width)).unwrap_or(u16::MAX)
+}
+
+fn problem_prefix_width(row: &super::PickerRow, config: &Config) -> u16 {
+    row.cells.iter().fold(0u16, |width, cell| {
+        width.saturating_add(problem_cell_width(cell, config))
+    })
+}
+
 /// Emphasise only complete query matches in the visible row, after its columns are fitted.
 pub(super) fn highlight_picker_matches(
     frame: &mut Frame,
@@ -652,6 +662,8 @@ pub(super) fn render_picker(
             "picker_no_matches"
         } else if picker.surface == PickerSurfaceKind::Grep {
             "picker_grep_hint"
+        } else if picker.surface == PickerSurfaceKind::Problems {
+            "picker_problems_empty"
         } else {
             "picker_empty"
         };
@@ -672,6 +684,14 @@ pub(super) fn render_picker(
         let y = first_row + u16::try_from(display_row).unwrap_or(0);
         let selected = picker.selected == Some(index);
         let marker = if selected { ">" } else { " " };
+        // Problems uses its cells as a styled prefix before the usual location and message.
+        let problems = picker.surface == PickerSurfaceKind::Problems;
+        let prefix = if problems {
+            problem_prefix_width(row, config)
+        } else {
+            0
+        };
+        let label_x = content_left.saturating_add(prefix);
         // Every picker uses the same trailing provenance column. Reserve at
         // most a third of the row so long sources cannot crowd out the label.
         let source_right = list_right.saturating_sub(1);
@@ -712,7 +732,7 @@ pub(super) fn render_picker(
         let (label, detail) = fitted_picker_row(
             &row.label,
             &row.detail,
-            usize::from(label_right.saturating_sub(content_left))
+            usize::from(label_right.saturating_sub(label_x))
                 .saturating_sub(text_width(marker, ambiguous) + 1),
             ambiguous,
         );
@@ -738,7 +758,7 @@ pub(super) fn render_picker(
             );
             continue;
         }
-        if !row.cells.is_empty() {
+        if !problems && !row.cells.is_empty() {
             // A row with cells draws every column at its own declared width with its own
             // style, so a status column, a lane and a badge are coloured independently.
             // The marker keeps focus legible; a cell that carries a meaningful style keeps
@@ -808,10 +828,37 @@ pub(super) fn render_picker(
             }
             continue;
         }
+        let (text_x, text) = if problems && !row.cells.is_empty() {
+            let style = if selected {
+                Style::Selection
+            } else {
+                Style::Default
+            };
+            frame
+                .grid
+                .put_text_clipped(content_left, y, marker, style, label_right);
+            let mut x = content_left.saturating_add(2);
+            for cell in &row.cells {
+                let next = x.saturating_add(problem_cell_width(cell, config));
+                let style = match cell.style {
+                    Style::ProblemSeverity(severity, _) => {
+                        Style::ProblemSeverity(severity, selected)
+                    }
+                    _ => style,
+                };
+                frame
+                    .grid
+                    .put_text_clipped(x, y, &cell.text, style, next.min(label_right));
+                x = next;
+            }
+            (x, &text[2..])
+        } else {
+            (content_left, text.as_str())
+        };
         frame.grid.put_text_clipped(
-            content_left,
+            text_x,
             y,
-            &text,
+            text,
             if selected {
                 Style::Selection
             } else {
@@ -824,7 +871,9 @@ pub(super) fn render_picker(
                 source_x,
                 y,
                 &source,
-                if selected {
+                if problems {
+                    Style::ProblemSeverity(crate::workspace::DiagnosticSeverity::Hint, selected)
+                } else if selected {
                     Style::Selection
                 } else {
                     Style::Muted
@@ -841,14 +890,20 @@ pub(super) fn render_picker(
         .enumerate()
     {
         if row.kind == PickerRowKind::Entry {
+            let prefix = if picker.surface == PickerSurfaceKind::Problems {
+                problem_prefix_width(row, config)
+            } else {
+                0
+            };
+            let match_x = content_left.saturating_add(2).saturating_add(prefix);
             highlight_picker_matches(
                 frame,
                 &picker.query,
                 picker.surface == PickerSurfaceKind::Grep,
                 WindowRect {
-                    x: content_left.saturating_add(2),
+                    x: match_x,
                     y: first_row.saturating_add(display_row as u16),
-                    width: list_right.saturating_sub(content_left.saturating_add(2)),
+                    width: list_right.saturating_sub(match_x),
                     height: 1,
                 },
             );
@@ -1172,6 +1227,11 @@ pub fn picker_content_geometry(
             text_width(&row.label, config.editor.ambiguous_width)
                 .saturating_add(text_width(&row.detail, config.editor.ambiguous_width))
                 .saturating_add(text_width(&row.source, config.editor.ambiguous_width))
+                .saturating_add(if picker.surface == PickerSurfaceKind::Problems {
+                    usize::from(problem_prefix_width(row, config))
+                } else {
+                    0
+                })
                 .saturating_add(8)
         })
         .max()

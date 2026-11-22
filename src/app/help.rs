@@ -324,6 +324,10 @@ mod tests {
         assert!(picker.rows.iter().any(|row| {
             row.label.starts_with("r  ") && row.detail.contains("explorer.rename.prompt")
         }));
+        assert!(picker.rows.iter().any(|row| {
+            row.label == "+  Show changed line counts"
+                && row.detail == "explorer.git_line_counts.toggle"
+        }));
         assert!(picker.rows.iter().all(|row| row.source == "explorer"));
         app.picker_insert("rename");
         assert!(!app.search.picker().unwrap().presentation().rows.is_empty());

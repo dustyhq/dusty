@@ -1,5 +1,6 @@
 //! Content rectangles shared by surface painting and interaction.
 use crate::config::AmbiguousWidth;
+use std::borrow::Cow;
 
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
@@ -10,6 +11,22 @@ pub fn text_width(text: &str, ambiguous_width: AmbiguousWidth) -> usize {
     } else {
         UnicodeWidthStr::width(text)
     }
+}
+
+/// Display a (possibly lossy) file name or path without letting controls affect the screen.
+pub fn sanitize_file_name(name: &str) -> Cow<'_, str> {
+    if !name.chars().any(char::is_control) {
+        return Cow::Borrowed(name);
+    }
+    let mut safe = String::with_capacity(name.len());
+    for c in name.chars() {
+        if c.is_control() {
+            safe.push_str(crate::grid::CONTROL_CHARACTER_REPLACEMENT);
+        } else {
+            safe.push(c);
+        }
+    }
+    Cow::Owned(safe)
 }
 
 /// Width of text painted by CellGrid, including its visible replacements.

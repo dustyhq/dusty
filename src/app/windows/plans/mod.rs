@@ -765,7 +765,6 @@ impl Windows {
             descriptions.signature.focused_explorer = None;
             descriptions.signature.terminal_focused = false;
             descriptions.signature.agent_focused = false;
-            descriptions.signature.problems_panel_focused = false;
         }
         if plan.hide_dashboard {
             descriptions.signature.dashboard_visible = source.active_tab().is_none();

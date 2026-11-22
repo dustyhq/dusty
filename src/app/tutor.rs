@@ -1616,6 +1616,7 @@ impl App {
             let view = &mut self.state.views[view_id];
             view.cursor = ByteOffset(from.get() + indent);
             view.preferred_column = None;
+            view.preferred_screen_column = None;
             view.selection = None;
             view.scroll_line = line.saturating_sub(6);
             view.scroll_wrap_row = 0;

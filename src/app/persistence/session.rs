@@ -198,13 +198,14 @@ impl Persistence {
     }
     pub(in crate::app) fn begin_restore(
         &mut self,
-        session: PersistedSession,
+        mut session: PersistedSession,
         context: RestoreContext<'_>,
         maximum: usize,
     ) -> Result<Option<Vec<PathBuf>>, String> {
         if self.restore.is_some() || self.closing {
             return Err("session restoration is already pending or closing".into());
         }
+        session.discard_legacy_problems_panel();
         validate_window_rules(&session.window_rules).map_err(|error| error.to_string())?;
         validate_content_descriptors(&session, maximum).map_err(|error| error.to_string())?;
         let Some(source) = self.load_source.take() else {

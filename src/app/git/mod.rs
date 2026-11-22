@@ -28,6 +28,7 @@ use crate::git::GitMutationRequestId;
 use crate::git::GitMutationWorker;
 use crate::git::GitRepositoryId;
 use crate::git::GitResetHunkRequest;
+use crate::git::GitStatusLineCounts;
 use crate::git::GitStatusPolicy;
 use crate::git::GitStatusRequestId;
 use crate::git::GitStatusSnapshot;
@@ -327,6 +328,7 @@ impl Git {
         root: Option<&Path>,
         revision: u64,
         report: bool,
+        line_counts: GitStatusLineCounts,
     ) -> Result<(), String> {
         self.clear_status();
         self.silent = !report;
@@ -334,7 +336,7 @@ impl Git {
             Some(root) => {
                 let unsaved = Self::unsaved_documents(editor, root);
                 self.status
-                    .start_with_unsaved(
+                    .start_with_details(
                         GitStatusPolicy {
                             root: root.to_owned(),
                             root_revision: revision,
@@ -343,6 +345,7 @@ impl Git {
                             deadline: Duration::from_secs(5),
                         },
                         unsaved,
+                        line_counts,
                     )
                     .map_err(|e| e.to_string())
             }
@@ -1671,7 +1674,9 @@ mod regression_tests {
     }
 
     pub(in crate::app) fn refresh(session: &mut Git, editor: &EditorState, root: &Path) {
-        session.refresh(editor, Some(root), 1, true).unwrap();
+        session
+            .refresh(editor, Some(root), 1, true, GitStatusLineCounts::Omit)
+            .unwrap();
         let deadline = Instant::now() + Duration::from_secs(30);
         while session.status_pending() {
             session.poll_status(1).unwrap();
@@ -1714,7 +1719,13 @@ mod regression_tests {
         app.git = git;
         let revision = app.workspace.root_revision();
         app.git
-            .refresh(&app.state, Some(dir.path()), revision, true)
+            .refresh(
+                &app.state,
+                Some(dir.path()),
+                revision,
+                true,
+                GitStatusLineCounts::Omit,
+            )
             .unwrap();
         let deadline = Instant::now() + Duration::from_secs(30);
         while app.git.status_pending() {
@@ -2211,7 +2222,13 @@ mod regression_tests {
         let (dir, _, editor, mut session) = fixture();
         session.start_branches(dir.path(), 1).unwrap();
         session
-            .refresh(&editor, Some(dir.path()), 1, false)
+            .refresh(
+                &editor,
+                Some(dir.path()),
+                1,
+                false,
+                GitStatusLineCounts::Omit,
+            )
             .unwrap();
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
@@ -3448,11 +3465,17 @@ impl App {
             .and_then(|id| self.workspace.roots().iter().find(|r| r.id == id))
             .map(|r| r.identity.canonical_path.as_path());
         self.ui.git_signs.clear();
+        let line_counts = if self.explorer.git_line_counts() {
+            GitStatusLineCounts::Include
+        } else {
+            GitStatusLineCounts::Omit
+        };
         if let Err(error) = self.git.refresh(
             &self.state,
             root,
             self.workspace.root_revision(),
             report_errors,
+            line_counts,
         ) {
             self.show_error(error);
         }

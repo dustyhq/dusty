@@ -73,6 +73,7 @@ pub use settings::DocumentationPopupConfig;
 pub use settings::EditorConfig;
 pub use settings::EditorViewportConfig;
 pub use settings::ExplorerConfig;
+pub use settings::ExplorerGitColors;
 pub use settings::ExplorerGlyphSet;
 pub use settings::ExplorerGlyphs;
 pub use settings::ExplorerIconMode;

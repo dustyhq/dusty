@@ -42,6 +42,16 @@ pub(in crate::app) fn register_commands(
             AppEffect::ExplorerMove(-1),
         ),
         (
+            "explorer.first",
+            "Select first explorer row",
+            AppEffect::ExplorerMove(isize::MIN),
+        ),
+        (
+            "explorer.last",
+            "Select last explorer row",
+            AppEffect::ExplorerMove(isize::MAX),
+        ),
+        (
             "explorer.page_up",
             "Page explorer selection up",
             AppEffect::ExplorerPage(-1),
@@ -85,6 +95,11 @@ pub(in crate::app) fn register_commands(
             "explorer.ignored.toggle",
             "Toggle ignored explorer entries",
             AppEffect::ExplorerToggleIgnored,
+        ),
+        (
+            "explorer.git_line_counts.toggle",
+            "Show changed line counts",
+            AppEffect::ExplorerToggleGitLineCounts,
         ),
         (
             "explorer.file.open",
@@ -266,7 +281,7 @@ impl App {
                 self.ensure_cursor_visible();
             }
             AppEffect::ExplorerMove(delta) => {
-                self.move_explorer_selection(isize::from(delta));
+                self.move_explorer_selection(delta);
             }
             AppEffect::ExplorerPage(direction) => self.page_explorer_selection(direction),
             AppEffect::ExplorerParent => self.explorer_collapse_or_parent(),
@@ -287,6 +302,10 @@ impl App {
             AppEffect::ExplorerToggleIgnored => {
                 self.explorer.toggle_ignored();
                 self.refresh_explorer();
+            }
+            AppEffect::ExplorerToggleGitLineCounts => {
+                self.set_explorer_git_line_counts(!self.explorer.git_line_counts());
+                self.sync_explorer_ui();
             }
             AppEffect::ExplorerFileOpen { split } => self.explorer_open_file(split),
             AppEffect::ExplorerCreate(path) => self.create_explorer_path(path),

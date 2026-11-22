@@ -7,6 +7,7 @@ use crate::editor::state::EditingPolicy;
 use crate::editor::state::FoldedLines;
 
 use crate::editor::state::RegisterShape;
+use crate::editor::state::ScreenDirection;
 
 use crate::editor::state::SelectionKind;
 
@@ -429,16 +430,41 @@ fn vertical_destination(
 #[allow(clippy::too_many_arguments)]
 pub(super) fn operator_range(
     buffer: &Buffer,
-    cursor: ByteOffset,
+    view: &View,
     motion: &str,
     count: usize,
     operator: &str,
     linewise: bool,
     character: Option<char>,
     policy: EditingPolicy,
-    folds: &FoldedLines,
 ) -> Result<Option<(ByteRange, RegisterShape)>, CommandError> {
     let text = &buffer.text;
+    let cursor = view.cursor;
+    let folds = &view.folded_lines;
+    if let Some(direction) = ScreenDirection::from_motion(motion) {
+        let target = if let Some(projection) = view.projected_screen_motion(direction, count) {
+            projection.target
+        } else {
+            motion_target(
+                buffer,
+                cursor,
+                direction.file_motion(),
+                count,
+                None,
+                policy,
+                view.preferred_column,
+                folds,
+            )?
+        };
+        let target = on_last_character(text, target)?;
+        // Unlike file-line motions, screen-row motions exclude the end of the range.
+        return if cursor == target {
+            Ok(None)
+        } else {
+            let range = ByteRange::new(cursor.min(target), cursor.max(target)).map_err(failed)?;
+            Ok(Some((range, RegisterShape::Character)))
+        };
+    }
     let objects = buffer.current_syntax_objects();
     let shape = if linewise {
         RegisterShape::Line

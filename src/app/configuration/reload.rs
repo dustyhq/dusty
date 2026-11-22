@@ -179,6 +179,9 @@ impl App {
         );
         self.resize_active_terminal_to_panel();
         self.sync_terminal_panel();
+        self.set_explorer_git_line_counts(
+            self.configuration.settings().ui.explorer.git_line_counts,
+        );
         self.sync_explorer_ui();
         self.rebuild_matcher_cache();
         if let Some(menu) = &self.ui.tool_menu {

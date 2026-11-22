@@ -6432,7 +6432,7 @@ fn leader_u_c_toggles_completion_while_typing_but_keeps_ctrl_space() {
 }
 
 #[test]
-fn inline_diagnostics_off_notice_prefers_the_problems_panel_shortcut() {
+fn inline_diagnostics_off_notice_shows_a_problems_popup_shortcut() {
     let (_app_dirs, mut app) = app();
     app.state
         .open_text(TextBuffer::from_text(""), None)
@@ -6444,28 +6444,8 @@ fn inline_diagnostics_off_notice_prefers_the_problems_panel_shortcut() {
     }
     assert_eq!(
         app.ui.notification.as_deref(),
-        Some("Messages beside code: off · Space x x opens Problems")
+        Some("Messages beside code: off · Space s d opens Problems")
     );
-}
-
-#[test]
-fn inline_diagnostics_off_notice_has_no_shortcut_while_problems_is_open() {
-    let mut session =
-        crate::app::tests::driver::TestSession::new(crate::config::load_bundled_config());
-    let app = session.application_mut();
-    app.state
-        .open_text(TextBuffer::from_text("source"), None)
-        .unwrap();
-    app.set_dashboard_visibility(false);
-    for key in ["space", "x", "x", "ctrl-k"] {
-        session.key(key);
-    }
-    assert!(session.application().problems_panel.is_some());
-    assert_eq!(session.context(), "editor.normal");
-    for key in ["space", "u", "d"] {
-        session.key(key);
-    }
-    assert_eq!(session.notification(), Some("Messages beside code: off"));
 }
 
 #[test]
@@ -6481,6 +6461,7 @@ fn inline_diagnostics_off_notice_uses_live_editor_key_layers() {
     let stock = ["space", "x", "x"].map(|key| key.parse().unwrap());
     let mut layer = Keymap::default();
     layer.insert_disabled(&stock);
+    layer.insert_disabled(&["space", "s", "d"].map(|key| key.parse().unwrap()));
     app.process_effect(AppEffect::Input(InputCommand::PushLayer(Box::new(layer))));
 
     let toggle = |app: &mut App| {
@@ -6498,7 +6479,7 @@ fn inline_diagnostics_off_notice_uses_live_editor_key_layers() {
     let mut layer = Keymap::default();
     layer.insert(
         &["f6".parse().unwrap()],
-        crate::app::command("diagnostic.panel.toggle").unwrap(),
+        crate::app::command("diagnostic.open").unwrap(),
     );
     app.process_effect(AppEffect::Input(InputCommand::PushLayer(Box::new(layer))));
     toggle(&mut app);
@@ -6507,7 +6488,10 @@ fn inline_diagnostics_off_notice_uses_live_editor_key_layers() {
         Some("Messages beside code: off · f6 opens Problems")
     );
     app.handle_configured_key("f6".parse().unwrap());
-    assert!(app.problems_panel.is_some());
+    assert_eq!(
+        app.ui.picker.as_ref().unwrap().surface,
+        crate::ui::PickerSurfaceKind::Problems
+    );
 }
 
 #[test]

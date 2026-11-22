@@ -358,6 +358,9 @@ fn choice_label<'a>(key: &str, value: &'a str) -> &'a str {
         ("agents.placement", "docked") => "Docked",
         ("agents.placement", "float") => "Floating",
         ("agents.placement", "fullscreen") => "Fullscreen",
+        ("ui.explorer.git_colors", "kind") => "By change",
+        ("ui.explorer.git_colors", "single") => "One color",
+        ("ui.explorer.git_colors", "off") => "Off",
         _ => value,
     }
 }

@@ -1,6 +1,6 @@
 //! Repository status reads and accepted snapshots.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::hash::Hash;
 use std::hash::Hasher;
 use std::path::Path;
@@ -242,6 +242,21 @@ impl GitStatusEntry {
         )
     }
 }
+/// The line changes counted against HEAD, or lines in an untracked file.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct GitLineCounts {
+    pub added: usize,
+    pub removed: usize,
+}
+
+/// Whether to collect line counts in addition to the ordinary status.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum GitStatusLineCounts {
+    #[default]
+    Omit,
+    Include,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct GitStatusSnapshot {
     pub request_id: GitStatusRequestId,
@@ -253,11 +268,26 @@ pub struct GitStatusSnapshot {
     pub worktree_repository: Option<String>,
     pub scope_root: PathBuf,
     pub repository_id: GitRepositoryId,
+    /// Entries sorted by their scope-relative paths.
     pub entries: Vec<GitStatusEntry>,
+    /// Counts keyed by absolute path, including totals for ancestor directories.
+    #[serde(default)]
+    pub line_counts: BTreeMap<PathBuf, GitLineCounts>,
     pub truncated: bool,
     pub revision: u64,
 }
 impl GitStatusSnapshot {
+    /// Find the file's index and worktree status by absolute path.
+    #[must_use]
+    pub fn entry(&self, absolute_path: &Path) -> Option<&GitStatusEntry> {
+        let relative = absolute_path.strip_prefix(&self.scope_root).ok()?;
+        let index = self
+            .entries
+            .binary_search_by(|entry| entry.relative_path.as_path().cmp(relative))
+            .ok()?;
+        self.entries.get(index)
+    }
+
     /// Update editor-only changes without re-reading or changing the disk status revision.
     pub fn reconcile_unsaved_documents(
         &mut self,
@@ -352,7 +382,14 @@ pub struct GitStatusWorker {
     active_request_id: Option<GitStatusRequestId>,
     revision: u64,
     worker: Option<thread::JoinHandle<()>>,
-    pending: Option<(GitStatusRequestId, GitStatusPolicy, Vec<GitUnsavedDocument>)>,
+    pending: Option<StatusRequest>,
+}
+
+struct StatusRequest {
+    id: GitStatusRequestId,
+    policy: GitStatusPolicy,
+    unsaved: Vec<GitUnsavedDocument>,
+    line_counts: GitStatusLineCounts,
 }
 impl GitStatusWorker {
     pub fn start(&mut self, policy: GitStatusPolicy) -> Result<GitStatusRequestId, GitStatusError> {
@@ -365,6 +402,16 @@ impl GitStatusWorker {
         &mut self,
         policy: GitStatusPolicy,
         unsaved: Vec<GitUnsavedDocument>,
+    ) -> Result<GitStatusRequestId, GitStatusError> {
+        self.start_with_details(policy, unsaved, GitStatusLineCounts::Omit)
+    }
+
+    /// Start the same bounded status refresh, with optional worktree line counts.
+    pub fn start_with_details(
+        &mut self,
+        policy: GitStatusPolicy,
+        unsaved: Vec<GitUnsavedDocument>,
+        line_counts: GitStatusLineCounts,
     ) -> Result<GitStatusRequestId, GitStatusError> {
         if policy.maximum_files == 0
             || policy.maximum_files > 100_000
@@ -380,7 +427,12 @@ impl GitStatusWorker {
         self.next = self.next.saturating_add(1);
         let request_id = GitStatusRequestId(self.next);
         self.active_request_id = Some(request_id);
-        self.pending = Some((request_id, policy, unsaved));
+        self.pending = Some(StatusRequest {
+            id: request_id,
+            policy,
+            unsaved,
+            line_counts,
+        });
         self.launch_pending()?;
         Ok(request_id)
     }
@@ -396,7 +448,13 @@ impl GitStatusWorker {
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
         }
-        let Some((request_id, policy, unsaved)) = self.pending.take() else {
+        let Some(StatusRequest {
+            id: request_id,
+            policy,
+            unsaved,
+            line_counts,
+        }) = self.pending.take()
+        else {
             return Ok(());
         };
         let cancel = Arc::new(AtomicBool::new(false));
@@ -406,7 +464,13 @@ impl GitStatusWorker {
             thread::Builder::new()
                 .name(format!("dusty-git-status-{}", request_id.0))
                 .spawn(move || {
-                    let result = read_status(request_id, &policy, &unsaved, &worker);
+                    let result = read_status_with_details(
+                        request_id,
+                        &policy,
+                        &unsaved,
+                        line_counts,
+                        &worker,
+                    );
                     let _ = tx.send(Event::Complete(result));
                 })
                 .map_err(|_| GitStatusError::Stopped)?,
@@ -438,6 +502,7 @@ impl GitStatusWorker {
                     old.repository != snapshot.repository
                         || old.scope_root != snapshot.scope_root
                         || old.entries != snapshot.entries
+                        || old.line_counts != snapshot.line_counts
                         || old.truncated != snapshot.truncated
                         || old.root_revision != snapshot.root_revision
                 });
@@ -480,8 +545,18 @@ pub(super) fn git_status_precedence(status: &GitFileStatus) -> u8 {
     }
 }
 
-/// Build immutable file and ancestor-directory decorations. Conflicted wins,
-/// followed by deleted, renamed, modified, added, and untracked.
+fn folder_status_precedence(status: &GitFileStatus) -> u8 {
+    match status {
+        GitFileStatus::Renamed => 0,
+        GitFileStatus::Untracked => 1,
+        GitFileStatus::Added => 2,
+        GitFileStatus::Modified | GitFileStatus::TypeChanged | GitFileStatus::Deleted => 3,
+        GitFileStatus::Conflicted => 4,
+    }
+}
+
+/// Keep each file's merged status and roll the most serious change from either
+/// Git column into its ancestor directories. Deletions count as modifications there.
 #[must_use]
 pub fn aggregate_git_status(
     scope_root: &Path,
@@ -501,16 +576,30 @@ pub fn aggregate_git_status(
         if !absolute.starts_with(scope_root) {
             continue;
         }
+        let folder_status = entry
+            .staged_status
+            .iter()
+            .chain(&entry.unstaged_status)
+            .chain(std::iter::once(&entry.status))
+            .max_by_key(|status| folder_status_precedence(status))
+            .unwrap_or(&entry.status);
+        let folder_status = if *folder_status == GitFileStatus::Deleted {
+            &GitFileStatus::Modified
+        } else {
+            folder_status
+        };
         let mut current = Some(absolute.as_path());
-        while let Some(path) = current {
-            if !path.starts_with(scope_root) {
-                break;
-            }
+        while let Some(path) = current.filter(|path| path.starts_with(scope_root)) {
+            let status = if path == absolute.as_path() && path != scope_root {
+                &entry.status
+            } else {
+                folder_status
+            };
             let replace = result.get(path).is_none_or(|existing| {
-                git_status_precedence(&entry.status) > git_status_precedence(existing)
+                folder_status_precedence(status) > folder_status_precedence(existing)
             });
             if replace {
-                result.insert(path.to_path_buf(), entry.status.clone());
+                result.insert(path.to_path_buf(), status.clone());
             }
             if path == scope_root {
                 break;
@@ -652,10 +741,94 @@ pub(super) fn status_command(
     }
 }
 
+fn parse_numstat(output: &[u8]) -> impl Iterator<Item = (PathBuf, GitLineCounts)> {
+    let mut fields = output
+        .split_inclusive(|byte| *byte == 0)
+        .filter_map(|field| field.strip_suffix(&[0]));
+    std::iter::from_fn(move || {
+        while let Some(field) = fields.next() {
+            let mut parts = field.splitn(3, |byte| *byte == b'\t');
+            let (Some(added), Some(removed), Some(path)) =
+                (parts.next(), parts.next(), parts.next())
+            else {
+                continue;
+            };
+            let path = if path.is_empty() {
+                // In -z output, renames/copies have a NUL before the old and new paths.
+                fields.next()?;
+                fields.next()?
+            } else {
+                path
+            };
+            let parse = |number| std::str::from_utf8(number).ok()?.parse::<usize>().ok();
+            // A binary record has "-" for both counts, including when it was renamed.
+            if let (Some(added), Some(removed), Some(path)) = (
+                parse(added),
+                parse(removed),
+                crate::conflict::git_path(path),
+            ) {
+                return Some((path, GitLineCounts { added, removed }));
+            }
+        }
+        None
+    })
+}
+
+fn aggregate_line_counts(
+    root: &Path,
+    files: impl IntoIterator<Item = (PathBuf, GitLineCounts)>,
+) -> BTreeMap<PathBuf, GitLineCounts> {
+    let mut result = BTreeMap::<PathBuf, GitLineCounts>::new();
+    for (path, counts) in files {
+        if counts.added == 0 && counts.removed == 0 {
+            continue;
+        }
+        for ancestor in path.ancestors().take_while(|path| path.starts_with(root)) {
+            let total = result
+                .entry(ancestor.to_path_buf())
+                .or_insert(GitLineCounts {
+                    added: 0,
+                    removed: 0,
+                });
+            total.added = total.added.saturating_add(counts.added);
+            total.removed = total.removed.saturating_add(counts.removed);
+        }
+    }
+    result
+}
+
+fn count_untracked_lines(path: &Path) -> Option<GitLineCounts> {
+    const MAXIMUM_BYTES: u64 = 1024 * 1024;
+    let bytes = crate::files::read_file_bounded(path, MAXIMUM_BYTES).ok()?;
+    if bytes.contains(&0) {
+        return None;
+    }
+    let added = bytes.iter().filter(|&&byte| byte == b'\n').count()
+        + usize::from(bytes.last().is_some_and(|&last| last != b'\n'));
+    Some(GitLineCounts { added, removed: 0 })
+}
+
+#[cfg(test)]
 pub(super) fn read_status(
+    request_id: GitStatusRequestId,
+    policy: &GitStatusPolicy,
+    unsaved: &[GitUnsavedDocument],
+    cancel: &AtomicBool,
+) -> Result<GitStatusSnapshot, GitStatusError> {
+    read_status_with_details(
+        request_id,
+        policy,
+        unsaved,
+        GitStatusLineCounts::Omit,
+        cancel,
+    )
+}
+
+fn read_status_with_details(
     request_id: GitStatusRequestId,
     p: &GitStatusPolicy,
     unsaved: &[GitUnsavedDocument],
+    line_counts: GitStatusLineCounts,
     cancel: &AtomicBool,
 ) -> Result<GitStatusSnapshot, GitStatusError> {
     let root = crate::files::canonicalize(&p.root).map_err(|e| backend(&e.to_string()))?;
@@ -805,6 +978,7 @@ pub(super) fn read_status(
             .collect::<Vec<_>>()
     });
     let mut output_truncated = false;
+    let mut submodules = BTreeSet::new();
     for ((arguments, source), output) in commands.into_iter().zip(outputs) {
         let (output, clipped) = output?;
         output_truncated |= clipped;
@@ -845,6 +1019,19 @@ pub(super) fn read_status(
             };
             let path = crate::conflict::git_path(path)
                 .ok_or_else(|| backend("unsupported Git path encoding"))?;
+            if line_counts == GitStatusLineCounts::Include
+                && field.first() == Some(&b':')
+                && arguments[0] == "diff"
+                && field[1..]
+                    .split(|byte| *byte == b' ')
+                    .take(2)
+                    .any(|mode| mode == b"160000")
+            {
+                submodules.insert(workdir.join(&path));
+                if let Some(original) = &original {
+                    submodules.insert(workdir.join(original));
+                }
+            }
             if !add(path, original, status, source) {
                 break;
             }
@@ -878,6 +1065,61 @@ pub(super) fn read_status(
             },
         );
     }
+    let line_counts = if line_counts == GitStatusLineCounts::Include {
+        let mut files = BTreeMap::new();
+        // On an unborn branch HEAD does not exist. Still count untracked text files.
+        if let Ok((output, false)) = status_command(
+            &workdir,
+            &[
+                "diff",
+                "HEAD",
+                "--numstat",
+                "-z",
+                "--find-renames",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--",
+            ],
+            p,
+            started,
+            cancel,
+        ) {
+            for (path, counts) in parse_numstat(&output) {
+                let absolute = workdir.join(path);
+                if !submodules.contains(&absolute)
+                    && absolute
+                        .strip_prefix(&root)
+                        .ok()
+                        .and_then(|path| entries.get(path))
+                        .is_some_and(|entry| {
+                            !matches!(
+                                entry.status,
+                                GitFileStatus::Conflicted | GitFileStatus::Untracked
+                            )
+                        })
+                {
+                    files.insert(absolute, counts);
+                }
+            }
+        }
+        for entry in entries
+            .values()
+            .filter(|entry| entry.status == GitFileStatus::Untracked)
+        {
+            if check_status_deadline(p, started, cancel).is_err() {
+                break;
+            }
+            let absolute = root.join(&entry.relative_path);
+            if !submodules.contains(&absolute)
+                && let Some(counts) = count_untracked_lines(&absolute)
+            {
+                files.insert(absolute, counts);
+            }
+        }
+        aggregate_line_counts(&root, files)
+    } else {
+        BTreeMap::new()
+    };
     let entries = entries.into_values().collect();
     let mut snapshot = GitStatusSnapshot {
         request_id,
@@ -888,11 +1130,125 @@ pub(super) fn read_status(
         scope_root: root,
         repository_id,
         entries,
+        line_counts,
         truncated,
         revision: 0,
     };
     snapshot.reconcile_unsaved_documents(unsaved, p.maximum_files, p.maximum_path_bytes);
     Ok(snapshot)
+}
+
+#[cfg(test)]
+mod line_count_tests {
+    use super::*;
+
+    #[test]
+    fn numstat_uses_nul_paths_and_the_rename_destination() {
+        let output = b"12\t3\tpath with spaces\x00\
+            4\t0\t\x00old name\x00new\tname\x00\
+            -\t-\tbinary file\x00\
+            -\t-\t\x00old binary\x00new binary\x00\
+            0\t2\tlast name\x00";
+        assert_eq!(
+            parse_numstat(output).collect::<Vec<_>>(),
+            vec![
+                (
+                    PathBuf::from("path with spaces"),
+                    GitLineCounts {
+                        added: 12,
+                        removed: 3
+                    }
+                ),
+                (
+                    PathBuf::from("new\tname"),
+                    GitLineCounts {
+                        added: 4,
+                        removed: 0
+                    }
+                ),
+                (
+                    PathBuf::from("last name"),
+                    GitLineCounts {
+                        added: 0,
+                        removed: 2
+                    }
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn untracked_counts_are_bounded_and_text_only() {
+        let folder = tempfile::tempdir().unwrap();
+        let path = folder.path().join("untracked.txt");
+        std::fs::write(&path, b"one\ntwo\nthree").unwrap();
+        assert_eq!(
+            count_untracked_lines(&path),
+            Some(GitLineCounts {
+                added: 3,
+                removed: 0
+            })
+        );
+        std::fs::write(&path, b"binary\x00data").unwrap();
+        assert_eq!(count_untracked_lines(&path), None);
+        std::fs::File::create(&path)
+            .unwrap()
+            .set_len(1024 * 1024 + 1)
+            .unwrap();
+        assert_eq!(count_untracked_lines(&path), None);
+    }
+
+    #[test]
+    fn folder_totals_include_all_descendants() {
+        let root = Path::new("workspace");
+        let counts = aggregate_line_counts(
+            root,
+            [
+                (
+                    root.join("src/main.rs"),
+                    GitLineCounts {
+                        added: 5,
+                        removed: 2,
+                    },
+                ),
+                (
+                    root.join("src/folded/inner.rs"),
+                    GitLineCounts {
+                        added: 1,
+                        removed: 3,
+                    },
+                ),
+                (
+                    root.join("other/readme"),
+                    GitLineCounts {
+                        added: 2,
+                        removed: 0,
+                    },
+                ),
+            ],
+        );
+        assert_eq!(
+            counts[&root.join("src/folded")],
+            GitLineCounts {
+                added: 1,
+                removed: 3
+            }
+        );
+        assert_eq!(
+            counts[&root.join("src")],
+            GitLineCounts {
+                added: 6,
+                removed: 5
+            }
+        );
+        assert_eq!(
+            counts[root],
+            GitLineCounts {
+                added: 8,
+                removed: 5
+            }
+        );
+    }
 }
 
 #[cfg(all(test, unix))]
@@ -1036,7 +1392,7 @@ mod tests {
                 "a second scan must not start while the old worker is alive"
             );
         }
-        assert_eq!(service.pending.as_ref().unwrap().0, latest);
+        assert_eq!(service.pending.as_ref().unwrap().id, latest);
         release.send(()).unwrap();
         let deadline = Instant::now() + Duration::from_secs(3);
         loop {

@@ -24,7 +24,9 @@ use debug::debug_layout_in;
 
 use debug::render_debug_panes;
 
+mod severity;
 pub use explorer::explorer_segment_style;
+pub use severity::severity_glyph;
 
 use explorer::place_workspace_frame;
 
@@ -87,7 +89,6 @@ pub use editor::workspace_title;
 use overlays::content_tab_width;
 
 use picker::render_picker;
-pub mod problems;
 
 use plugins::render_plugin_surface;
 
@@ -832,8 +833,6 @@ pub enum PickerSurfaceKind {
     #[default]
     Generic,
     Problems,
-    /// The native dock; unlike the picker, it does not capture input when unfocused.
-    ProblemsPanel,
     Output,
     Logs,
     Debug,
@@ -1093,8 +1092,15 @@ pub struct ExplorerUiSegment {
 pub struct ExplorerUiRow {
     pub node_id: u64,
     pub selected: bool,
+    /// One glyph string per indent level, in root-to-entry order.
+    pub guides: Vec<String>,
     pub segments: Vec<ExplorerUiSegment>,
+    /// Status letters; a staged letter precedes the worktree letter on a mixed row.
     pub right_segments: Vec<ExplorerUiSegment>,
+    /// The optional line counts. The renderer uses the status segments if space is tight.
+    pub git_line_count_segments: Vec<ExplorerUiSegment>,
+    /// The selected entry's project-relative path for the footer.
+    pub relative_path: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1268,7 +1274,6 @@ pub struct NativeSurfaceWindowBinding {
     pub terminal: Option<(u64, WindowId)>,
     pub dashboard: Option<WindowId>,
     pub picker: Option<WindowId>,
-    pub problems_panel: Option<WindowId>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1490,7 +1495,6 @@ pub struct UiState {
     pub diagnostics: Vec<UiDiagnostic>,
     pub expanded_diagnostic: Option<ExpandedDiagnosticState>,
     pub picker: Option<PickerUiState>,
-    pub problems_panel: Option<problems::ProblemsPanelUi>,
     /// The operation bar: present only while an operation with a lifecycle is paused, so its
     /// presence is itself the statement that something is in progress.
     pub operation_bar: Option<OperationBarState>,
@@ -2399,18 +2403,6 @@ pub fn render_with_documentation_geometry(
         {
             agent::render_agent_overlay(&mut frame, panel, &projected, config);
         }
-        if let Some(panel) = &ui.problems_panel
-            && let Some(projected) = compositor
-                .surfaces
-                .problems_panel
-                .and_then(|window| compositor.projection.window(window))
-            && projected.layer != crate::windows::CompositorLayer::Floating
-        {
-            problems::render(&mut frame, panel, config, projected.rect, projected.focused);
-            if projected.focused {
-                frame.cursor = None;
-            }
-        }
         let mut plugin_surfaces = ui
             .plugin_surfaces
             .iter()
@@ -2475,15 +2467,6 @@ pub fn render_with_documentation_geometry(
                 continue;
             }
             if render_non_tiled_editor_window(&mut frame, state, ui, config, projected) {
-                continue;
-            }
-            if compositor.surfaces.problems_panel == Some(projected.window) {
-                if let Some(panel) = &ui.problems_panel {
-                    problems::render(&mut frame, panel, config, projected.rect, projected.focused);
-                    if projected.focused {
-                        frame.cursor = None;
-                    }
-                }
                 continue;
             }
             if compositor.surfaces.dashboard == Some(projected.window) {

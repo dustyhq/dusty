@@ -9,6 +9,7 @@ use crate::editor::state::EditorState;
 use crate::editor::state::RegisterShape;
 
 use crate::editor::state::ReplaceRecord;
+use crate::editor::state::{ScreenColumn, ScreenDirection};
 
 use crate::editor::text::ByteOffset;
 
@@ -264,7 +265,14 @@ pub(super) fn execute_builtin<E>(
                 });
             }
             let character = character_argument(invocation, "character")?;
-            // Like Vim, `j` and `k` keep the column they started from across shorter lines.
+            let direction = ScreenDirection::from_motion(motion);
+            let screen_motion =
+                direction.and_then(|direction| view.projected_screen_motion(direction, count));
+            let motion = match (direction, screen_motion) {
+                (Some(direction), None) => direction.file_motion(),
+                _ => motion,
+            };
+            // Like Vim, file-line motions keep the column they started from across shorter lines.
             let wanted_column = match (motion, view.preferred_column) {
                 ("up" | "down", Some(column)) => Some(column),
                 ("up" | "down", None) => Some(cursor_display_column(
@@ -274,14 +282,17 @@ pub(super) fn execute_builtin<E>(
                 )?),
                 _ => None,
             };
-            let target = match crate::editor::command::builtins::structural::motion_target(
+            let target = if let Some(projection) = screen_motion {
+                projection.target
+            } else if let Some(target) = crate::editor::command::builtins::structural::motion_target(
                 buffer.current_syntax_objects(),
                 view.cursor,
                 motion,
                 count,
             ) {
-                Some(target) => target?,
-                None => motion_target(
+                target?
+            } else {
+                motion_target(
                     buffer,
                     view.cursor,
                     motion,
@@ -290,10 +301,10 @@ pub(super) fn execute_builtin<E>(
                     state.policy,
                     wanted_column,
                     &view.folded_lines,
-                )?,
+                )?
             };
             let target = if matches!(view.mode, EditorMode::Normal | EditorMode::OperatorPending)
-                || (wanted_column.is_some()
+                || ((wanted_column.is_some() || screen_motion.is_some())
                     && !matches!(view.mode, EditorMode::Insert | EditorMode::Replace))
             {
                 on_last_character(&buffer.text, target)?
@@ -308,6 +319,19 @@ pub(super) fn execute_builtin<E>(
                 transaction
                     .operations
                     .push(EditorOperation::SetPreferredColumn {
+                        view: view_id,
+                        column,
+                    });
+            }
+            let screen_column = if motion == "line_end" {
+                Some(ScreenColumn::EndOfRow)
+            } else {
+                screen_motion.map(|projection| projection.column)
+            };
+            if let Some(column) = screen_column {
+                transaction
+                    .operations
+                    .push(EditorOperation::SetPreferredScreenColumn {
                         view: view_id,
                         column,
                     });
@@ -1011,14 +1035,13 @@ pub(super) fn execute_builtin<E>(
                     } else {
                         operator_range(
                             buffer,
-                            view.cursor,
+                            view,
                             motion,
                             count,
                             operator,
                             requested_linewise,
                             character,
                             state.policy,
-                            &view.folded_lines,
                         )?
                     };
                     let Some((range, shape)) = resolved_range else {

@@ -711,7 +711,38 @@ fn queue_style(
         Style::BufferLineDirty => &theme.styles.buffer_line_dirty,
         Style::BufferLineIcon => &theme.styles.buffer_line_icon,
         Style::BufferLinePin => &theme.styles.buffer_line_pin,
-        Style::BufferLineDiagnostic => &theme.styles.buffer_line_diagnostic,
+        Style::BufferLineDiagnostic(severity, active) => {
+            use crate::render::ContentTabDiagnosticSeverity::{Error, Warning};
+            let foreground = match severity {
+                Error => &theme.styles.error,
+                Warning => &theme.styles.warning,
+            };
+            let tab = if active {
+                &theme.styles.buffer_line_active
+            } else {
+                &theme.styles.buffer_line_inactive
+            };
+            derived = with_foreground(tab, foreground);
+            &derived
+        }
+        Style::ProblemSeverity(severity, selected) => {
+            use crate::workspace::DiagnosticSeverity::{Error, Hint, Information, Warning};
+            let foreground = match severity {
+                Error => &theme.styles.error,
+                Warning => &theme.styles.warning,
+                Information => Highlight::named("DiagnosticInfo")
+                    .and_then(|role| theme.highlight(role))
+                    .unwrap_or(&theme.styles.accent),
+                Hint => &theme.styles.muted,
+            };
+            let row = if selected {
+                &theme.styles.selection
+            } else {
+                &theme.styles.default
+            };
+            derived = with_foreground(row, foreground);
+            &derived
+        }
         Style::BufferLineClose => &theme.styles.buffer_line_close,
         Style::BufferLineSeparator => &theme.styles.buffer_line_separator,
         Style::KeyHintBackground => &theme.styles.key_hint_background,
@@ -736,6 +767,67 @@ fn queue_style(
         Style::ExplorerFile => &theme.styles.explorer_file,
         Style::ExplorerSymlink => &theme.styles.explorer_symlink,
         Style::ExplorerGit => &theme.styles.explorer_git,
+        Style::ExplorerGitModified
+        | Style::ExplorerGitAdded
+        | Style::ExplorerGitRenamed
+        | Style::ExplorerGitConflict
+        | Style::ExplorerGitStaged
+        | Style::ExplorerGitDim => {
+            let styles = &theme.styles;
+            let (configured, fallback) = match style {
+                Style::ExplorerGitModified => (
+                    styles.explorer_git_modified.as_ref(),
+                    &styles.git_sign_changed,
+                ),
+                Style::ExplorerGitAdded => {
+                    (styles.explorer_git_added.as_ref(), &styles.git_sign_added)
+                }
+                Style::ExplorerGitRenamed => (styles.explorer_git_renamed.as_ref(), &styles.accent),
+                Style::ExplorerGitConflict => {
+                    (styles.explorer_git_conflict.as_ref(), &styles.error)
+                }
+                Style::ExplorerGitStaged => {
+                    (styles.explorer_git_staged.as_ref(), &styles.git_sign_added)
+                }
+                Style::ExplorerGitDim => (None, &styles.explorer_file),
+                _ => unreachable!(),
+            };
+            if let Some(configured) = configured {
+                configured
+            } else {
+                let background = &styles.explorer_background;
+                derived = ThemeStyle {
+                    background: background.background,
+                    background_256: background.background_256,
+                    background_16: background.background_16,
+                    attributes: match style {
+                        Style::ExplorerGitDim => vec![ThemeAttribute::Dim],
+                        Style::ExplorerGitConflict => vec![ThemeAttribute::Bold],
+                        _ => Vec::new(),
+                    },
+                    ..fallback.clone()
+                };
+                &derived
+            }
+        }
+        Style::ExplorerGitLineCount { added } => {
+            let background = &theme.styles.explorer_background;
+            derived = ThemeStyle {
+                background: background.background,
+                background_256: background.background_256,
+                background_16: background.background_16,
+                ..theme.git(
+                    if added {
+                        crate::GitRole::Added
+                    } else {
+                        crate::GitRole::Removed
+                    },
+                    crate::GitSurface::Pane,
+                    crate::Emphasis::None,
+                )
+            };
+            &derived
+        }
         Style::ExplorerDiagnostic => &theme.styles.explorer_diagnostic,
         Style::ExplorerDecoration => &theme.styles.explorer_decoration,
         Style::ExplorerSelection => &theme.styles.explorer_selection,
@@ -848,8 +940,15 @@ fn queue_colors(
     Ok(())
 }
 
-/// The status bar's blocks are mixed from colours every theme already has, so a mode shows in
-/// its own colour without a theme naming each block.
+fn with_foreground(base: &ThemeStyle, foreground: &ThemeStyle) -> ThemeStyle {
+    ThemeStyle {
+        foreground: foreground.foreground,
+        foreground_256: foreground.foreground_256,
+        foreground_16: foreground.foreground_16,
+        ..base.clone()
+    }
+}
+
 fn diagnostic_text_style(style: Style, theme: &ThemeConfig) -> ThemeStyle {
     let mut derived = match style {
         Style::DiagnosticError => theme.styles.error.clone(),
@@ -862,6 +961,8 @@ fn diagnostic_text_style(style: Style, theme: &ThemeConfig) -> ThemeStyle {
     derived
 }
 
+/// The status bar's blocks are mixed from colours every theme already has, so a mode shows in
+/// its own colour without a theme naming each block.
 fn status_bar_style(style: Style, theme: &ThemeConfig) -> ThemeStyle {
     type Colour = (ThemeColor, Option<ThemeColor>, Option<ThemeColor>);
     let text = |style: &ThemeStyle| (style.foreground, style.foreground_256, style.foreground_16);
@@ -1134,6 +1235,8 @@ mod tests {
     use crate::Style;
     use crate::editor::input::KeyCode as DustyKeyCode;
     use crate::editor::input::Modifiers;
+    use crate::terminal::ThemeAttribute;
+    use crate::terminal::ThemeStyle;
     use crossterm::event::Event;
     use crossterm::event::KeyCode;
     use crossterm::event::KeyEvent;
@@ -1427,6 +1530,9 @@ mod tests {
             ExplorerSegmentRole::Directory,
             ExplorerSegmentRole::IconBlue,
             ExplorerSegmentRole::Git,
+            ExplorerSegmentRole::GitStaged,
+            ExplorerSegmentRole::GitConflict,
+            ExplorerSegmentRole::GitDim,
         ] {
             for tier in [ColorTier::TrueColor, ColorTier::Ansi256, ColorTier::Ansi16] {
                 let mut foreground = match role {
@@ -1436,6 +1542,18 @@ mod tests {
                         .unwrap()
                         .clone(),
                     ExplorerSegmentRole::Git => theme.styles.explorer_git.clone(),
+                    ExplorerSegmentRole::GitStaged => {
+                        theme.styles.explorer_git_staged.as_ref().unwrap().clone()
+                    }
+                    ExplorerSegmentRole::GitConflict => {
+                        let conflict = theme.styles.explorer_git_conflict.as_ref().unwrap();
+                        assert!(conflict.attributes.contains(&ThemeAttribute::Bold));
+                        conflict.clone()
+                    }
+                    ExplorerSegmentRole::GitDim => ThemeStyle {
+                        attributes: vec![ThemeAttribute::Dim],
+                        ..theme.styles.explorer_file.clone()
+                    },
                     _ => unreachable!(),
                 };
                 foreground.background = theme.styles.explorer_selection.background;

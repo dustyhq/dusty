@@ -201,7 +201,6 @@ pub(super) fn attach_test_compositor(
             terminal: terminal_window,
             dashboard: dashboard_window,
             picker: picker_window.map(|(window, _)| window),
-            problems_panel: None,
         },
     });
 }
@@ -788,7 +787,10 @@ fn content_line_segment_width_and_hit_testing_share_exact_boundaries() {
         crate::Style::BufferLinePin,
         crate::Style::BufferLineIcon,
         crate::Style::BufferLineDirty,
-        crate::Style::BufferLineDiagnostic,
+        crate::Style::BufferLineDiagnostic(
+            crate::render::ContentTabDiagnosticSeverity::Error,
+            true,
+        ),
         crate::Style::BufferLineClose,
     ] {
         assert!(styles.contains(&role));

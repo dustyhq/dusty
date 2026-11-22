@@ -193,13 +193,11 @@ impl Explorer {
             .max_by_key(|root| root.components().count())
             .ok_or("rename source has no workspace root")?
             .clone();
-        let initial = path
+        let relative = path
             .strip_prefix(&root)
-            .ok()
-            .and_then(Path::to_str)
-            .filter(|value| !value.chars().any(char::is_control) && value.len() <= 4096)
-            .ok_or("rename source cannot be represented safely in the prompt")?
-            .to_owned();
+            .map_err(|_| "rename source has no workspace root")?;
+        let initial =
+            crate::ui::geometry::sanitize_file_name(&relative.to_string_lossy()).into_owned();
         if editor.revision().is_none()
             || roots
                 .iter()
@@ -310,7 +308,23 @@ impl Explorer {
                     .into(),
             );
         }
-        let target = rename.root.join(value);
+        let Ok(relative) = rename.path.strip_prefix(&rename.root) else {
+            return Err("rename source has no workspace root".into());
+        };
+        if crate::ui::geometry::sanitize_file_name(&relative.to_string_lossy()) == value {
+            return Err("rename target is unchanged".into());
+        }
+        let entered = Path::new(value);
+        // A basename edit must not change an odd ancestor's real spelling.
+        let target = match (relative.parent(), entered.parent(), entered.file_name()) {
+            (Some(original), Some(parent), Some(name))
+                if crate::ui::geometry::sanitize_file_name(&original.to_string_lossy())
+                    == parent.to_string_lossy() =>
+            {
+                rename.root.join(original).join(name)
+            }
+            _ => rename.root.join(entered),
+        };
         if target == rename.path {
             return Err("rename target is unchanged".into());
         }
@@ -424,13 +438,14 @@ impl Explorer {
             self.clipboard = None;
             return Some(Err(CLIPBOARD_CHECK_FAILED.into()));
         };
+        let name = path
+            .file_name()
+            .unwrap_or(path.as_os_str())
+            .to_string_lossy();
         let notice = format!(
             "{} `{}`; select a destination and press p",
             if entry.cut { "moving" } else { "copied" },
-            path.file_name().map_or_else(
-                || path.display().to_string(),
-                |name| name.to_string_lossy().into_owned()
-            )
+            crate::ui::geometry::sanitize_file_name(&name)
         );
         entry.state = ClipboardState::Ready(source.clone());
         Some(Ok(notice))

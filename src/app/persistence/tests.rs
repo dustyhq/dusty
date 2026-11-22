@@ -168,6 +168,76 @@ fn safe_mode_historyclear_reports_a_local_clear_without_writing() {
 }
 
 #[test]
+fn session_restore_silently_ignores_the_retired_problems_dock() {
+    use crate::persistence::{
+        PersistedContentDescriptor, PersistedWindowPlacement, PersistedWindowRule,
+    };
+    let directory = tempfile::tempdir().unwrap();
+    let state_dir = tempfile::tempdir().unwrap();
+    let root = crate::files::canonicalize(directory.path()).unwrap();
+    let path = root.join("main.rs");
+    fs::write(&path, "fn main() {}\n").unwrap();
+    let seed = seeded_split(&root, state_dir.path(), &["main.rs"], &[]);
+    let mut saved: PersistedState = serde_json::from_slice(&seed).unwrap();
+    let session = saved.session.as_mut().unwrap();
+    let placement = PersistedWindowPlacement::Docked {
+        edge: "bottom".into(),
+        size: 10,
+    };
+    session.window_rules.push(PersistedWindowRule {
+        content_type: "builtin.problems.panel".into(),
+        placement: placement.clone(),
+    });
+    session
+        .content_descriptors
+        .push(PersistedContentDescriptor {
+            semantic_id: "native:problems".into(),
+            content_type: "builtin.problems.panel".into(),
+            adapter: "declarative-ui".into(),
+            path: None,
+            provider: None,
+            source: None,
+            key: None,
+            desired_placement: placement,
+        });
+    fs::write(
+        state_dir.path().join(super::STATE_FILE),
+        serde_json::to_vec(&saved).unwrap(),
+    )
+    .unwrap();
+
+    let mut app = startup_with_saved_layout(&root, state_dir.path(), false, true, true);
+    app.load_session_on_request();
+    poll_until(&mut app, |app| {
+        app.process_persistence_events();
+        app.process_vfs_results();
+        !app.persistence.restoring()
+    });
+    assert_eq!(
+        app.state.buffers[app.state.active_buffer_id().unwrap()]
+            .path
+            .as_ref(),
+        Some(&path)
+    );
+    assert_eq!(app.state.editor_windows().count(), 1);
+    assert!(
+        app.ui
+            .content_tabs
+            .iter()
+            .all(|tab| tab.title != "Problems")
+    );
+    assert!(
+        app.window_session
+            .graph()
+            .content_snapshots()
+            .iter()
+            .all(|content| content.content_type.as_str() != "builtin.problems.panel")
+    );
+    assert!(app.ui.config_diagnostic.is_none());
+    assert!(!app.ui.notification_error);
+}
+
+#[test]
 fn missing_leaf_restores_the_rest_of_the_split_and_saves_it_on_quit() {
     use crate::persistence::PersistedLayout;
     let directory = tempfile::tempdir().unwrap();

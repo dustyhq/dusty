@@ -144,15 +144,6 @@ foreground_16 = "magenta"
 background_16 = "black"
 attributes = []
 
-[styles.buffer_line_diagnostic]
-foreground = "#f0883e"
-background = "#21262d"
-foreground_256 = "indexed:208"
-background_256 = "indexed:235"
-foreground_16 = "yellow"
-background_16 = "black"
-attributes = []
-
 [styles.buffer_line_close]
 foreground = "#8b949e"
 background = "#21262d"
@@ -366,6 +357,51 @@ background = "#0d1117"
 foreground_256 = "indexed:178"
 background_256 = "indexed:233"
 foreground_16 = "yellow"
+background_16 = "black"
+attributes = []
+
+[styles.explorer_git_modified]
+foreground = "#d29922"
+background = "#0d1117"
+foreground_256 = "indexed:178"
+background_256 = "indexed:233"
+foreground_16 = "yellow"
+background_16 = "black"
+attributes = []
+
+[styles.explorer_git_added]
+foreground = "#3fb950"
+background = "#0d1117"
+foreground_256 = "indexed:71"
+background_256 = "indexed:233"
+foreground_16 = "green"
+background_16 = "black"
+attributes = []
+
+[styles.explorer_git_renamed]
+foreground = "#58a6ff"
+background = "#0d1117"
+foreground_256 = "indexed:75"
+background_256 = "indexed:233"
+foreground_16 = "blue"
+background_16 = "black"
+attributes = []
+
+[styles.explorer_git_conflict]
+foreground = "#f85149"
+background = "#0d1117"
+foreground_256 = "indexed:203"
+background_256 = "indexed:233"
+foreground_16 = "red"
+background_16 = "black"
+attributes = ["bold"]
+
+[styles.explorer_git_staged]
+foreground = "#3fb950"
+background = "#0d1117"
+foreground_256 = "indexed:71"
+background_256 = "indexed:233"
+foreground_16 = "green"
 background_16 = "black"
 attributes = []
 

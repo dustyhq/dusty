@@ -181,6 +181,7 @@ fn grammar_input(invocation: &CommandInvocation) -> Option<GrammarInput> {
         "input.motion" => GrammarInput::Motion {
             motion: text("motion")?,
             linewise: flag("linewise"),
+            screen_when_uncounted: flag("screen_when_uncounted"),
         },
         "input.visual.operator" => GrammarInput::VisualOperator {
             operator: text("operator")?,

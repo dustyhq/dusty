@@ -1263,7 +1263,6 @@ pub enum ConfigurationWorkerError {
 const GLOBAL_KEYMAP_TARGETS: &[(&str, &str)] = &[
     ("editor", "normal"),
     ("explorer", ""),
-    ("problems_panel", ""),
     ("dashboard", ""),
     ("terminal_normal", ""),
     ("tool_manager", ""),

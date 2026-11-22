@@ -5,13 +5,16 @@ use crate::app::explorer::tree::ExplorerKind;
 use crate::app::explorer::tree::ExplorerLoadState;
 use crate::app::explorer::tree::ExplorerNodeId;
 use crate::app::explorer::tree::ExplorerState;
+use crate::app::git::Git;
 use crate::app::workspace::WorkspaceVersion;
+use crate::config::ExplorerGitColors;
 use crate::files::DirectoryEntryKind;
 use crate::files::DirectoryWorker;
 use crate::files::ExplorerWatchBatch;
 use crate::files::ExplorerWatchEvent;
 use crate::files::ExplorerWatchId;
 use crate::files::ExplorerWatchWorker;
+use crate::git::{GitFileStatus, GitLineCounts, GitStatusEntry};
 use crate::ui::ExplorerSegmentRole;
 use crate::ui::ExplorerUiRow;
 use crate::ui::ExplorerUiSegment;
@@ -85,6 +88,7 @@ pub(in crate::app) struct Explorer {
     root_count: usize,
     hidden: bool,
     ignored: bool,
+    git_line_counts: bool,
     /// Whether keys type into the search at the top.
     searching: bool,
     /// The row under the last pointer press, read before focus moved the tree.
@@ -98,7 +102,7 @@ pub(in crate::app) struct Explorer {
     watch_reload: VecDeque<PathBuf>,
 }
 impl Explorer {
-    pub(in crate::app) fn new(watch: ExplorerWatchWorker) -> Self {
+    pub(in crate::app) fn new(watch: ExplorerWatchWorker, git_line_counts: bool) -> Self {
         Self {
             primary: ExplorerViewState {
                 tree: ExplorerState::default(),
@@ -122,6 +126,7 @@ impl Explorer {
             root_count: 0,
             hidden: false,
             ignored: false,
+            git_line_counts,
             searching: false,
             clicked: None,
             follow: None,
@@ -434,6 +439,9 @@ impl Explorer {
     pub(in crate::app) fn toggle_ignored(&mut self) {
         self.ignored = !self.ignored;
         self.mark_view_changed();
+    }
+    pub(in crate::app) fn git_line_counts(&self) -> bool {
+        self.git_line_counts
     }
     fn load_request_for(
         &self,
@@ -819,7 +827,7 @@ impl Explorer {
         view: ExplorerViewId,
         config: &crate::config::ExplorerConfig,
         body: crate::windows::WindowRect,
-        git_status: &BTreeMap<PathBuf, crate::git::GitFileStatus>,
+        git: &Git,
         title: String,
         root_label: &str,
     ) -> Result<ExplorerUiState, &'static str> {
@@ -828,7 +836,7 @@ impl Explorer {
         }
         let active = self.active_view;
         self.active_view = view;
-        let mut projection = self.projection(config, body, git_status, title, root_label);
+        let mut projection = self.projection(config, body, git, title, root_label);
         projection.searching &= view == active;
         self.active_view = active;
         Ok(projection)
@@ -837,7 +845,7 @@ impl Explorer {
         &mut self,
         config: &crate::config::ExplorerConfig,
         body: crate::windows::WindowRect,
-        git_status: &BTreeMap<PathBuf, crate::git::GitFileStatus>,
+        git: &Git,
         title: String,
         root_label: &str,
     ) -> ExplorerUiState {
@@ -860,6 +868,11 @@ impl Explorer {
         });
         let rich_icons = config.icon_mode == crate::config::ExplorerIconMode::NerdFont;
         let glyphs = config.active_glyphs();
+        let decorations = git.decorations();
+        let snapshot = git.status();
+        let counts = snapshot
+            .filter(|_| self.git_line_counts)
+            .map(|status| &status.line_counts);
         let rows = visible_ids
             .iter()
             .skip(scroll)
@@ -867,31 +880,56 @@ impl Explorer {
             .filter_map(|id| tree.node(*id))
             .map(|node| {
                 let lineage = tree.tree_lineage(node.id);
-                let mut tree_prefix = String::new();
-                for (index, is_last) in lineage.iter().enumerate() {
-                    let final_segment = index + 1 == lineage.len();
-                    tree_prefix.push_str(if final_segment {
-                        if *is_last {
-                            &glyphs.tree_last
-                        } else {
-                            &glyphs.tree_middle
+                let guides = lineage
+                    .iter()
+                    .enumerate()
+                    .map(|(index, is_last)| {
+                        match (index + 1 == lineage.len(), *is_last) {
+                            (true, true) => &glyphs.tree_last,
+                            (true, false) => &glyphs.tree_middle,
+                            (false, true) => &glyphs.tree_space,
+                            (false, false) => &glyphs.tree_vertical,
                         }
-                    } else if *is_last {
-                        &glyphs.tree_space
-                    } else {
-                        &glyphs.tree_vertical
-                    });
-                }
-                let git_status = git_status.get(&node.path);
-                let name_role = if git_status.is_some() {
-                    ExplorerSegmentRole::Git
+                        .clone()
+                    })
+                    .collect();
+                let selected = selected_id == Some(node.id);
+                let name = if node.kind == ExplorerKind::Root && self.root_count == 1 {
+                    root_label
                 } else {
-                    match node.kind {
-                        ExplorerKind::Root => ExplorerSegmentRole::IconPurple,
-                        ExplorerKind::Directory => ExplorerSegmentRole::Directory,
-                        ExplorerKind::File => ExplorerSegmentRole::File,
-                        ExplorerKind::Symlink => ExplorerSegmentRole::Symlink,
+                    &node.name
+                };
+                let relative_path = selected.then(|| {
+                    if node.kind == ExplorerKind::Root {
+                        name.to_owned()
+                    } else {
+                        self.roots
+                            .iter()
+                            .filter_map(|root| node.path.strip_prefix(root).ok())
+                            .min_by_key(|relative| relative.components().count())
+                            .unwrap_or(&node.path)
+                            .to_string_lossy()
+                            .into_owned()
                     }
+                });
+                let directory = matches!(node.kind, ExplorerKind::Root | ExplorerKind::Directory);
+                let git_status = decorations.get(&node.path).map(|status| {
+                    if directory && *status == GitFileStatus::Deleted {
+                        &GitFileStatus::Modified
+                    } else {
+                        status
+                    }
+                });
+                let normal_name_role = match node.kind {
+                    ExplorerKind::Root => ExplorerSegmentRole::IconPurple,
+                    ExplorerKind::Directory => ExplorerSegmentRole::Directory,
+                    ExplorerKind::File => ExplorerSegmentRole::File,
+                    ExplorerKind::Symlink => ExplorerSegmentRole::Symlink,
+                };
+                let name_role = match (config.git_colors, git_status) {
+                    (ExplorerGitColors::Kind, Some(status)) => git_kind_role(status),
+                    (ExplorerGitColors::Single, Some(_)) => ExplorerSegmentRole::Git,
+                    _ => normal_name_role,
                 };
                 let rich_icon = if rich_icons {
                     match node.kind {
@@ -923,13 +961,7 @@ impl Explorer {
                         (glyphs.symlink.clone(), ExplorerSegmentRole::Icon)
                     }
                 };
-                let mut segments = Vec::with_capacity(4);
-                if !tree_prefix.is_empty() {
-                    segments.push(ExplorerUiSegment {
-                        text: tree_prefix,
-                        role: ExplorerSegmentRole::Tree,
-                    });
-                }
+                let mut segments = Vec::with_capacity(3);
                 segments.push(ExplorerUiSegment {
                     text: icon,
                     role: icon_role,
@@ -940,11 +972,6 @@ impl Explorer {
                 });
                 segments.push(ExplorerUiSegment {
                     text: {
-                        let name = if node.kind == ExplorerKind::Root && self.root_count == 1 {
-                            root_label.to_owned()
-                        } else {
-                            node.name.clone()
-                        };
                         if matches!(node.kind, ExplorerKind::Root | ExplorerKind::Directory)
                             && node.load == ExplorerLoadState::Loaded
                             && tree.is_expanded(node.id)
@@ -952,32 +979,29 @@ impl Explorer {
                         {
                             format!("{name} (empty)")
                         } else {
-                            name
+                            name.to_owned()
                         }
                     },
                     role: name_role,
                 });
-                let right_segments = git_status
-                    .map(|status| ExplorerUiSegment {
-                        text: match status {
-                            crate::git::GitFileStatus::Untracked => "?",
-                            crate::git::GitFileStatus::Added => "A",
-                            crate::git::GitFileStatus::Modified => "M",
-                            crate::git::GitFileStatus::TypeChanged => "T",
-                            crate::git::GitFileStatus::Deleted => "D",
-                            crate::git::GitFileStatus::Renamed => "R",
-                            crate::git::GitFileStatus::Conflicted => "!",
-                        }
-                        .into(),
-                        role: ExplorerSegmentRole::Git,
-                    })
-                    .into_iter()
-                    .collect();
+                let right_segments = git_status.map_or_else(Vec::new, |status| {
+                    let entry = snapshot
+                        .filter(|_| config.git_colors == ExplorerGitColors::Kind && !directory)
+                        .and_then(|snapshot| snapshot.entry(&node.path));
+                    git_status_segments(status, entry, config.git_colors)
+                });
                 ExplorerUiRow {
                     node_id: node.id.0,
-                    selected: selected_id == Some(node.id),
+                    selected,
+                    guides,
                     segments,
                     right_segments,
+                    git_line_count_segments: counts
+                        .and_then(|counts| counts.get(&node.path).copied())
+                        .map_or_else(Vec::new, |counts| {
+                            git_line_count_segments(counts, config.git_colors)
+                        }),
+                    relative_path,
                 }
             })
             .collect();
@@ -1022,6 +1046,99 @@ impl Explorer {
         self.follow.is_some()
     }
 }
+fn git_kind_role(status: &GitFileStatus) -> ExplorerSegmentRole {
+    match status {
+        GitFileStatus::Untracked | GitFileStatus::Added => ExplorerSegmentRole::GitAdded,
+        GitFileStatus::Modified | GitFileStatus::TypeChanged | GitFileStatus::Deleted => {
+            ExplorerSegmentRole::GitModified
+        }
+        GitFileStatus::Renamed => ExplorerSegmentRole::GitRenamed,
+        GitFileStatus::Conflicted => ExplorerSegmentRole::GitConflict,
+    }
+}
+
+fn git_status_segments(
+    status: &GitFileStatus,
+    entry: Option<&GitStatusEntry>,
+    colors: ExplorerGitColors,
+) -> Vec<ExplorerUiSegment> {
+    let segment = |status: &GitFileStatus, role| ExplorerUiSegment {
+        text: match status {
+            GitFileStatus::Untracked => "?",
+            GitFileStatus::Added => "A",
+            GitFileStatus::Modified => "M",
+            GitFileStatus::TypeChanged => "T",
+            GitFileStatus::Deleted => "D",
+            GitFileStatus::Renamed => "R",
+            GitFileStatus::Conflicted => "!",
+        }
+        .into(),
+        role,
+    };
+    let role = match colors {
+        ExplorerGitColors::Kind => git_kind_role(status),
+        ExplorerGitColors::Single => ExplorerSegmentRole::Git,
+        ExplorerGitColors::Off => ExplorerSegmentRole::GitDim,
+    };
+    if colors == ExplorerGitColors::Kind
+        && !matches!(status, GitFileStatus::Untracked | GitFileStatus::Conflicted)
+        && let Some(entry) = entry
+        && let Some(staged) = &entry.staged_status
+    {
+        let mut segments = vec![segment(staged, ExplorerSegmentRole::GitStaged)];
+        if let Some(unstaged) = &entry.unstaged_status {
+            segments.push(segment(unstaged, git_kind_role(unstaged)));
+        }
+        return segments;
+    }
+    vec![segment(status, role)]
+}
+
+fn git_line_count_segments(
+    counts: GitLineCounts,
+    colors: ExplorerGitColors,
+) -> Vec<ExplorerUiSegment> {
+    let role = |added| {
+        if colors == ExplorerGitColors::Off {
+            ExplorerSegmentRole::GitDim
+        } else {
+            ExplorerSegmentRole::GitLineCount { added }
+        }
+    };
+    let mut segments = Vec::with_capacity(2);
+    if counts.added != 0 {
+        segments.push(ExplorerUiSegment {
+            text: format!("+{}", short_line_count(counts.added)),
+            role: role(true),
+        });
+    }
+    if counts.removed != 0 {
+        let gap = if segments.is_empty() { "" } else { " " };
+        segments.push(ExplorerUiSegment {
+            text: format!("{gap}−{}", short_line_count(counts.removed)),
+            role: role(false),
+        });
+    }
+    segments
+}
+
+fn short_line_count(count: usize) -> String {
+    const THOUSAND: usize = 1_000;
+    const MILLION: usize = 1_000_000;
+    let (unit, suffix) = match count {
+        0..THOUSAND => return count.to_string(),
+        n if n >= MILLION - THOUSAND / 20 => (MILLION, "M"),
+        _ => (THOUSAND, "k"),
+    };
+    let tenths = (count / unit) * 10 + (count % unit + unit / 20) / (unit / 10);
+    let (whole, decimal) = (tenths / 10, tenths % 10);
+    if decimal == 0 {
+        format!("{whole}{suffix}")
+    } else {
+        format!("{whole}.{decimal}{suffix}")
+    }
+}
+
 pub(in crate::app) fn explorer_icon_role(
     color: crate::files::ExplorerIconColor,
 ) -> ExplorerSegmentRole {
@@ -1306,7 +1423,7 @@ impl App {
         self.open_prompt(PromptKind::ExplorerRename, request.initial);
         self.prompt_help(format!(
             "Relative to `{}`. Checking source… Enter renames; Esc cancels.",
-            request.root.display()
+            crate::ui::geometry::sanitize_file_name(&request.root.to_string_lossy())
         ));
     }
 }
@@ -1466,7 +1583,7 @@ impl App {
             ) {
                 Some(Ok(root)) => self.prompt_help(format!(
                     "Relative to `{}`. Enter renames; Esc cancels.",
-                    root.display()
+                    crate::ui::geometry::sanitize_file_name(&root.to_string_lossy())
                 )),
                 Some(Err(error)) => self.prompt_error(error),
                 None => {}
@@ -1723,6 +1840,15 @@ impl App {
 impl App {
     // EXPLORER_WATCH_FOREGROUND_END
 
+    pub(in crate::app) fn set_explorer_git_line_counts(&mut self, enabled: bool) {
+        if self.explorer.git_line_counts != enabled {
+            self.explorer.git_line_counts = enabled;
+            if enabled {
+                self.start_git_status_refresh_with_feedback(false);
+            }
+        }
+    }
+
     pub(in crate::app) fn sync_explorer_ui(&mut self) {
         self.refresh_window_content();
         if self.ui.explorer.is_none() {
@@ -1746,7 +1872,6 @@ impl App {
             .collect::<Vec<_>>();
         let focused = self.window_session.focused_explorer();
         let policy = &self.configuration.settings().ui.explorer;
-        let decorations = self.git.decorations();
         let mut primary = None;
         let mut clones = Vec::new();
         for (view, window, rect) in explorer_windows {
@@ -1762,7 +1887,7 @@ impl App {
                 crate::app::explorer::ExplorerViewId(view),
                 policy,
                 body,
-                decorations,
+                &self.git,
                 title.clone(),
                 &root_label,
             ) else {
@@ -1792,7 +1917,7 @@ impl App {
                     crate::app::explorer::PRIMARY_EXPLORER_VIEW,
                     policy,
                     body,
-                    decorations,
+                    &self.git,
                     title,
                     &root_label,
                 )

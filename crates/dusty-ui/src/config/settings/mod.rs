@@ -33,6 +33,7 @@ pub use ui::CommandLineConfig;
 pub use ui::CursorConfig;
 pub use ui::DocumentationPopupConfig;
 pub use ui::ExplorerConfig;
+pub use ui::ExplorerGitColors;
 pub use ui::ExplorerGlyphSet;
 pub use ui::ExplorerGlyphs;
 pub use ui::ExplorerIconMode;

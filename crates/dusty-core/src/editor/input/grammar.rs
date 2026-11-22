@@ -46,6 +46,7 @@ pub enum GrammarInput {
     Motion {
         motion: String,
         linewise: bool,
+        screen_when_uncounted: bool,
     },
     PrefixBegin,
     ReplaceBegin,
@@ -223,7 +224,31 @@ impl ModalResolver {
                 self.reset_pending();
                 Ok(InputAction::Invoke(invocation))
             }
-            GrammarInput::Motion { motion, linewise } => self.motion(&motion, linewise, None),
+            GrammarInput::Motion {
+                motion,
+                linewise,
+                screen_when_uncounted,
+            } => {
+                let motion = if screen_when_uncounted
+                    && self.count.is_none()
+                    && self.operator.is_none()
+                    && matches!(
+                        mode,
+                        EditorMode::Normal
+                            | EditorMode::VisualChar
+                            | EditorMode::VisualLine
+                            | EditorMode::VisualBlock
+                    ) {
+                    match motion.as_str() {
+                        "up" => "screen_up",
+                        "down" => "screen_down",
+                        other => other,
+                    }
+                } else {
+                    motion.as_str()
+                };
+                self.motion(motion, linewise, None)
+            }
             GrammarInput::PrefixBegin => {
                 self.pending = Some(PendingInputContext::Prefix);
                 Ok(InputAction::Pending)
@@ -544,6 +569,7 @@ mod tests {
         let motion = || GrammarInput::Motion {
             motion: "document_end".into(),
             linewise: false,
+            screen_when_uncounted: false,
         };
         let count = |resolver: &mut ModalResolver, mode| {
             let InputAction::Invoke(invocation) = resolver.feed(mode, motion()).expect("motion")
@@ -617,6 +643,7 @@ mod tests {
                 GrammarInput::Motion {
                     motion: "word_forward".into(),
                     linewise: false,
+                    screen_when_uncounted: false,
                 },
             )
             .expect("motion")
@@ -737,7 +764,8 @@ mod tests {
                     EditorMode::OperatorPending,
                     GrammarInput::Motion {
                         motion: "word_forward".into(),
-                        linewise: false
+                        linewise: false,
+                        screen_when_uncounted: false,
                     }
                 )
                 .is_err()

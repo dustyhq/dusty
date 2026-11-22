@@ -33,6 +33,7 @@ use crate::editor::text::ByteOffset;
 use crate::editor::text::ByteRange;
 use crate::editor::text::DisplayWidthPolicy;
 use crate::editor::text::TextBuffer;
+use crate::editor::{ScreenColumn, ScreenDirection, ScreenMotionProjection};
 use crate::ui::VisualRowAnchor;
 use crate::ui::VisualRowModel;
 use crate::ui::active_editor_pane_viewport;
@@ -40,6 +41,7 @@ use crate::ui::editor_state_content_width;
 use crate::ui::render::SCRATCH_LABEL;
 use crate::ui::snap_display_column;
 use crate::ui::snap_display_column_forward;
+use crate::ui::view_pane_viewport;
 
 use crate::app::syntax::nth_non_blank;
 
@@ -734,22 +736,76 @@ impl App {
 }
 
 impl App {
-    pub(in crate::app) fn project_motion_folds(&mut self, invocation: &CommandInvocation) {
-        if matches!(
+    pub(in crate::app) fn project_vertical_motion(
+        &mut self,
+        invocation: &CommandInvocation,
+    ) -> Option<ViewId> {
+        if !matches!(
             invocation.id.as_str(),
             "view.cursor.move" | "edit.operator" | "multi.move"
-        ) && matches!(
-            invocation.arguments.get("motion"),
-            Some(CommandValue::String(motion)) if matches!(motion.as_str(), "up" | "down")
-        ) && let Some(view_id) = invocation.target.view
-            && let Some(view) = self.state.views.get(view_id)
-        {
-            let text = &self.state.buffers[view.buffer].text;
-            let folds = VisualRowModel::folded_lines(text, view_id, &self.ui);
-            if folds != view.folded_lines {
-                self.state.views[view_id].folded_lines = folds;
-            }
+        ) {
+            return None;
         }
+        let Some(CommandValue::String(motion)) = invocation.arguments.get("motion") else {
+            return None;
+        };
+        let direction = ScreenDirection::from_motion(motion);
+        if direction.is_none() && !matches!(motion.as_str(), "up" | "down") {
+            return None;
+        }
+        let view_id = invocation
+            .target
+            .view
+            .or_else(|| self.state.active_view())?;
+        let view = self.state.views.get(view_id)?;
+        let text = &self.state.buffers[view.buffer].text;
+        let folds = VisualRowModel::folded_lines(text, view_id, &self.ui);
+        if folds != view.folded_lines {
+            self.state.views[view_id].folded_lines = folds;
+        }
+
+        let direction = direction?;
+        let count = invocation.count.map_or(1, |count| count.get());
+        if count > crate::editor::input::ABSOLUTE_MAX_COUNT {
+            return None;
+        }
+        let count = usize::try_from(count).ok()?;
+        if !self.configuration.settings().editor.wrap {
+            return None;
+        }
+        self.reconcile_editor_windows();
+        let view = self.state.views.get(view_id)?;
+        let text = &self.state.buffers[view.buffer].text;
+        let viewport = active_editor_pane_viewport(&self.state, &self.ui)
+            .filter(|viewport| viewport.view == view_id)
+            .or_else(|| view_pane_viewport(&self.state, &self.ui, view_id))?;
+        let config = self.configuration.settings();
+        if self.ui.large_file_buffers.contains(&view.buffer)
+            || editor_state_content_width(&self.state, text, &config.editor, viewport.width) == 0
+        {
+            return None;
+        }
+        let rows = VisualRowModel::new_for_state(
+            &self.state,
+            text,
+            view_id,
+            &self.ui,
+            config,
+            viewport.width,
+            true,
+        );
+        let (start, cell) = rows.cursor_projection(view.cursor);
+        let column = view
+            .preferred_screen_column
+            .unwrap_or(ScreenColumn::Cell(cell));
+        let target = rows.move_cursor_rows(view.cursor, start, column, direction, count);
+        self.state.views[view_id].screen_motion = Some(ScreenMotionProjection {
+            direction,
+            count,
+            target,
+            column,
+        });
+        Some(view_id)
     }
 
     /// Closing a fold must put its cursor on the header, not leave it hidden.

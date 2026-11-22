@@ -483,6 +483,7 @@ impl App {
         let terminal_session =
             crate::app::terminal::Terminals::new(&configuration.settings.terminals);
         let terminal_panel_height = configuration.settings.ui.terminal_panel.height;
+        let git_line_counts = configuration.settings.ui.explorer.git_line_counts;
         let explorer_watch =
             ExplorerWatchWorker::start(crate::files::ExplorerWatchPolicy::default())
                 .map_err(|error| InteractiveError::Configuration(error.to_string()))?;
@@ -509,7 +510,6 @@ impl App {
             ),
             workspace,
             diagnostics,
-            problems_panel: None,
             workspace_edits: crate::app::workspace::edits::WorkspaceEdits::default(),
             commands,
             effect_authority: crate::editor::CommandAuthority::Host,
@@ -576,7 +576,7 @@ impl App {
             clipboard: crate::app::editing::clipboard::Clipboard::default(),
             macro_replays: Vec::new(),
             macro_running: false,
-            explorer: crate::app::explorer::Explorer::new(explorer_watch),
+            explorer: crate::app::explorer::Explorer::new(explorer_watch, git_line_counts),
             syntax: Syntax::new(syntax_queue_capacity),
             persistence: saved_state,
             tasks,

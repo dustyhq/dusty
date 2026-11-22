@@ -757,7 +757,6 @@ impl Windows {
         let semantic_focus = match self.focus {
             crate::app::windows::FocusTarget::Explorer(_)
             | crate::app::windows::FocusTarget::Terminal(_)
-            | crate::app::windows::FocusTarget::ProblemsPanel
             | crate::app::windows::FocusTarget::Agent => Some(self.focus),
             crate::app::windows::FocusTarget::Editor
             | crate::app::windows::FocusTarget::Plugin(_) => None,

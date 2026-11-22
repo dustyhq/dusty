@@ -225,11 +225,6 @@ pub(super) struct TestKey {
     run: Arc<()>,
     pub(super) index: usize,
 }
-impl TestKey {
-    pub(super) fn same(&self, other: &Self) -> bool {
-        self.name == other.name && self.index == other.index && Arc::ptr_eq(&self.run, &other.run)
-    }
-}
 
 struct Plan {
     remaining: VecDeque<(String, TaskConfig)>,
@@ -1265,14 +1260,14 @@ use std::time::Instant;
 impl App {
     pub(in crate::app) fn rebuild_matcher_cache(&mut self) {
         self.tasks.configure(self.configuration.settings());
-        self.refresh_problems_panel();
+        self.refresh_problems_picker();
     }
 }
 
 impl App {
     pub(in crate::app) fn stop_task(&mut self, name: &str) {
         let stopped = self.tasks.stop(name);
-        self.refresh_problems_panel();
+        self.refresh_problems_picker();
         match stopped {
             Ok(source) => {
                 if let Some(source) = source {
@@ -1405,7 +1400,7 @@ impl App {
             self.diagnostics.clear_owner(&owner);
             self.sync_ui_diagnostics();
         } else {
-            self.refresh_problems_panel();
+            self.refresh_problems_picker();
         }
         self.start_task_step(name.into());
     }
@@ -1622,7 +1617,7 @@ impl App {
                         continue;
                     }
                     if matches!(task.adapter(), AdapterContext::Test { .. }) {
-                        self.refresh_problems_panel();
+                        self.refresh_problems_picker();
                     }
                     let next_step = next.then(|| task.requested().clone());
                     let succeeded = !timed_out && code == Some(0);

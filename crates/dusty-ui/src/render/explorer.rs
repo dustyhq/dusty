@@ -4,7 +4,7 @@ use crate::CellGrid;
 use crate::Style;
 use crate::config::AmbiguousWidth;
 use crate::config::Config;
-use crate::geometry::text_width;
+use crate::geometry::{cell_text_width, sanitize_file_name, text_width};
 use crate::grid::CONTROL_CHARACTER_REPLACEMENT;
 use crate::grid::ZERO_WIDTH_REPLACEMENT;
 use crate::windows::PANE_MINIMUM_WIDTH;
@@ -12,7 +12,10 @@ use crate::windows::WindowRect;
 
 use crate::render::ExplorerSegmentRole;
 
-use crate::render::ExplorerUiState;
+use crate::render::{ExplorerUiRow, ExplorerUiSegment, ExplorerUiState};
+use std::borrow::Cow;
+use std::path::Path;
+use unicode_segmentation::UnicodeSegmentation;
 
 use crate::grid::Frame;
 
@@ -20,7 +23,7 @@ use crate::config::Highlight;
 use crate::render::editor::cursor_style;
 
 pub const EXPLORER_MAXIMUM_VISIBLE_ROWS: usize = 200;
-pub const EXPLORER_MINIMUM_WIDTH: u16 = 28;
+pub const EXPLORER_MINIMUM_WIDTH: u16 = 12;
 pub const EXPLORER_MAXIMUM_WIDTH: u16 = 60;
 pub const EXPLORER_FOCUS_MARKER: &str = ">";
 pub const EXPLORER_LOADING_LABEL: &str = "loading…";
@@ -150,7 +153,12 @@ pub(super) fn render_explorer_window(
             .map(|row| {
                 (
                     // The margin left of the tree, so the cursor doesn't cover its lines.
-                    rect.x,
+                    rect.x
+                        + if panel_width <= NARROW_EXPLORER_WIDTH {
+                            panel_width
+                        } else {
+                            0
+                        },
                     body.y.saturating_add(row),
                     cursor_style(config.ui.cursor.normal),
                 )
@@ -193,60 +201,110 @@ pub(super) fn render_explorer_dock(
 
     let body_top = body.y;
     let available_rows = usize::from(body.height);
-    let mut rendered_rows = 0usize;
-    for (screen_row, row) in explorer.rows.iter().take(available_rows).enumerate() {
-        rendered_rows = rendered_rows.saturating_add(1);
+    let (content_left, content_right) = explorer_row_columns(panel_width);
+    let rows = &explorer.rows[..explorer.rows.len().min(available_rows)];
+    let ambiguous = config.editor.ambiguous_width;
+    let width = |text: &str| cell_text_width(text, ambiguous);
+    let glyphs = config.ui.explorer.active_glyphs();
+    let guide_width = [
+        &glyphs.tree_vertical,
+        &glyphs.tree_middle,
+        &glyphs.tree_last,
+        &glyphs.tree_space,
+    ]
+    .into_iter()
+    .map(|glyph| width(glyph))
+    .max()
+    .unwrap_or(2) as u16;
+    let right_column = ExplorerRightColumn::new(rows, content_left, content_right, ambiguous);
+    let selected = rows.iter().find(|row| row.selected);
+    let shift = selected.map_or(0, |row| {
+        let Some((name, prefix)) = row.segments.split_last() else {
+            return 0;
+        };
+        let desired = width(&sanitize_file_name(&name.text)).min(24);
+        let prefix_width: usize = prefix.iter().map(|segment| width(&segment.text)).sum();
+        let room = usize::from(
+            right_column
+                .layout(row)
+                .name_right
+                .saturating_sub(content_left),
+        );
+        (0..row.guides.len())
+            .find(|&shift| {
+                let marker = if shift == 0 { 0 } else { width("…") };
+                marker
+                    + (row.guides.len() - shift) * usize::from(guide_width)
+                    + prefix_width
+                    + desired
+                    <= room
+            })
+            .unwrap_or(row.guides.len())
+    });
+    let mut footer_path = None;
+    for (screen_row, row) in rows.iter().enumerate() {
         let y = body_top.saturating_add(u16::try_from(screen_row).unwrap_or(0));
         if row.selected {
             for x in 0..panel_width {
                 grid.set_cell(x, y, " ", Style::ExplorerSelection);
             }
         }
-        let right_width = row.right_segments.iter().fold(0usize, |width, segment| {
-            width.saturating_add(text_width(&segment.text, config.editor.ambiguous_width))
-        });
-        let content_right = panel_width.saturating_sub(1);
-        let right_x =
-            content_right.saturating_sub(u16::try_from(right_width).unwrap_or(content_right));
-        let main_right = if row.right_segments.is_empty() {
-            content_right
-        } else {
-            right_x
-        };
-        let mut x = 1;
-        for (index, segment) in row.segments.iter().enumerate() {
-            let text = if index + 1 == row.segments.len() {
-                crate::render::overlays::truncate_content_title(
-                    &segment.text,
-                    usize::from(main_right.saturating_sub(x)),
-                    config.editor.ambiguous_width,
-                )
+        let style = |role| {
+            if row.selected {
+                Style::ExplorerSelected(role)
             } else {
-                segment.text.clone()
-            };
-            x = grid.put_text_clipped(
-                x,
-                y,
-                &text,
-                if row.selected {
-                    Style::ExplorerSelected(segment.role)
-                } else {
-                    explorer_segment_style(segment.role)
-                },
-                main_right,
-            );
+                explorer_segment_style(role)
+            }
+        };
+        let ExplorerRowLayout {
+            segments: right_segments,
+            status_left: mut right_x,
+            name_right,
+            using_counts,
+        } = right_column.layout(row);
+        let mut x = content_left;
+        if shift != 0 && !row.guides.is_empty() {
+            x = grid.put_text_clipped(x, y, "…", style(ExplorerSegmentRole::Tree), name_right);
         }
-        let mut right_x = right_x;
-        for segment in &row.right_segments {
+        if let Some((name, prefix)) = row.segments.split_last() {
+            let name_text = sanitize_file_name(&name.text);
+            let name_width = width(&name_text);
+            let minimum_name = if using_counts {
+                MINIMUM_NAME_WITH_COUNTS
+            } else {
+                3 + width("…")
+            };
+            let minimum_name = name_width.min(minimum_name) as u16;
+            let prefix_width: usize = prefix.iter().map(|segment| width(&segment.text)).sum();
+            let prefix_width = u16::try_from(prefix_width).unwrap_or(u16::MAX);
+            // Give an overflowing row's icon and name priority over any remaining guides.
+            let guides_right = name_right.saturating_sub(minimum_name.saturating_add(prefix_width));
+            for guide in row.guides.iter().skip(shift) {
+                let next = x.saturating_add(guide_width);
+                if next > guides_right {
+                    break;
+                }
+                grid.put_text_clipped(x, y, guide, style(ExplorerSegmentRole::Tree), next);
+                x = next;
+            }
+            // On very narrow rows the icon can use its space, but not its optional padding.
+            let prefix_right = name_right.saturating_sub(minimum_name);
+            for segment in prefix {
+                x = grid.put_text_clipped(x, y, &segment.text, style(segment.role), prefix_right);
+            }
+            let name_room = usize::from(name_right.saturating_sub(x));
+            let text = truncate_explorer_name(&name_text, name_room, ambiguous);
+            grid.put_text_clipped(x, y, &text, style(name.role), name_right);
+            if row.selected && (shift != 0 || name_width > name_room) {
+                footer_path = row.relative_path.as_deref();
+            }
+        }
+        for segment in right_segments {
             right_x = grid.put_text_clipped(
                 right_x,
                 y,
                 &segment.text,
-                if row.selected {
-                    Style::ExplorerSelected(segment.role)
-                } else {
-                    explorer_segment_style(segment.role)
-                },
+                style(segment.role),
                 content_right,
             );
         }
@@ -265,8 +323,8 @@ pub(super) fn render_explorer_dock(
             panel_width.saturating_sub(1),
         );
     }
-    if explorer.loading && rendered_rows < available_rows {
-        let y = body_top.saturating_add(u16::try_from(rendered_rows).unwrap_or(0));
+    if explorer.loading && rows.len() < available_rows {
+        let y = body_top.saturating_add(u16::try_from(rows.len()).unwrap_or(0));
         grid.put_text_clipped(
             1,
             y,
@@ -275,7 +333,219 @@ pub(super) fn render_explorer_dock(
             panel_width.saturating_sub(1),
         );
     }
+    if height > EXPLORER_SEARCH_ROWS {
+        render_explorer_footer(
+            grid,
+            footer_path,
+            panel_width,
+            height - 1,
+            border == "|",
+            ambiguous,
+        );
+    }
     search_cursor
+}
+
+const NARROW_EXPLORER_WIDTH: u16 = 12;
+
+/// Keep the usual margins unless they would take space from the icon and file name.
+fn explorer_row_columns(panel_width: u16) -> (u16, u16) {
+    if panel_width <= NARROW_EXPLORER_WIDTH {
+        (0, panel_width)
+    } else {
+        (1, panel_width - 1)
+    }
+}
+
+const MINIMUM_NAME_WITH_COUNTS: usize = 8;
+
+struct ExplorerRightColumn {
+    left: u16,
+    right: u16,
+    ambiguous: AmbiguousWidth,
+    count_width: usize,
+    two_letter_column: bool,
+}
+
+struct ExplorerRowLayout<'a> {
+    segments: &'a [ExplorerUiSegment],
+    status_left: u16,
+    name_right: u16,
+    using_counts: bool,
+}
+
+fn has_two_git_letters(segments: &[ExplorerUiSegment]) -> bool {
+    matches!(
+        segments,
+        [
+            ExplorerUiSegment {
+                role: ExplorerSegmentRole::GitStaged,
+                ..
+            },
+            _
+        ]
+    )
+}
+
+impl ExplorerRightColumn {
+    fn new(rows: &[ExplorerUiRow], left: u16, right: u16, ambiguous: AmbiguousWidth) -> Self {
+        let mut column = Self {
+            left,
+            right,
+            ambiguous,
+            count_width: 0,
+            // The narrow layout drops the usual margins and keeps only the worktree letter.
+            two_letter_column: left != 0
+                && rows
+                    .iter()
+                    .any(|row| has_two_git_letters(&row.right_segments)),
+        };
+        column.count_width = rows
+            .iter()
+            .filter(|row| !row.git_line_count_segments.is_empty())
+            .filter_map(|row| {
+                let width = column.width(&row.git_line_count_segments);
+                (width <= column.count_room(row)).then_some(width)
+            })
+            .max()
+            .unwrap_or(0);
+        column
+    }
+
+    fn width(&self, segments: &[ExplorerUiSegment]) -> usize {
+        segments
+            .iter()
+            .map(|segment| cell_text_width(&segment.text, self.ambiguous))
+            .sum()
+    }
+
+    fn count_room(&self, row: &ExplorerUiRow) -> usize {
+        let prefix = row
+            .segments
+            .split_last()
+            .map_or(0, |(_, prefix)| self.width(prefix));
+        // Leave space for the whole-level shift marker when the selected row needs a shift.
+        let marker = if row.guides.is_empty() {
+            0
+        } else {
+            cell_text_width("…", self.ambiguous)
+        };
+        usize::from(self.right.saturating_sub(self.left))
+            .saturating_sub(prefix + marker + MINIMUM_NAME_WITH_COUNTS + 1)
+    }
+
+    fn layout<'a>(&self, row: &'a ExplorerUiRow) -> ExplorerRowLayout<'a> {
+        let shared = self.count_width != 0 && self.count_width <= self.count_room(row);
+        let using_counts = shared
+            && !row.git_line_count_segments.is_empty()
+            && self.width(&row.git_line_count_segments) <= self.count_width;
+        let segments = if using_counts {
+            &row.git_line_count_segments[..]
+        } else if !self.two_letter_column && has_two_git_letters(&row.right_segments) {
+            &row.right_segments[1..]
+        } else {
+            &row.right_segments[..]
+        };
+        let status_width = self.width(segments);
+        let reserved = status_width
+            .max(if shared { self.count_width } else { 0 })
+            .max(if self.two_letter_column { 2 } else { 0 });
+        let status_left = self
+            .right
+            .saturating_sub(u16::try_from(status_width).unwrap_or(u16::MAX))
+            .max(self.left);
+        let name_right = self
+            .right
+            .saturating_sub(u16::try_from(reserved).unwrap_or(u16::MAX))
+            .saturating_sub(u16::from(reserved != 0));
+        ExplorerRowLayout {
+            segments,
+            status_left,
+            name_right,
+            using_counts,
+        }
+    }
+}
+
+fn truncate_explorer_name(name: &str, maximum: usize, ambiguous: AmbiguousWidth) -> Cow<'_, str> {
+    let width = |text: &str| cell_text_width(text, ambiguous);
+    if width(name) <= maximum {
+        return Cow::Borrowed(name);
+    }
+    let ellipsis = "…";
+    let Some(available) = maximum.checked_sub(width(ellipsis)) else {
+        return Cow::Borrowed("");
+    };
+    let first = name.graphemes(true).next().map_or(0, width);
+    let extension = Path::new(name).extension().and_then(|ext| ext.to_str());
+    let suffix_limit = available.saturating_sub(first);
+    let extension_width = extension
+        .map(|ext| width(ext) + 1)
+        .filter(|&width| width <= suffix_limit)
+        .unwrap_or(0);
+    let suffix_room = (available * 2 / 5).max(extension_width).min(suffix_limit);
+    let mut suffix_start = name.len();
+    let mut suffix_width = 0;
+    for (index, grapheme) in name.grapheme_indices(true).rev() {
+        let next = suffix_width + width(grapheme);
+        if next > suffix_room {
+            break;
+        }
+        suffix_start = index;
+        suffix_width = next;
+    }
+    let mut prefix_end = 0;
+    let mut prefix_width = 0;
+    for (index, grapheme) in name[..suffix_start].grapheme_indices(true) {
+        prefix_width += width(grapheme);
+        if prefix_width > available - suffix_width {
+            break;
+        }
+        prefix_end = index + grapheme.len();
+    }
+    Cow::Owned(format!(
+        "{0}{ellipsis}{1}",
+        &name[..prefix_end],
+        &name[suffix_start..]
+    ))
+}
+
+fn render_explorer_footer(
+    grid: &mut CellGrid,
+    path: Option<&str>,
+    panel_width: u16,
+    y: u16,
+    ascii: bool,
+    ambiguous: AmbiguousWidth,
+) {
+    let (horizontal, left, right) = if ascii {
+        ("-", "+", "+")
+    } else {
+        ("─", "╰", "╯")
+    };
+    grid.set_cell(0, y, left, Style::ExplorerBorder);
+    for x in 1..panel_width {
+        grid.set_cell(x, y, horizontal, Style::ExplorerBorder);
+    }
+    grid.set_cell(panel_width, y, right, Style::ExplorerBorder);
+    if let Some(path) = path {
+        let right = panel_width.saturating_sub(1);
+        let path = sanitize_file_name(path);
+        let title = crate::render::overlays::truncate_content_title(
+            &path,
+            usize::from(right.saturating_sub(2)),
+            ambiguous,
+        );
+        if !title.is_empty() {
+            grid.put_text_clipped(
+                1,
+                y,
+                &format!(" {title} "),
+                Style::ExplorerTree,
+                panel_width,
+            );
+        }
+    }
 }
 
 /// The titled box at the top of the panel: the prompt, the query and how many rows match.
@@ -355,6 +625,13 @@ pub fn explorer_segment_style(role: ExplorerSegmentRole) -> Style {
         ExplorerSegmentRole::Symlink => Style::ExplorerSymlink,
         ExplorerSegmentRole::Loading => Style::ExplorerDecoration,
         ExplorerSegmentRole::Git => Style::ExplorerGit,
+        ExplorerSegmentRole::GitModified => Style::ExplorerGitModified,
+        ExplorerSegmentRole::GitAdded => Style::ExplorerGitAdded,
+        ExplorerSegmentRole::GitRenamed => Style::ExplorerGitRenamed,
+        ExplorerSegmentRole::GitConflict => Style::ExplorerGitConflict,
+        ExplorerSegmentRole::GitStaged => Style::ExplorerGitStaged,
+        ExplorerSegmentRole::GitDim => Style::ExplorerGitDim,
+        ExplorerSegmentRole::GitLineCount { added } => Style::ExplorerGitLineCount { added },
         ExplorerSegmentRole::Diagnostic => Style::ExplorerDiagnostic,
     }
 }
@@ -373,7 +650,7 @@ pub fn explorer_body_geometry(rect: WindowRect) -> WindowRect {
         width: rect.width.saturating_sub(1),
         height: rect
             .height
-            .saturating_sub(EXPLORER_SEARCH_ROWS)
+            .saturating_sub(EXPLORER_SEARCH_ROWS + 1)
             .min(u16::try_from(EXPLORER_MAXIMUM_VISIBLE_ROWS).unwrap_or(u16::MAX)),
     }
 }
@@ -435,11 +712,12 @@ mod tests {
     #[test]
     fn wide_explorer_separator_fits_the_final_column() {
         let frame = render_search("", AmbiguousWidth::Wide);
-        for y in 0..8 {
+        for y in 0..7 {
             let cell = frame.grid.get(28, y).unwrap();
             assert_eq!(cell.symbol, "|");
             assert!(!cell.continuation);
         }
+        assert_eq!(frame.grid.get(28, 7).unwrap().symbol, "+");
     }
 
     #[test]

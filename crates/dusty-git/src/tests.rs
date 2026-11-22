@@ -181,6 +181,47 @@ fn read_status(root: &Path) -> GitStatusSnapshot {
 }
 
 #[test]
+fn status_snapshot_keeps_index_and_worktree_changes_separate() {
+    use GitFileStatus::{Conflicted, Modified, Untracked};
+
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+    conflicted_fixture(root);
+    let repo = git2::Repository::open(root).unwrap();
+    let mut index = repo.index().unwrap();
+    std::fs::write(root.join("untouched.txt"), "staged edit\n").unwrap();
+    index.add_path(Path::new("untouched.txt")).unwrap();
+    index.write().unwrap();
+    std::fs::write(root.join("new.txt"), "untracked\n").unwrap();
+
+    let snapshot = read_status(root);
+    let layers = |snapshot: &GitStatusSnapshot, name| {
+        let entry = snapshot.entry(&snapshot.scope_root.join(name)).unwrap();
+        (entry.staged_status.clone(), entry.unstaged_status.clone())
+    };
+    assert_eq!(layers(&snapshot, "untouched.txt"), (Some(Modified), None));
+    assert_eq!(layers(&snapshot, "new.txt"), (None, Some(Untracked)));
+    assert_eq!(
+        layers(&snapshot, "shared.txt"),
+        (Some(Conflicted), Some(Conflicted))
+    );
+
+    std::fs::write(root.join("untouched.txt"), "further worktree edit\n").unwrap();
+    let snapshot = read_status(root);
+    assert_eq!(
+        layers(&snapshot, "untouched.txt"),
+        (Some(Modified), Some(Modified))
+    );
+
+    std::fs::write(root.join("untouched.txt"), "original\n").unwrap();
+    index.add_path(Path::new("untouched.txt")).unwrap();
+    index.write().unwrap();
+    std::fs::write(root.join("untouched.txt"), "worktree edit only\n").unwrap();
+    let snapshot = read_status(root);
+    assert_eq!(layers(&snapshot, "untouched.txt"), (None, Some(Modified)));
+}
+
+#[test]
 fn status_paths_include_configured_worktree_below_workspace() {
     let dir = tempdir().unwrap();
     let repo = git2::Repository::init(dir.path()).unwrap();
@@ -1090,6 +1131,52 @@ fn mutation_service_rejects_symlink_root_replacement_binary_and_directory_paths(
         wait_mutation_error(&mut service),
         GitMutationError::UnsupportedPath
     );
+}
+
+#[test]
+fn explorer_folder_status_takes_the_most_serious_change_inside() {
+    use GitFileStatus::{Added, Conflicted, Deleted, Modified, Renamed, Untracked};
+
+    let root = PathBuf::from("/workspace");
+    let entry = |path: &str, status: GitFileStatus| GitStatusEntry {
+        original_path: None,
+        relative_path: path.into(),
+        status: status.clone(),
+        staged_status: None,
+        unstaged_status: Some(status),
+        sources: GitChangeSources {
+            unstaged: true,
+            ..GitChangeSources::default()
+        },
+    };
+    let entries = [
+        entry("src/added.rs", Added),
+        entry("src/renamed.rs", Renamed),
+        entry("assets/image.png", Added),
+        entry("assets/renamed.png", Renamed),
+        entry("src/nested/only-deletion.rs", Deleted),
+        entry("conflicts/modified.rs", Modified),
+        entry("conflicts/conflicted.rs", Conflicted),
+        entry("docs/untracked.md", Untracked),
+        entry("docs/renamed.md", Renamed),
+        GitStatusEntry {
+            status: Renamed,
+            staged_status: Some(Renamed),
+            ..entry("mixed/renamed-and-edited.rs", Modified)
+        },
+    ];
+    let decorations = aggregate_git_status(&root, &entries);
+    assert_eq!(
+        decorations[&root.join("src/nested/only-deletion.rs")],
+        Deleted
+    );
+    assert_eq!(decorations[&root.join("src/nested")], Modified);
+    assert_eq!(decorations[&root.join("src")], Modified);
+    assert_eq!(decorations[&root.join("assets")], Added);
+    assert_eq!(decorations[&root.join("conflicts")], Conflicted);
+    assert_eq!(decorations[&root.join("docs")], Untracked);
+    assert_eq!(decorations[&root.join("mixed")], Modified);
+    assert_eq!(decorations[&root], Conflicted);
 }
 
 #[test]

@@ -12,7 +12,6 @@ use crate::windows::WindowId;
 pub(in crate::app) enum FocusTarget {
     #[default]
     Editor,
-    ProblemsPanel,
     Agent,
     Explorer(u64),
     Terminal(u64),
@@ -97,14 +96,6 @@ impl Windows {
             self.before_terminal = before_terminal;
         }
     }
-    pub(in crate::app) fn focus_problems_panel(&mut self) {
-        self.request_focus(FocusTarget::ProblemsPanel);
-    }
-    pub(in crate::app) fn focus_editor_from_problems(&mut self) {
-        if self.focus == FocusTarget::ProblemsPanel {
-            self.request_focus(FocusTarget::Editor);
-        }
-    }
     fn request_focus(&mut self, focus: FocusTarget) {
         self.remember_before_terminal(focus);
         if self.focus != focus {
@@ -140,9 +131,6 @@ impl Windows {
             return;
         }
         match self.core.native.target_for_window(window) {
-            Some(NativeSurfaceTarget::Picker(crate::ui::PickerSurfaceKind::ProblemsPanel)) => {
-                self.focus = FocusTarget::ProblemsPanel;
-            }
             Some(NativeSurfaceTarget::Picker(_)) => {} // temporary capture, not terminal selection
             Some(NativeSurfaceTarget::Explorer) => self.focus = FocusTarget::Explorer(1),
             Some(NativeSurfaceTarget::ExplorerView(view)) => {
@@ -175,7 +163,6 @@ impl Windows {
             }
             FocusTarget::Terminal(id) => self.core.native.terminal(id).map(|ids| ids.window),
             FocusTarget::Agent => self.core.native.agent().map(|ids| ids.window),
-            FocusTarget::ProblemsPanel => self.core.native.problems_panel().map(|ids| ids.window),
             FocusTarget::Plugin(window) => Some(window),
             FocusTarget::Editor => self.core.graph.focused(),
         }?;
