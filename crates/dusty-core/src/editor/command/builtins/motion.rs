@@ -221,36 +221,6 @@ pub(super) fn motion_target(
     Ok(target)
 }
 
-pub(super) fn block_start_column(
-    text: &TextBuffer,
-    view: &View,
-    policy: EditingPolicy,
-) -> Result<usize, CommandError> {
-    let width_policy = DisplayWidthPolicy {
-        tab_width: policy.tab_width,
-        ambiguous_wide: policy.ambiguous_width_wide,
-    };
-    let column_at = |offset: ByteOffset| -> Result<usize, CommandError> {
-        let line = text.byte_to_line(offset).map_err(failed)?;
-        let start = text.line_to_byte(line).map_err(failed)?;
-        let line_text = text.line(line).map_err(failed)?;
-        let content = line_text.strip_suffix('\n').unwrap_or(&line_text);
-        Ok(display_column_at(
-            content,
-            offset.get().saturating_sub(start.get()),
-            width_policy,
-        ))
-    };
-    if let Some(selection) = view
-        .selection
-        .filter(|selection| selection.kind == SelectionKind::Block)
-    {
-        Ok(column_at(selection.anchor)?.min(column_at(selection.head)?))
-    } else {
-        column_at(view.cursor)
-    }
-}
-
 pub(super) fn repeat_visual_ranges(
     text: &TextBuffer,
     view: &View,

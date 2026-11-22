@@ -2,6 +2,7 @@
 
 use std::ops::Range;
 
+use regex::Regex;
 use regex::RegexBuilder;
 use thiserror::Error;
 
@@ -60,6 +61,39 @@ pub fn substitution_regex(pattern: &str, flags: &str) -> Result<regex::Regex, St
         .map_err(|error| error.to_string())
 }
 
+fn literal_search_regex(
+    query: &str,
+    smart_case: bool,
+    whole_word: bool,
+) -> Result<Regex, SearchPatternError> {
+    let pattern = if whole_word {
+        format!(r"\b(?:{})\b", regex::escape(query))
+    } else {
+        regex::escape(query)
+    };
+    RegexBuilder::new(&pattern)
+        .case_insensitive(smart_case && !query.chars().any(char::is_uppercase))
+        .build()
+        .map_err(|error| SearchPatternError::InvalidRegex(error.to_string()))
+}
+
+fn overlapping_literal_matches<'a>(
+    expression: &'a Regex,
+    source: &'a str,
+) -> impl Iterator<Item = regex::Match<'a>> {
+    let mut from = 0;
+    std::iter::from_fn(move || {
+        let found = expression.find_at(source, from)?;
+        from = found.start()
+            + source[found.start()..]
+                .chars()
+                .next()
+                .expect("literal is nonempty")
+                .len_utf8();
+        Some(found)
+    })
+}
+
 /// Find one occurrence without retaining a range for every match in a large file.
 pub fn search_match(
     source: &str,
@@ -73,29 +107,8 @@ pub fn search_match(
     if query.is_empty() {
         return Ok(None);
     }
-    let pattern = if whole_word {
-        format!(r"\b(?:{})\b", regex::escape(query))
-    } else {
-        regex::escape(query)
-    };
-    let expression = RegexBuilder::new(&pattern)
-        .case_insensitive(smart_case && !query.chars().any(char::is_uppercase))
-        .build()
-        .map_err(|error| SearchPatternError::InvalidRegex(error.to_string()))?;
-    let matches = || {
-        let mut from = 0;
-        let expression = &expression;
-        std::iter::from_fn(move || {
-            let found = expression.find_at(source, from)?;
-            from = found.start()
-                + source[found.start()..]
-                    .chars()
-                    .next()
-                    .expect("literal is nonempty")
-                    .len_utf8();
-            Some(found)
-        })
-    };
+    let expression = literal_search_regex(query, smart_case, whole_word)?;
+    let matches = || overlapping_literal_matches(&expression, source);
     let found = if forward {
         let found = expression.find_at(source, offset);
         found.or_else(|| if wrap { matches().next() } else { None })
@@ -106,6 +119,53 @@ pub fn search_match(
             .or_else(|| if wrap { matches().last() } else { None })
     };
     Ok(found.map(|found| found.start()..found.end()))
+}
+
+/// Resolve a counted search selection, starting with the match at or after the caret.
+pub fn counted_search_match(
+    source: &str,
+    query: &str,
+    smart_case: bool,
+    whole_word: bool,
+    cursor: usize,
+    wrap: bool,
+    count: u64,
+) -> Result<Option<Range<usize>>, SearchPatternError> {
+    if query.is_empty() {
+        return Ok(None);
+    }
+    let expression = literal_search_regex(query, smart_case, whole_word)?;
+    // Find the caret and count in the same non-overlapping sequence that wraps.
+    let mut remaining = count.max(1);
+    for found in expression
+        .find_iter(source)
+        .skip_while(|found| found.end() <= cursor)
+    {
+        remaining -= 1;
+        if remaining == 0 {
+            return Ok(Some(found.range()));
+        }
+    }
+    if !wrap {
+        return Ok(None);
+    }
+
+    // Count from the start of the buffer once before skipping whole cycles.
+    let mut cycle_len = 0;
+    for next in expression.find_iter(source) {
+        cycle_len += 1;
+        if cycle_len == remaining {
+            return Ok(Some(next.range()));
+        }
+    }
+    if cycle_len == 0 {
+        return Ok(None);
+    }
+    let index = usize::try_from((remaining - 1) % cycle_len).expect("index within match count");
+    Ok(expression
+        .find_iter(source)
+        .nth(index)
+        .map(|next| next.range()))
 }
 
 #[cfg(test)]

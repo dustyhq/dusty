@@ -4132,7 +4132,8 @@ fn universal_window_clone_uses_editor_owned_independent_text_and_virtual_views()
         });
         view.scroll_line = 1;
         view.scroll_column = 3;
-        view.mode = crate::editor::EditorMode::Insert;
+        // Visual, not Insert: cloning an Insert view hands its session to the clone.
+        view.mode = crate::editor::EditorMode::VisualChar;
     }
     app.set_dashboard_visibility(false);
     app.reconcile_editor_windows();
@@ -4208,7 +4209,7 @@ fn universal_window_clone_uses_editor_owned_independent_text_and_virtual_views()
     assert_eq!(app.state.views[cloned_view].scroll_column, 3);
     assert_eq!(
         app.state.views[cloned_view].mode,
-        crate::editor::EditorMode::Insert
+        crate::editor::EditorMode::VisualChar
     );
 
     let transaction = crate::editor::EditorTransaction::new(crate::editor::TransactionId(999))
@@ -4243,7 +4244,7 @@ fn universal_window_clone_uses_editor_owned_independent_text_and_virtual_views()
     assert!(app.state.views[original_view].selection.is_some());
     assert_eq!(
         app.state.views[original_view].mode,
-        crate::editor::EditorMode::Insert
+        crate::editor::EditorMode::VisualChar
     );
 
     app.process_effect(AppEffect::WindowClone {

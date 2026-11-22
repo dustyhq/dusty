@@ -5,8 +5,12 @@ use crate::app::AppEffect;
 use crate::app::configuration::compile_keymaps;
 use crate::app::startup::StartupTarget;
 use crate::app::tests::*;
+use crate::editor::CommandInvocation;
 use crate::editor::CommandValue;
+use crate::editor::EditorOperation;
+use crate::editor::EditorTransaction;
 use crate::editor::InvocationSource;
+use crate::editor::UndoPolicy;
 use crate::editor::input::KeyEvent;
 use crate::editor::text::ByteOffset;
 use crate::editor::text::ByteRange;
@@ -865,7 +869,7 @@ fn normalized_blockwise_change_repeats_without_a_stale_selection() {
 }
 
 #[test]
-fn normalized_block_repeat_pads_new_ragged_and_empty_rows_by_display_column() {
+fn normalized_block_change_skips_new_ragged_and_empty_rows() {
     let (_app_dirs, mut app) = app();
     let (buffer, view) = app
         .state
@@ -902,7 +906,7 @@ fn normalized_block_repeat_pads_new_ragged_and_empty_rows_by_display_column() {
     let buffer = app.state.active_buffer_id().expect("buffer");
     assert_eq!(
         app.state.buffers[buffer].text.to_string(),
-        "abZ\nx Z\npqZ\né-Z\n  Z\n界Z"
+        "abZ\nx\npqZ\né-Z\n\n界Z"
     );
 }
 
@@ -2349,6 +2353,75 @@ fn word_search_projects_its_boundary_policy_until_an_ordinary_search_replaces_it
 }
 
 #[test]
+fn search_operators_and_dot_use_the_counted_match() {
+    let (_dirs, mut app) = app();
+    app.set_dashboard_visibility(false);
+    for (edit, expected) in [
+        (&["2", "d", "g", "n"][..], "one a  b one c\n"),
+        (
+            &["2", "c", "g", "n", "X", "escape"][..],
+            "one a X b one c\n",
+        ),
+        (&["d", "g", "n", "2", "."][..], " a one b  c\n"),
+    ] {
+        let (buffer, _) = app
+            .state
+            .open_text(TextBuffer::from_text("one a one b one c\n"), None)
+            .unwrap();
+        press_keys(&mut app, &["/", "o", "n", "e", "enter", "g", "g"]);
+        press_keys(&mut app, edit);
+        assert_eq!(
+            app.state.buffers[buffer].text.to_string(),
+            expected,
+            "{edit:?}"
+        );
+    }
+}
+
+#[test]
+fn vimmulti_r13_counted_search_delete_wraps_to_the_third_match() {
+    let (_dirs, mut app) = app();
+    app.set_dashboard_visibility(false);
+    let tail = "unmatched line\n".repeat(4096);
+    let (buffer, _) = app
+        .state
+        .open_text(TextBuffer::from_text(&format!("one one one\n{tail}")), None)
+        .unwrap();
+    app.ui.search_query = Some("one".into());
+    press_keys(&mut app, &["9", "9", "9", "9", "9", "9", "d", "g", "n"]);
+    assert_eq!(
+        app.state.buffers[buffer].text.to_string(),
+        format!("one one \n{tail}")
+    );
+}
+
+#[test]
+fn vimmulti_r13_counted_search_uses_non_overlapping_matches() {
+    let (_dirs, mut app) = app();
+    app.set_dashboard_visibility(false);
+    for (wrap, expected) in [(true, "ba j aba"), (false, "ababa j aba")] {
+        let mut fixture = app.configuration.fixture_snapshot();
+        fixture.settings.search.wrap = wrap;
+        app.configuration.install_fixture(fixture);
+        let (buffer, _) = app
+            .state
+            .open_text(TextBuffer::from_text("ababa j aba"), None)
+            .unwrap();
+        press_keys(
+            &mut app,
+            &[
+                "/", "a", "b", "a", "enter", "0", "3", "l", "2", "d", "g", "n",
+            ],
+        );
+        assert_eq!(
+            app.state.buffers[buffer].text.to_string(),
+            expected,
+            "wrap = {wrap}"
+        );
+    }
+}
+
+#[test]
 fn cgn_repeats_with_dot_substitute_confirms_each_match_and_global_deletes_lines() {
     let (_app_dirs, mut app) = app();
     let (_, view) = app
@@ -2765,6 +2838,560 @@ fn visual_block_i_and_a_type_before_and_after_every_row() {
     keys(&mut app, "jA:");
     app.handle_configured_key(KeyEvent::plain(crate::editor::input::KeyCode::Escape));
     assert_eq!(text(&app), "  let x: = 1\n  let y: = 2\n  let z = 3\n");
+}
+
+#[test]
+fn synchronized_insert_navigation_edits_at_the_moved_caret() {
+    let (_dirs, mut app) = app();
+    app.set_dashboard_visibility(false);
+
+    let (buffer, _) = app
+        .state
+        .open_text(TextBuffer::from_text("foo foo\n"), None)
+        .unwrap();
+    press_keys(&mut app, &["ctrl-n", "ctrl-n", "i", "right", "X", "escape"]);
+    assert_eq!(app.state.buffers[buffer].text.to_string(), "fXoo foo\n");
+
+    let (buffer, view) = app
+        .state
+        .open_text(TextBuffer::from_text("foo foo\n"), None)
+        .unwrap();
+    press_keys(&mut app, &["ctrl-n", "ctrl-n", "i"]);
+    let navigate = EditorTransaction::new(app.transaction_id())
+        .with_operation(EditorOperation::SetCursor {
+            view,
+            position: ByteOffset(1),
+        })
+        .with_undo_policy(UndoPolicy::Ignore);
+    app.state.apply_transaction(&navigate).unwrap();
+    press_keys(&mut app, &["backspace", "escape"]);
+    assert_eq!(app.state.buffers[buffer].text.to_string(), "oo foo\n");
+
+    let (buffer, _) = app
+        .state
+        .open_text(TextBuffer::from_text("foo foo\nbar bar\n"), None)
+        .unwrap();
+    press_keys(&mut app, &["ctrl-v", "j", "A", "right", "X", "escape"]);
+    assert_eq!(
+        app.state.buffers[buffer].text.to_string(),
+        "foXo foo\nboar bar\n"
+    );
+}
+
+#[test]
+fn block_append_keeps_esc_copy_after_two_rights_without_live_followers() {
+    let (_dirs, mut app) = app();
+    app.set_dashboard_visibility(false);
+    let (buffer, view) = app
+        .state
+        .open_text(TextBuffer::from_text("foo foo\nbar bar\n"), None)
+        .unwrap();
+    press_keys(&mut app, &["ctrl-v", "j", "A"]);
+    assert_eq!(app.state.views[view].block_insert.len(), 2);
+    press_keys(&mut app, &["right"]);
+    // The renderer highlights only the live positions in block_insert.
+    assert!(app.state.views[view].block_insert.is_empty());
+    press_keys(&mut app, &["right", "X"]);
+    assert_eq!(
+        app.state.buffers[buffer].text.to_string(),
+        "fooX foo\nbar bar\n"
+    );
+    press_keys(&mut app, &["escape"]);
+    assert_eq!(
+        app.state.buffers[buffer].text.to_string(),
+        "fooX foo\nboar bar\n"
+    );
+}
+
+#[test]
+fn dot_does_not_replay_an_older_change_after_a_multi_edit() {
+    let (_dirs, mut app) = app();
+    app.set_dashboard_visibility(false);
+    for (edit, expected) in [
+        (&["d"][..], "oo  \nXbar\n"),
+        (&["x", "escape"][..], "oo oo oo\nXbar\n"),
+        (&["i", "X", "escape"][..], "oo Xfoo Xfoo\nXbar\n"),
+        (&["c", "escape"][..], "oo  \nXbar\n"),
+        (&["n", "i", "escape"][..], "oo foo foo\nbar\n"),
+    ] {
+        let (buffer, _) = app
+            .state
+            .open_text(TextBuffer::from_text("foo foo foo\nXbar\n"), None)
+            .unwrap();
+        press_keys(&mut app, &["x", "w", "ctrl-n", "ctrl-n"]);
+        press_keys(&mut app, edit);
+        press_keys(&mut app, &["j", "0", "."]);
+        assert_eq!(
+            app.state.buffers[buffer].text.to_string(),
+            expected,
+            "{edit:?}"
+        );
+    }
+}
+
+#[test]
+fn api_edit_during_multi_insert_invalidates_dot() {
+    let (_dirs, mut app) = app();
+    app.set_dashboard_visibility(false);
+    let (buffer, _) = app
+        .state
+        .open_text(TextBuffer::from_text("foo foo foo\nXbar\n"), None)
+        .unwrap();
+    press_keys(&mut app, &["x", "w", "ctrl-n", "ctrl-n", "i"]);
+    let revision = i64::try_from(app.state.buffers[buffer].text.revision().0).unwrap();
+    let edit = CommandInvocation::new("edit.apply", InvocationSource::Test)
+        .unwrap()
+        .with_argument("revision", CommandValue::Integer(revision))
+        .with_argument("start", CommandValue::Integer(3))
+        .with_argument("end", CommandValue::Integer(3))
+        .with_argument("text", CommandValue::String("X".into()))
+        .with_argument("cursor", CommandValue::Integer(4));
+    assert!(app.invoke_checked(edit));
+    press_keys(&mut app, &["escape", "j", "0", "."]);
+    assert_eq!(
+        app.state.buffers[buffer].text.to_string(),
+        "oo Xfoo foo\nXbar\n"
+    );
+}
+
+#[test]
+fn vimmulti_r13_dot_records_changes_in_the_other_split() {
+    let (_dirs, mut app) = app();
+    app.set_dashboard_visibility(false);
+    let (first_buffer, first_view) = app
+        .state
+        .open_text(TextBuffer::from_text("foo foo"), None)
+        .unwrap();
+    let first_pane = app.state.focused_window().unwrap();
+    app.state
+        .split_active(crate::windows::TileAxis::Horizontal, 500)
+        .unwrap();
+    let (second_buffer, second_view) = app
+        .state
+        .open_text(TextBuffer::from_text("abcd"), None)
+        .unwrap();
+    let second_pane = app.state.focused_window().unwrap();
+    assert_ne!(first_pane, second_pane);
+
+    app.state.focus_pane_id(first_pane).unwrap();
+    assert_eq!(app.state.active_view(), Some(first_view));
+    press_keys(&mut app, &["ctrl-n", "ctrl-n", "i"]);
+    assert_eq!(app.state.views[first_view].block_insert.len(), 2);
+
+    app.state.focus_pane_id(second_pane).unwrap();
+    assert_eq!(app.state.active_view(), Some(second_view));
+    press_keys(&mut app, &["x", "."]);
+    assert_eq!(app.state.buffers[first_buffer].text.to_string(), "foo foo");
+    assert_eq!(app.state.buffers[second_buffer].text.to_string(), "cd");
+}
+
+#[test]
+fn vimmulti_r14_empty_multi_insert_preserves_other_splits_pending_change() {
+    let (_dirs, mut app) = app();
+    app.set_dashboard_visibility(false);
+    let (first_buffer, first_view) = app
+        .state
+        .open_text(TextBuffer::from_text("abcd"), None)
+        .unwrap();
+    let first_pane = app.state.focused_window().unwrap();
+    app.state
+        .split_active(crate::windows::TileAxis::Horizontal, 500)
+        .unwrap();
+    let (second_buffer, second_view) = app
+        .state
+        .open_text(TextBuffer::from_text("foo foo"), None)
+        .unwrap();
+    let second_pane = app.state.focused_window().unwrap();
+
+    app.state.focus_pane_id(first_pane).unwrap();
+    press_keys(&mut app, &["i", "X"]);
+    assert_eq!(app.state.views[first_view].cursor, ByteOffset(1));
+
+    app.state.focus_pane_id(second_pane).unwrap();
+    assert_eq!(app.state.active_view(), Some(second_view));
+    press_keys(&mut app, &["ctrl-n", "ctrl-n", "i", "escape"]);
+    assert_eq!(app.state.buffers[second_buffer].text.to_string(), "foo foo");
+
+    app.state.focus_pane_id(first_pane).unwrap();
+    assert_eq!(app.state.active_view(), Some(first_view));
+    press_keys(&mut app, &["escape", "0", "."]);
+    assert_eq!(app.state.buffers[first_buffer].text.to_string(), "XXabcd");
+}
+
+#[test]
+fn vimmulti_r14_disk_reload_retires_multi_insert_before_normal_dot() {
+    let (_dirs, mut app) = app();
+    let path = app.state.workspace_root.join("multi-reload.txt");
+    fs::write(&path, "foo foo").unwrap();
+    app.start_open(path.clone());
+    wait_vfs(&mut app);
+    let buffer = app.state.active_buffer_id().unwrap();
+    let view = app.state.active_view().unwrap();
+    let source = app.state.buffers[buffer].text.source_version();
+    app.set_dashboard_visibility(false);
+    press_keys(&mut app, &["ctrl-n", "ctrl-n", "i"]);
+    assert_eq!(app.state.views[view].block_insert.len(), 2);
+
+    fs::write(&path, "abcd").unwrap();
+    app.next_disk_check = None;
+    app.process_disk_changes();
+    wait_vfs(&mut app);
+    assert_eq!(app.state.active_view(), Some(view));
+    assert_eq!(app.state.active_buffer_id(), Some(buffer));
+    assert!(
+        !app.state.buffers[buffer]
+            .text
+            .source_version()
+            .same_instance(&source)
+    );
+    assert_eq!(
+        app.state.views[view].mode,
+        crate::editor::EditorMode::Normal
+    );
+
+    press_keys(&mut app, &["0", "x", "."]);
+    assert_eq!(app.state.buffers[buffer].text.to_string(), "cd");
+}
+
+fn choose_vimmulti_r15_palette_command(app: &mut App, label: &str) {
+    press_keys(app, &["f1"]);
+    assert!(app.palette_is_open());
+    app.picker_insert(label);
+    let palette = app.search.picker_projection().expect("command palette");
+    let selected = &palette.rows[palette.selected.unwrap()].label;
+    assert_eq!(
+        selected
+            .rsplit_once(": ")
+            .map_or(selected.as_str(), |(_, title)| title),
+        label
+    );
+    press_keys(app, &["enter"]);
+    assert!(!app.palette_is_open());
+}
+
+#[test]
+fn vimmulti_r15_split_continues_recording_the_insert_change() {
+    let (_dirs, mut app) = app();
+    app.set_dashboard_visibility(false);
+    let (buffer, from) = app
+        .state
+        .open_text(TextBuffer::from_text("abcd"), None)
+        .unwrap();
+    press_keys(&mut app, &["x", "i", "X"]);
+    choose_vimmulti_r15_palette_command(&mut app, "Split pane horizontally");
+    assert_ne!(app.state.active_view(), Some(from));
+    assert_eq!(app.state.active_buffer_id(), Some(buffer));
+
+    press_keys(&mut app, &["Y", "escape", "0", "."]);
+    assert_eq!(app.state.buffers[buffer].text.to_string(), "XYXYbcd");
+}
+
+#[test]
+fn vimmulti_r15_split_moves_multi_insert_without_replaying_the_old_dot() {
+    let (_dirs, mut app) = app();
+    app.set_dashboard_visibility(false);
+    let (buffer, from) = app
+        .state
+        .open_text(TextBuffer::from_text("foo foo foo\nXbar"), None)
+        .unwrap();
+    press_keys(&mut app, &["x", "w", "ctrl-n", "ctrl-n", "i"]);
+    choose_vimmulti_r15_palette_command(&mut app, "Split pane horizontally");
+    let to = app.state.active_view().unwrap();
+    assert_ne!(from, to);
+    assert_eq!(app.state.active_buffer_id(), Some(buffer));
+
+    let source = app.state.buffers[buffer].text.source_version();
+    assert!(app.state.views[to].is_multi_insert(to, &source));
+    assert!(!app.state.views[from].is_multi_insert(from, &source));
+    assert!(app.state.views[from].block_insert.is_empty());
+    assert_eq!(
+        app.state.views[from].mode,
+        crate::editor::EditorMode::Normal
+    );
+
+    press_keys(&mut app, &["X", "escape", "j", "0", "."]);
+    assert_eq!(
+        app.state.buffers[buffer].text.to_string(),
+        "oo Xfoo Xfoo\nXbar"
+    );
+}
+
+#[test]
+fn vimmulti_r15_tab_and_zoom_continue_recording_the_insert_change() {
+    for zoom in [false, true] {
+        let (_dirs, mut app) = app();
+        app.set_dashboard_visibility(false);
+        let (buffer, _) = app
+            .state
+            .open_text(TextBuffer::from_text("abcd"), None)
+            .unwrap();
+        if zoom {
+            choose_vimmulti_r15_palette_command(&mut app, "Split pane horizontally");
+        }
+        let origin = app.state.active_view().unwrap();
+        press_keys(&mut app, &["x", "i", "X"]);
+        choose_vimmulti_r15_palette_command(
+            &mut app,
+            if zoom {
+                "Zoom the pane"
+            } else {
+                "Open new tab"
+            },
+        );
+        assert_ne!(app.state.active_view(), Some(origin));
+        assert_eq!(app.state.active_buffer_id(), Some(buffer));
+        assert_eq!(
+            app.state.views[origin].mode,
+            crate::editor::EditorMode::Normal
+        );
+
+        press_keys(&mut app, &["Y"]);
+        if zoom {
+            choose_vimmulti_r15_palette_command(&mut app, "Zoom the pane");
+            assert_eq!(app.state.active_view(), Some(origin));
+        }
+        press_keys(&mut app, &["escape", "0", "."]);
+        assert_eq!(
+            app.state.buffers[buffer].text.to_string(),
+            "XYXYbcd",
+            "zoom={zoom}"
+        );
+    }
+}
+
+#[test]
+fn vimmulti_r16_split_source_is_normal_and_keeps_only_the_previous_dot() {
+    let (_dirs, mut app) = app();
+    app.set_dashboard_visibility(false);
+    let (buffer, from) = app
+        .state
+        .open_text(TextBuffer::from_text("abcd"), None)
+        .unwrap();
+    press_keys(&mut app, &["x", "i", "X"]);
+    assert_eq!(app.state.views[from].cursor, ByteOffset(1));
+    choose_vimmulti_r15_palette_command(&mut app, "Split pane horizontally");
+    let to = app.state.active_view().unwrap();
+    assert_ne!(to, from);
+    assert_eq!(
+        app.state.views[from].mode,
+        crate::editor::EditorMode::Normal
+    );
+    assert_eq!(app.state.views[from].cursor, ByteOffset(0));
+    assert_eq!(app.state.views[to].mode, crate::editor::EditorMode::Insert);
+    assert_eq!(app.state.views[to].cursor, ByteOffset(1));
+    assert_eq!(app.state.buffers[buffer].last_insert, None);
+
+    choose_vimmulti_r15_palette_command(&mut app, "Focus next pane");
+    assert_eq!(app.state.active_view(), Some(from));
+    press_keys(&mut app, &["Y", "escape", "0"]);
+    assert_eq!(app.state.registers.get('"').unwrap().text, "Xbcd");
+    assert_eq!(app.state.buffers[buffer].text.to_string(), "Xbcd");
+    press_keys(&mut app, &["."]);
+    assert_eq!(app.state.buffers[buffer].text.to_string(), "bcd");
+}
+
+#[test]
+fn vimmulti_r16_only_the_split_destination_finalizes_counted_insert() {
+    let (_dirs, mut app) = app();
+    app.set_dashboard_visibility(false);
+    let (buffer, from) = app
+        .state
+        .open_text(TextBuffer::from_text("bcd"), None)
+        .unwrap();
+    press_keys(&mut app, &["2", "i", "X"]);
+    choose_vimmulti_r15_palette_command(&mut app, "Split pane horizontally");
+    assert_eq!(
+        app.state.views[from].mode,
+        crate::editor::EditorMode::Normal
+    );
+    assert_eq!(app.state.buffers[buffer].text.to_string(), "Xbcd");
+    press_keys(&mut app, &["escape"]);
+    assert_eq!(app.state.buffers[buffer].text.to_string(), "XXbcd");
+}
+
+#[test]
+fn vimmulti_r17_split_source_at_final_newline_matches_escape() {
+    let escaped_cursor = {
+        let (_dirs, mut app) = app();
+        app.set_dashboard_visibility(false);
+        let (_, view) = app
+            .state
+            .open_text(TextBuffer::from_text("abc"), None)
+            .unwrap();
+        press_keys(&mut app, &["o", "escape"]);
+        app.state.views[view].cursor
+    };
+
+    let (_dirs, mut app) = app();
+    app.set_dashboard_visibility(false);
+    let (buffer, from) = app
+        .state
+        .open_text(TextBuffer::from_text("abc"), None)
+        .unwrap();
+    press_keys(&mut app, &["o"]);
+    let insert_cursor = app.state.views[from].cursor;
+    assert_ne!(insert_cursor, escaped_cursor);
+    choose_vimmulti_r15_palette_command(&mut app, "Split pane horizontally");
+    let to = app.state.active_view().unwrap();
+    assert_ne!(from, to);
+    assert_eq!(
+        app.state.views[from].mode,
+        crate::editor::EditorMode::Normal
+    );
+    assert_eq!(app.state.views[from].cursor, escaped_cursor);
+    assert_eq!(app.state.views[to].mode, crate::editor::EditorMode::Insert);
+    assert_eq!(app.state.views[to].cursor, insert_cursor);
+
+    choose_vimmulti_r15_palette_command(&mut app, "Focus next pane");
+    assert_eq!(app.state.active_view(), Some(from));
+    assert_eq!(app.state.views[from].cursor, escaped_cursor);
+    press_keys(&mut app, &["x"]);
+    assert_eq!(app.state.buffers[buffer].text.to_string(), "bc\n");
+}
+
+#[test]
+fn vimmulti_r13_undo_ends_multi_insert_before_typing() {
+    let (_dirs, mut app) = app();
+    app.set_dashboard_visibility(false);
+    let (buffer, view) = app
+        .state
+        .open_text(TextBuffer::from_text("foo foo\nXbar\n"), None)
+        .unwrap();
+    press_keys(
+        &mut app,
+        &["j", "0", "x", "k", "0", "ctrl-n", "ctrl-n", "i"],
+    );
+    assert_eq!(app.state.views[view].block_insert.len(), 2);
+    let undo = CommandInvocation::new("history.undo", InvocationSource::Test).unwrap();
+    assert!(app.invoke_checked(undo));
+    press_keys(&mut app, &["Y"]);
+    assert_eq!(
+        app.state.buffers[buffer].text.to_string(),
+        "foo foo\nYXbar\n"
+    );
+}
+
+#[test]
+fn vimmulti_r13_erasing_block_append_removes_generated_padding() {
+    let (_dirs, mut app) = app();
+    app.set_dashboard_visibility(false);
+    let source = "abcde\nx\nvwxyz";
+    let (buffer, _) = app
+        .state
+        .open_text(TextBuffer::from_text(source), None)
+        .unwrap();
+    press_keys(
+        &mut app,
+        &[
+            "2",
+            "l",
+            "ctrl-v",
+            "2",
+            "j",
+            "A",
+            "X",
+            "backspace",
+            "escape",
+        ],
+    );
+    assert_eq!(app.state.buffers[buffer].text.to_string(), source);
+}
+
+#[test]
+fn block_insert_and_change_respect_short_rows() {
+    let (_dirs, mut app) = app();
+    app.set_dashboard_visibility(false);
+    for (edit, expected) in [
+        (&["I", "X", "escape"][..], "abXcde\nx\nvwXxyz\n"),
+        (&["c", "X", "escape"][..], "abXde\nx\nvwXyz\n"),
+        (&["A", "escape"][..], "abcde\nx\nvwxyz\n"),
+        (&["A", "X", "escape"][..], "abcXde\nx  X\nvwxXyz\n"),
+    ] {
+        let (buffer, _) = app
+            .state
+            .open_text(TextBuffer::from_text("abcde\nx\nvwxyz\n"), None)
+            .unwrap();
+        press_keys(&mut app, &["0", "2", "l", "ctrl-v", "2", "j"]);
+        press_keys(&mut app, edit);
+        assert_eq!(
+            app.state.buffers[buffer].text.to_string(),
+            expected,
+            "{edit:?}"
+        );
+    }
+}
+
+#[test]
+fn block_insert_change_and_dot_include_rows_ending_at_the_edge() {
+    let (_dirs, mut app) = app();
+    app.set_dashboard_visibility(false);
+    for (source, prefix, edit, expected) in [
+        (
+            "abcd\nx\nxyz\n",
+            &["l"][..],
+            &["I", "X", "escape"][..],
+            "aXbcd\nxX\nxXyz\n",
+        ),
+        (
+            "abcd\n\nxyz\n",
+            &[][..],
+            &["I", "X", "escape"][..],
+            "Xabcd\nX\nXxyz\n",
+        ),
+        (
+            "abcd\nx\nxyz\nabcd\nx\nxyz\n",
+            &["l"][..],
+            &["c", "X", "escape", "3", "j", "0", "l", "."][..],
+            "aXcd\nxX\nxXz\naXcd\nxX\nxXz\n",
+        ),
+        (
+            "abcd\n\nxyz\nabcd\n\nxyz\n",
+            &[][..],
+            &["c", "X", "escape", "3", "j", "0", "."][..],
+            "Xbcd\nX\nXyz\nXbcd\nX\nXyz\n",
+        ),
+    ] {
+        let (buffer, _) = app
+            .state
+            .open_text(TextBuffer::from_text(source), None)
+            .unwrap();
+        press_keys(&mut app, prefix);
+        press_keys(&mut app, &["ctrl-v", "2", "j"]);
+        press_keys(&mut app, edit);
+        assert_eq!(
+            app.state.buffers[buffer].text.to_string(),
+            expected,
+            "{source:?} {edit:?}"
+        );
+    }
+}
+
+#[test]
+fn block_append_backspace_before_typing_does_not_erase_short_rows() {
+    let (_dirs, mut app) = app();
+    app.set_dashboard_visibility(false);
+    let (buffer, _) = app
+        .state
+        .open_text(TextBuffer::from_text("abcde\nx\nvwxyz\n"), None)
+        .unwrap();
+    press_keys(
+        &mut app,
+        &[
+            "2",
+            "l",
+            "ctrl-v",
+            "2",
+            "j",
+            "A",
+            "backspace",
+            "X",
+            "escape",
+        ],
+    );
+    assert_eq!(
+        app.state.buffers[buffer].text.to_string(),
+        "abXde\nx\nvwxyz\n"
+    );
 }
 
 #[test]

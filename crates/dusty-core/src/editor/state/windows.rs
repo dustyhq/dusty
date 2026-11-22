@@ -2,7 +2,7 @@
 
 use crate::editor::state::store::{EditorState, Zoom};
 use crate::editor::text::TextBuffer;
-use crate::editor::{Buffer, BufferId, BufferOrigin, EditorMode, View, ViewId};
+use crate::editor::{Buffer, BufferId, EditorEvent, EditorMode, View, ViewId};
 use crate::windows::{
     ContentAdapterKind, ContentId, ContentTypeId, SpatialDirection, TileAxis, TiledLayoutNode,
     WindowError, WindowId, WindowPlacement, WorkspaceTabDescriptor, WorkspaceTabId,
@@ -299,7 +299,10 @@ impl EditorState {
             return self.select_editor_window(other);
         }
         let original = self.window_view(window).ok_or("focused view is stale")?;
-        let clone = self.clone_pane(window, TileAxis::Horizontal, 500)?;
+        // The clone is immediately replaced by the opened document. Keep the
+        // original view and its editing session in the right-hand window.
+        let (_, clone) = self.split_pane(window, TileAxis::Horizontal, 500)?;
+        self.views[clone].leave_insert_without_commit(&self.buffers[kept].text);
         let right = self.view_window(clone).ok_or("cloned view is absent")?;
         // Keep the original editor view in the right-hand window, as before opening a file.
         let original_id = self.graph_views[&original];
@@ -329,6 +332,17 @@ impl EditorState {
         axis: TileAxis,
         ratio: u16,
     ) -> Result<ViewId, &'static str> {
+        let (from, to) = self.split_pane(source, axis, ratio)?;
+        self.handoff_insert_session(from, to);
+        Ok(to)
+    }
+
+    fn split_pane(
+        &mut self,
+        source: WindowId,
+        axis: TileAxis,
+        ratio: u16,
+    ) -> Result<(ViewId, ViewId), &'static str> {
         if !(100..=900).contains(&ratio) {
             return Err("split ratio must be between 100 and 900");
         }
@@ -349,7 +363,7 @@ impl EditorState {
                 .tile(window, Some(source), axis, true, ratio)
                 .map_err(layout_error)?;
             self.select_editor_window_after_layout_change(window)?;
-            Ok(view)
+            Ok((old, view))
         })();
         if result.is_err() {
             self.graph = before;
@@ -387,7 +401,35 @@ impl EditorState {
             self.graph_views.remove(&view);
             self.views.remove(view);
         }
+        if result.is_ok() {
+            self.handoff_insert_session(source, view);
+        }
         result
+    }
+
+    // The destination already has a copy of the source view, including its live
+    // insert positions. Move ownership only once the new layout has succeeded.
+    fn handoff_insert_session(&mut self, from: ViewId, to: ViewId) {
+        let view = &mut self.views[to];
+        if !matches!(view.mode, EditorMode::Insert | EditorMode::Replace) {
+            return;
+        }
+        let buffer = view.buffer;
+        let text = &self.buffers[buffer].text;
+        let source = text.source_version();
+        view.rebind_multi_insert(from, to, &source);
+        if let Some(old) = self.views.get_mut(from) {
+            // Only the destination can finalize counted/deferred edits or set
+            // the last-insert mark when it eventually leaves Insert.
+            old.leave_insert_without_commit(text);
+            old.keep_cursor_off_final_newline(text);
+        }
+        self.events.push(EditorEvent::InsertSessionMoved {
+            from,
+            to,
+            buffer,
+            source,
+        });
     }
 
     pub fn toggle_zoom(&mut self) -> Result<(), &'static str> {
@@ -400,22 +442,19 @@ impl EditorState {
             if self.active_tab() == Some(zoom.tab)
                 && let Some(window) = origin
             {
-                let zoomed = self
-                    .active_view()
-                    .and_then(|id| self.views.get(id))
-                    .cloned();
+                let from = self.active_view().ok_or("zoom view is absent")?;
+                let zoomed = self.views[from].clone();
                 self.close_active_tab()?;
-                if let Some(zoomed) = zoomed {
-                    if self.views[zoom.origin_view].buffer == zoomed.buffer {
-                        self.views[zoom.origin_view] = zoomed;
-                    } else {
-                        self.select_editor_window(window)?;
-                        self.replace_active_view(Some(zoomed.buffer))?;
-                        let view = self.active_view().ok_or("zoom view is absent")?;
-                        self.views[view] = zoomed;
-                    }
-                }
-                return self.select_editor_window(window);
+                self.select_editor_window(window)?;
+                let to = if self.views[zoom.origin_view].buffer == zoomed.buffer {
+                    zoom.origin_view
+                } else {
+                    self.replace_active_view(Some(zoomed.buffer))?;
+                    self.active_view().ok_or("zoom view is absent")?
+                };
+                self.views[to] = zoomed;
+                self.handoff_insert_session(from, to);
+                return Ok(());
             }
         }
         let origin_tab = self.active_tab().ok_or("no active tab")?;

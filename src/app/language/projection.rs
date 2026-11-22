@@ -1859,15 +1859,29 @@ mod tests {
     use crate::language::lsp::LspSemanticTokenDelta;
     use crate::language::lsp::LspSemanticTokenEdit;
     use crate::language::lsp::LspSemanticTokens;
+    use crate::language::lsp::file_uri;
     use std::collections::HashMap;
+    use std::path::Path;
+    use std::path::PathBuf;
     use std::time::Duration;
     use std::time::Instant;
 
+    fn test_path(name: &str) -> PathBuf {
+        #[cfg(windows)]
+        let root = Path::new(r"C:\");
+        #[cfg(not(windows))]
+        let root = Path::new("/");
+        root.join(name)
+    }
+
     #[test]
     fn cancelled_completion_rejects_a_late_secondary_response() {
-        let mut editor = EditorState::new("/root".into());
+        let root = test_path("root");
+        let path = root.join("a.rs");
+        let uri = file_uri(&path);
+        let mut editor = EditorState::new(root);
         let (buffer, view) = editor
-            .open_text(TextBuffer::from_text("a"), Some("/root/a.rs".into()))
+            .open_text(TextBuffer::from_text("a"), Some(path))
             .unwrap();
         let source = LspProjectionOwner {
             server: "first".into(),
@@ -1875,7 +1889,7 @@ mod tests {
             view,
             text: editor.buffers[buffer].text.source_version(),
             revision: editor.buffers[buffer].text.revision(),
-            uri: "file:///root/a.rs".into(),
+            uri,
             language: "rust".into(),
         };
         let mut owner = LspSession::default();
@@ -1920,7 +1934,7 @@ mod tests {
     ) {
         use crate::app::language::LspLaunch;
         use crate::app::language::LspRuntimeState;
-        let root = std::path::PathBuf::from("/fixture");
+        let root = test_path("fixture");
         let mut editor = EditorState::new(root.clone());
         let (buffer, _) = editor
             .open_text(
@@ -1947,7 +1961,7 @@ mod tests {
                 server_id: definition.id.clone(),
                 definition,
                 launch: LspLaunch::Direct {
-                    executable: "/server".into(),
+                    executable: test_path("server"),
                     managed: false,
                 },
                 capabilities: Some(Default::default()),
@@ -2006,7 +2020,7 @@ mod tests {
         );
         let mut state = owner.sessions.remove("owned").unwrap();
         for index in 0..70 {
-            let path = std::path::PathBuf::from(format!("/fixture/{index}.rs"));
+            let path = state.root_path.join(format!("{index}.rs"));
             let (id, _) = editor
                 .open_text(TextBuffer::from_text("fn f() {}"), Some(path.clone()))
                 .unwrap();
@@ -2048,7 +2062,7 @@ mod tests {
         editor
             .open_text(
                 TextBuffer::from_text("other"),
-                Some("/fixture/other.rs".into()),
+                Some(document.path.with_file_name("other.rs")),
             )
             .unwrap();
         owner.retry_documents(&editor);
@@ -2077,13 +2091,13 @@ mod tests {
         let (renamed, _) = editor
             .open_text(
                 TextBuffer::from_text("renamed"),
-                Some("/fixture/old.rs".into()),
+                Some(document.path.with_file_name("old.rs")),
             )
             .unwrap();
         let (kept, _) = editor
             .open_text(
                 TextBuffer::from_text("kept"),
-                Some("/fixture/kept.rs".into()),
+                Some(document.path.with_file_name("kept.rs")),
             )
             .unwrap();
         for id in [buffer, renamed, kept] {
@@ -2101,7 +2115,7 @@ mod tests {
             );
         }
         editor.buffers.remove(buffer);
-        editor.buffers[renamed].path = Some("/fixture/new.rs".into());
+        editor.buffers[renamed].path = Some(document.path.with_file_name("new.rs"));
         owner.sessions.get_mut("owned").unwrap().capabilities = None;
         owner.retry_documents(&editor);
         assert_eq!(
@@ -2155,7 +2169,7 @@ mod tests {
         editor
             .open_text(
                 TextBuffer::from_text("active"),
-                Some("/fixture/active.rs".into()),
+                Some(document.path.with_file_name("active.rs")),
             )
             .unwrap();
         editor.buffers[buffer]
@@ -3022,20 +3036,20 @@ mod tests {
     }
     #[test]
     fn completion_items_and_resolves_reject_a_reloaded_text_instance() {
-        let (mut editor, buffer, view) = {
-            let mut editor = EditorState::new("/workspace".into());
-            let (buffer, view) = editor
-                .open_text(TextBuffer::from_text("old"), Some("/workspace/test".into()))
-                .unwrap();
-            (editor, buffer, view)
-        };
+        let root = test_path("workspace");
+        let path = root.join("test");
+        let uri = file_uri(&path);
+        let mut editor = EditorState::new(root);
+        let (buffer, view) = editor
+            .open_text(TextBuffer::from_text("old"), Some(path))
+            .unwrap();
         let source = LspProjectionOwner {
             server: "server".into(),
             buffer,
             view,
             revision: editor.buffers[buffer].text.revision(),
             text: editor.buffers[buffer].text.source_version(),
-            uri: "file:///workspace/test".into(),
+            uri,
             language: "text".into(),
         };
         let mut session = LspSession::default();
@@ -3068,7 +3082,7 @@ mod tests {
 
     #[test]
     fn retiring_a_save_format_request_rejects_its_late_result() {
-        let mut editor = EditorState::new("/workspace".into());
+        let mut editor = EditorState::new(test_path("workspace"));
         let (buffer, view) = editor
             .open_text(TextBuffer::from_text("text"), None)
             .unwrap();

@@ -405,7 +405,7 @@ impl EditorState {
             document,
             revision,
         };
-        *target = replacement;
+        let previous = std::mem::replace(target, replacement).text;
         self.events.push(EditorEvent::BufferReloaded { buffer });
         let text = &target.text;
         let len = text.len_bytes();
@@ -414,6 +414,12 @@ impl EditorState {
             .iter_mut()
             .filter(|(_, view)| view.buffer == buffer)
         {
+            if !view.leave_insert_without_commit(&previous) {
+                view.clear_editing_state();
+                if view.mode == EditorMode::Multi {
+                    view.mode = EditorMode::Normal;
+                }
+            }
             view.cursor = ByteOffset(view.cursor.get().min(len));
             while !text.is_char_boundary(view.cursor) {
                 view.cursor = ByteOffset(view.cursor.get().saturating_sub(1));
@@ -426,10 +432,6 @@ impl EditorState {
             });
             if let Some(selection) = &mut view.selection {
                 selection.head = view.cursor;
-            }
-            view.clear_editing_state();
-            if view.mode == EditorMode::Multi {
-                view.mode = EditorMode::Normal;
             }
             view.scroll_line = view.scroll_line.min(text.len_lines().saturating_sub(1));
             view.scroll_wrap_row = 0;

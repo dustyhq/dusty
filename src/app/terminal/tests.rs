@@ -2814,7 +2814,6 @@ fn clicking_another_split_releases_the_exited_terminal_close_key() {
 
     let mut driver = TestSession::new(crate::config::load_bundled_config());
     driver.new_buffer();
-    driver.key("i");
     let app = driver.application_mut();
     let buffer = app.state.active_buffer_id().unwrap();
     let first_view = app.state.active_view().unwrap();
@@ -2823,6 +2822,22 @@ fn clicking_another_split_releases_the_exited_terminal_close_key() {
         .split_active(crate::windows::TileAxis::Horizontal, 500)
         .unwrap();
     driver.reconcile_windows();
+    // Each pane gets its own Insert session; a split made during Insert hands the
+    // session to the new pane and returns the original to Normal.
+    driver
+        .application_mut()
+        .state
+        .focus_view(first_view)
+        .unwrap();
+    driver.reconcile_windows();
+    driver.key("i");
+    driver
+        .application_mut()
+        .state
+        .focus_view(second_view)
+        .unwrap();
+    driver.reconcile_windows();
+    driver.key("i");
 
     close_exited_shell_over_insert_buffer(&mut driver);
     assert_eq!(driver.application().state.active_view(), Some(second_view));

@@ -1511,7 +1511,11 @@ impl App {
             invocation.target.view = self.state.active_view();
         }
         if invocation.target.buffer.is_none() {
-            invocation.target.buffer = self.state.active_buffer_id();
+            invocation.target.buffer = invocation
+                .target
+                .view
+                .and_then(|view| self.state.views.get(view))
+                .map(|view| view.buffer);
         }
         if authority == CommandAuthority::Host
             && invocation.id.as_str() == "edit.put"
@@ -1558,11 +1562,25 @@ impl App {
                 == Some(&CommandValue::String("search_match".into())))
         .then(|| invocation.clone());
         if search_match.is_some() {
-            if !self.select_next_search_match(1) {
-                self.set_mode(EditorMode::Normal);
+            let Some(view_id) = invocation.target.view else {
+                self.show_error("No editor is active.");
+                return false;
+            };
+            let Some(view) = self.state.views.get(view_id) else {
+                self.show_error("That editor is no longer open.");
+                return false;
+            };
+            if invocation.target.buffer != Some(view.buffer) {
+                self.show_error("That editor is showing a different document.");
+                return false;
+            }
+            let count = invocation.count.map_or(1, |count| count.get());
+            if !self.select_next_search_match_in(view_id, count) {
+                self.set_specific_mode(view_id, EditorMode::Normal);
                 return false;
             }
             invocation = invocation.with_argument("motion", CommandValue::String("visual".into()));
+            invocation.count = None;
         }
         let visual_operator = invocation.id.as_str() == "edit.operator"
             && invocation
@@ -1725,6 +1743,8 @@ impl App {
                     }
                     return true;
                 }
+                let multi_insert_before =
+                    crate::app::input::is_multi_insert(&self.state, invocation.target);
                 let text_before = invocation.target.buffer.and_then(|buffer| {
                     self.state
                         .buffers
@@ -1781,12 +1801,31 @@ impl App {
                 if let Some(view) = invocation.target.view {
                     self.reveal_cursor_fold(view);
                 }
-                let text_changed = invocation.target.buffer.and_then(|buffer| {
+                let text_after = invocation.target.buffer.and_then(|buffer| {
                     self.state
                         .buffers
                         .get(buffer)
                         .map(|buffer| buffer.text.source_version())
-                }) != text_before;
+                });
+                let text_changed = text_after != text_before;
+                let multi_insert_after =
+                    crate::app::input::is_multi_insert(&self.state, invocation.target);
+                if multi_insert_after && !multi_insert_before {
+                    self.input.discard_pending_change(invocation.target);
+                }
+                // A commit can end the session it edited (for example, Escape with
+                // a deferred block append). A replacement is not part of that session.
+                let multi_insert_edit = text_changed
+                    && (multi_insert_after
+                        || (multi_insert_before
+                            && text_before
+                                .as_ref()
+                                .zip(text_after.as_ref())
+                                .is_some_and(|(before, after)| before.same_instance(after))));
+                if multi_insert_edit {
+                    self.input.invalidate_dot();
+                }
+                let suppress_repeat = suppress_repeat || multi_insert_edit;
                 if text_changed {
                     self.debugger_session
                         .sync_breakpoint_locations(&mut self.state);
@@ -1830,7 +1869,8 @@ impl App {
                     self.input.record_command_outcome(
                         &invocation,
                         repeat_override.as_ref(),
-                        suppress_repeat,
+                        suppress_repeat
+                            || crate::app::input::is_multi_insert(&self.state, invocation.target),
                         text_changed,
                     );
                 }

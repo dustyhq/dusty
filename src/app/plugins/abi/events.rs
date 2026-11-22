@@ -93,6 +93,7 @@ pub(super) fn event_batch(
                     view.mode = format!("{mode:?}");
                     wit::Occurrence::Mode(view)
                 }
+                EditorEvent::InsertSessionMoved { .. } => return None,
                 EditorEvent::WorkspaceChanged { root } => {
                     wit::Occurrence::Workspace(root.to_string_lossy().into())
                 }

@@ -1131,11 +1131,22 @@ impl App {
     /// `gn`: selects the search match under the cursor, else the next one, as Vim does.
     /// Returns false, having said why, when there is none.
     pub(in crate::app) fn select_next_search_match(&mut self, count: u64) -> bool {
+        self.state
+            .active_view()
+            .is_some_and(|view| self.select_next_search_match_in(view, count))
+    }
+
+    pub(in crate::app) fn select_next_search_match_in(
+        &mut self,
+        view_id: crate::editor::ViewId,
+        count: u64,
+    ) -> bool {
+        if count > crate::editor::input::ABSOLUTE_MAX_COUNT {
+            self.show_error(crate::editor::CommandError::CountTooLarge);
+            return false;
+        }
         let Some(query) = self.ui.search_query.clone() else {
             self.show_error(self.message("no_previous_search", &[]));
-            return false;
-        };
-        let Some(view_id) = self.state.active_view() else {
             return false;
         };
         let view = &self.state.views[view_id];
@@ -1144,31 +1155,15 @@ impl App {
         let source = buffer.text.to_string();
         let search = &self.configuration.settings().search;
         let whole_word = self.input.whole_word_search();
-        let found = crate::editor::input::search_match(
+        let found = match crate::editor::input::counted_search_match(
             &source,
             &query,
             search.smart_case,
             whole_word,
-            cursor.saturating_add(1),
-            false,
-            false,
-        )
-        .and_then(|previous| {
-            if let Some(found) = previous.filter(|found| found.end > cursor) {
-                Ok(Some(found))
-            } else {
-                crate::editor::input::search_match(
-                    &source,
-                    &query,
-                    search.smart_case,
-                    whole_word,
-                    cursor,
-                    true,
-                    search.wrap,
-                )
-            }
-        });
-        let found = match found {
+            cursor,
+            search.wrap,
+            count,
+        ) {
             Ok(Some(found)) => found,
             Ok(None) => {
                 self.show_error(self.message("pattern_not_found", &[("query", query)]));
@@ -1179,28 +1174,6 @@ impl App {
                 return false;
             }
         };
-        let mut found = found;
-        for _ in 1..count {
-            match crate::editor::input::search_match(
-                &source,
-                &query,
-                search.smart_case,
-                whole_word,
-                found.end,
-                true,
-                search.wrap,
-            ) {
-                Ok(Some(next)) => found = next,
-                Ok(None) => {
-                    self.show_error(self.message("pattern_not_found", &[("query", query)]));
-                    return false;
-                }
-                Err(error) => {
-                    self.show_error(error);
-                    return false;
-                }
-            }
-        }
         self.select_text(view_id, found.start, found.end)
     }
 }

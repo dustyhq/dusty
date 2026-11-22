@@ -4607,6 +4607,56 @@ fn lsp_completion_applies_through_one_validated_transaction() {
 }
 
 #[test]
+fn vimmulti_r13_completion_before_typing_invalidates_dot() {
+    use crate::app::editing::tests::press_keys;
+
+    let (_dirs, mut app) = app();
+    let path = app.state.workspace_root.join("completion.rs");
+    let uri = file_uri(&path);
+    let (buffer, view) = app
+        .state
+        .open_text(TextBuffer::from_text("foo foo foo\nXbar"), Some(path))
+        .unwrap();
+    app.set_dashboard_visibility(false);
+    press_keys(&mut app, &["x", "w", "ctrl-n", "ctrl-n", "i"]);
+    assert_eq!(app.state.views[view].cursor, ByteOffset(3));
+    let owner = crate::app::language::LspProjectionOwner {
+        server: "server".into(),
+        buffer,
+        view,
+        revision: app.state.buffers[buffer].text.revision(),
+        text: app.state.buffers[buffer].text.source_version(),
+        uri,
+        language: "rust".into(),
+    };
+    app.language.fixture_projection(Some(owner.clone()));
+    app.language.fixture_completion_source(Some((7, owner)));
+    let here = crate::language::lsp::LspPosition {
+        line: 0,
+        character: 3,
+    };
+    let mut item = source_completion("X", "X", "0");
+    item.text_edit = Some(crate::language::lsp::LspTextEdit {
+        range: crate::language::lsp::LspRange {
+            start: here.clone(),
+            end: here,
+        },
+        new_text: "X".into(),
+    });
+    app.language.fixture_completion_items(vec![item]);
+    app.invoke_mapped_command("completion.accept");
+    assert_eq!(
+        app.state.buffers[buffer].text.to_string(),
+        "oo Xfoo foo\nXbar"
+    );
+    press_keys(&mut app, &["escape", "j", "0", "."]);
+    assert_eq!(
+        app.state.buffers[buffer].text.to_string(),
+        "oo Xfoo foo\nXbar"
+    );
+}
+
+#[test]
 fn lsp_completion_selection_scrolls_and_wraps_inside_the_visible_window() {
     let (_app_dirs, mut app) = app();
     let count = usize::from(COMPLETION_MAX_ROWS) + 2;

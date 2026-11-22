@@ -38,13 +38,11 @@ use crate::editor::command::CommandError;
 
 use crate::editor::command::CommandId;
 
-use crate::editor::CommandInvocation;
+use crate::editor::{CommandInvocation, CommandValue};
 
 use crate::editor::command::CommandOutcome;
 
 use crate::editor::command::builtins::comment::build_comment_toggle;
-
-use crate::editor::command::builtins::motion::block_start_column;
 
 use crate::editor::command::builtins::motion::cursor_display_column;
 
@@ -317,6 +315,13 @@ pub(super) fn execute_builtin<E>(
         }
         "mode.normal" => {
             transaction.undo_policy = UndoPolicy::Boundary;
+            let append = multi::finish_block_append(view, &buffer.text, state.policy)?;
+            if !append.is_empty() {
+                transaction.operations.push(EditorOperation::ApplyEdits {
+                    buffer: buffer_id,
+                    edits: TextEditSet::new(buffer.text.revision(), append),
+                });
+            }
             let repeated = if view.mode == EditorMode::Insert {
                 view.insert_repeat
                     .as_ref()
@@ -355,19 +360,12 @@ pub(super) fn execute_builtin<E>(
                     view: view_id,
                     position: ByteOffset(view.cursor.get() + last),
                 });
-            } else if matches!(view.mode, EditorMode::Insert | EditorMode::Replace)
-                && view.cursor.get() > 0
-            {
-                let previous = previous_grapheme_boundary(&buffer.text, view.cursor);
-                let crossed_newline = buffer
-                    .text
-                    .slice(ByteRange::new(previous, view.cursor).map_err(failed)?)
-                    .map_err(failed)?
-                    == "\n";
-                if !crossed_newline {
+            } else {
+                let position = view.insert_exit_cursor(&buffer.text);
+                if position != view.cursor {
                     transaction.operations.push(EditorOperation::SetCursor {
                         view: view_id,
-                        position: previous,
+                        position,
                     });
                 }
             }
@@ -559,7 +557,8 @@ pub(super) fn execute_builtin<E>(
                     ..CommandOutcome::empty()
                 });
             }
-            let pair = (state.policy.autopairs && view.block_insert.is_empty())
+            let synchronized = view.block_insert.as_slice();
+            let pair = (state.policy.autopairs && synchronized.is_empty())
                 .then(|| auto_pair(&buffer.text, view.cursor, text))
                 .flatten();
             if let Some(pair) = pair {
@@ -585,26 +584,29 @@ pub(super) fn execute_builtin<E>(
                     ..CommandOutcome::empty()
                 });
             }
-            let positions = if view.block_insert.is_empty() {
-                vec![view.cursor]
-            } else {
-                view.block_insert.clone()
-            };
-            let edits = TextEditSet::new(
-                buffer.text.revision(),
-                positions
+            if !text.is_empty() {
+                let positions = if synchronized.is_empty() {
+                    std::slice::from_ref(&view.cursor)
+                } else {
+                    synchronized
+                };
+                let append_column = view.block_append_pending_column();
+                let edits = positions
                     .iter()
-                    .map(|position| TextEdit::new(ByteRange::empty(*position), text))
-                    .collect(),
-            );
-            transaction.operations.push(EditorOperation::ApplyEdits {
-                buffer: buffer_id,
-                edits,
-            });
-            transaction.operations.push(EditorOperation::SetCursor {
-                view: view_id,
-                position: ByteOffset(positions[0].get() + text.len()),
-            });
+                    .map(|&position| {
+                        multi::insert_at(&buffer.text, position, text, append_column, state.policy)
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let cursor = ByteOffset(positions[0].get() + edits[0].replacement().len());
+                transaction.operations.push(EditorOperation::ApplyEdits {
+                    buffer: buffer_id,
+                    edits: TextEditSet::new(buffer.text.revision(), edits),
+                });
+                transaction.operations.push(EditorOperation::SetCursor {
+                    view: view_id,
+                    position: cursor,
+                });
+            }
         }
         "edit.replace_text" => {
             transaction.undo_policy = if state.policy.undo_break_on_text_commit {
@@ -717,15 +719,55 @@ pub(super) fn execute_builtin<E>(
                     ..CommandOutcome::empty()
                 });
             }
-            let positions = if view.block_insert.is_empty() {
+            // Backspacing before the first append ends the block. On a short
+            // primary row it moves through virtual space, not into real text.
+            let synchronized = if let Some(column) = view.block_append_pending_column() {
+                let cursor_column = cursor_display_column(&buffer.text, view.cursor, state.policy)?;
+                let in_virtual_space = column > cursor_column;
+                transaction
+                    .operations
+                    .push(EditorOperation::SetBlockInsert {
+                        view: view_id,
+                        positions: if in_virtual_space {
+                            vec![view.cursor]
+                        } else {
+                            Vec::new()
+                        },
+                        append_column: in_virtual_space.then(|| column - 1),
+                    });
+                if in_virtual_space {
+                    return Ok(CommandOutcome {
+                        transaction: Some(transaction),
+                        ..CommandOutcome::empty()
+                    });
+                }
+                &[]
+            } else {
+                view.block_insert.as_slice()
+            };
+            let positions = if synchronized.is_empty() {
                 vec![view.cursor]
             } else {
-                view.block_insert.clone()
+                synchronized.to_vec()
             };
-            let starts = positions
+            let mut starts = positions
                 .iter()
                 .map(|position| previous_grapheme_boundary(&buffer.text, *position))
                 .collect::<Vec<_>>();
+            let live_append = !synchronized.is_empty() && view.block_append_column.is_some();
+            if let Some(column) = view.block_append_column.filter(|_| live_append)
+                && let Some(&origin) = view.block_append_origins.first()
+            {
+                let origin_column = cursor_display_column(&buffer.text, origin, state.policy)?;
+                let padding = column.saturating_sub(origin_column);
+                // When Backspace erases the whole appended body, remove each
+                // row's generated padding in that same edit.
+                if starts[0].get() == origin.get() + padding
+                    && starts.len() == view.block_append_origins.len()
+                {
+                    starts.copy_from_slice(&view.block_append_origins);
+                }
+            }
             let pair_end = (state.policy.autopairs && view.block_insert.is_empty())
                 .then(|| empty_pair_end(&buffer.text, view.cursor))
                 .flatten();
@@ -741,12 +783,13 @@ pub(super) fn execute_builtin<E>(
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             if !edits.is_empty() {
-                if !view.block_insert.is_empty() {
+                if !synchronized.is_empty() && !live_append {
                     transaction
                         .operations
                         .push(EditorOperation::SetBlockInsert {
                             view: view_id,
                             positions: starts.clone(),
+                            append_column: None,
                         });
                 }
                 transaction.operations.push(EditorOperation::ApplyEdits {
@@ -1225,39 +1268,52 @@ pub(super) fn execute_builtin<E>(
                 if operator == "change" {
                     transaction.undo_policy = UndoPolicy::Merge;
                 }
+                let mut cursor = first_range.start;
                 if operator == "change" && shape == RegisterShape::Block {
+                    // Keep the register's row alignment, but insert only where the
+                    // row reaches the left edge, including a caret right at EOL.
+                    let column = if invocation.id.as_str() == "edit.repeat_visual" {
+                        cursor_display_column(&buffer.text, view.cursor, state.policy)?
+                    } else if let Some(selection) = view.selection {
+                        multi::block_columns(
+                            &buffer.text,
+                            selection.anchor,
+                            selection.head,
+                            state.policy,
+                        )?
+                        .0
+                    } else {
+                        cursor_display_column(&buffer.text, view.cursor, state.policy)?
+                    };
+                    let mut positions = Vec::new();
+                    for &range in &ranges {
+                        if multi::block_row_reaches(&buffer.text, range, column, state.policy)? {
+                            positions.push(range.start);
+                        }
+                    }
+                    let Some(&first) = positions.first() else {
+                        transaction.operations.push(EditorOperation::SetMode {
+                            view: view_id,
+                            mode: EditorMode::Normal,
+                        });
+                        return Ok(CommandOutcome {
+                            transaction: Some(transaction),
+                            ..CommandOutcome::empty()
+                        });
+                    };
+                    cursor = first;
                     transaction
                         .operations
                         .push(EditorOperation::SetBlockInsert {
                             view: view_id,
-                            positions: ranges.iter().map(|range| range.start).collect(),
+                            positions,
+                            append_column: None,
                         });
                 }
-                let block_column = (operator == "change" && shape == RegisterShape::Block)
-                    .then(|| block_start_column(&buffer.text, view, state.policy))
-                    .transpose()?;
                 let edits = ranges
                     .iter()
-                    .copied()
-                    .map(|range| {
-                        let replacement = block_column.map_or_else(String::new, |column| {
-                            if range.is_empty() {
-                                let line = buffer.text.byte_to_line(range.start).unwrap_or(0);
-                                let line_text = buffer.text.line(line).unwrap_or_default();
-                                let content = line_text.strip_suffix('\n').unwrap_or(&line_text);
-                                let width_policy = DisplayWidthPolicy {
-                                    tab_width: state.policy.tab_width,
-                                    ambiguous_wide: state.policy.ambiguous_width_wide,
-                                };
-                                let (_, padding) =
-                                    insertion_at_display_column(content, column, width_policy);
-                                " ".repeat(padding)
-                            } else {
-                                String::new()
-                            }
-                        });
-                        TextEdit::new(range, replacement)
-                    })
+                    .filter(|range| !range.is_empty())
+                    .map(|&range| TextEdit::new(range, ""))
                     .collect();
                 transaction.operations.push(EditorOperation::ApplyEdits {
                     buffer: buffer_id,
@@ -1265,7 +1321,7 @@ pub(super) fn execute_builtin<E>(
                 });
                 transaction.operations.push(EditorOperation::SetCursor {
                     view: view_id,
-                    position: first_range.start,
+                    position: cursor,
                 });
             } else {
                 transaction.undo_policy = UndoPolicy::Ignore;

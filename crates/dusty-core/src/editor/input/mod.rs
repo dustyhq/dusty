@@ -40,6 +40,7 @@ pub use keymap::KeymapSequence;
 pub use keymap::MappingResolution;
 pub use modes::{ModeCursor, ModeError, ModeKeys, NamedMode};
 pub use search::SearchPatternError;
+pub use search::counted_search_match;
 pub use search::search_match;
 pub use search::search_matches;
 pub use search::substitution_regex;

@@ -15,8 +15,11 @@ mod tests;
 use crate::app::configuration::KeymapOperation;
 use crate::app::configuration::ResolvedKeymaps;
 use crate::app::configuration::display_key_sequence;
+use crate::editor::BufferId;
 use crate::editor::CommandInvocation;
+use crate::editor::CommandTarget;
 use crate::editor::EditorMode;
+use crate::editor::EditorState;
 use crate::editor::input::GrammarInput;
 use crate::editor::input::InputAction;
 use crate::editor::input::InputError;
@@ -103,6 +106,13 @@ impl MappingKeyKinds {
     }
 }
 
+type ChangeTarget = (Option<ViewId>, Option<BufferId>);
+
+struct PendingChange {
+    commands: Vec<CommandInvocation>,
+    edited: bool,
+}
+
 /// Runtime input state is separate from immutable compiled configuration bindings.
 pub(super) struct InputState {
     pub(in crate::app) snippet: Option<snippets::SnippetExpansion>,
@@ -154,8 +164,7 @@ pub(super) struct InputState {
     capture_epoch: std::sync::Arc<()>,
     completion_request_id: u64,
     last_change: Vec<CommandInvocation>,
-    pending_change: Option<Vec<CommandInvocation>>,
-    pending_change_edited: bool,
+    pending_changes: HashMap<ChangeTarget, PendingChange>,
     recording_macro: Option<(char, Vec<CommandInvocation>)>,
     last_macro: Option<char>,
     replay_depth: usize,
@@ -246,8 +255,7 @@ impl InputState {
             capture_epoch: std::sync::Arc::new(()),
             completion_request_id: 0,
             last_change: Vec::new(),
-            pending_change: None,
-            pending_change_edited: false,
+            pending_changes: HashMap::new(),
             recording_macro: None,
             last_macro: None,
             replay_depth: 0,
@@ -608,8 +616,44 @@ use crate::editor::InvocationSource;
 use crate::app::editing::replay::repeated;
 use crate::app::editing::replay::replayed;
 
+pub(in crate::app) fn is_multi_insert(state: &EditorState, target: CommandTarget) -> bool {
+    let Some(view_id) = target.view else {
+        return false;
+    };
+    state.views.get(view_id).is_some_and(|view| {
+        Some(view.buffer) == target.buffer
+            && state
+                .buffers
+                .get(view.buffer)
+                .is_some_and(|buffer| view.is_multi_insert(view_id, &buffer.text.source_version()))
+    })
+}
+
 /// Semantic recording and replay limits belong to input, not command dispatch.
 impl InputState {
+    pub(in crate::app) fn invalidate_dot(&mut self) {
+        self.last_change.clear();
+    }
+
+    pub(in crate::app) fn discard_pending_change(&mut self, target: CommandTarget) {
+        self.pending_changes.remove(&(target.view, target.buffer));
+    }
+
+    pub(in crate::app) fn move_pending_change(
+        &mut self,
+        from: ViewId,
+        to: ViewId,
+        buffer: BufferId,
+    ) {
+        let pending = self.pending_changes.remove(&(Some(from), Some(buffer)));
+        let target = (Some(to), Some(buffer));
+        if let Some(pending) = pending {
+            self.pending_changes.insert(target, pending);
+        } else {
+            self.pending_changes.remove(&target);
+        }
+    }
+
     pub(in crate::app) fn record_successful_invocation(
         &mut self,
         invocation: &CommandInvocation,
@@ -647,17 +691,23 @@ impl InputState {
         }
         let mut semantic = repeat_override.unwrap_or(invocation).clone();
         semantic.target = Default::default();
+        let target = (invocation.target.view, invocation.target.buffer);
         match invocation.id.as_str() {
-            "mode.insert" | "mode.replace" | "edit.substitute" => {
-                self.pending_change = Some(vec![semantic]);
-                self.pending_change_edited = text_changed;
+            "multi.delete" | "multi.delete_char" if text_changed => {
+                self.last_change.clear();
             }
-            "edit.operator" | "edit.repeat_visual"
-                if semantic.arguments.get("operator")
-                    == Some(&CommandValue::String("change".into())) =>
+            id if matches!(id, "mode.insert" | "mode.replace" | "edit.substitute")
+                || (matches!(id, "edit.operator" | "edit.repeat_visual")
+                    && semantic.arguments.get("operator")
+                        == Some(&CommandValue::String("change".into()))) =>
             {
-                self.pending_change = Some(vec![semantic]);
-                self.pending_change_edited = text_changed;
+                self.pending_changes.insert(
+                    target,
+                    PendingChange {
+                        commands: vec![semantic],
+                        edited: text_changed,
+                    },
+                );
             }
             "edit.insert_text"
             | "edit.backspace"
@@ -665,23 +715,26 @@ impl InputState {
             | "edit.replace_backspace" => {
                 // Typing a closer may move over an existing pair without changing text.
                 // Keep that keystroke in an edited insert so dot restores the cursor too.
-                if (text_changed
-                    || (invocation.id.as_str() == "edit.insert_text" && self.pending_change_edited))
-                    && let Some(pending) = &mut self.pending_change
+                if let Some(pending) = self.pending_changes.get_mut(&target)
+                    && (text_changed
+                        || (invocation.id.as_str() == "edit.insert_text" && pending.edited))
                 {
-                    pending.push(semantic);
-                    self.pending_change_edited |= text_changed;
+                    pending.commands.push(semantic);
+                    pending.edited |= text_changed;
                 }
             }
-            "view.cursor.move" if self.pending_change.is_some() => {
-                let pending = self.pending_change.take().expect("pending insert");
-                let mode = if pending[0].id.as_str() == "mode.replace" {
+            "view.cursor.move" if self.pending_changes.contains_key(&target) => {
+                let pending = self
+                    .pending_changes
+                    .remove(&target)
+                    .expect("pending insert");
+                let mode = if pending.commands[0].id.as_str() == "mode.replace" {
                     "mode.replace"
                 } else {
                     "mode.insert"
                 };
-                if self.pending_change_edited {
-                    self.last_change = pending;
+                if pending.edited {
+                    self.last_change = pending.commands;
                     self.last_change.push(
                         CommandInvocation::new("mode.normal", invocation.source).expect("builtin"),
                     );
@@ -692,25 +745,26 @@ impl InputState {
                     transition = transition
                         .with_argument("placement", CommandValue::String("before".into()));
                 }
-                self.pending_change = Some(vec![transition]);
-                self.pending_change_edited = false;
+                self.pending_changes.insert(
+                    target,
+                    PendingChange {
+                        commands: vec![transition],
+                        edited: false,
+                    },
+                );
             }
             "mode.normal" => {
-                if let Some(mut pending) = self.pending_change.take()
-                    && self.pending_change_edited
+                if let Some(mut pending) = self.pending_changes.remove(&target)
+                    && pending.edited
                 {
-                    pending.push(semantic);
-                    self.last_change = pending;
+                    pending.commands.push(semantic);
+                    self.last_change = pending.commands;
                 }
-                self.pending_change_edited = false;
             }
-            "edit.delete_char" if self.pending_change.is_some() => {
-                if text_changed {
-                    self.pending_change
-                        .as_mut()
-                        .expect("pending insert")
-                        .push(semantic);
-                    self.pending_change_edited = true;
+            "edit.delete_char" if self.pending_changes.contains_key(&target) => {
+                if text_changed && let Some(pending) = self.pending_changes.get_mut(&target) {
+                    pending.commands.push(semantic);
+                    pending.edited = true;
                 }
             }
             "edit.delete_char"
@@ -729,9 +783,9 @@ impl InputState {
                 self.last_change = vec![semantic];
             }
             _ if text_changed && repeat_override.is_some() => {
-                if let Some(pending) = &mut self.pending_change {
-                    pending.push(semantic);
-                    self.pending_change_edited = true;
+                if let Some(pending) = self.pending_changes.get_mut(&target) {
+                    pending.commands.push(semantic);
+                    pending.edited = true;
                 } else {
                     self.last_change = vec![semantic];
                 }
@@ -3682,6 +3736,9 @@ impl InputState {
             .and_then(|id| self.pending_commands.get_mut(&id))
         {
             pending.text_changed |= text_changed;
+            if text_changed && pending.invocation.target == invocation.target {
+                pending.suppress_repeat |= suppress_repeat;
+            }
         } else {
             self.record_successful_invocation(invocation, repeat, suppress_repeat, text_changed);
         }
@@ -3689,6 +3746,7 @@ impl InputState {
 
     fn finish_command(
         &mut self,
+        state: &EditorState,
         id: crate::editor::PendingCommandId,
         succeeded: bool,
         text_changed: bool,
@@ -3701,11 +3759,16 @@ impl InputState {
         }
         self.pending_input = None;
         if succeeded {
+            let multi_insert = is_multi_insert(state, pending.invocation.target);
+            let text_changed = pending.text_changed || text_changed;
+            if multi_insert && text_changed {
+                self.invalidate_dot();
+            }
             self.record_successful_invocation(
                 &pending.invocation,
                 pending.repeat.as_ref(),
-                pending.suppress_repeat,
-                pending.text_changed || text_changed,
+                pending.suppress_repeat || multi_insert,
+                text_changed,
             );
         }
         true
@@ -3719,7 +3782,10 @@ impl App {
         succeeded: bool,
         text_changed: bool,
     ) {
-        if !self.input.finish_command(id, succeeded, text_changed) {
+        if !self
+            .input
+            .finish_command(&self.state, id, succeeded, text_changed)
+        {
             return;
         }
         if succeeded {

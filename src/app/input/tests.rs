@@ -382,7 +382,6 @@ fn pending_release_prefix_does_not_follow_focus_or_keyboard_capture() {
     let timeout = Duration::from_millis(loaded.config.input.mapping_timeout_ms + 1);
     let mut session = TestSession::new(loaded);
     session.new_buffer();
-    session.key("i");
     let app = session.application_mut();
     let buffer = app.state.active_buffer_id().unwrap();
     let first = app.state.active_view().unwrap();
@@ -391,6 +390,14 @@ fn pending_release_prefix_does_not_follow_focus_or_keyboard_capture() {
         .split_active(crate::windows::TileAxis::Horizontal, 500)
         .unwrap();
     session.reconcile_windows();
+    // Each pane gets its own Insert session; a split made during Insert hands the
+    // session to the new pane and returns the original to Normal.
+    session.application_mut().state.focus_view(first).unwrap();
+    session.reconcile_windows();
+    session.key("i");
+    session.application_mut().state.focus_view(second).unwrap();
+    session.reconcile_windows();
+    session.key("i");
     let _ = session.frame();
 
     let start_prefix = |session: &mut TestSession| {

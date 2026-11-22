@@ -4,7 +4,7 @@ use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use crate::editor::text::{BufferRevision, ByteOffset, EditDelta, TextEditSet};
+use crate::editor::text::{BufferRevision, ByteOffset, EditDelta, TextEditSet, TextVersion};
 use crate::editor::{BufferId, EditorMode, ViewId};
 
 #[derive(Clone, Debug)]
@@ -42,6 +42,13 @@ pub enum EditorEvent {
     ModeChanged {
         view: ViewId,
         mode: EditorMode,
+    },
+    /// A layout operation moved a live insert/replace session to another view.
+    InsertSessionMoved {
+        from: ViewId,
+        to: ViewId,
+        buffer: BufferId,
+        source: TextVersion,
     },
     WorkspaceChanged {
         root: PathBuf,

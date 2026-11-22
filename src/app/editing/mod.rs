@@ -321,9 +321,28 @@ impl App {
         self.persistence.reconcile_marks(&self.state);
         self.debugger_session
             .sync_breakpoint_locations(&mut self.state);
+        let before_events = self.state.events.sequence();
         *self.state = self
             .window_session
             .accept_editor_transition(transition, &current, &catalog)?;
+        if let Some(events) = self.state.events.since(before_events) {
+            for (_, event) in events {
+                if let crate::editor::EditorEvent::InsertSessionMoved {
+                    from,
+                    to,
+                    buffer,
+                    source,
+                } = event
+                    && self
+                        .state
+                        .buffers
+                        .get(buffer)
+                        .is_some_and(|buffer| source.same_instance(&buffer.text.source_version()))
+                {
+                    self.input.move_pending_change(from, to, buffer);
+                }
+            }
+        }
         self.debugger_session
             .sync_breakpoint_locations(&mut self.state);
         self.persistence.reconcile_marks(&self.state);
@@ -580,25 +599,11 @@ impl App {
         &mut self,
         view_id: crate::editor::ViewId,
     ) {
-        let Some(view) = self.state.views.get(view_id) else {
-            return;
-        };
-        if view.mode != EditorMode::Normal {
-            return;
+        // Deref once so the view and its buffer are disjoint field borrows.
+        let state = &mut *self.state;
+        if let Some(view) = state.views.get_mut(view_id) {
+            view.keep_cursor_off_final_newline(&state.buffers[view.buffer].text);
         }
-        let text = &self.state.buffers[view.buffer].text;
-        let last = text.visible_lines().saturating_sub(1);
-        if text.byte_to_line(view.cursor).unwrap_or(0) <= last {
-            return;
-        }
-        let Ok(start) = text.line_to_byte(last) else {
-            return;
-        };
-        let indent = text.line(last).map_or(0, |line| {
-            line.find(|character: char| !character.is_whitespace())
-                .unwrap_or(0)
-        });
-        self.state.views[view_id].cursor = ByteOffset(start.get() + indent);
     }
 }
 

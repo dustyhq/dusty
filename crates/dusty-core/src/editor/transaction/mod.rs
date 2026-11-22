@@ -128,6 +128,10 @@ pub enum EditorOperation {
     SetBlockInsert {
         view: ViewId,
         positions: Vec<ByteOffset>,
+        append_column: Option<usize>,
+    },
+    BeginMultiInsert {
+        view: ViewId,
     },
     SetMultiMarks {
         view: ViewId,
@@ -478,11 +482,7 @@ fn apply_operation(
                     selection.anchor = delta.map_offset(selection.anchor, Affinity::Before);
                     selection.head = delta.map_offset(selection.head, Affinity::After);
                 }
-                for position in &mut view.block_insert {
-                    *position = delta.map_offset(*position, Affinity::After);
-                }
-                view.block_insert.sort();
-                view.block_insert.dedup();
+                view.map_block_insert(&delta);
                 for mark in &mut view.multi_marks {
                     mark.start = delta.map_offset(mark.start, Affinity::Before);
                     mark.end = delta.map_offset(mark.end, Affinity::After);
@@ -498,12 +498,12 @@ fn apply_operation(
                 .get(*view)
                 .ok_or(TransactionError::MissingView)?
                 .buffer;
-            state
+            let text = &state
                 .buffers
                 .get(buffer_id)
                 .ok_or(TransactionError::MissingBuffer)?
-                .text
-                .validate_offset(*position)
+                .text;
+            text.validate_offset(*position)
                 .map_err(|error| TransactionError::InvalidCursor {
                     position: position.get(),
                     reason: error.to_string(),
@@ -520,6 +520,24 @@ fn apply_operation(
             }
             if target.cursor != *position && undo_policy == UndoPolicy::Boundary {
                 target.insert_repeat = None;
+            }
+            if target.cursor != *position
+                && target.mode == EditorMode::Insert
+                && (target.deferred_block_append.is_some()
+                    || target
+                        .block_insert
+                        .first()
+                        .is_some_and(|first| *first != *position))
+            {
+                // Before block A types anything, forward motions on the first row let
+                // Esc copy a span from the original edge without leaving live cursors.
+                let deferred = undo_policy == UndoPolicy::Boundary
+                    && target.cursor < *position
+                    && text.byte_to_line(target.cursor).ok() == text.byte_to_line(*position).ok()
+                    && target.defer_block_append(*position);
+                if !deferred {
+                    target.clear_block_insert();
+                }
             }
             target.syntax_selections.clear();
             target.cursor = *position;
@@ -617,6 +635,7 @@ fn apply_operation(
                 .flatten();
             let marked = target.buffer;
             target.syntax_selections.clear();
+            target.end_multi_insert();
             target.mode = *mode;
             match mode {
                 EditorMode::VisualChar | EditorMode::VisualLine | EditorMode::VisualBlock => {
@@ -645,7 +664,7 @@ fn apply_operation(
             }
             if *mode != EditorMode::Insert {
                 target.insert_repeat = None;
-                target.block_insert.clear();
+                target.clear_block_insert();
             }
             if *mode != EditorMode::Multi {
                 target.multi_marks.clear();
@@ -725,12 +744,33 @@ fn apply_operation(
             target.multi_whole_word = *whole_word;
             target.multi_preferred_columns = preferred_columns.clone();
         }
-        EditorOperation::SetBlockInsert { view, positions } => {
-            state
+        EditorOperation::SetBlockInsert {
+            view,
+            positions,
+            append_column,
+        } => {
+            let target = state
                 .views
                 .get_mut(*view)
-                .ok_or(TransactionError::MissingView)?
-                .block_insert = positions.clone();
+                .ok_or(TransactionError::MissingView)?;
+            target.block_insert = positions.clone();
+            target.block_append_column = *append_column;
+            target.block_append_origins.clear();
+            if append_column.is_some() {
+                target.block_append_origins.extend_from_slice(positions);
+            }
+            target.deferred_block_append = None;
+        }
+        EditorOperation::BeginMultiInsert { view } => {
+            let target = state
+                .views
+                .get_mut(*view)
+                .ok_or(TransactionError::MissingView)?;
+            let source = state
+                .buffers
+                .get(target.buffer)
+                .ok_or(TransactionError::MissingBuffer)?;
+            target.begin_multi_insert(*view, source.text.source_version());
         }
         EditorOperation::Yanked { .. } => {}
         EditorOperation::SetRegister { name, text, shape } => state.registers.set(
@@ -796,11 +836,12 @@ fn apply_operation(
                 {
                     view.syntax_selections.clear();
                     view.cursor = delta.map_offset(view.cursor, Affinity::Before);
-                    for position in &mut view.block_insert {
-                        *position = delta.map_offset(*position, Affinity::After);
+                    if view.mode == EditorMode::Insert {
+                        view.clear_block_insert();
+                        view.end_multi_insert();
+                    } else {
+                        view.map_block_insert(&delta);
                     }
-                    view.block_insert.sort();
-                    view.block_insert.dedup();
                     for mark in &mut view.multi_marks {
                         mark.start = delta.map_offset(mark.start, Affinity::Before);
                         mark.end = delta.map_offset(mark.end, Affinity::After);
@@ -1684,7 +1725,7 @@ mod tests {
     }
 
     #[test]
-    fn history_deduplicates_collapsed_block_insert_positions() {
+    fn history_ends_synchronized_insert_even_when_positions_collapse() {
         for undo in [true, false] {
             let mut state = EditorState::new("/workspace".into());
             let (buffer, view) = state.open_text(TextBuffer::from_text(""), None).unwrap();
@@ -1696,7 +1737,7 @@ mod tests {
             state.views[view].mode = crate::editor::EditorMode::Insert;
             state.views[view].block_insert = vec![ByteOffset(0), ByteOffset(2)];
             assert_eq!(history(&mut state, buffer, undo), "");
-            assert_eq!(state.views[view].block_insert, [ByteOffset(0)]);
+            assert!(state.views[view].block_insert.is_empty());
             let mut registry = crate::editor::CommandRegistry::<()>::default();
             crate::editor::register_builtin_commands(&mut registry).unwrap();
             let invocation = crate::editor::CommandInvocation::new(
@@ -1740,10 +1781,14 @@ mod tests {
         let second = state
             .split_active(crate::windows::TileAxis::Horizontal, 500)
             .unwrap();
-        for id in [first, second] {
+        let source = state.buffers[buffer].text.source_version();
+        for (id, mode) in [(first, EditorMode::Multi), (second, EditorMode::Insert)] {
             let view = &mut state.views[id];
             view.cursor = ByteOffset(8);
-            view.mode = crate::editor::EditorMode::Multi;
+            view.mode = mode;
+            if mode == EditorMode::Insert {
+                view.begin_multi_insert(id, source.clone());
+            }
             view.multi_marks = vec![ByteRange::new(ByteOffset(5), ByteOffset(9)).unwrap()];
             view.block_insert = vec![ByteOffset(8)];
             view.preferred_column = Some(8);

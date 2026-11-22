@@ -503,7 +503,7 @@ mod tests {
     }
 
     #[test]
-    fn blockwise_change_pads_ragged_lines_to_the_display_rectangle() {
+    fn blockwise_change_skips_rows_shorter_than_the_left_edge() {
         let mut editor = HeadlessEditor::with_text("abcd\nx\npqrs");
         let view = editor.active_view();
         editor.state.views[view].cursor = crate::editor::text::ByteOffset(10);
@@ -518,7 +518,7 @@ mod tests {
         editor
             .feed(KeyEvent::plain(crate::editor::input::KeyCode::Escape))
             .expect("normal");
-        assert_eq!(editor.text(), "abZ\nx Z\npqZ");
+        assert_eq!(editor.text(), "abZ\nx\npqZ");
     }
 
     #[test]

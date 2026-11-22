@@ -713,6 +713,13 @@ fn replace_backspace_never_restores_text_over_another_views_edit() {
 #[test]
 fn replace_backspace_preserves_earlier_records_and_remaps_unaffected_ones() {
     let (mut state, buffer, view) = editing("abc", 0);
+    // Split before Replace starts: a split made during Replace hands the session to
+    // the new pane, and this test needs the first pane to keep its records.
+    let second = state
+        .split_active(crate::windows::TileAxis::Vertical, 500)
+        .unwrap();
+    state.focus_pane(-1, true).unwrap();
+    assert_eq!(state.active_view(), Some(view));
     apply(&mut state, "mode.replace", &[], 1);
     apply(&mut state, "edit.replace_text", &[("text", "X")], 1);
     apply(&mut state, "edit.replace_text", &[("text", "Y")], 1);
@@ -723,9 +730,8 @@ fn replace_backspace_preserves_earlier_records_and_remaps_unaffected_ones() {
 
     state.views[view].cursor = crate::editor::text::ByteOffset(1);
     apply(&mut state, "edit.replace_text", &[("text", "X")], 1);
-    let second = state
-        .split_active(crate::windows::TileAxis::Vertical, 500)
-        .unwrap();
+    state.focus_pane(1, true).unwrap();
+    assert_eq!(state.active_view(), Some(second));
     state.views[second].cursor = crate::editor::text::ByteOffset(0);
     state.views[second].mode = crate::editor::EditorMode::Insert;
     apply(&mut state, "edit.insert_text", &[("text", "zz")], 1);

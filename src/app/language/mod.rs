@@ -1313,6 +1313,7 @@ impl App {
         }
         let mut edits = vec![edit];
         edits.extend(item.additional_edits);
+        let source_before = self.state.buffers[buffer_id].text.source_version();
         let applied =
             crate::app::language::edits::decode_edits(edits, &buffer, encoding).and_then(|edits| {
                 let transaction = EditorTransaction::new(self.transaction_id()).with_operation(
@@ -1332,6 +1333,17 @@ impl App {
         if let Err(error) = applied {
             self.show_error(error);
         } else {
+            if self.state.buffers[buffer_id].text.source_version() != source_before
+                && crate::app::input::is_multi_insert(
+                    &self.state,
+                    crate::editor::CommandTarget {
+                        view: self.state.active_view(),
+                        buffer: Some(buffer_id),
+                    },
+                )
+            {
+                self.input.invalidate_dot();
+            }
             if let Some(start) = insertion_start
                 && !tabstops.is_empty()
             {

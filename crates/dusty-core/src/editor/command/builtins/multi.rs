@@ -24,8 +24,6 @@ use crate::editor::text::TextEdit;
 
 use crate::editor::text::TextEditSet;
 
-use crate::editor::text::display_column_at;
-
 use crate::editor::text::insertion_at_display_column;
 
 use crate::editor::text::next_grapheme_boundary;
@@ -500,42 +498,22 @@ pub(super) fn begin_insert(
     policy: EditingPolicy,
 ) -> Result<(), CommandError> {
     let mut positions = Vec::with_capacity(marks.len());
-    let mut padding = Vec::new();
-    let append_column = if placement == "end" && view.mode == EditorMode::VisualBlock {
-        view.selection
-            .map(|selection| {
-                Ok::<_, CommandError>(
-                    cursor_display_column(text, selection.anchor, policy)?
-                        .max(cursor_display_column(text, selection.head, policy)?)
-                        + 1,
-                )
-            })
-            .transpose()?
-    } else {
-        None
-    };
+    let columns = (view.mode == EditorMode::VisualBlock)
+        .then_some(view.selection)
+        .flatten()
+        .map(|selection| block_columns(text, selection.anchor, selection.head, policy))
+        .transpose()?;
+    let append_column = columns
+        .filter(|_| placement == "end")
+        .map(|(_, right)| right + 1);
     for mark in marks {
-        if let Some(column) = append_column {
-            let line = text.byte_to_line(mark.end).map_err(failed)?;
-            let line_start = text.line_to_byte(line).map_err(failed)?;
-            let content = text.line(line).map_err(failed)?;
-            let content = content.strip_suffix('\n').unwrap_or(&content);
-            let end_column = display_column_at(
-                content,
-                content.len(),
-                DisplayWidthPolicy {
-                    tab_width: policy.tab_width,
-                    ambiguous_wide: policy.ambiguous_width_wide,
-                },
-            );
-            if column > end_column {
-                let end = ByteOffset(line_start.get() + content.len());
-                padding.push(TextEdit::new(
-                    ByteRange::empty(end),
-                    " ".repeat(column - end_column),
-                ));
-            }
+        if append_column.is_some() {
             positions.push(mark.end);
+            continue;
+        }
+        if let Some((left, _)) = columns
+            && !block_row_reaches(text, *mark, left, policy)?
+        {
             continue;
         }
         positions.push(match placement {
@@ -559,26 +537,108 @@ pub(super) fn begin_insert(
         view: view_id,
         mode: EditorMode::Insert,
     });
+    transaction.operations.push(EditorOperation::SetCursor {
+        view: view_id,
+        position: first,
+    });
     transaction
         .operations
         .push(EditorOperation::SetBlockInsert {
             view: view_id,
             positions,
+            append_column,
         });
-    transaction.operations.push(EditorOperation::SetCursor {
-        view: view_id,
-        position: first,
-    });
-    if !padding.is_empty() {
-        transaction.operations.push(EditorOperation::ApplyEdits {
-            buffer: view.buffer,
-            edits: TextEditSet::new(text.revision(), padding),
-        });
-    }
+    transaction
+        .operations
+        .push(EditorOperation::BeginMultiInsert { view: view_id });
     if placement == "change" {
         push_delete(transaction, view.buffer, marks, text);
     }
     Ok(())
+}
+
+pub(super) fn block_columns(
+    text: &TextBuffer,
+    anchor: ByteOffset,
+    head: ByteOffset,
+    policy: EditingPolicy,
+) -> Result<(usize, usize), CommandError> {
+    let anchor = cursor_display_column(text, anchor, policy)?;
+    let head = cursor_display_column(text, head, policy)?;
+    Ok((anchor.min(head), anchor.max(head)))
+}
+
+/// Empty projected ranges can be either before the block or exactly at its left edge.
+pub(super) fn block_row_reaches(
+    text: &TextBuffer,
+    range: ByteRange,
+    column: usize,
+    policy: EditingPolicy,
+) -> Result<bool, CommandError> {
+    Ok(!range.is_empty() || cursor_display_column(text, range.start, policy)? >= column)
+}
+
+/// Build an insertion, padding only when text is actually committed.
+pub(super) fn insert_at(
+    text: &TextBuffer,
+    position: ByteOffset,
+    inserted: &str,
+    append_column: Option<usize>,
+    policy: EditingPolicy,
+) -> Result<TextEdit, CommandError> {
+    let range = ByteRange::empty(position);
+    let Some(column) = append_column else {
+        return Ok(TextEdit::new(range, inserted));
+    };
+    let padding = column.saturating_sub(cursor_display_column(text, position, policy)?);
+    Ok(TextEdit::new(
+        range,
+        format!("{}{inserted}", " ".repeat(padding)),
+    ))
+}
+
+/// After block A leaves live synchronization, Esc copies from the original append edge,
+/// taking as many graphemes as were inserted at the moved caret.
+pub(super) fn finish_block_append(
+    view: &View,
+    text: &TextBuffer,
+    policy: EditingPolicy,
+) -> Result<Vec<TextEdit>, CommandError> {
+    let Some(append) = &view.deferred_block_append else {
+        return Ok(Vec::new());
+    };
+    let Some((&edge, followers)) = append.positions.split_first() else {
+        return Ok(Vec::new());
+    };
+    let start = append.start;
+    if edge > start || start >= view.cursor || followers.is_empty() {
+        return Ok(Vec::new());
+    }
+    let typed = text
+        .slice(ByteRange::new(start, view.cursor).map_err(failed)?)
+        .map_err(failed)?;
+    if typed.contains('\n') {
+        return Ok(Vec::new());
+    }
+    let from_edge = text
+        .slice(ByteRange::new(edge, view.cursor).map_err(failed)?)
+        .map_err(failed)?;
+    let copied_end = from_edge
+        .grapheme_indices(true)
+        .nth(typed.graphemes(true).count())
+        .map_or(from_edge.len(), |(offset, _)| offset);
+    followers
+        .iter()
+        .map(|&position| {
+            insert_at(
+                text,
+                position,
+                &from_edge[..copied_end],
+                Some(append.column),
+                policy,
+            )
+        })
+        .collect()
 }
 
 /// `d`: removes every mark and goes back to Normal mode.

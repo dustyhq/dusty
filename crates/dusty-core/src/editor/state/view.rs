@@ -1,7 +1,14 @@
 //! Cursor, selection and viewport state.
 
 use crate::editor::state::id::BufferId;
+use crate::editor::state::id::ViewId;
+use crate::editor::text::Affinity;
 use crate::editor::text::ByteOffset;
+use crate::editor::text::ByteRange;
+use crate::editor::text::EditDelta;
+use crate::editor::text::TextBuffer;
+use crate::editor::text::TextVersion;
+use crate::editor::text::previous_grapheme_boundary;
 
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 pub enum EditorMode {
@@ -136,6 +143,21 @@ impl FoldedLines {
     }
 }
 
+/// Block append text to copy on Escape after live synchronized editing has ended.
+#[derive(Clone, Debug)]
+pub(crate) struct DeferredBlockAppend {
+    pub positions: Vec<ByteOffset>,
+    pub column: usize,
+    pub start: ByteOffset,
+}
+
+#[derive(Clone, Debug)]
+struct MultiInsertSession {
+    view: ViewId,
+    buffer: BufferId,
+    source: TextVersion,
+}
+
 #[derive(Clone, Debug)]
 pub struct View {
     pub buffer: BufferId,
@@ -154,6 +176,12 @@ pub struct View {
     pub replace_history: Vec<ReplaceRecord>,
     pub insert_repeat: Option<InsertRepeat>,
     pub block_insert: Vec<ByteOffset>,
+    /// Virtual column to reach on the first text insertion for Visual Block A.
+    pub(crate) block_append_column: Option<usize>,
+    /// Physical insertion sites before any append text or generated padding.
+    pub(crate) block_append_origins: Vec<ByteOffset>,
+    pub(crate) deferred_block_append: Option<DeferredBlockAppend>,
+    multi_insert_session: Option<MultiInsertSession>,
     /// The ranges marked in `EditorMode::Multi`, in order. Empty ranges are plain cursors.
     pub multi_marks: Vec<crate::editor::text::ByteRange>,
     pub multi_whole_word: bool,
@@ -162,11 +190,150 @@ pub struct View {
 }
 
 impl View {
+    pub(crate) fn begin_multi_insert(&mut self, view: ViewId, source: TextVersion) {
+        self.multi_insert_session = Some(MultiInsertSession {
+            view,
+            buffer: self.buffer,
+            source,
+        });
+    }
+
+    pub(crate) fn end_multi_insert(&mut self) {
+        self.multi_insert_session = None;
+    }
+
+    /// Rebind the guard in a view cloned to continue this Insert session.
+    pub(crate) fn rebind_multi_insert(&mut self, from: ViewId, to: ViewId, source: &TextVersion) {
+        if self.is_multi_insert(from, source) {
+            self.multi_insert_session
+                .as_mut()
+                .expect("checked session")
+                .view = to;
+        } else {
+            self.end_multi_insert();
+        }
+    }
+
+    /// The cursor left by Escape when no final text is inserted.
+    pub(crate) fn insert_exit_cursor(&self, text: &TextBuffer) -> ByteOffset {
+        if !matches!(self.mode, EditorMode::Insert | EditorMode::Replace) || self.cursor.get() == 0
+        {
+            return self.cursor;
+        }
+        let previous = previous_grapheme_boundary(text, self.cursor);
+        let range = ByteRange {
+            start: previous,
+            end: self.cursor,
+        };
+        if text.slice(range).is_ok_and(|grapheme| grapheme != "\n") {
+            previous
+        } else {
+            self.cursor
+        }
+    }
+
+    /// Move a Normal cursor on the hidden line after a final newline to the
+    /// first nonblank on the last visible line, or its start if blank.
+    pub fn keep_cursor_off_final_newline(&mut self, text: &TextBuffer) {
+        if self.mode != EditorMode::Normal {
+            return;
+        }
+        let last = text.visible_lines().saturating_sub(1);
+        if text.byte_to_line(self.cursor).unwrap_or(0) <= last {
+            return;
+        }
+        let Ok(start) = text.line_to_byte(last) else {
+            return;
+        };
+        let indent = text.line(last).map_or(0, |line| {
+            line.find(|character: char| !character.is_whitespace())
+                .unwrap_or(0)
+        });
+        self.cursor = ByteOffset(start.get() + indent);
+    }
+
+    /// Leave Insert/Replace without finalizing the session's edits or marks.
+    pub(crate) fn leave_insert_without_commit(&mut self, text: &TextBuffer) -> bool {
+        if !matches!(self.mode, EditorMode::Insert | EditorMode::Replace) {
+            return false;
+        }
+        self.cursor = self.insert_exit_cursor(text);
+        self.mode = EditorMode::Normal;
+        self.selection = None;
+        self.clear_editing_state();
+        true
+    }
+
+    /// True only for the owning view and text instance, including edits during Insert.
+    #[must_use]
+    pub fn is_multi_insert(&self, view: ViewId, source: &TextVersion) -> bool {
+        self.mode == EditorMode::Insert
+            && self.multi_insert_session.as_ref().is_some_and(|session| {
+                session.view == view
+                    && session.buffer == self.buffer
+                    && session.source.same_instance(source)
+            })
+    }
+
+    pub(crate) fn clear_block_insert(&mut self) {
+        self.block_insert.clear();
+        self.block_append_column = None;
+        self.block_append_origins.clear();
+        self.deferred_block_append = None;
+    }
+
+    pub(crate) fn block_append_pending_column(&self) -> Option<usize> {
+        self.block_append_column
+            .filter(|_| self.block_insert == self.block_append_origins)
+    }
+
+    pub(crate) fn defer_block_append(&mut self, position: ByteOffset) -> bool {
+        if let Some(append) = &mut self.deferred_block_append {
+            if append.start != self.cursor {
+                return false;
+            }
+            append.start = position;
+            return true;
+        }
+        let Some(column) = self.block_append_pending_column() else {
+            return false;
+        };
+        self.block_append_column = None;
+        self.block_append_origins.clear();
+        self.deferred_block_append = Some(DeferredBlockAppend {
+            positions: std::mem::take(&mut self.block_insert),
+            column,
+            start: position,
+        });
+        true
+    }
+
+    pub(crate) fn map_block_insert(&mut self, delta: &EditDelta) {
+        fn map_positions(positions: &mut Vec<ByteOffset>, delta: &EditDelta) {
+            for position in positions.iter_mut() {
+                *position = delta.map_offset(*position, Affinity::After);
+            }
+            positions.sort();
+            positions.dedup();
+        }
+
+        map_positions(&mut self.block_insert, delta);
+        for origin in &mut self.block_append_origins {
+            *origin = delta.map_offset(*origin, Affinity::Before);
+        }
+        self.block_append_origins.dedup();
+        if let Some(append) = &mut self.deferred_block_append {
+            map_positions(&mut append.positions, delta);
+            append.start = delta.map_offset(append.start, Affinity::Before);
+        }
+    }
+
     pub fn clear_editing_state(&mut self) {
         self.syntax_selections.clear();
         self.replace_history.clear();
         self.insert_repeat = None;
-        self.block_insert.clear();
+        self.clear_block_insert();
+        self.end_multi_insert();
         self.multi_marks.clear();
         self.multi_whole_word = true;
         self.multi_preferred_columns.clear();
@@ -189,6 +356,10 @@ impl View {
             replace_history: Vec::new(),
             insert_repeat: None,
             block_insert: Vec::new(),
+            block_append_column: None,
+            block_append_origins: Vec::new(),
+            deferred_block_append: None,
+            multi_insert_session: None,
             multi_marks: Vec::new(),
             multi_whole_word: true,
             multi_preferred_columns: Vec::new(),
