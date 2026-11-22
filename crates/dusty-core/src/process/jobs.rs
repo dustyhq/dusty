@@ -1366,9 +1366,11 @@ mod pipe_tests {
         let (stderr, stderr_writer) = io::pipe().unwrap();
         let mut engine = JobEngine::new(capacity);
         let id = JobId(1);
+        // Backslashes only: cmd parses its own command line, and "System32/cmd.exe"
+        // reads as the switch /c followed by the command "md.exe".
         #[cfg(windows)]
         let child = Command::new(
-            PathBuf::from(std::env::var_os("SystemRoot").unwrap()).join("System32/cmd.exe"),
+            PathBuf::from(std::env::var_os("SystemRoot").unwrap()).join(r"System32\cmd.exe"),
         )
         .args(["/D", "/E:ON", "/C", "exit", "/B", "0"])
         .spawn()
@@ -1640,7 +1642,8 @@ mod windows_tests {
         let mut engine = JobEngine::new(64);
         let id = JobId(1);
         let request = JobRequest {
-            program: system_root.join("System32/cmd.exe"),
+            // Backslashes only; see pipe_job.
+            program: system_root.join(r"System32\cmd.exe"),
             argv0: None,
             arguments: ["/D", "/E:ON", "/C", "emit-lines.cmd"]
                 .into_iter()
