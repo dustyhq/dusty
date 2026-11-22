@@ -18,6 +18,15 @@ use crate::tools::ToolDefinition;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
+/// Snapshot the same authorized roots used by workspace-edit preparation.
+pub(super) fn edit_roots(workspace: &Workspace) -> std::sync::Arc<[PathBuf]> {
+    workspace
+        .roots()
+        .iter()
+        .map(|root| root.identity.canonical_path.clone())
+        .collect()
+}
+
 #[derive(Clone, Debug)]
 pub(in crate::app) enum LspLaunchSource {
     Direct { executable: PathBuf, managed: bool },

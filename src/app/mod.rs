@@ -158,6 +158,8 @@ struct FormatOnSave {
     source: crate::editor::text::TextVersion,
     path: Option<std::path::PathBuf>,
     formatter: Option<String>,
+    formatter_refusal: Option<String>,
+    formatter_ran: bool,
     started: bool,
     quit_after: bool,
     deadline: std::time::Instant,

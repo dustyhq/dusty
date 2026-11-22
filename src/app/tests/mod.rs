@@ -197,7 +197,7 @@ pub(in crate::app) fn write_plugin_manifest(
 
 pub(in crate::app) fn wait_vfs(app: &mut App) {
     let deadline = Instant::now() + Duration::from_secs(20);
-    while app.documents.has_work() {
+    while app.documents.has_work() || app.workspace_edits.preparing() {
         app.queue_startup_reads();
         app.process_vfs_results();
         assert!(Instant::now() < deadline, "VFS completion timed out");

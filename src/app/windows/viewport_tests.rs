@@ -1233,6 +1233,9 @@ pub(in crate::app) fn operation_bar_visibility_reprojects_the_editor_footer_inse
 
 #[test]
 pub(in crate::app) fn half_page_scrolling_and_cursor_follow_include_expanded_diagnostic_rows() {
+    use crate::app::diagnostics::{DiagnosticBatch, DiagnosticDocument, DiagnosticValidity};
+    use crate::workspace::{Diagnostic, DiagnosticOwner, DiagnosticProducer};
+
     let (_app_dirs, mut app) = app();
     app.window_session.observe_size((80, 8));
     {
@@ -1241,7 +1244,7 @@ pub(in crate::app) fn half_page_scrolling_and_cursor_follow_include_expanded_dia
         fixture.settings.ui.status_line.enabled = false;
         app.configuration.install_fixture(fixture);
     }
-    let path = PathBuf::from("/tmp/expanded-diagnostics.rs");
+    let path = app.state.workspace_root.join("expanded-diagnostics.rs");
     let (buffer, view) = app
         .state
         .open_text(
@@ -1252,22 +1255,42 @@ pub(in crate::app) fn half_page_scrolling_and_cursor_follow_include_expanded_dia
     app.set_dashboard_visibility(false);
     app.reconcile_editor_windows();
     let cursor = app.state.buffers[buffer].text.line_to_byte(3).unwrap();
-    app.state.views[view].cursor = cursor;
-    app.ui.diagnostics.push(crate::ui::UiDiagnostic {
-        buffer: None,
-        path: path.clone(),
-        range: ByteRange::empty(cursor),
-        severity: DiagnosticSeverity::Error,
-        source: String::new(),
-        code: None,
-        message: "diagnostic ".repeat(40),
-    });
-    app.ui.expanded_diagnostic = Some(crate::ui::ExpandedDiagnosticState {
-        buffer: None,
-        path,
-        line: 3,
-        severities: vec![DiagnosticSeverity::Error],
-    });
+    let uri = crate::language::lsp::file_uri(&path);
+    let producer = DiagnosticProducer::new(DiagnosticOwner::new("lsp.viewport").unwrap());
+    app.diagnostics.activate(producer.clone());
+    app.diagnostics
+        .publish(
+            DiagnosticBatch {
+                producer,
+                uri: uri.clone(),
+                document: DiagnosticDocument::capture(&app.state, buffer),
+                validity: DiagnosticValidity::UnversionedReport,
+                disk_points: Default::default(),
+                items: vec![Diagnostic {
+                    uri,
+                    version: None,
+                    range: ByteRange::empty(cursor),
+                    severity: DiagnosticSeverity::Error,
+                    source: String::new(),
+                    code: None,
+                    message: "diagnostic ".repeat(40),
+                    related: Vec::new(),
+                    tags: Vec::new(),
+                    fixes: Vec::new(),
+                    data: None,
+                    timestamp: std::time::SystemTime::UNIX_EPOCH,
+                }],
+            },
+            &app.state,
+        )
+        .unwrap();
+    // Reconciliation regenerates the UI projection from the diagnostics store.
+    app.invoke_mapped_command("diagnostic.error.next");
+    assert_eq!(app.state.views[view].cursor, cursor);
+    assert_eq!(
+        app.ui.expanded_diagnostic.as_ref().map(|state| state.line),
+        Some(3)
+    );
     // Cursor follow must not count the expanded rows as ordinary source lines.
     app.state.views[view].cursor = app.state.buffers[buffer].text.line_to_byte(6).unwrap();
     app.ensure_cursor_visible();

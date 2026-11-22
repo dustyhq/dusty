@@ -29,6 +29,29 @@ use crate::files::vfs::read_file_bounded;
 
 use crate::files::vfs::scoped_existing_path;
 
+/// Use the same traversal and ignore rules for workspace search and LSP edit snapshots.
+pub fn workspace_search_walk(
+    roots: &[PathBuf],
+    include_hidden: bool,
+    include_ignored: bool,
+) -> Option<WalkBuilder> {
+    let (first, rest) = roots.split_first()?;
+    let mut builder = WalkBuilder::new(first);
+    for root in rest {
+        builder.add(root);
+    }
+    // Match workspace grep: skip hidden files by default and honor Git and global ignores.
+    builder
+        .follow_links(false)
+        .hidden(!include_hidden)
+        .ignore(!include_ignored)
+        .git_ignore(!include_ignored)
+        .git_global(!include_ignored)
+        .git_exclude(!include_ignored)
+        .parents(!include_ignored);
+    Some(builder)
+}
+
 pub(super) const ABSOLUTE_WORKSPACE_SEARCH_FILES: usize = 1_000_000;
 pub(super) const ABSOLUTE_WORKSPACE_SEARCH_RESULTS: usize = 100_000;
 pub(super) const ABSOLUTE_WORKSPACE_SEARCH_FILE_BYTES: u64 = 256 * 1024 * 1024;
@@ -339,21 +362,9 @@ pub(super) fn run_workspace_search(
     }
     roots.sort();
     roots.dedup();
-    let mut builder = WalkBuilder::new(&roots[0]);
-    for root in roots.iter().skip(1) {
-        builder.add(root);
-    }
+    let builder = workspace_search_walk(&roots, policy.include_hidden, policy.include_ignored)
+        .expect("validated search roots");
     let mut summary = WorkspaceSearchSummary::default();
-    // What Git ignores, linked worktrees in `.worktree/` among it, is not searched, as in
-    // LazyVim's grep.
-    builder
-        .follow_links(false)
-        .hidden(!policy.include_hidden)
-        .ignore(!policy.include_ignored)
-        .git_ignore(!policy.include_ignored)
-        .git_global(!policy.include_ignored)
-        .git_exclude(!policy.include_ignored)
-        .parents(!policy.include_ignored);
     let mut paths = Vec::new();
     let mut seen = HashSet::new();
     for entry in builder.build() {

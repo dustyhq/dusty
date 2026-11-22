@@ -1878,6 +1878,8 @@ impl App {
                 source: self.state.buffers[buffer].text.source_version(),
                 path: self.state.buffers[buffer].path.clone(),
                 formatter: None,
+                formatter_refusal: None,
+                formatter_ran: false,
                 started: false,
                 quit_after,
                 deadline: Instant::now() + std::time::Duration::from_secs(3),
@@ -1889,6 +1891,17 @@ impl App {
 }
 
 impl App {
+    pub(in crate::app) fn formatting_save_source_current(
+        &self,
+        buffer: crate::editor::BufferId,
+    ) -> bool {
+        self.format_on_save.get(&buffer).is_some_and(|pending| {
+            self.state.buffers.get(buffer).is_some_and(|current| {
+                current.path == pending.path && current.text.source_version() == pending.source
+            })
+        })
+    }
+
     pub(in crate::app) fn formatting_save_for_request(
         &self,
         server: &str,
@@ -1922,10 +1935,20 @@ impl App {
             pending.started = true;
             pending.deadline = Instant::now() + std::time::Duration::from_millis(3000);
             let previous = std::mem::replace(&mut self.effect_authority, pending.authority.clone());
-            match crate::app::tasks::FormatterSource::capture(&self.state, buffer) {
+            let format_only = self.documents.save_work.format_only.contains(&buffer);
+            let source = if format_only {
+                self.capture_task_formatter(&name, buffer)
+            } else {
+                self.capture_save_task_formatter(&name, buffer)
+            };
+            match source {
                 Ok(source) => self.run_trusted(TrustedAction::RunFormatter { name, source }),
                 Err(error) => {
-                    self.show_error(error);
+                    if format_only {
+                        self.show_error(error);
+                    } else if let Some(pending) = self.format_on_save.get_mut(&buffer) {
+                        pending.formatter_refusal.get_or_insert(error);
+                    }
                     self.finish_format_on_save(buffer);
                 }
             }
@@ -1934,7 +1957,29 @@ impl App {
     }
 }
 
+#[derive(Clone)]
+pub(in crate::app) struct FormatterRefusal {
+    reason: String,
+    formatter_ran: bool,
+}
+
+impl FormatterRefusal {
+    fn save_notice(&self, saved: &str) -> String {
+        if self.formatter_ran {
+            format!("{saved}. Skipped formatter: {}.", self.reason)
+        } else {
+            format!("{saved} without formatting. {}.", self.reason)
+        }
+    }
+}
+
 impl App {
+    pub(in crate::app) fn note_save_formatter_ran(&mut self, buffer: BufferId) {
+        if let Some(pending) = self.format_on_save.get_mut(&buffer) {
+            pending.formatter_ran = true;
+        }
+    }
+
     pub(in crate::app) fn finish_format_on_save(&mut self, buffer: crate::editor::BufferId) {
         let Some(mut pending) = self.format_on_save.remove(&buffer) else {
             return;
@@ -1977,13 +2022,32 @@ impl App {
                 return;
             }
             let previous = std::mem::replace(&mut self.effect_authority, pending.authority);
-            match self.request_save_buffer(pending.buffer, pending.quit_after, None, false, None) {
-                Ok(_) => self.notify_message(self.message("saving", &[]), false),
+            let formatter_refusal = pending.formatter_refusal.map(|reason| FormatterRefusal {
+                reason,
+                formatter_ran: pending.formatter_ran,
+            });
+            let refused = formatter_refusal.is_some();
+            match self.request_save_buffer_with_refusal(
+                pending.buffer,
+                pending.quit_after,
+                None,
+                false,
+                None,
+                formatter_refusal,
+            ) {
+                Ok(_) if !refused => self.notify_message(self.message("saving", &[]), false),
+                Ok(_) => {}
                 Err(error) => self.show_document_failure(error),
             }
             self.effect_authority = previous;
         } else {
-            self.show_error(self.message("format_on_save_skipped", &[]));
+            self.documents
+                .save_work
+                .remaining_formatters
+                .remove(&buffer);
+            if !self.documents.save_work.format_only.remove(&buffer) {
+                self.show_error(self.message("format_on_save_skipped", &[]));
+            }
         }
     }
 }
@@ -2215,17 +2279,44 @@ impl App {
         force: bool,
         close: Option<EditorCloseSave>,
     ) -> Result<Option<crate::files::RequestId>, crate::app::documents::DocumentFailure> {
+        self.request_save_buffer_with_refusal(
+            buffer,
+            quit_after,
+            requested_path,
+            force,
+            close,
+            None,
+        )
+    }
+
+    fn request_save_buffer_with_refusal(
+        &mut self,
+        buffer: BufferId,
+        quit_after: bool,
+        requested_path: Option<PathBuf>,
+        force: bool,
+        close: Option<EditorCloseSave>,
+        formatter_refusal: Option<FormatterRefusal>,
+    ) -> Result<Option<RequestId>, DocumentFailure> {
         if self.begin_save_work(
             buffer,
             quit_after,
             requested_path.clone(),
             force,
             close.clone(),
+            formatter_refusal.clone(),
         )? {
             return Ok(None);
         }
-        self.request_disk_save(buffer, quit_after, requested_path, force, close)
-            .map(Some)
+        self.request_disk_save(
+            buffer,
+            quit_after,
+            requested_path,
+            force,
+            close,
+            formatter_refusal,
+        )
+        .map(Some)
     }
 
     fn request_disk_save(
@@ -2235,6 +2326,7 @@ impl App {
         requested_path: Option<PathBuf>,
         force: bool,
         close: Option<EditorCloseSave>,
+        formatter_refusal: Option<FormatterRefusal>,
     ) -> Result<crate::files::RequestId, crate::app::documents::DocumentFailure> {
         let view = self
             .state
@@ -2251,6 +2343,7 @@ impl App {
             force,
             quit: quit_after,
             close,
+            formatter_refusal,
             other_open_paths: self
                 .state
                 .buffers
@@ -2534,6 +2627,7 @@ impl App {
                 target: path,
                 quit: quit_after,
                 close,
+                formatter_refusal,
             } => {
                 let mut candidate = self.state.draft();
                 if !candidate.save_document(buffer, &text, revision, bytes, path.clone(), *snapshot)
@@ -2582,20 +2676,29 @@ impl App {
                     })
                 });
                 self.git.forget_hunks();
-                self.notify_message(
+                if let Some(refusal) = formatter_refusal {
+                    let mut notice =
+                        refusal.save_notice(&format!("Saved {}", self.notice_file_label(&path)));
                     if still_dirty {
-                        self.message(
-                            "saved_dirty",
-                            &[
-                                ("revision", revision.0.to_string()),
-                                ("path", self.notice_file_label(&path)),
-                            ],
-                        )
-                    } else {
-                        self.message("saved", &[("path", self.notice_file_label(&path))])
-                    },
-                    false,
-                );
+                        notice.push_str(" Newer edits are not saved yet.");
+                    }
+                    self.notify_warning(notice);
+                } else {
+                    self.notify_message(
+                        if still_dirty {
+                            self.message(
+                                "saved_dirty",
+                                &[
+                                    ("revision", revision.0.to_string()),
+                                    ("path", self.notice_file_label(&path)),
+                                ],
+                            )
+                        } else {
+                            self.message("saved", &[("path", self.notice_file_label(&path))])
+                        },
+                        false,
+                    );
+                }
                 if let Some(document) = lsp_document {
                     let current = LspDocument {
                         text: self.state.buffers[buffer].text.to_string(),

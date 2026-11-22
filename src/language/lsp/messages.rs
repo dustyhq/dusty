@@ -20,6 +20,10 @@ impl LspDocument {
     pub fn uri(&self) -> String {
         file_uri(&self.path)
     }
+
+    pub(super) fn wire_uri(&self) -> Option<String> {
+        super::paths::wire_file_uri(&self.path)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -434,6 +438,18 @@ impl LspFeature {
         }
     }
 
+    pub(super) fn carries_document_edits(&self) -> bool {
+        matches!(
+            self,
+            Self::Rename { .. }
+                | Self::CodeAction { .. }
+                | Self::Formatting { .. }
+                | Self::RangeFormatting { .. }
+                | Self::Completion
+                | Self::CompletionResolve { .. }
+        )
+    }
+
     pub(super) fn replace_key(&self) -> Option<&'static str> {
         match self {
             Self::Hover => Some("hover"),
@@ -590,6 +606,11 @@ pub enum LspEvent {
         request_id: u64,
         method: String,
         message: String,
+    },
+    RequestObsolete {
+        server: String,
+        request_id: u64,
+        method: String,
     },
     Stopped {
         server: String,

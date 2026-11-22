@@ -1256,6 +1256,8 @@ pub(in crate::app) fn app_waiting_to_save_formatted(
             source: app.state.buffers[buffer].text.source_version(),
             path: app.state.buffers[buffer].path.clone(),
             formatter: None,
+            formatter_refusal: None,
+            formatter_ran: false,
             started: true,
             quit_after: false,
             deadline: std::time::Instant::now() + std::time::Duration::from_secs(60),
@@ -1299,6 +1301,924 @@ fn a_format_result_applies_without_a_review_and_finishes_the_waiting_save() {
     assert_eq!(app.state.buffers[buffer].text.to_string(), "a b\n");
     crate::app::tests::wait_vfs(&mut app);
     assert_eq!(std::fs::read_to_string(&path).unwrap(), "a b\n");
+}
+
+#[test]
+fn late_format_reply_does_not_edit_the_next_buffer_at_its_path() {
+    use crate::language::lsp::{LspDocumentEdit, LspPosition, LspRange, LspTextEdit};
+    let (_dirs, mut app, original, path, _) = app_waiting_to_save_formatted("reused.rs");
+    let transport = fixture_owned_lsp(&mut app, "formatter", original);
+    let renamed = path.with_file_name("renamed.rs");
+    fs::rename(&path, &renamed).unwrap();
+    let change = app.state.capture_path_change(&path).unwrap();
+    let (draft, _) = app.state.reconcile_paths(change, Some(&renamed)).unwrap();
+    app.commit_editor_draft(draft.unwrap(), None, false)
+        .unwrap();
+    fs::write(&path, "new file\n").unwrap();
+    let (replacement, _) = app
+        .state
+        .open_text(TextBuffer::from_text("new file\n"), Some(path.clone()))
+        .unwrap();
+    let requested = crate::language::lsp::LspDocument {
+        path: path.clone(),
+        language_id: "rust".into(),
+        version: app.state.buffers[original].text.revision().0,
+        text: "a  b\n".into(),
+    };
+    transport.publish_result(
+        1,
+        "textDocument/formatting",
+        &requested,
+        LspFeatureResult::WorkspaceEdit(LspWorkspaceEdit {
+            resources: Vec::new(),
+            documents: vec![LspDocumentEdit {
+                uri: String::new(),
+                version: None,
+                edits: vec![LspTextEdit {
+                    range: LspRange {
+                        start: LspPosition {
+                            line: 0,
+                            character: 0,
+                        },
+                        end: LspPosition {
+                            line: 0,
+                            character: 1,
+                        },
+                    },
+                    new_text: "X".into(),
+                }],
+            }],
+        }),
+    );
+    app.handle_lsp_event(app.language.poll_event().unwrap());
+    assert_eq!(
+        app.state.buffers[replacement].text.to_string(),
+        "new file\n"
+    );
+    assert_eq!(app.state.buffers[original].text.to_string(), "a  b\n");
+    assert!(app.format_on_save.is_empty());
+}
+
+fn rename_edit(targets: &[&std::path::Path]) -> LspWorkspaceEdit {
+    use crate::language::lsp::{LspDocumentEdit, LspPosition, LspRange, LspTextEdit};
+    LspWorkspaceEdit {
+        resources: Vec::new(),
+        documents: targets
+            .iter()
+            .map(|path| LspDocumentEdit {
+                uri: file_uri(path),
+                version: None,
+                edits: vec![LspTextEdit {
+                    range: LspRange {
+                        start: LspPosition {
+                            line: 0,
+                            character: 0,
+                        },
+                        end: LspPosition {
+                            line: 0,
+                            character: 6,
+                        },
+                    },
+                    new_text: "rename".into(),
+                }],
+            })
+            .collect(),
+    }
+}
+
+#[test]
+fn rename_checks_unopened_bytes_not_mtime() {
+    for same_bytes in [false, true] {
+        let (_dirs, mut app) = app();
+        let root = app.state.workspace_root.clone();
+        let source = root.join("source.rs");
+        let target = root.join("target.rs");
+        fs::write(&target, "before\n").unwrap();
+        let (buffer, _) = app
+            .state
+            .open_text(TextBuffer::from_text("before\n"), Some(source.clone()))
+            .unwrap();
+        let transport = fixture_owned_lsp(&mut app, "rename", buffer);
+        let original_time = fs::metadata(&target).unwrap().modified().unwrap();
+        let context = transport.context().with_workspace_baseline(&root);
+        let modified = if same_bytes {
+            original_time + Duration::from_secs(60)
+        } else {
+            fs::write(&target, "edited\n").unwrap(); // same length, restore the dispatch mtime
+            original_time
+        };
+        fs::File::options()
+            .write(true)
+            .open(&target)
+            .unwrap()
+            .set_modified(modified)
+            .unwrap();
+        assert_eq!(fs::metadata(&target).unwrap().modified().unwrap(), modified);
+        app.present_lsp_result_owned(
+            "rename",
+            1,
+            "textDocument/rename",
+            &file_uri(&source),
+            LspFeatureResult::WorkspaceEdit(rename_edit(&[&target])),
+            Some(context),
+        );
+        wait_vfs(&mut app);
+        assert!(!app.workspace_edits.preparing());
+        assert_eq!(app.workspace_edits.proposal().is_some(), same_bytes);
+        if same_bytes {
+            app.accept_workspace_proposal();
+            wait_workspace_approval(&mut app);
+            assert!(app.state.buffers.iter().any(|(_, buffer)| {
+                buffer.path.as_ref() == Some(&target) && buffer.text.to_string() == "rename\n"
+            }));
+        }
+    }
+}
+
+// Exercise the real capture queue and wire dispatch. The server waits for a
+// marker so the test can change disk state after the request but before its reply.
+fn rename_through_live_session(
+    app: &mut App,
+    target: &std::path::Path,
+    after_launch: impl FnOnce(&mut App),
+    after_dispatch: impl FnOnce(),
+) -> crate::language::lsp::EditContext {
+    use crate::app::language::LspLaunch;
+    use crate::language::lsp::{LspEvent, LspPolicy, LspServerConfiguration, LspSessionLaunch};
+
+    const SERVER: &str = r#"
+import json, pathlib, sys, time
+def read():
+    size = 0
+    while True:
+        line = sys.stdin.buffer.readline()
+        if not line: return None
+        if line in (b'\r\n', b'\n'): break
+        if line.lower().startswith(b'content-length:'): size = int(line.split(b':', 1)[1])
+    return json.loads(sys.stdin.buffer.read(size))
+def send(id, result):
+    data = json.dumps({'jsonrpc':'2.0', 'id':id, 'result':result}).encode()
+    sys.stdout.buffer.write(('Content-Length: %d\r\n\r\n' % len(data)).encode() + data)
+    sys.stdout.buffer.flush()
+send(read()['id'], {'capabilities':{'renameProvider':True, 'textDocumentSync':1}})
+while (m := read()) is not None:
+    if m.get('method') == 'textDocument/rename':
+        pathlib.Path('.rename-received').touch()
+        deadline = time.monotonic() + 18
+        while not pathlib.Path('.rename-reply').exists():
+            if time.monotonic() > deadline: sys.exit(1)
+            time.sleep(0.005)
+        send(m['id'], {'changes':{sys.argv[1]:[{
+            'range':{'start':{'line':0,'character':0},'end':{'line':0,'character':6}},
+            'newText':'rename'
+        }]}})
+    if m.get('method') == 'shutdown': send(m['id'], None)
+    if m.get('method') == 'exit': break
+"#;
+    prepare_trust_identity(app);
+    let key = "live-rename";
+    let root = app.workspace.roots()[0].identity.canonical_path.clone();
+    let source = root.join("main.rs");
+    fs::write(&source, "before\n").unwrap();
+    let (buffer, _) = app
+        .state
+        .open_text(TextBuffer::from_text("before\n"), Some(source))
+        .unwrap();
+    app.set_dashboard_visibility(false);
+    let (_, document) = app.active_lsp_document().unwrap();
+    let script = root.join(".rename-server.py");
+    fs::write(&script, SERVER).unwrap();
+    let mut definition = crate::tools::bundled_tool_catalog()
+        .into_iter()
+        .find(|tool| tool.id == "rust-analyzer")
+        .unwrap();
+    let executable = crate::debugger::test_python();
+    definition.executable = executable.display().to_string();
+    app.language
+        .start(
+            LspSessionLaunch {
+                session_key: key,
+                definition: &definition,
+                executable: executable.clone(),
+                arguments: vec!["-u".into(), script.display().to_string(), file_uri(target)],
+                root: root.clone(),
+                document: Some(document),
+                policy: LspPolicy::default(),
+                configuration: LspServerConfiguration::standard(),
+                environment: Default::default(),
+            },
+            (buffer, app.state.buffers[buffer].text.source_version()),
+            (
+                app.workspace.active_root().unwrap(),
+                LspLaunch::Direct {
+                    executable,
+                    managed: false,
+                },
+                false,
+            ),
+            &app.state,
+        )
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !app.language.sessions()[key]
+        .capabilities
+        .as_ref()
+        .is_some_and(|caps| caps.rename)
+    {
+        app.process_lsp_events();
+        assert!(
+            Instant::now() < deadline,
+            "rename server did not initialize"
+        );
+        thread::sleep(Duration::from_millis(2));
+    }
+    after_launch(app);
+    app.request_lsp(LspFeature::Rename {
+        new_name: "rename".into(),
+    });
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !root.join(".rename-received").exists() {
+        assert!(Instant::now() < deadline, "rename was not sent");
+        thread::sleep(Duration::from_millis(2));
+    }
+    after_dispatch();
+    fs::write(root.join(".rename-reply"), "").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let context = loop {
+        if let Some(event) = app.language.poll_event() {
+            if matches!(&event.event, LspEvent::Result { method, .. } if method == "textDocument/rename")
+            {
+                let context = event.context.clone();
+                app.handle_lsp_event(event);
+                break context;
+            }
+            app.handle_lsp_event(event);
+        }
+        assert!(Instant::now() < deadline, "rename reply was not received");
+        thread::sleep(Duration::from_millis(2));
+    };
+    wait_vfs(app);
+    context
+}
+
+fn assert_unopened_rename_applies(app: &mut App, target: &std::path::Path) {
+    assert_eq!(
+        app.workspace_edits.proposal().unwrap().files[0].canonical_path,
+        target
+    );
+    app.accept_workspace_proposal();
+    wait_workspace_approval(app);
+    assert!(app.state.buffers.iter().any(|(_, buffer)| {
+        buffer.path.as_deref() == Some(target) && buffer.text.to_string() == "rename\n"
+    }));
+}
+
+#[test]
+fn rename_dispatch_skips_over_budget_ignored_build_output() {
+    let (_dirs, mut app) = app();
+    let root = crate::files::canonicalize(&app.state.workspace_root).unwrap();
+    fs::create_dir(root.join("src")).unwrap();
+    let target = root.join("src/reference.rs");
+    fs::write(&target, "before\n").unwrap();
+    fs::create_dir(root.join(".git")).unwrap();
+    fs::write(root.join(".gitignore"), "/target/\n").unwrap();
+    let build = root.join("target");
+    fs::create_dir(&build).unwrap();
+    // More than 256 MiB of hashable output without allocating 256 MiB of test data.
+    for index in 0..33 {
+        fs::File::create(build.join(format!("{index}.rlib")))
+            .unwrap()
+            .set_len(8 * 1024 * 1024)
+            .unwrap();
+    }
+    let context = rename_through_live_session(
+        &mut app,
+        &target,
+        |_| {},
+        || {
+            // A touch inside the unsafe mtime window is OK only with a captured hash.
+            fs::File::options()
+                .write(true)
+                .open(&target)
+                .unwrap()
+                .set_modified(std::time::SystemTime::now() + Duration::from_secs(60))
+                .unwrap();
+        },
+    );
+    assert!(
+        !context
+            .workspace_capture_entries()
+            .iter()
+            .any(|path| path.starts_with(&build)),
+        "ignored build output entered the bounded walk"
+    );
+    assert_unopened_rename_applies(&mut app, &target);
+}
+
+#[test]
+fn rename_dispatch_uses_old_mtime_only_for_uncaptured_targets() {
+    for changed in [false, true] {
+        let (_dirs, mut app) = app();
+        let root = crate::files::canonicalize(&app.state.workspace_root).unwrap();
+        let target = root.join("ignored.rs");
+        fs::write(root.join(".ignore"), "/ignored.rs\n").unwrap();
+        fs::write(&target, "before\n").unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&target)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - Duration::from_secs(30))
+            .unwrap();
+        rename_through_live_session(
+            &mut app,
+            &target,
+            |_| {},
+            || {
+                if changed {
+                    fs::write(&target, "edited\n").unwrap();
+                }
+            },
+        );
+        if changed {
+            assert!(app.workspace_edits.proposal().is_none());
+            assert!(!app.workspace_edits.preparing());
+        } else {
+            assert_unopened_rename_applies(&mut app, &target);
+        }
+    }
+}
+
+#[test]
+fn rename_dispatch_captures_a_root_added_after_server_launch() {
+    let (_dirs, mut app) = app();
+    let sibling = tempfile::tempdir().unwrap();
+    let identity = crate::files::RootIdentity::capture(sibling.path()).unwrap();
+    let target = identity.canonical_path.join("reference.rs");
+    fs::write(&target, "before\n").unwrap();
+    rename_through_live_session(
+        &mut app,
+        &target,
+        |app| {
+            app.workspace
+                .fixture_add_root("shared".into(), identity)
+                .unwrap();
+            app.invalidate_root_scoped_operations();
+        },
+        || {},
+    );
+    assert_unopened_rename_applies(&mut app, &target);
+}
+
+#[cfg(unix)]
+#[test]
+fn rename_resolves_an_in_root_alias_and_rechecks_it_at_approval() {
+    use std::os::unix::fs::symlink;
+
+    for retarget in [false, true] {
+        let (_dirs, mut app) = app();
+        let root = app.state.workspace_root.clone();
+        let source = root.join("source.rs");
+        let shared = root.join("shared");
+        let other = root.join("other");
+        let linked = root.join("linked");
+        fs::create_dir(&shared).unwrap();
+        fs::create_dir(&other).unwrap();
+        let canonical = shared.join("target.rs");
+        fs::write(&canonical, "before\n").unwrap();
+        fs::write(other.join("target.rs"), "before\n").unwrap();
+        symlink(&shared, &linked).unwrap();
+        let (buffer, _) = app
+            .state
+            .open_text(TextBuffer::from_text("before\n"), Some(source.clone()))
+            .unwrap();
+        let transport = fixture_owned_lsp(&mut app, "rename", buffer);
+        let context = transport.context().with_workspace_baseline(&root);
+        app.present_lsp_result_owned(
+            "rename",
+            1,
+            "textDocument/rename",
+            &file_uri(&source),
+            LspFeatureResult::WorkspaceEdit(rename_edit(&[&linked.join("target.rs")])),
+            Some(context),
+        );
+        wait_vfs(&mut app);
+        assert_eq!(
+            app.workspace_edits.proposal().unwrap().files[0].canonical_path,
+            canonical
+        );
+        if retarget {
+            fs::remove_file(&linked).unwrap();
+            symlink(&other, &linked).unwrap();
+        }
+        app.accept_workspace_proposal();
+        wait_workspace_approval(&mut app);
+        assert_eq!(
+            !retarget,
+            app.state.buffers.iter().any(|(_, buffer)| {
+                buffer.path.as_ref() == Some(&canonical) && buffer.text.to_string() == "rename\n"
+            })
+        );
+    }
+}
+
+#[test]
+fn code_action_can_create_an_absent_target_after_an_unrelated_sibling_changes() {
+    use crate::language::lsp::{LspCodeAction, LspResourceOperation};
+
+    let (_dirs, mut app) = app();
+    let root = app.state.workspace_root.clone();
+    let source = root.join("source.rs");
+    let created = root.join("created.rs");
+    let (buffer, _) = app
+        .state
+        .open_text(TextBuffer::from_text("before\n"), Some(source.clone()))
+        .unwrap();
+    app.set_dashboard_visibility(false);
+    let transport = fixture_owned_lsp(&mut app, "actions", buffer);
+    let context = transport.context().with_workspace_baseline(&root);
+    fs::write(root.join("unrelated.rs"), "unrelated\n").unwrap();
+    app.present_lsp_result_owned(
+        "actions",
+        1,
+        "textDocument/codeAction",
+        &file_uri(&source),
+        LspFeatureResult::CodeActions(vec![LspCodeAction {
+            title: "Create a file".into(),
+            kind: None,
+            preferred: false,
+            edit: Some(LspWorkspaceEdit {
+                documents: Vec::new(),
+                resources: vec![LspResourceOperation::Create {
+                    uri: file_uri(&created),
+                    overwrite: false,
+                    ignore_if_exists: false,
+                }],
+            }),
+            command: None,
+        }]),
+        Some(context),
+    );
+    assert!(app.ui.picker.is_some());
+    app.accept_picker();
+    wait_vfs(&mut app);
+    assert_eq!(
+        app.workspace_edits.proposal().unwrap().files[0].canonical_path,
+        created
+    );
+}
+
+fn preview_code_action_resource(
+    app: &mut App,
+    source: &std::path::Path,
+    context: crate::language::lsp::EditContext,
+    resource: crate::language::lsp::LspResourceOperation,
+) {
+    app.present_lsp_result_owned(
+        "actions",
+        1,
+        "textDocument/codeAction",
+        &file_uri(source),
+        LspFeatureResult::CodeActions(vec![crate::language::lsp::LspCodeAction {
+            title: "Refactor".into(),
+            kind: None,
+            preferred: false,
+            edit: Some(LspWorkspaceEdit {
+                documents: Vec::new(),
+                resources: vec![resource],
+            }),
+            command: None,
+        }]),
+        Some(context),
+    );
+    assert!(app.ui.picker.is_some());
+    app.accept_picker();
+    wait_vfs(app);
+    assert!(app.workspace_edits.proposal().is_some());
+}
+
+#[test]
+fn code_action_creates_a_file_in_a_hidden_parent() {
+    use crate::language::lsp::LspResourceOperation;
+
+    let (_dirs, mut app) = app();
+    let root = crate::files::canonicalize(&app.state.workspace_root).unwrap();
+    let hidden = root.join(".storybook");
+    fs::create_dir(&hidden).unwrap();
+    let source = hidden.join("main.ts");
+    let created = hidden.join("helpers.ts");
+    fs::write(&source, "before\n").unwrap();
+    let (buffer, _) = app
+        .state
+        .open_text(TextBuffer::from_text("before\n"), Some(source.clone()))
+        .unwrap();
+    app.set_dashboard_visibility(false);
+    let transport = fixture_owned_lsp(&mut app, "actions", buffer);
+    let context = transport.context().with_workspace_baseline(&root);
+    assert!(!context.workspace_capture_entries().contains(&hidden));
+    preview_code_action_resource(
+        &mut app,
+        &source,
+        context,
+        LspResourceOperation::Create {
+            uri: file_uri(&created),
+            overwrite: false,
+            ignore_if_exists: false,
+        },
+    );
+    app.accept_workspace_proposal();
+    wait_workspace_approval(&mut app);
+    assert!(app.state.buffers.iter().any(|(_, buffer)| {
+        buffer.path.as_ref() == Some(&created) && buffer.dirty && buffer.new_file
+    }));
+    assert!(!created.exists()); // Create is staged as an unsaved buffer.
+}
+
+#[test]
+fn code_action_renames_to_a_parent_beyond_the_capture_budget() {
+    use crate::language::lsp::LspResourceOperation;
+
+    let (_dirs, mut app) = app();
+    let root = crate::files::canonicalize(&app.state.workspace_root).unwrap();
+    let parent = root.join("src");
+    fs::create_dir(&parent).unwrap();
+    let source = root.join("old.rs");
+    let target = parent.join("renamed.rs");
+    fs::write(&source, "before\n").unwrap();
+    fs::File::options()
+        .write(true)
+        .open(&source)
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() - Duration::from_secs(30))
+        .unwrap();
+    let (buffer, _) = app
+        .state
+        .open_text(TextBuffer::from_text("before\n"), Some(source.clone()))
+        .unwrap();
+    app.set_dashboard_visibility(false);
+    let transport = fixture_owned_lsp(&mut app, "actions", buffer);
+    // Stop after the root entry. The destination's visible parent and the
+    // source file both miss the capture, independent of traversal order.
+    let context = transport
+        .context()
+        .with_workspace_capture_entry_limit(&root, 1);
+    let visited = context.workspace_capture_entries();
+    assert_eq!(visited.len(), 1);
+    assert!(visited.contains(&root));
+    preview_code_action_resource(
+        &mut app,
+        &source,
+        context,
+        LspResourceOperation::Rename {
+            old_uri: file_uri(&source),
+            new_uri: file_uri(&target),
+            overwrite: false,
+            ignore_if_exists: false,
+        },
+    );
+    app.accept_workspace_proposal();
+    wait_workspace_approval(&mut app);
+    app.process_effect(AppEffect::WorkspaceResourceApply);
+    wait_vfs(&mut app);
+    assert!(!source.exists());
+    assert_eq!(fs::read_to_string(&target).unwrap(), "before\n");
+    assert_eq!(app.state.buffers[buffer].path.as_ref(), Some(&target));
+}
+
+#[test]
+fn occupied_resource_destinations_use_dispatch_hash_or_safe_mtime() {
+    use std::time::SystemTime;
+
+    let (_dirs, mut app) = app();
+    let root = crate::files::canonicalize(&app.state.workspace_root).unwrap();
+    let source = root.join("main.rs");
+    let target = root.join("destination.rs");
+    let (buffer, _) = app
+        .state
+        .open_text(TextBuffer::from_text("before\n"), Some(source))
+        .unwrap();
+    let transport = fixture_owned_lsp(&mut app, "actions", buffer);
+    fs::write(&target, "before\n").unwrap();
+    let set_mtime = |time| {
+        fs::File::options()
+            .write(true)
+            .open(&target)
+            .unwrap()
+            .set_modified(time)
+            .unwrap();
+    };
+    let old = SystemTime::now() - Duration::from_secs(30);
+    set_mtime(old);
+    let captured = transport.context().with_workspace_baseline(&root);
+    let uncaptured = transport
+        .context()
+        .with_workspace_capture_entry_limit(&root, 1);
+    assert!(uncaptured.destination_current(&target, &target));
+
+    set_mtime(SystemTime::now() + Duration::from_secs(60));
+    assert!(!uncaptured.destination_current(&target, &target));
+    assert!(captured.destination_current(&target, &target));
+
+    fs::write(&target, "edited\n").unwrap();
+    set_mtime(old);
+    assert!(!captured.destination_current(&target, &target));
+
+    fs::remove_file(&target).unwrap();
+    assert!(captured.destination_current(&target, &target));
+}
+
+#[cfg(windows)]
+#[test]
+fn rename_accepts_ntfs_case_alias_after_scoped_resolution() {
+    let (_dirs, mut app) = app();
+    let root = app.state.workspace_root.clone();
+    let canonical = root.join("Types.rs");
+    let alias = root.join("types.rs");
+    fs::write(&canonical, "before\n").unwrap();
+    if !alias.exists() {
+        return; // This directory opts into case sensitivity.
+    }
+    let source = root.join("source.rs");
+    let (buffer, _) = app
+        .state
+        .open_text(TextBuffer::from_text("before\n"), Some(source.clone()))
+        .unwrap();
+    let transport = fixture_owned_lsp(&mut app, "rename", buffer);
+    let context = transport.context().with_workspace_baseline(&root);
+    app.present_lsp_result_owned(
+        "rename",
+        1,
+        "textDocument/rename",
+        &file_uri(&source),
+        LspFeatureResult::WorkspaceEdit(rename_edit(&[&alias])),
+        Some(context),
+    );
+    wait_vfs(&mut app);
+    assert_eq!(
+        app.workspace_edits.proposal().unwrap().files[0].canonical_path,
+        canonical
+    );
+}
+
+#[test]
+fn rename_and_inline_actions_accept_unchanged_unopened_and_detached_targets() {
+    use crate::language::lsp::LspCodeAction;
+
+    for inline in [false, true] {
+        let (_dirs, mut app) = app();
+        let root = app.state.workspace_root.clone();
+        let source = root.join("source.rs");
+        let package = root.join("other-package");
+        fs::create_dir(&package).unwrap();
+        let detached = package.join("open.rs");
+        let unopened = package.join("closed.rs");
+        fs::write(&detached, "before\n").unwrap();
+        fs::write(&unopened, "before\n").unwrap();
+        let (detached_buffer, _) = app
+            .state
+            .open_text(TextBuffer::from_text("before\n"), Some(detached.clone()))
+            .unwrap();
+        let (buffer, _) = app
+            .state
+            .open_text(TextBuffer::from_text("before\n"), Some(source.clone()))
+            .unwrap();
+        app.set_dashboard_visibility(false);
+        let transport = fixture_owned_lsp(&mut app, "edits", buffer);
+        let edit = rename_edit(&[&detached, &unopened]);
+        let context = transport.context().with_workspace_baseline(&root);
+        let (method, result) = if inline {
+            (
+                "textDocument/codeAction",
+                LspFeatureResult::CodeActions(vec![LspCodeAction {
+                    title: "Fix the name".into(),
+                    kind: None,
+                    preferred: false,
+                    edit: Some(edit),
+                    command: None,
+                }]),
+            )
+        } else {
+            ("textDocument/rename", LspFeatureResult::WorkspaceEdit(edit))
+        };
+        app.present_lsp_result_owned(
+            "edits",
+            1,
+            method,
+            &file_uri(&source),
+            result,
+            Some(context),
+        );
+        if inline {
+            app.accept_picker();
+        }
+        wait_vfs(&mut app);
+        assert_eq!(app.workspace_edits.proposal().unwrap().files.len(), 2);
+        app.accept_workspace_proposal();
+        wait_workspace_approval(&mut app);
+        assert_eq!(
+            app.state.buffers[detached_buffer].text.to_string(),
+            "rename\n"
+        );
+        assert!(app.state.buffers.iter().any(|(_, buffer)| {
+            buffer.path.as_ref() == Some(&unopened) && buffer.text.to_string() == "rename\n"
+        }));
+    }
+}
+
+#[test]
+fn changed_deselected_disk_target_does_not_block_workspace_approval() {
+    let (_dirs, mut app) = app();
+    let root = app.state.workspace_root.clone();
+    let source = root.join("source.rs");
+    let selected = root.join("selected.rs");
+    let deselected = root.join("deselected.rs");
+    fs::write(&selected, "before\n").unwrap();
+    fs::write(&deselected, "before\n").unwrap();
+    let (buffer, _) = app
+        .state
+        .open_text(TextBuffer::from_text("before\n"), Some(source.clone()))
+        .unwrap();
+    let transport = fixture_owned_lsp(&mut app, "rename", buffer);
+    let edit = rename_edit(&[&selected, &deselected]);
+    let context = transport.context().with_workspace_baseline(&root);
+    app.present_lsp_result_owned(
+        "rename",
+        1,
+        "textDocument/rename",
+        &file_uri(&source),
+        LspFeatureResult::WorkspaceEdit(edit),
+        Some(context),
+    );
+    wait_vfs(&mut app);
+    let index = app
+        .workspace_edits
+        .proposal()
+        .unwrap()
+        .files
+        .iter()
+        .position(|file| file.canonical_path == deselected)
+        .unwrap();
+    app.workspace_edits.toggle(index).unwrap();
+    fs::write(&deselected, "edited\n").unwrap();
+    app.accept_workspace_proposal();
+    wait_workspace_approval(&mut app);
+    assert!(app.state.buffers.iter().any(|(_, buffer)| {
+        buffer.path.as_ref() == Some(&selected) && buffer.text.to_string() == "rename\n"
+    }));
+    assert!(
+        !app.state
+            .buffers
+            .iter()
+            .any(|(_, buffer)| buffer.path.as_ref() == Some(&deselected))
+    );
+    assert_eq!(fs::read_to_string(deselected).unwrap(), "edited\n");
+}
+
+#[test]
+fn command_apply_edit_accepts_unversioned_unchanged_synced_document() {
+    check_command_apply_edit(1, 0);
+}
+
+#[test]
+fn overlapping_commands_can_apply_an_unversioned_edit() {
+    check_command_apply_edit(2, 0);
+}
+
+#[test]
+fn a_just_finished_command_can_still_apply_an_unversioned_edit() {
+    check_command_apply_edit(1, 1);
+}
+
+fn check_command_apply_edit(commands: usize, finished: usize) {
+    use crate::language::lsp::{LspCodeAction, LspCommand};
+
+    let (_dirs, mut app) = app();
+    let root = crate::files::canonicalize(&app.state.workspace_root).unwrap();
+    let source = root.join("source.rs");
+    let uri = file_uri(&source);
+    let (buffer, _) = app
+        .state
+        .open_text(TextBuffer::from_text("before\n"), Some(source))
+        .unwrap();
+    app.set_dashboard_visibility(false);
+    let mut transport = fixture_owned_lsp(&mut app, "quick-fix", buffer);
+    app.language.select("quick-fix");
+    app.present_lsp_result_owned(
+        "quick-fix",
+        1,
+        "textDocument/codeAction",
+        &uri,
+        LspFeatureResult::CodeActions(vec![LspCodeAction {
+            title: "Fix the name".into(),
+            kind: None,
+            preferred: false,
+            edit: None,
+            command: Some(LspCommand {
+                command: "fixName".into(),
+                arguments: Vec::new(),
+            }),
+        }]),
+        Some(transport.context()),
+    );
+    app.accept_picker();
+    for _ in 1..commands {
+        app.request_lsp(LspFeature::ExecuteCommand(LspCommand {
+            command: "fixNameToo".into(),
+            arguments: Vec::new(),
+        }));
+    }
+    transport.apply_edit_during_commands(
+        &root,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "workspace/applyEdit",
+            "id": 31,
+            "params": {"edit": {"changes": { (uri): [{
+                "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 6}},
+                "newText": "rename"
+            }]}}}
+        }),
+        commands,
+        finished,
+    );
+    app.process_lsp_events();
+    wait_vfs(&mut app);
+    assert!(
+        app.workspace_edits.proposal().is_some(),
+        "unversioned command edit must reach the preview"
+    );
+    app.accept_workspace_proposal();
+    wait_workspace_approval(&mut app);
+    assert_eq!(app.state.buffers[buffer].text.to_string(), "rename\n");
+}
+
+#[test]
+fn obsolete_code_action_reply_does_not_hide_the_other_servers_actions() {
+    use crate::language::lsp::{LspCodeAction, LspEvent, LspPosition, LspRange, OwnedLspEvent};
+    for obsolete_first in [false, true] {
+        let (_dirs, mut app) = app();
+        let path = app.state.workspace_root.join("source.rs");
+        let (buffer, _) = app
+            .state
+            .open_text(TextBuffer::from_text("before\n"), Some(path))
+            .unwrap();
+        app.set_dashboard_visibility(false);
+        let working = fixture_owned_lsp(&mut app, "working", buffer);
+        let obsolete = fixture_owned_lsp(&mut app, "obsolete", buffer);
+        app.language.select("working");
+        let (_, document) = app.active_lsp_document().unwrap();
+        let position = LspPosition {
+            line: 0,
+            character: 0,
+        };
+        app.request_lsp(LspFeature::CodeAction {
+            range: LspRange {
+                start: position.clone(),
+                end: position,
+            },
+            diagnostics: Vec::new(),
+        });
+        let request_id = app.language.request_id();
+        let obsolete_event = OwnedLspEvent {
+            event: LspEvent::RequestObsolete {
+                server: "obsolete".into(),
+                request_id,
+                method: "textDocument/codeAction".into(),
+            },
+            context: obsolete.context(),
+            reply: None,
+        };
+        let valid = LspFeatureResult::CodeActions(vec![LspCodeAction {
+            title: "Fix the name".into(),
+            kind: None,
+            preferred: false,
+            edit: Some(LspWorkspaceEdit::default()),
+            command: None,
+        }]);
+        assert!(matches!(
+            obsolete.requested_feature(),
+            Some(LspFeature::CodeAction { .. })
+        ));
+        working.publish_result(request_id, "textDocument/codeAction", &document, valid);
+        let valid_event = app.language.poll_event().unwrap();
+        let (first, last) = if obsolete_first {
+            (obsolete_event, valid_event)
+        } else {
+            (valid_event, obsolete_event)
+        };
+        app.handle_lsp_event(first);
+        assert!(app.ui.picker.is_none());
+        assert!(app.language.request_pending(request_id));
+        app.handle_lsp_event(last);
+        assert!(
+            app.ui
+                .picker
+                .as_ref()
+                .unwrap()
+                .rows
+                .iter()
+                .any(|row| row.label == "Fix the name")
+        );
+    }
 }
 
 #[test]
@@ -1863,6 +2783,8 @@ fn formatting_saves_using_the_same_managed_tool_run_in_turn() {
             source: app.state.buffers[second].text.source_version(),
             path: Some(second_path.clone()),
             formatter: Some("serial-formatter".into()),
+            formatter_refusal: None,
+            formatter_ran: false,
             started: false,
             quit_after: false,
             deadline: Instant::now(),
@@ -2155,11 +3077,23 @@ fn lsp_fold_toggle_uses_the_innermost_fold_and_moves_out_of_hidden_text() {
             collapsed: false,
         },
     ];
+    app.invoke_mapped_command("mode.visual_char");
+    assert!(app.state.views[view].selection.is_some());
     app.process_effect(AppEffect::LspFoldToggle);
     assert!(!app.ui.lsp_folds[0].collapsed);
     assert!(app.ui.lsp_folds[1].collapsed);
     assert_eq!(app.state.views[view].cursor, ByteOffset(6));
-    app.invoke_mapped_command("edit.delete_char");
+    assert!(app.state.views[view].selection.is_none());
+    let mode_after_fold = app.state.views[view].mode;
+    app.handle_configured_key(KeyEvent::character('d'));
+    assert!(!app.ui.notification_error);
+    assert_eq!(mode_after_fold, crate::editor::EditorMode::Normal);
+    assert_eq!(
+        app.state.views[view].mode,
+        crate::editor::EditorMode::OperatorPending
+    );
+    app.handle_configured_key(KeyEvent::character('l'));
+    assert!(!app.ui.notification_error);
     assert_eq!(
         app.state.buffers[buffer].text.to_string(),
         "outer\nnner\nbody\nend\ntail"
@@ -3753,7 +4687,7 @@ fn stale_lsp_workspace_edit_is_rejected_without_mutation() {
         resources: Vec::new(),
     };
     assert!(
-        app.apply_lsp_workspace_edit(edit, crate::editor::text::PositionEncoding::Utf16)
+        app.apply_lsp_formatter_edit(buffer, edit, crate::editor::text::PositionEncoding::Utf16)
             .is_err()
     );
     assert_eq!(app.state.buffers[buffer].text.to_string(), "abc");
@@ -5387,6 +6321,439 @@ fn save_notifications_describe_written_text_not_newer_unsaved_edits() {
         "newer unsaved text"
     );
     assert!(app.state.buffers[buffer].dirty);
+}
+
+#[test]
+fn leader_u_c_toggles_completion_while_typing_but_keeps_ctrl_space() {
+    let (_app_dirs, mut app) = app();
+    let path = app.state.workspace_root.join("completion.rs");
+    let (buffer, view) = app
+        .state
+        .open_text(TextBuffer::from_text(""), Some(path))
+        .unwrap();
+    app.set_dashboard_visibility(false);
+    let mut transport = fixture_owned_lsp(&mut app, "server", buffer);
+    app.language.select("server");
+    let mut config = app.configuration.fixture_snapshot();
+    config.settings.lsp.auto_completion = true;
+    config.settings.lsp.auto_start = false;
+    app.configuration.install_fixture(config);
+    app.sync_lsp_document();
+
+    for key in ["space", "u", "c", "i", "p"] {
+        app.handle_configured_key(key.parse().unwrap());
+    }
+    app.sync_lsp_document();
+    assert_eq!(app.state.buffers[buffer].text.to_string(), "p");
+    assert_eq!(
+        app.state.views[view].mode,
+        crate::editor::EditorMode::Insert
+    );
+    assert!(transport.requested_feature_after_sync().is_none());
+    assert!(app.ui.language_completion.is_none());
+
+    app.handle_configured_key("ctrl-space".parse().unwrap());
+    assert_eq!(
+        transport.requested_feature_after_sync(),
+        Some(LspFeature::Completion)
+    );
+    app.cancel_lsp_completion();
+
+    for key in ["escape", "space", "u", "c", "a", "r"] {
+        app.handle_configured_key(key.parse().unwrap());
+    }
+    app.sync_lsp_document();
+    assert_eq!(app.state.buffers[buffer].text.to_string(), "pr");
+    assert_eq!(
+        transport.requested_feature_after_sync(),
+        Some(LspFeature::Completion)
+    );
+    transport.publish_result(
+        app.language.request_id(),
+        "textDocument/completion",
+        &app.active_lsp_document().unwrap().1,
+        LspFeatureResult::Completion {
+            items: vec![source_completion("print", "print", "0")],
+            incomplete: false,
+        },
+    );
+    app.process_lsp_events();
+    assert!(app.ui.language_completion.is_some());
+}
+
+#[test]
+fn inline_diagnostics_off_notice_prefers_the_problems_panel_shortcut() {
+    let (_app_dirs, mut app) = app();
+    app.state
+        .open_text(TextBuffer::from_text(""), None)
+        .unwrap();
+    app.set_dashboard_visibility(false);
+    assert_eq!(app.active_input_context(), "editor.normal");
+    for key in ["space", "u", "d"] {
+        app.handle_configured_key(key.parse().unwrap());
+    }
+    assert_eq!(
+        app.ui.notification.as_deref(),
+        Some("Messages beside code: off · Space x x opens Problems")
+    );
+}
+
+#[test]
+fn inline_diagnostics_off_notice_has_no_shortcut_while_problems_is_open() {
+    let mut session =
+        crate::app::tests::driver::TestSession::new(crate::config::load_bundled_config());
+    let app = session.application_mut();
+    app.state
+        .open_text(TextBuffer::from_text("source"), None)
+        .unwrap();
+    app.set_dashboard_visibility(false);
+    for key in ["space", "x", "x", "ctrl-k"] {
+        session.key(key);
+    }
+    assert!(session.application().problems_panel.is_some());
+    assert_eq!(session.context(), "editor.normal");
+    for key in ["space", "u", "d"] {
+        session.key(key);
+    }
+    assert_eq!(session.notification(), Some("Messages beside code: off"));
+}
+
+#[test]
+fn inline_diagnostics_off_notice_uses_live_editor_key_layers() {
+    use crate::app::input::InputCommand;
+    use crate::editor::input::Keymap;
+
+    let (_app_dirs, mut app) = app();
+    app.state
+        .open_text(TextBuffer::from_text("source"), None)
+        .unwrap();
+    app.set_dashboard_visibility(false);
+    let stock = ["space", "x", "x"].map(|key| key.parse().unwrap());
+    let mut layer = Keymap::default();
+    layer.insert_disabled(&stock);
+    app.process_effect(AppEffect::Input(InputCommand::PushLayer(Box::new(layer))));
+
+    let toggle = |app: &mut App| {
+        for key in ["space", "u", "d"] {
+            app.handle_configured_key(key.parse().unwrap());
+        }
+    };
+    toggle(&mut app);
+    assert_eq!(
+        app.ui.notification.as_deref(),
+        Some("Messages beside code: off")
+    );
+    toggle(&mut app);
+
+    let mut layer = Keymap::default();
+    layer.insert(
+        &["f6".parse().unwrap()],
+        crate::app::command("diagnostic.panel.toggle").unwrap(),
+    );
+    app.process_effect(AppEffect::Input(InputCommand::PushLayer(Box::new(layer))));
+    toggle(&mut app);
+    assert_eq!(
+        app.ui.notification.as_deref(),
+        Some("Messages beside code: off · f6 opens Problems")
+    );
+    app.handle_configured_key("f6".parse().unwrap());
+    assert!(app.problems_panel.is_some());
+}
+
+#[test]
+fn insert_completion_toggle_cancels_only_the_automatic_request() {
+    for (automatic, failure) in [(true, false), (false, false), (true, true), (false, true)] {
+        let (_app_dirs, mut app) = app();
+        let path = app.state.workspace_root.join("completion.rs");
+        let text = TextBuffer::from_text(if automatic { "" } else { "p" });
+        let (buffer, view) = app.state.open_text(text, Some(path)).unwrap();
+        app.set_dashboard_visibility(false);
+        let transport = fixture_owned_lsp(&mut app, "server", buffer);
+        app.language.select("server");
+        let mut config = app.configuration.fixture_snapshot();
+        config.settings.lsp.auto_completion = true;
+        config.settings.lsp.auto_start = false;
+        app.configuration.install_fixture(config);
+        let mut loaded = crate::config::load_bundled_config().keymaps;
+        loaded.entries.push(crate::config::KeymapEntry {
+            id: "user.test.toggle-completion".into(),
+            context: Some("editor".into()),
+            mode: "insert".into(),
+            keys: Some("f2".into()),
+            command: Some("lsp.auto_completion.toggle".into()),
+            arguments: Default::default(),
+            unmap: false,
+            disable: false,
+            pass_through: false,
+            desc: None,
+        });
+        let (keymaps, diagnostic) = crate::app::configuration::compile_keymaps(
+            &app.commands,
+            &loaded,
+            &app.configuration.settings().input.keymaps,
+        );
+        assert!(diagnostic.is_none(), "{diagnostic:?}");
+        app.configuration.install_bindings(keymaps, false);
+        app.sync_lsp_document();
+
+        let keys = if automatic {
+            ["i", "p"]
+        } else {
+            ["a", "ctrl-space"]
+        };
+        for key in keys {
+            app.handle_configured_key(key.parse().unwrap());
+        }
+        app.sync_lsp_document();
+        assert_eq!(app.state.buffers[buffer].text.to_string(), "p");
+        assert_eq!(
+            app.state.views[view].mode,
+            crate::editor::EditorMode::Insert
+        );
+        assert_eq!(transport.requested_feature(), Some(LspFeature::Completion));
+        assert_eq!(app.language.completion_automatic(), automatic);
+        let request = app.language.request_id();
+        let document = app.active_lsp_document().unwrap().1;
+        assert!(app.language.request_pending(request));
+        let failure = failure.then(|| crate::language::lsp::OwnedLspEvent {
+            event: crate::language::lsp::LspEvent::RequestFailed {
+                server: "server".into(),
+                request_id: request,
+                method: "textDocument/completion".into(),
+                message: "fixture completion failure".into(),
+            },
+            context: transport.context(),
+            reply: None,
+        });
+
+        app.handle_configured_key("f2".parse().unwrap());
+        assert!(!app.configuration.settings().lsp.auto_completion);
+        assert_eq!(app.language.request_pending(request), !automatic);
+        if let Some(failure) = failure {
+            app.handle_lsp_event(failure);
+            assert_eq!(app.ui.notification_error, !automatic);
+            let notice = app.ui.notification.as_deref().unwrap();
+            if automatic {
+                assert_eq!(notice, "Completion while typing: off");
+            } else {
+                assert!(notice.contains("fixture completion failure"));
+            }
+            continue;
+        }
+
+        transport.publish_result(
+            request,
+            "textDocument/completion",
+            &document,
+            LspFeatureResult::Completion {
+                items: vec![source_completion("print", "print", "0")],
+                incomplete: false,
+            },
+        );
+        app.process_lsp_events();
+        assert_eq!(app.ui.language_completion.is_some(), !automatic);
+    }
+}
+
+fn start_completion_resolve_after_trigger_refresh(
+    app: &mut App,
+) -> (
+    crate::editor::BufferId,
+    crate::language::lsp::EditSourceFixture,
+    crate::language::lsp::LspCompletionItem,
+) {
+    use crate::language::lsp::LspCapabilities;
+
+    let path = app.state.workspace_root.join("completion.rs");
+    let (buffer, view) = app
+        .state
+        .open_text(TextBuffer::from_text("receiver"), Some(path))
+        .unwrap();
+    app.state.views[view].mode = crate::editor::EditorMode::Insert;
+    app.state.views[view].cursor = ByteOffset(8);
+    app.set_dashboard_visibility(false);
+    let mut config = app.configuration.fixture_snapshot();
+    config.settings.lsp.auto_completion = false;
+    config.settings.lsp.auto_start = false;
+    app.configuration.install_fixture(config);
+    let mut transport = fixture_owned_lsp(app, "server", buffer);
+    app.language.running(
+        "server",
+        LspCapabilities {
+            completion: true,
+            completion_resolve: true,
+            completion_triggers: vec![".".into()],
+            ..Default::default()
+        },
+    );
+    app.language.select("server");
+    app.sync_lsp_document();
+
+    app.handle_configured_key("ctrl-space".parse().unwrap());
+    assert_eq!(
+        transport.requested_feature_after_sync(),
+        Some(LspFeature::Completion)
+    );
+    assert!(!app.language.completion_automatic());
+    transport.publish_result(
+        app.language.request_id(),
+        "textDocument/completion",
+        &app.active_lsp_document().unwrap().1,
+        LspFeatureResult::Completion {
+            items: vec![source_completion("receiver", "receiver", "0")],
+            incomplete: false,
+        },
+    );
+    app.process_lsp_events();
+    assert_eq!(app.active_input_context(), "completion");
+
+    app.handle_configured_key(KeyEvent::character('.'));
+    app.sync_lsp_document();
+    assert_eq!(app.state.buffers[buffer].text.to_string(), "receiver.");
+    assert_eq!(
+        transport.requested_feature_after_sync(),
+        Some(LspFeature::Completion)
+    );
+    assert!(app.language.completion_automatic());
+    let document = app.active_lsp_document().unwrap().1;
+
+    let mut item = source_completion("method", "method()", "0");
+    item.resolved = false;
+    item.resolve_item = Some(serde_json::json!({"label": "method"}));
+    transport.publish_result(
+        app.language.request_id(),
+        "textDocument/completion",
+        &document,
+        LspFeatureResult::Completion {
+            items: vec![item.clone()],
+            incomplete: false,
+        },
+    );
+    app.process_lsp_events();
+    assert!(matches!(
+        transport.requested_feature_after_sync(),
+        Some(LspFeature::CompletionResolve { .. })
+    ));
+    (buffer, transport, item)
+}
+
+fn deliver_completion_resolve_failure(
+    app: &mut App,
+    transport: &crate::language::lsp::EditSourceFixture,
+    request_id: u64,
+    message: &str,
+) {
+    use crate::language::lsp::{LspEvent, OwnedLspEvent};
+
+    app.handle_lsp_event(OwnedLspEvent {
+        event: LspEvent::RequestFailed {
+            server: "server".into(),
+            request_id,
+            method: "completionItem/resolve".into(),
+            message: message.into(),
+        },
+        context: transport.context(),
+        reply: None,
+    });
+    assert!(
+        app.language.logs().back().is_some_and(|line| {
+            line.contains("completionItem/resolve") && line.contains(message)
+        })
+    );
+}
+
+#[test]
+fn completion_preview_failure_is_logged_without_a_notice() {
+    let (_dirs, mut app) = app();
+    let (_, transport, _) = start_completion_resolve_after_trigger_refresh(&mut app);
+    let request_id = app.language.request_id();
+    assert!(!app.language.completion_resolve_accepts(request_id));
+    app.clear_notice();
+    deliver_completion_resolve_failure(
+        &mut app,
+        &transport,
+        request_id,
+        r#"{"code":-32801,"message":"content modified"}"#,
+    );
+    assert!(app.ui.notification.is_none());
+    assert!(!app.language.request_pending(request_id));
+
+    app.handle_configured_key("enter".parse().unwrap());
+    assert!(matches!(
+        transport.requested_feature(),
+        Some(LspFeature::CompletionResolve { .. })
+    ));
+    assert!(app.language.request_id() > request_id);
+}
+
+#[test]
+fn completion_acceptance_failure_after_typing_is_logged_without_a_notice() {
+    let (_dirs, mut app) = app();
+    let (buffer, transport, _) = start_completion_resolve_after_trigger_refresh(&mut app);
+    let request_id = app.language.request_id();
+    app.handle_configured_key("enter".parse().unwrap());
+    assert!(app.language.completion_resolve_accepts(request_id));
+
+    app.handle_configured_key(KeyEvent::character('m'));
+    assert_eq!(app.state.buffers[buffer].text.to_string(), "receiver.m");
+    // A queued reply can arrive before the next document sync updates the projection.
+    assert!(
+        app.language
+            .expects_result("server", request_id, "completionItem/resolve")
+    );
+    app.clear_notice();
+    deliver_completion_resolve_failure(&mut app, &transport, request_id, "obsolete resolve");
+    assert!(app.ui.notification.is_none());
+    assert!(!app.language.request_pending(request_id));
+    assert!(!app.language.completion_resolve_accepts(request_id));
+}
+
+#[test]
+fn failed_completion_acceptance_after_trigger_refresh_reports_and_can_retry() {
+    let (_dirs, mut app) = app();
+    let (buffer, mut transport, mut item) =
+        start_completion_resolve_after_trigger_refresh(&mut app);
+    let document = app.active_lsp_document().unwrap().1;
+    let failed_request = app.language.request_id();
+
+    app.handle_configured_key("enter".parse().unwrap());
+    assert!(app.language.completion_resolve_accepts(failed_request));
+    deliver_completion_resolve_failure(
+        &mut app,
+        &transport,
+        failed_request,
+        "fixture resolve failure",
+    );
+    assert!(app.ui.notification_error);
+    assert_eq!(
+        app.ui.notification.as_deref(),
+        Some("Could not insert the suggestion. Try again.")
+    );
+    assert!(!app.language.request_pending(failed_request));
+    assert_eq!(app.active_input_context(), "completion");
+
+    app.handle_configured_key("enter".parse().unwrap());
+    assert_eq!(
+        transport.requested_feature_after_sync(),
+        Some(LspFeature::CompletionResolve {
+            item: item.resolve_item.clone().unwrap(),
+        })
+    );
+    let retry = app.language.request_id();
+    assert!(retry > failed_request);
+    assert!(app.language.completion_resolve_accepts(retry));
+    item.resolved = true;
+    transport.publish_result(
+        retry,
+        "completionItem/resolve",
+        &document,
+        LspFeatureResult::CompletionResolved(Box::new(item)),
+    );
+    app.process_lsp_events();
+    assert_eq!(
+        app.state.buffers[buffer].text.to_string(),
+        "receiver.method()"
+    );
 }
 
 #[test]

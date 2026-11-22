@@ -313,7 +313,7 @@ impl LspSession {
             language: document.language_id.clone(),
         };
         let previous = self.projection.owner.replace(owner);
-        let result = self.request_projected(server, feature, document, ByteOffset(0));
+        let result = self.request_projected(server, feature, document, ByteOffset(0), None);
         self.projection.owner = previous;
         result
     }
@@ -324,6 +324,7 @@ impl LspSession {
         mut feature: LspFeature,
         document: LspDocument,
         offset: ByteOffset,
+        workspace: Option<&crate::app::workspace::Workspace>,
     ) -> Result<(), LspError> {
         let Some(owner) = self.projection.owner.clone() else {
             return Ok(());
@@ -378,12 +379,16 @@ impl LspSession {
         if !self.synced(server, owner.buffer, &owner.text) {
             self.sync_owned(server, document.clone(), (owner.buffer, owner.text.clone()))?;
         }
-        self.service.request(
+        let roots = workspace
+            .filter(|_| feature.needs_workspace_baseline())
+            .map(super::launch::edit_roots);
+        self.service.request_with_workspace(
             server,
             self.feature_for_server(&feature, &document, &owner.server, server)?,
             document.clone(),
             offset,
             request_id,
+            roots.clone(),
         )?;
         self.projection.request = Some((request_id, owner.clone()));
         self.projection.request_servers = vec![server.to_owned()];
@@ -398,12 +403,13 @@ impl LspSession {
             }
             if self
                 .service
-                .request(
+                .request_with_workspace(
                     &other,
                     self.feature_for_server(&feature, &document, &owner.server, &other)?,
                     document.clone(),
                     offset,
                     request_id,
+                    roots.clone(),
                 )
                 .is_ok()
             {
@@ -750,6 +756,23 @@ impl LspSession {
         *request = None;
         true
     }
+    /// Whether this server still owes this result to the current projection.
+    pub(in crate::app) fn expects_result(
+        &self,
+        server: &str,
+        request_id: u64,
+        method: &str,
+    ) -> bool {
+        self.projection
+            .requests
+            .get(&request_id)
+            .is_some_and(|(owner, servers, expected)| {
+                expected == method
+                    && Some(owner) == self.projection.owner.as_ref()
+                    && servers.iter().any(|pending| pending == server)
+            })
+    }
+
     /// Whether another server still owes an answer to this request.
     pub(in crate::app) fn request_pending(&self, request_id: u64) -> bool {
         self.projection
@@ -887,10 +910,13 @@ impl LspSession {
                         .views
                         .get(owner.view)
                         .is_some_and(|view| view.buffer == owner.buffer)
-                    && editor
-                        .buffers
-                        .get(owner.buffer)
-                        .is_some_and(|buffer| buffer.text.source_version() == owner.text)
+                    && editor.buffers.get(owner.buffer).is_some_and(|buffer| {
+                        buffer.text.source_version() == owner.text
+                            && (owner.server.is_empty()
+                                || buffer.path.as_deref().is_some_and(|path| {
+                                    crate::language::lsp::file_uri(path) == owner.uri
+                                }))
+                    })
             })
     }
     pub(in crate::app) fn completion_items(&self) -> &[LspCompletionItem] {
@@ -1357,6 +1383,46 @@ impl LspSession {
                 .as_ref()
                 .is_some_and(|(id, ..)| *id == request_id)
     }
+    /// Retire a failed resolve and report whether a live insertion was waiting for it.
+    pub(in crate::app) fn fail_completion_resolve(
+        &mut self,
+        server: &str,
+        request_id: u64,
+        editor: &EditorState,
+    ) -> bool {
+        if !self.expects_result(server, request_id, "completionItem/resolve") {
+            return false;
+        }
+        self.finish_request(server, request_id);
+        let Some((_, owner, index, offset)) = self
+            .projection
+            .resolve
+            .take_if(|(id, ..)| *id == request_id)
+        else {
+            return false;
+        };
+        let accept = std::mem::take(&mut self.projection.resolve_accept);
+        accept && self.completion_resolve_selection_current(editor, &owner, index, offset)
+    }
+    fn completion_resolve_selection_current(
+        &self,
+        editor: &EditorState,
+        owner: &LspProjectionOwner,
+        index: usize,
+        offset: ByteOffset,
+    ) -> bool {
+        index == self.projection.completion_selected
+            && index < self.projection.completion_items.len()
+            && editor.active_view() == Some(owner.view)
+            && editor
+                .views
+                .get(owner.view)
+                .is_some_and(|view| view.buffer == owner.buffer && view.cursor == offset)
+            && editor
+                .buffers
+                .get(owner.buffer)
+                .is_some_and(|buffer| buffer.text.source_version() == owner.text)
+    }
     pub(in crate::app) fn accept_resolved(
         &mut self,
         request_id: u64,
@@ -1373,16 +1439,7 @@ impl LspSession {
             return false;
         }
         let index = *index;
-        let activate = index == self.projection.completion_selected
-            && editor.active_view() == Some(owner.view)
-            && editor
-                .views
-                .get(owner.view)
-                .is_some_and(|view| view.buffer == owner.buffer && view.cursor == *offset)
-            && editor
-                .buffers
-                .get(owner.buffer)
-                .is_some_and(|buffer| buffer.text.source_version() == owner.text);
+        let activate = self.completion_resolve_selection_current(editor, owner, index, *offset);
         self.projection.resolve = None;
         if let Some(canonical) =
             self.projection
@@ -2968,7 +3025,7 @@ mod tests {
         let (mut editor, buffer, view) = {
             let mut editor = EditorState::new("/workspace".into());
             let (buffer, view) = editor
-                .open_text(TextBuffer::from_text("old"), None)
+                .open_text(TextBuffer::from_text("old"), Some("/workspace/test".into()))
                 .unwrap();
             (editor, buffer, view)
         };

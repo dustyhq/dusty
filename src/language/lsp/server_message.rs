@@ -57,6 +57,7 @@ pub(super) struct ServerMessageContext<'a> {
     pub registrations: &'a mut HashMap<String, (String, Value)>,
     pub configuration: &'a LspServerConfiguration,
     pub sources: &'a HashMap<String, (crate::editor::BufferId, crate::editor::text::TextVersion)>,
+    pub edit_commands: Vec<super::origins::CommandEditSource>,
     pub diagnostic_lineage: &'a crate::language::lsp::origins::DiagnosticLineage,
     pub documents: &'a HashMap<String, LspDocument>,
     pub apply_requests: &'a mut HashMap<ServerRequestId, std::sync::Arc<()>>,
@@ -74,6 +75,7 @@ pub(super) fn handle_server_message(context: ServerMessageContext<'_>, message: 
         registrations,
         configuration,
         sources,
+        edit_commands,
         diagnostic_lineage,
         documents,
         apply_requests,
@@ -297,23 +299,41 @@ pub(super) fn handle_server_message(context: ServerMessageContext<'_>, message: 
                 if apply_requests.contains_key(&request_id) {
                     return;
                 }
-                let key = std::sync::Arc::new(());
-                let delivered = apply_requests.len() < MAX_PENDING_REQUESTS
-                    && events.apply(
-                        LspEvent::ApplyEditRequest {
-                            server: server.into(),
-                            request_id: request_id.clone(),
-                            label: message
-                                .pointer("/params/label")
-                                .and_then(Value::as_str)
-                                .map(str::to_owned),
-                            edit,
-                        },
-                        request_id.clone(),
-                        key.clone(),
-                        capabilities.position_encoding,
-                        sources.clone(),
+                if apply_requests.len() >= MAX_PENDING_REQUESTS {
+                    let _ = write_content_length_message(
+                        stdin,
+                        &json!({"jsonrpc":"2.0","id":request_id.value(),"result":{"applied":false,"failureReason":"workspace edit request queue is full"}}),
                     );
+                    return;
+                }
+                let key = std::sync::Arc::new(());
+                let sources = if edit_commands.is_empty() {
+                    sources.clone()
+                } else {
+                    HashMap::new()
+                };
+                let events = EventSender {
+                    context: EditContext {
+                        command_sources: edit_commands.into(),
+                        ..events.context.clone()
+                    },
+                    ..events.clone()
+                };
+                let delivered = events.apply(
+                    LspEvent::ApplyEditRequest {
+                        server: server.into(),
+                        request_id: request_id.clone(),
+                        label: message
+                            .pointer("/params/label")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned),
+                        edit,
+                    },
+                    request_id.clone(),
+                    key.clone(),
+                    capabilities.position_encoding,
+                    sources,
+                );
                 if delivered {
                     apply_requests.insert(request_id, key);
                 } else {

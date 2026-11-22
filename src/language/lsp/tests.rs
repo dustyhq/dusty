@@ -120,7 +120,9 @@ fn language_mapping_preserves_case_sensitive_cpp_extensions() {
 fn file_uris_validate_authorities() {
     for uri in [
         "file:///home/user/a%20b.rs",
+        #[cfg(unix)]
         "file://localhost/home/user/a%20b.rs",
+        #[cfg(unix)]
         "file://LOCALHOST/home/user/a%20b.rs",
     ] {
         assert_eq!(
@@ -293,6 +295,11 @@ fn server_message_replies(
             diagnostic_ambiguous: false,
             sources: Arc::new(Default::default()),
             disk: None,
+            workspace: None,
+            workspace_sent_at: None,
+            request_document: None,
+            command_sources: Default::default(),
+            wire_versions: None,
         },
         cancelled: Arc::new(false.into()),
         stop_requested: Arc::new(false.into()),
@@ -313,6 +320,7 @@ fn server_message_replies(
             diagnostic_lineage: &Default::default(),
             documents,
             apply_requests: &mut Default::default(),
+            edit_commands: Vec::new(),
         },
         &message,
     );
@@ -361,6 +369,11 @@ fn diagnostic_disk_snapshots_reject_nonregular_and_oversized_targets() {
             diagnostic_ambiguous: false,
             sources: Arc::new(Default::default()),
             disk: None,
+            workspace: None,
+            workspace_sent_at: None,
+            request_document: None,
+            command_sources: Default::default(),
+            wire_versions: None,
         },
     };
     let worker_root = crate::files::canonicalize(root.path()).unwrap();
@@ -382,6 +395,7 @@ fn diagnostic_disk_snapshots_reject_nonregular_and_oversized_targets() {
                     diagnostic_lineage: &Default::default(),
                     documents: &Default::default(),
                     apply_requests: &mut Default::default(),
+                    edit_commands: Vec::new(),
                 },
                 &json!({"method":"textDocument/publishDiagnostics", "params":{"uri":uri,"diagnostics":[]}}),
             );
@@ -985,7 +999,7 @@ fn failed_document_sync_keeps_the_last_sent_document_and_stops_the_session() {
                     ..Default::default()
                 },
                 &mut documents,
-                &mut HashMap::new(),
+                &mut Default::default(),
                 &mut Default::default(),
                 &mut HashMap::new(),
                 &mut opened_documents,

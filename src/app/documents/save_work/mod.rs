@@ -1,7 +1,7 @@
 //! Editable documents and ordered work that must finish before a save.
 
 use crate::app::App;
-use crate::app::documents::{DocumentFailure, Documents};
+use crate::app::documents::{DocumentFailure, Documents, FormatterRefusal};
 use crate::app::windows::EditorCloseSave;
 use crate::editor::BufferId;
 use crate::editor::text::{TextBuffer, TextVersion};
@@ -49,6 +49,7 @@ struct PendingSave {
     force: bool,
     quit: bool,
     close: Option<EditorCloseSave>,
+    formatter_refusal: Option<FormatterRefusal>,
     provider: bool,
     stage: bool,
     formatting: bool,
@@ -196,6 +197,7 @@ impl App {
         path: Option<PathBuf>,
         force: bool,
         close: Option<EditorCloseSave>,
+        formatter_refusal: Option<FormatterRefusal>,
     ) -> Result<bool, DocumentFailure> {
         if self.documents.save_work.pending.contains_key(&buffer) {
             return Err(DocumentFailure::Error(
@@ -253,6 +255,7 @@ impl App {
                 force,
                 quit,
                 close,
+                formatter_refusal,
                 provider: provider.is_some(),
                 stage: false,
                 formatting: false,
@@ -306,6 +309,7 @@ impl App {
                         force: false,
                         quit: false,
                         close: None,
+                        formatter_refusal: None,
                         provider: false,
                         stage: false,
                         formatting: true,
@@ -429,6 +433,7 @@ impl App {
                 pending.reply = Some(receiver);
                 self.documents.save_work.pending.insert(buffer, pending);
             } else if pending.formatting {
+                self.note_save_formatter_ran(buffer);
                 self.finish_format_on_save(buffer);
             } else if pending.provider {
                 self.state.mark_buffer_saved_as(
@@ -446,6 +451,7 @@ impl App {
                     pending.path,
                     pending.force,
                     pending.close.clone(),
+                    pending.formatter_refusal,
                 );
                 self.effect_authority = previous;
                 match result {
@@ -484,7 +490,11 @@ impl App {
     }
 
     fn finish_provider_save(&mut self, buffer: BufferId, pending: PendingSave) {
-        self.notify_message("Saved".into(), false);
+        if let Some(refusal) = pending.formatter_refusal {
+            self.notify_warning(refusal.save_notice("Saved"));
+        } else {
+            self.notify_message("Saved".into(), false);
+        }
         if let Some(close) = pending.close {
             match self
                 .window_session

@@ -7,8 +7,9 @@ use crate::editor::WorkspaceEditSources;
 use crate::files::CheckedResourceIntent;
 use crate::files::RequestId;
 use crate::files::VfsResult;
+use crate::language::lsp::PreparedDiskFile;
 use crate::workspace::ProposalId;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -58,17 +59,34 @@ pub(in crate::app) struct Preparation {
     pub(in crate::app) slots: Vec<Slot>,
     pub(in crate::app) requests: HashMap<RequestId, (usize, InputFile, Arc<()>)>,
     pub(in crate::app) snapshots: Vec<FileSnapshot>,
+    disk_paths: HashSet<PathBuf>,
+    digests: HashMap<PathBuf, PreparedDiskFile>,
+    hashing: Option<std::thread::JoinHandle<HashedFiles>>,
+    hashed: bool,
     pub(in crate::app) paths: HashMap<PathBuf, PathBuf>,
     pub(in crate::app) creates: Vec<PathBuf>,
     pub(in crate::app) resources: Vec<CheckedResourceIntent>,
     pub(in crate::app) maximum: usize,
     pub(in crate::app) roots: Vec<PathBuf>,
 }
+struct HashedFiles {
+    snapshots: Vec<FileSnapshot>,
+    resources: Vec<CheckedResourceIntent>,
+    digests: HashMap<PathBuf, PreparedDiskFile>,
+}
+
 pub(in crate::app) struct PreparedFiles<'a> {
     snapshots: &'a [FileSnapshot],
     paths: &'a HashMap<PathBuf, PathBuf>,
+    digests: &'a HashMap<PathBuf, PreparedDiskFile>,
 }
 impl PreparedFiles<'_> {
+    pub(in crate::app) fn canonical(&self, requested: &Path) -> Option<&Path> {
+        self.paths.get(requested).map(PathBuf::as_path)
+    }
+    pub(in crate::app) fn disk_file(&self, canonical: &Path) -> Option<&PreparedDiskFile> {
+        self.digests.get(canonical)
+    }
     pub(in crate::app) fn snapshot(&self, requested: &Path) -> Option<&FileSnapshot> {
         let canonical = self.paths.get(requested)?;
         self.snapshots
@@ -211,8 +229,107 @@ impl WorkspaceEdits {
         Ok(PreparedFiles {
             snapshots: &p.snapshots,
             paths: &p.paths,
+            digests: &p.digests,
         })
     }
+    /// Hash only the chosen edit's already-scoped reads on a preparation worker.
+    /// Move the bytes, rather than copying the full read set into the worker.
+    pub(in crate::app) fn hash_prepared_files(&mut self) -> Result<bool, String> {
+        let p = self
+            .preparing
+            .as_mut()
+            .ok_or("workspace preparation is stale")?;
+        if p.hashed || p.disk_paths.is_empty() && p.resources.is_empty() && p.hashing.is_none() {
+            return Ok(true);
+        }
+        if let Some(worker) = &p.hashing {
+            if !worker.is_finished() {
+                return Ok(false);
+            }
+            let hashed = p
+                .hashing
+                .take()
+                .expect("hash worker")
+                .join()
+                .map_err(|_| "workspace preparation worker failed")?;
+            p.snapshots = hashed.snapshots;
+            p.resources = hashed.resources;
+            p.digests = hashed.digests;
+            p.hashed = true;
+            return Ok(true);
+        }
+        const MAX_HASH_BYTES: usize = 256 * 1024 * 1024;
+        let disk_bytes = p
+            .snapshots
+            .iter()
+            .filter(|snapshot| p.disk_paths.contains(&snapshot.canonical_path))
+            .map(|snapshot| snapshot.bytes.len())
+            .chain(
+                p.resources
+                    .iter()
+                    .map(|resource| resource.source_bytes.len()),
+            )
+            .fold(0_usize, usize::saturating_add);
+        if disk_bytes > MAX_HASH_BYTES {
+            return Err("workspace edit preparation exceeds its safety limit".into());
+        }
+        let snapshots = std::mem::take(&mut p.snapshots);
+        let resources = std::mem::take(&mut p.resources);
+        let disk_paths = p.disk_paths.clone();
+        p.hashing = Some(
+            std::thread::Builder::new()
+                .name("dusty-workspace-edit-verify".into())
+                .spawn(move || {
+                    let mut digests = HashMap::new();
+                    for snapshot in &snapshots {
+                        if disk_paths.contains(&snapshot.canonical_path) {
+                            digests
+                                .entry(snapshot.canonical_path.clone())
+                                .or_insert_with(|| {
+                                    PreparedDiskFile::from_bytes(
+                                        &snapshot.canonical_path,
+                                        &snapshot.bytes,
+                                    )
+                                });
+                        }
+                    }
+                    for resource in &resources {
+                        digests.insert(
+                            resource.source.clone(),
+                            PreparedDiskFile::from_bytes(&resource.source, &resource.source_bytes),
+                        );
+                    }
+                    HashedFiles {
+                        snapshots,
+                        resources,
+                        digests,
+                    }
+                })
+                .map_err(|error| error.to_string())?,
+        );
+        Ok(false)
+    }
+
+    pub(in crate::app) fn normalize_lsp_alias_snapshots(
+        &mut self,
+        editor: &crate::editor::EditorState,
+    ) -> Result<(), String> {
+        let p = self
+            .preparing
+            .as_mut()
+            .ok_or("workspace preparation is stale")?;
+        for file in &mut p.snapshots {
+            if file.revision.is_none()
+                && p.disk_paths.contains(&file.canonical_path)
+                && let Some(open) =
+                    editor.workspace_snapshot(&p.source.editor, &file.canonical_path, p.maximum)?
+            {
+                *file = open.into_file(&p.source.editor, &file.canonical_path)?;
+            }
+        }
+        Ok(())
+    }
+
     pub(in crate::app) fn open_snapshot(
         &mut self,
         index: usize,
@@ -314,12 +431,13 @@ impl WorkspaceEdits {
                 }
                 let revision = if let InputFile::ReadMatchingDisk { text, .. } = &file {
                     if !text.matches_encoded_text(&bytes) {
-                        return Err("untracked workspace edit buffer differs from disk".into());
+                        return Err(crate::app::language::edits::STALE_EDIT.into());
                     }
                     Some(text.revision())
                 } else {
                     None
                 };
+                p.disk_paths.insert(path.clone());
                 p.paths.insert(file.path().to_owned(), path.clone());
                 p.snapshots.push(FileSnapshot {
                     canonical_path: path,
@@ -337,8 +455,18 @@ impl WorkspaceEdits {
                     bytes: Vec::new(),
                 });
             }
-            (InputFile::Resource { .. }, VfsResult::ResourceResolved { result, .. }) => {
-                p.resources.push(result.map_err(|e| e.to_string())?);
+            (
+                InputFile::Resource { source, target },
+                VfsResult::ResourceResolved { result, .. },
+            ) => {
+                let intent = result.map_err(|e| e.to_string())?;
+                p.paths.insert(source, intent.source.clone());
+                if let (Some(requested), crate::files::ResourceIntentKind::Rename { target, .. }) =
+                    (target, &intent.kind)
+                {
+                    p.paths.insert(requested, target.clone());
+                }
+                p.resources.push(intent);
             }
             _ => return Err("workspace worker returned the wrong operation terminal".into()),
         }
@@ -356,6 +484,10 @@ impl Preparation {
             slots: Vec::new(),
             requests: HashMap::new(),
             snapshots: Vec::new(),
+            disk_paths: HashSet::new(),
+            digests: HashMap::new(),
+            hashing: None,
+            hashed: false,
             paths: HashMap::new(),
             creates: Vec::new(),
             resources: Vec::new(),

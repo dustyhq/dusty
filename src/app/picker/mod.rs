@@ -1980,6 +1980,7 @@ impl App {
             Some(PickerPayload::CodeAction(_)) => {
                 let offered = match code_action.expect("selected code action") {
                     Ok(offered) => offered,
+                    Err(error) if error == crate::app::language::edits::STALE_EDIT => return,
                     Err(error) => {
                         self.show_error(error);
                         return;
@@ -2025,6 +2026,7 @@ impl App {
                             LspFeature::CodeLensResolve { item },
                             document,
                             ByteOffset(0),
+                            None,
                         )
                     {
                         self.show_error(error);

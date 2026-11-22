@@ -103,7 +103,7 @@ fn workspace_approval_restores_unopened_file_history_on_a_worker() {
         .unwrap();
     assert!(
         owner
-            .prepare_approval(&editor, TransactionId(2), Vec::new(), &version, 1)
+            .prepare_approval(&editor, TransactionId(2), Vec::new(), None, &version, 1)
             .unwrap()
             .is_none()
     );
@@ -111,7 +111,7 @@ fn workspace_approval_restores_unopened_file_history_on_a_worker() {
     assert!(owner.toggle(0).is_err());
     assert!(
         owner
-            .prepare_approval(&editor, TransactionId(3), Vec::new(), &version, 1)
+            .prepare_approval(&editor, TransactionId(3), Vec::new(), None, &version, 1)
             .is_err()
     );
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);

@@ -251,10 +251,10 @@ pub(super) fn send_change(
     previous: Option<&LspDocument>,
     document: &LspDocument,
     capabilities: &LspCapabilities,
-) -> Result<(), crate::process::ProtocolError> {
+) -> Result<bool, crate::process::ProtocolError> {
     let sync_kind = capabilities.sync_kind_for_document(document);
     if sync_kind == SyncKind::None {
-        return Ok(());
+        return Ok(false);
     }
     let content_changes = if sync_kind == SyncKind::Incremental {
         previous
@@ -269,7 +269,8 @@ pub(super) fn send_change(
             "jsonrpc":"2.0","method":"textDocument/didChange",
             "params":{"textDocument":{"uri":document.uri(),"version":document.version},"contentChanges":content_changes}
         }),
-    )
+    )?;
+    Ok(true)
 }
 
 pub(super) fn incremental_change(
@@ -449,14 +450,6 @@ pub(super) fn handle_response(
     message: Value,
     events: &EventSender,
 ) {
-    let events = &EventSender {
-        context: EditContext {
-            encoding: request.encoding,
-            sources: request.sources.clone(),
-            ..events.context.clone()
-        },
-        ..events.clone()
-    };
     if let Some(error) = message.get("error") {
         send_event(
             events,
@@ -469,8 +462,22 @@ pub(super) fn handle_response(
         );
         return;
     }
-    let result = message.get("result").unwrap_or(&Value::Null);
-    let normalized = normalize_result(&request.feature, result);
+    let normalized = normalize_result(
+        &request.feature,
+        message.get("result").unwrap_or(&Value::Null),
+    );
+    let events = &EventSender {
+        context: EditContext {
+            encoding: request.encoding,
+            sources: request.sources.clone(),
+            workspace: request.workspace.clone(),
+            workspace_sent_at: request.workspace_sent_at,
+            wire_versions: Some(request.wire_versions.clone()),
+            request_document: request.edit_origin.then(|| request.document.uri()),
+            ..events.context.clone()
+        },
+        ..events.clone()
+    };
     match normalized {
         Ok(result) => send_event(
             events,

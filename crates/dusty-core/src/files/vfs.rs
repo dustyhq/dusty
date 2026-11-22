@@ -535,15 +535,7 @@ impl VfsWorker {
                                     id,
                                     path,
                                     canonical_roots,
-                                } => match canonical_path(&path).or_else(|error| {
-                                    if matches!(&error, VfsError::Io { source, .. }
-                                        if source.kind() == io::ErrorKind::NotFound)
-                                    {
-                                        scoped_missing_target(&path, &canonical_roots)
-                                    } else {
-                                        Err(error)
-                                    }
-                                }) {
+                                } => match resolve_scoped_read_path(&path, &canonical_roots) {
                                     Ok(path)
                                         if canonical_roots
                                             .iter()
@@ -575,15 +567,7 @@ impl VfsWorker {
                                     path,
                                     canonical_roots,
                                     maximum_bytes,
-                                } => match canonical_path(&path).or_else(|error| {
-                                    if matches!(&error, VfsError::Io { source, .. }
-                                        if source.kind() == io::ErrorKind::NotFound)
-                                    {
-                                        scoped_missing_target(&path, &canonical_roots)
-                                    } else {
-                                        Err(error)
-                                    }
-                                }) {
+                                } => match resolve_scoped_read_path(&path, &canonical_roots) {
                                     Ok(path)
                                         if canonical_roots
                                             .iter()
@@ -1468,11 +1452,7 @@ fn hold_parents(path: &Path) -> io::Result<Vec<File>> {
 }
 
 #[cfg(windows)]
-pub(super) fn read_scoped_file(
-    path: &Path,
-    roots: &[PathBuf],
-    maximum: u64,
-) -> Result<Vec<u8>, VfsError> {
+pub fn read_scoped_file(path: &Path, roots: &[PathBuf], maximum: u64) -> Result<Vec<u8>, VfsError> {
     let _parents = hold_scoped_parents(path, roots)?;
     read_file_bounded(path, maximum)
 }
@@ -1859,7 +1839,7 @@ fn scoped_parent(
 }
 
 #[cfg(unix)]
-pub(super) fn read_scoped_file(
+pub fn read_scoped_file(
     path: &Path,
     roots: &[PathBuf],
     maximum_bytes: u64,
@@ -1895,6 +1875,21 @@ pub(super) fn scoped_existing_path(path: &Path, roots: &[PathBuf]) -> Result<Pat
         return Err(VfsError::OutsideScope(canonical));
     }
     Ok(canonical)
+}
+
+fn resolve_scoped_read_path(path: &Path, roots: &[PathBuf]) -> Result<PathBuf, VfsError> {
+    canonical_path(path).or_else(|error| {
+        if !matches!(&error, VfsError::Io { source, .. } if source.kind() == io::ErrorKind::NotFound) {
+            return Err(error);
+        }
+        match scoped_missing_target(path, roots) {
+            // The in-scope name exists but cannot be resolved (for example, a dangling link).
+            // Preserve the read error; the mutation helper's collision is not a read failure
+            // category, and a scope rejection from the parent check must still propagate.
+            Err(VfsError::DestinationExists(_)) => Err(error),
+            result => result,
+        }
+    })
 }
 
 pub(super) fn scoped_missing_target(path: &Path, roots: &[PathBuf]) -> Result<PathBuf, VfsError> {

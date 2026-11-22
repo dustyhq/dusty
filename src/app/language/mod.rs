@@ -364,15 +364,27 @@ impl LspSession {
         &self,
         key: &OriginKey,
         current: &[EditDocument<'_>],
+        proposal: Option<&crate::workspace::WorkspaceEditProposal>,
     ) -> Result<(), String> {
-        self.edits.check(key, current, &self.service)
+        self.edits.check(key, current, &self.service, proposal)
+    }
+    pub(in crate::app) fn edit_disk_approval(
+        &self,
+        key: &OriginKey,
+        proposal: &crate::workspace::WorkspaceEditProposal,
+    ) -> Result<Option<edits::DiskApproval>, String> {
+        self.edits.disk_approval(key, proposal)
+    }
+    pub(in crate::app) fn edit_needs_disk_hashes(&self, key: &OriginKey) -> bool {
+        self.edits.needs_disk_hashes(key)
     }
     pub(in crate::app) fn decode_edit(
         &mut self,
         key: &OriginKey,
         files: PreparedFiles<'_>,
+        editor: &EditorState,
     ) -> Result<Vec<crate::workspace::WorkspaceEditDraft>, String> {
-        self.edits.decode(key, files)
+        self.edits.decode_for_editor(key, files, editor)
     }
     pub(in crate::app) fn finish_edit(
         &mut self,
@@ -380,11 +392,12 @@ impl LspSession {
         applied: bool,
         reason: Option<String>,
         editor: &EditorState,
+        workspace: &crate::app::workspace::Workspace,
     ) -> Result<(), String> {
         let command = self.edits.take_command(key);
         self.edits.finish(key, applied, reason)?;
         if applied && let Some((server, command)) = command {
-            self.execute_edit_command(&server, command, editor)?;
+            self.execute_edit_command(&server, command, editor, workspace)?;
         }
         Ok(())
     }
@@ -393,6 +406,7 @@ impl LspSession {
         server: &str,
         command: crate::language::lsp::LspCommand,
         editor: &EditorState,
+        workspace: &crate::app::workspace::Workspace,
     ) -> Result<(), String> {
         let fallback = self
             .sessions
@@ -412,12 +426,13 @@ impl LspSession {
             .next_request_id()
             .ok_or("language-server request identity exhausted")?;
         self.service
-            .request(
+            .request_with_workspace(
                 server,
                 crate::language::lsp::LspFeature::ExecuteCommand(command),
                 document,
                 crate::editor::text::ByteOffset(0),
                 request_id,
+                Some(launch::edit_roots(workspace)),
             )
             .map_err(|error| error.to_string())?;
         Ok(())
@@ -482,6 +497,7 @@ impl LspSession {
         &mut self,
         proposal: ProposalId,
         editor: &EditorState,
+        workspace: &crate::app::workspace::Workspace,
     ) -> Result<(), String> {
         if let Some(index) = self
             .deferred_commands
@@ -489,7 +505,7 @@ impl LspSession {
             .position(|(id, _, _)| *id == proposal)
         {
             let (_, server, command) = self.deferred_commands.remove(index);
-            self.execute_edit_command(&server, command, editor)?;
+            self.execute_edit_command(&server, command, editor, workspace)?;
         }
         Ok(())
     }
@@ -1049,7 +1065,7 @@ impl App {
                     .language
                     .resolve_completion(selected, document, offset, false)
                 {
-                    self.show_error(error);
+                    self.append_lsp_log(format!("completionItem/resolve failed: {error}"));
                 }
             }
         }
@@ -1114,7 +1130,8 @@ impl App {
                 .language
                 .resolve_completion(selected, document, offset, true)
             {
-                self.show_error(error);
+                self.append_lsp_log(format!("completionItem/resolve failed: {error}"));
+                self.show_error(self.message("lsp_completion_insert_failed", &[]));
             }
             return;
         }
@@ -1355,6 +1372,7 @@ impl App {
                 LspFeature::ExecuteCommand(command),
                 document,
                 ByteOffset(0),
+                Some(&self.workspace),
             )
         {
             self.show_error(error);
@@ -1725,6 +1743,28 @@ impl App {
             // current failure is retried above. Neither is user-actionable.
             return;
         }
+        if method == "completionItem/resolve" {
+            let notify = self
+                .language
+                .fail_completion_resolve(&server, request_id, &self.state);
+            let label = self.lsp_server_label(&server);
+            self.append_lsp_log(format!("{label}: {method} failed: {message}"));
+            if notify {
+                self.show_error(self.message("lsp_completion_insert_failed", &[]));
+            }
+            return;
+        }
+        if method == "textDocument/completion" {
+            if !self.language.expects_result(&server, request_id, &method) {
+                return;
+            }
+            if self.language.completion_automatic()
+                && !self.configuration.settings().lsp.auto_completion
+            {
+                self.language.finish_request(&server, request_id);
+                return;
+            }
+        }
         let current_asked = self.lsp_asked_request_id == Some(request_id)
             && self
                 .lsp_asked
@@ -1778,7 +1818,11 @@ impl App {
         // so the request waits for the load to finish, as an empty answer does.
         // Right after opening a file the server can answer that way before it reports loading;
         // then the request is sent again shortly, a bounded number of times.
-        if message.contains("-32801") && current_asked {
+        if message.contains("-32801") {
+            if !current_asked {
+                self.language.forget_request(&server, request_id);
+                return;
+            }
             let loading = self.lsp_server_loading(&server);
             if loading || self.lsp_retries < LSP_CONTENT_MODIFIED_RETRIES {
                 if !loading {
@@ -1790,10 +1834,6 @@ impl App {
                 self.lsp_waiting_server = loading.then_some(server);
                 return;
             }
-        }
-        if !current_asked && message.contains("-32801") {
-            self.language.forget_request(&server, request_id);
-            return;
         }
         let server = self.lsp_server_label(&server);
         self.show_error(self.message(
@@ -1908,22 +1948,11 @@ impl App {
                 version,
                 result,
             } => {
-                if context
-                    .document_source(&uri)
-                    .is_some_and(|(buffer, source)| {
-                        self.state
-                            .buffers
-                            .get(*buffer)
-                            .is_none_or(|buffer| buffer.text.source_version() != *source)
-                    })
-                {
-                    return;
-                }
-                let save_format = method == "textDocument/formatting"
+                if method == "textDocument/formatting"
                     && self
                         .formatting_save_for_request(&server, request_id)
-                        .is_some();
-                if save_format {
+                        .is_some()
+                {
                     self.present_lsp_result_owned(
                         &server,
                         request_id,
@@ -1932,6 +1961,12 @@ impl App {
                         result,
                         Some(context),
                     );
+                    return;
+                }
+                if (context.request_document().is_some() || context.document_source(&uri).is_some())
+                    && self.lsp_edit_target(&context, &uri).is_none()
+                {
+                    self.discard_lsp_request(&server, request_id, &method);
                     return;
                 }
                 let current = self.active_lsp_document_without_text();
@@ -2043,6 +2078,13 @@ impl App {
                 method,
                 message,
             } => self.handle_lsp_request_failure(server, request_id, method, message),
+            LspEvent::RequestObsolete {
+                server,
+                request_id,
+                method,
+            } => {
+                self.discard_lsp_request(&server, request_id, &method);
+            }
             LspEvent::Stopped { server, success } => {
                 if context.diagnostic_ambiguous() {
                     self.language.request_start(&server, None);
@@ -2469,10 +2511,13 @@ impl App {
         if let Some((start, automatic)) = completion {
             self.language.begin_completion(start, automatic);
         }
-        match self
-            .language
-            .request_projected(&server, feature, document, offset)
-        {
+        match self.language.request_projected(
+            &server,
+            feature,
+            document,
+            offset,
+            Some(&self.workspace),
+        ) {
             Ok(()) => {
                 if asked {
                     self.lsp_asked_request_id = Some(self.language.request_id());
@@ -2552,6 +2597,42 @@ impl App {
 }
 
 impl App {
+    /// A reply may use only the buffer, path and text that supplied its coordinates.
+    fn lsp_edit_target(
+        &self,
+        context: &crate::language::lsp::EditContext,
+        uri: &str,
+    ) -> Option<crate::editor::BufferId> {
+        let (id, source) = context.document_source(uri)?;
+        let buffer = self.state.buffers.get(*id)?;
+        let path = buffer.path.as_deref()?;
+        (buffer.text.source_version() == *source
+            && path_from_file_uri(uri)
+                .as_deref()
+                .is_some_and(|expected| crate::language::lsp::same_file_path(path, expected)))
+        .then_some(*id)
+    }
+
+    fn discard_lsp_request(&mut self, server: &str, request_id: u64, method: &str) {
+        if let Some(buffer) = self.formatting_save_for_request(server, request_id) {
+            self.finish_format_on_save(buffer);
+            return;
+        }
+        let current_action = method == "textDocument/codeAction"
+            && self.lsp_asked_request_id == Some(request_id)
+            && self.language.request_pending(request_id);
+        self.language.finish_request(server, request_id);
+        if self.language.request_pending(request_id) {
+            return;
+        }
+        if current_action && self.language.has_offered_actions() {
+            self.open_lsp_code_actions_picker(server);
+        }
+        if self.lsp_asked_request_id == Some(request_id) {
+            self.ui.lsp_loading = None;
+        }
+    }
+
     pub(in crate::app) fn present_lsp_result_owned(
         &mut self,
         server: &str,
@@ -2680,23 +2761,22 @@ impl App {
                     method,
                     "textDocument/formatting" | "textDocument/rangeFormatting"
                 ) {
-                    // Typing while the server worked moved the text its edits point at.
-                    let edit_is_current = context.as_ref().is_some_and(|context| {
-                        self.language.edit_context_current(context)
-                            && context
-                                .document_source(uri)
-                                .is_some_and(|(buffer, version)| {
-                                    self.state.buffers.get(*buffer).is_some_and(|buffer| {
-                                        buffer.text.source_version() == *version
-                                    })
-                                })
-                    });
-                    let has_edits = edit
-                        .documents
-                        .iter()
-                        .any(|document| !document.edits.is_empty());
-                    if edit_is_current && has_edits {
-                        let encoding = self.language.server_encoding(server);
+                    let waiting = self.formatting_save_for_request(server, request_id);
+                    if let Some(context) = context.as_ref()
+                        && self.language.edit_context_current(context)
+                        && let Some(target) = self.lsp_edit_target(context, uri)
+                        && waiting.is_none_or(|buffer| {
+                            buffer == target && self.formatting_save_source_current(buffer)
+                        })
+                        && edit.resources.is_empty()
+                        && let [document] = edit.documents.as_slice()
+                        && document.uri == uri
+                        && !document.edits.is_empty()
+                        && document.version.is_none_or(|version| {
+                            self.state.buffers[target].text.revision().0 == version
+                        })
+                    {
+                        let encoding = context.encoding();
                         let replaced = edit
                             .documents
                             .iter()
@@ -2707,12 +2787,14 @@ impl App {
                         let positions = self.view_positions(|line| {
                             replaced.iter().any(|lines| lines.contains(&line))
                         });
-                        if let Err(error) = self.apply_lsp_workspace_edit(edit, encoding) {
-                            self.show_error(error);
+                        match self.apply_lsp_formatter_edit(target, edit, encoding) {
+                            Ok(()) if waiting.is_some() => self.note_save_formatter_ran(target),
+                            Ok(()) => {}
+                            Err(error) => self.show_error(error),
                         }
                         self.restore_view_positions(positions);
                     }
-                    if let Some(buffer) = self.formatting_save_for_request(server, request_id) {
+                    if let Some(buffer) = waiting {
                         self.finish_format_on_save(buffer);
                     }
                     return;
@@ -3015,6 +3097,7 @@ impl App {
                 ) =>
             {
                 if let Some(buffer) = self.formatting_save_for_request(server, request_id) {
+                    self.note_save_formatter_ran(buffer);
                     self.finish_format_on_save(buffer);
                 }
             }

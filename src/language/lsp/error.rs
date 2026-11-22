@@ -16,6 +16,8 @@ pub enum LspError {
     ExecutableMissing(String),
     #[error("language server launch requires an absolute executable from ExecutionPreflightWorker")]
     PreflightRequired,
+    #[error("The language server cannot use this file path.")]
+    UnsupportedPath,
     #[error("failed to create language-server thread: {0}")]
     Thread(#[source] std::io::Error),
 }

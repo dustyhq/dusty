@@ -23,11 +23,13 @@ use crate::language::lsp::LspTextEdit;
 use crate::language::lsp::LspWorkspaceEdit;
 use crate::language::lsp::OwnedLspEvent;
 use crate::language::lsp::PendingEditReply;
-use crate::language::lsp::path_from_file_uri;
+use crate::language::lsp::{path_from_file_uri, same_file_path};
 use crate::workspace::WorkspaceEditDraft;
 use std::collections::VecDeque;
 use std::path::Path;
 use std::path::PathBuf;
+
+pub(in crate::app) const STALE_EDIT: &str = "language-server edit is no longer current";
 
 pub(in crate::app) struct EditDocument<'a> {
     pub id: BufferId,
@@ -44,11 +46,75 @@ struct Request {
     key: OriginKey,
     documents: Option<Vec<LspDocumentEdit>>,
     paths: Vec<(String, PathBuf)>,
+    text_path_count: usize,
+    disk_checks: Vec<DiskCheck>,
+    destinations: Vec<PathBuf>,
     encoding: PositionEncoding,
     context: Option<EditContext>,
     reply: Option<ApplyEditReply>,
     command: Option<(String, crate::language::lsp::LspCommand)>,
 }
+fn selected_path(proposal: &crate::workspace::WorkspaceEditProposal, path: &Path) -> bool {
+    proposal
+        .files
+        .iter()
+        .any(|file| file.selected && same_file_path(path, &file.canonical_path))
+}
+
+#[derive(Clone)]
+enum DiskCheck {
+    File {
+        requested: PathBuf,
+        canonical: PathBuf,
+        hash: Option<crate::language::lsp::WorkspaceFileHash>,
+    },
+    Resource {
+        requested: PathBuf,
+        canonical: PathBuf,
+        hash: crate::language::lsp::WorkspaceFileHash,
+    },
+    Destination {
+        requested: PathBuf,
+        canonical: PathBuf,
+    },
+}
+
+pub(in crate::app) struct DiskApproval {
+    context: EditContext,
+    checks: Vec<DiskCheck>,
+}
+
+impl DiskApproval {
+    pub(in crate::app) fn check(self) -> Result<(), String> {
+        for check in &self.checks {
+            let current = match check {
+                DiskCheck::File {
+                    requested,
+                    canonical,
+                    hash,
+                } => self
+                    .context
+                    .disk_file_current(requested, canonical, hash.as_ref()),
+                DiskCheck::Resource {
+                    requested,
+                    canonical,
+                    hash,
+                } => self
+                    .context
+                    .disk_file_current(requested, canonical, Some(hash)),
+                DiskCheck::Destination {
+                    requested,
+                    canonical,
+                } => self.context.destination_current(requested, canonical),
+            };
+            if !current {
+                return Err(STALE_EDIT.into());
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(in crate::app) struct CodeActionKey {
     set: std::sync::Arc<()>,
@@ -183,10 +249,13 @@ impl LspEditSources {
             let path = path_from_file_uri(&offered.uri);
             let actual = current
                 .iter()
-                .find(|document| path.as_deref() == Some(document.path))
+                .find(|document| {
+                    path.as_deref()
+                        .is_some_and(|path| same_file_path(path, document.path))
+                })
                 .map(|document| (document.id, document.text.source_version()));
             if actual.is_none() || actual.as_ref() != context.document_source(&offered.uri) {
-                return Err("code-action document changed since it was requested".into());
+                return Err(STALE_EDIT.into());
             }
         }
         let set = self.actions.take().expect("checked action source");
@@ -235,6 +304,9 @@ impl LspEditSources {
     ) -> Result<SourcePlan, String> {
         let context = reply.as_ref().map(|r| r.context().clone()).or(context);
         let encoding = context.as_ref().map_or(encoding, EditContext::encoding);
+        let verify_prepared = context
+            .as_ref()
+            .is_some_and(EditContext::needs_workspace_verification);
         let parsed = (|| {
             if self.active.is_some() {
                 return Err("another source edit is pending".into());
@@ -255,29 +327,52 @@ impl LspEditSources {
             Self::validate_context(context.as_ref(), &[], current, service)?;
             let mut files = Vec::new();
             let mut paths = Vec::new();
+            let mut destinations = Vec::new();
             for doc in &edit.documents {
                 let path = path_from_file_uri(&doc.uri)
                     .ok_or_else(|| format!("unsupported workspace-edit URI {}", doc.uri))?;
-                if let Some(buffer) = current.iter().find(|buffer| buffer.path == path)
+                let buffer = current
+                    .iter()
+                    .find(|buffer| same_file_path(buffer.path, &path));
+                if !verify_prepared
                     && doc
                         .version
-                        .is_some_and(|version| version != buffer.text.revision().0)
+                        .zip(buffer)
+                        .is_some_and(|(version, buffer)| version != buffer.text.revision().0)
                 {
-                    return Err("workspace edit document revision is stale".into());
+                    return Err(STALE_EDIT.into());
+                }
+                let created = edit.resources.iter().any(|resource| matches!(resource,
+                    crate::language::lsp::LspResourceOperation::Create { uri, .. } if uri == &doc.uri));
+                if reply.is_some()
+                    && !verify_prepared
+                    && context.as_ref().is_some_and(|context| {
+                        context.requires_workspace_baseline()
+                            && (doc.version.is_none()
+                                || buffer.is_none()
+                                || context.document_source(&doc.uri).is_none())
+                    })
+                {
+                    return Err(STALE_EDIT.into());
                 }
                 paths.push((doc.uri.clone(), path.clone()));
-                if !edit.resources.iter().any(|resource| matches!(resource,
-                    crate::language::lsp::LspResourceOperation::Create { uri, .. } if uri == &doc.uri)) {
-                    files.push(if let Some(buffer) = current.iter().find(|buffer| buffer.path == path)
-                        && context.as_ref().is_some_and(|context| context.document_source(&doc.uri).is_none())
-                    {
-                        InputFile::ReadMatchingDisk { path, text: buffer.text.clone() }
-                    } else {
-                        InputFile::Read(path)
-                    });
+                if !created {
+                    files.push(
+                        if let Some(buffer) = buffer
+                            && context
+                                .as_ref()
+                                .is_some_and(|context| context.needs_disk_read(&doc.uri))
+                        {
+                            InputFile::ReadMatchingDisk {
+                                path,
+                                text: buffer.text.clone(),
+                            }
+                        } else {
+                            InputFile::Read(path)
+                        },
+                    );
                 }
             }
-            Self::validate_context(context.as_ref(), &paths, current, service)?;
             for resource in &edit.resources {
                 use crate::language::lsp::LspResourceOperation as R;
                 let path = |uri: &str| {
@@ -292,6 +387,9 @@ impl LspEditSources {
                 };
                 for uri in std::iter::once(first).chain(second) {
                     let requested = path(uri)?;
+                    if matches!(resource, R::Create { .. }) || second == Some(uri) {
+                        destinations.push(requested.clone());
+                    }
                     paths.push((uri.to_owned(), requested));
                 }
                 files.push(match resource {
@@ -320,10 +418,12 @@ impl LspEditSources {
                     _ => return Err("unsupported workspace resource operation".into()),
                 });
             }
-            Self::validate_context(context.as_ref(), &paths, current, service)?;
-            Ok::<_, String>((files, paths))
+            if !verify_prepared {
+                Self::validate_context(context.as_ref(), &paths, current, service)?;
+            }
+            Ok::<_, String>((files, paths, destinations))
         })();
-        let (files, paths) = match parsed {
+        let (files, paths, destinations) = match parsed {
             Ok(value) => value,
             Err(error) => {
                 self.reject_reply(reply, error.clone());
@@ -335,8 +435,11 @@ impl LspEditSources {
         self.active = Some(Request {
             command: None,
             key: key.clone(),
+            text_path_count: edit.documents.len(),
             documents: Some(edit.documents),
             paths,
+            disk_checks: Vec::new(),
+            destinations,
             encoding,
             context,
             reply,
@@ -359,19 +462,43 @@ impl LspEditSources {
         if !service.edit_context_current(context) {
             return Err("requesting language-server session is no longer current".into());
         }
-        for (uri, path) in paths {
-            let expected = context.document_source(uri);
+        let origin = context
+            .request_document()
+            .map(|uri| {
+                path_from_file_uri(uri)
+                    .map(|path| (uri, path))
+                    .ok_or(STALE_EDIT)
+            })
+            .transpose()?;
+        if origin
+            .as_ref()
+            .is_some_and(|(uri, _)| context.document_source(uri).is_none())
+        {
+            return Err(STALE_EDIT.into());
+        }
+        for (uri, path) in paths
+            .iter()
+            .map(|(uri, path)| (uri.as_str(), path))
+            .chain(origin.as_ref().map(|(uri, path)| (*uri, path)))
+        {
+            let address = crate::language::lsp::file_uri(path);
+            let expected = context
+                .document_source(&address)
+                .or_else(|| context.document_source(uri));
             let actual = current
                 .iter()
-                .find(|buffer| buffer.path == path)
+                .find(|buffer| same_file_path(buffer.path, path))
                 .map(|buffer| (buffer.id, buffer.text.source_version()));
             if if expected.is_some() {
                 actual.as_ref() != expected
             } else {
                 current
                     .iter()
-                    .any(|buffer| buffer.path == path && buffer.dirty)
+                    .any(|buffer| same_file_path(buffer.path, path) && buffer.dirty)
             } {
+                if context.requires_workspace_baseline() || context.request_document().is_some() {
+                    return Err(STALE_EDIT.into());
+                }
                 return Err(format!(
                     "{} no longer has the requesting session's document instance/content",
                     path.display()
@@ -385,18 +512,110 @@ impl LspEditSources {
         key: &OriginKey,
         current: &[EditDocument<'_>],
         service: &LspClient,
+        proposal: Option<&crate::workspace::WorkspaceEditProposal>,
     ) -> Result<(), String> {
         let request = self
             .active
             .as_ref()
             .filter(|r| r.key.same(key))
             .ok_or("workspace edit origin is foreign or stale")?;
-        Self::validate_context(request.context.as_ref(), &request.paths, current, service)
+        let Some(proposal) = proposal else {
+            let paths = if request
+                .context
+                .as_ref()
+                .is_some_and(EditContext::needs_workspace_verification)
+            {
+                &[][..]
+            } else {
+                request.paths.as_slice()
+            };
+            return Self::validate_context(request.context.as_ref(), paths, current, service);
+        };
+        let selected = request
+            .paths
+            .iter()
+            .enumerate()
+            .filter(|(index, (_, path))| {
+                *index >= request.text_path_count || selected_path(proposal, path)
+            })
+            .map(|(_, path)| path.clone())
+            .collect::<Vec<_>>();
+        Self::validate_context(request.context.as_ref(), &selected, current, service)
     }
-    pub(in crate::app) fn decode(
+
+    /// Capture only selected text files and mandatory resource checks for the approval worker.
+    pub(in crate::app) fn disk_approval(
+        &self,
+        key: &OriginKey,
+        proposal: &crate::workspace::WorkspaceEditProposal,
+    ) -> Result<Option<DiskApproval>, String> {
+        let request = self
+            .active
+            .as_ref()
+            .filter(|request| request.key.same(key))
+            .ok_or(STALE_EDIT)?;
+        let checks: Vec<_> = request
+            .disk_checks
+            .iter()
+            .filter(|check| match check {
+                DiskCheck::File { canonical, .. } => selected_path(proposal, canonical),
+                DiskCheck::Resource { .. } | DiskCheck::Destination { .. } => true,
+            })
+            .cloned()
+            .collect();
+        Ok(request
+            .context
+            .as_ref()
+            .filter(|_| !checks.is_empty())
+            .map(|context| DiskApproval {
+                context: context.clone(),
+                checks,
+            }))
+    }
+
+    pub(in crate::app) fn needs_disk_hashes(&self, key: &OriginKey) -> bool {
+        self.active
+            .as_ref()
+            .filter(|request| request.key.same(key))
+            .and_then(|request| request.context.as_ref())
+            .is_some_and(EditContext::needs_workspace_verification)
+    }
+
+    #[cfg(test)]
+    fn decode(
         &mut self,
         key: &OriginKey,
         files: PreparedFiles<'_>,
+    ) -> Result<Vec<WorkspaceEditDraft>, String> {
+        self.decode_prepared(key, files, &[])
+    }
+
+    pub(in crate::app) fn decode_for_editor(
+        &mut self,
+        key: &OriginKey,
+        files: PreparedFiles<'_>,
+        editor: &crate::editor::EditorState,
+    ) -> Result<Vec<WorkspaceEditDraft>, String> {
+        let current: Vec<_> = editor
+            .buffers
+            .iter()
+            .filter_map(|(id, buffer)| {
+                Some(EditDocument {
+                    id,
+                    path: buffer.path.as_deref()?,
+                    text: &buffer.text,
+                    dirty: buffer.dirty,
+                })
+            })
+            .collect();
+        self.decode_prepared(key, files, &current)
+    }
+
+    fn decode_prepared(
+        &mut self,
+        key: &OriginKey,
+        files: PreparedFiles<'_>,
+        current: &[EditDocument<'_>],
     ) -> Result<Vec<WorkspaceEditDraft>, String> {
         let request = self
             .active
@@ -407,6 +626,34 @@ impl LspEditSources {
             .documents
             .take()
             .ok_or("workspace source was already decoded")?;
+
+        if let Some(context) = &request.context
+            && context.needs_workspace_verification()
+        {
+            // A callback has no command ID. Check each complete dispatch snapshot;
+            // never splice a callback's targets together from different commands.
+            let (context, prepared) = if context.has_workspace_dispatch() {
+                (
+                    context.clone(),
+                    verify_prepared_edit(request, context, &documents, &files, current)?,
+                )
+            } else {
+                context
+                    .command_contexts()
+                    .find_map(|candidate| {
+                        let prepared =
+                            verify_prepared_edit(request, &candidate, &documents, &files, current)
+                                .ok()?;
+                        Some((candidate, prepared))
+                    })
+                    .ok_or(STALE_EDIT)?
+            };
+            request.context = Some(context);
+            request.paths = prepared.paths;
+            request.disk_checks = prepared.disk_checks;
+            return Ok(prepared.drafts);
+        }
+
         documents
             .into_iter()
             .map(|document| {
@@ -415,15 +662,11 @@ impl LspEditSources {
                 let snapshot = files
                     .snapshot(&path)
                     .ok_or("workspace edit snapshot is missing")?;
-                let text = TextBuffer::from_bytes(&snapshot.bytes).map_err(|e| e.to_string())?;
+                let text =
+                    TextBuffer::from_bytes(&snapshot.bytes).map_err(|error| error.to_string())?;
                 Ok(WorkspaceEditDraft {
                     canonical_path: snapshot.canonical_path.clone(),
-                    // gopls sends version 0 for a file that is not open; only an open buffer has
-                    // a version the edit could be out of date against.
-                    expected_revision: snapshot
-                        .revision
-                        .and(document.version.map(BufferRevision))
-                        .or(snapshot.revision),
+                    expected_revision: snapshot.revision,
                     edits: decode_edits(document.edits, &text, request.encoding)?,
                 })
             })
@@ -478,7 +721,7 @@ impl LspEditSources {
             let path = path_from_file_uri(&document.uri).ok_or("unsupported workspace-edit URI")?;
             let buffer = current
                 .iter()
-                .find(|buffer| buffer.path == path)
+                .find(|buffer| same_file_path(buffer.path, &path))
                 .ok_or_else(|| {
                     format!(
                         "workspace edit targets unopened file {}; preview required",
@@ -515,7 +758,125 @@ impl LspEditSources {
         Ok(transaction)
     }
 }
-pub(in crate::app::language) fn decode_edits(
+pub(in crate::app::language) struct VerifiedEdit {
+    paths: Vec<(String, PathBuf)>,
+    disk_checks: Vec<DiskCheck>,
+    drafts: Vec<WorkspaceEditDraft>,
+}
+
+fn verify_prepared_edit(
+    request: &Request,
+    context: &EditContext,
+    documents: &[LspDocumentEdit],
+    files: &PreparedFiles<'_>,
+    current: &[EditDocument<'_>],
+) -> Result<VerifiedEdit, String> {
+    let mut paths = Vec::with_capacity(request.paths.len());
+    let mut disk_checks = Vec::new();
+    let mut drafts = Vec::with_capacity(documents.len());
+    for (index, (uri, requested)) in request.paths.iter().enumerate() {
+        let canonical = files.canonical(requested).ok_or(STALE_EDIT)?;
+        let address = crate::language::lsp::file_uri(canonical);
+        let expected = context
+            .document_source(&address)
+            .or_else(|| context.document_source(uri));
+        let open = current
+            .iter()
+            .find(|buffer| same_file_path(buffer.path, canonical));
+        let destination = request.destinations.contains(requested);
+        let mapped = if destination {
+            context.destination_in_scope(canonical)
+        } else {
+            context.maps_to(requested, canonical)
+        };
+        if !mapped
+            || expected.is_some_and(|(id, version)| {
+                open.is_none_or(|buffer| {
+                    buffer.id != *id || buffer.text.source_version() != *version
+                })
+            })
+        {
+            return Err(STALE_EDIT.into());
+        }
+        if index < documents.len() {
+            let document = &documents[index];
+            let snapshot = files.snapshot(requested).ok_or(STALE_EDIT)?;
+            if destination && open.is_some() {
+                return Err(STALE_EDIT.into());
+            }
+            if let (Some(buffer), Some(version)) = (open, document.version)
+                && if expected.is_some() {
+                    !context.version_matches(&address, version, buffer.text.revision().0)
+                } else {
+                    version != buffer.text.revision().0
+                }
+            {
+                return Err(STALE_EDIT.into());
+            }
+            if !destination && expected.is_none() {
+                let disk = files.disk_file(canonical).ok_or(STALE_EDIT)?;
+                if context.knows_wire_document(&address)
+                    || context.knows_wire_document(uri)
+                    || !context.matches_prepared_disk(canonical, disk)
+                    || open.is_some_and(|buffer| {
+                        buffer.dirty || !buffer.text.matches_encoded_text(&snapshot.bytes)
+                    })
+                {
+                    return Err(STALE_EDIT.into());
+                }
+                disk_checks.push(DiskCheck::File {
+                    requested: requested.clone(),
+                    canonical: canonical.into(),
+                    hash: Some(disk.hash),
+                });
+            } else if !destination && requested != canonical {
+                disk_checks.push(DiskCheck::File {
+                    requested: requested.clone(),
+                    canonical: canonical.into(),
+                    hash: None,
+                });
+            }
+            let disk_text;
+            let text = if let Some(buffer) = open {
+                buffer.text
+            } else {
+                disk_text =
+                    TextBuffer::from_bytes(&snapshot.bytes).map_err(|error| error.to_string())?;
+                &disk_text
+            };
+            drafts.push(WorkspaceEditDraft {
+                canonical_path: canonical.into(),
+                expected_revision: open
+                    .map(|buffer| buffer.text.revision())
+                    .or(snapshot.revision),
+                edits: decode_edits(document.edits.clone(), text, context.encoding())?,
+            });
+        } else if destination {
+            disk_checks.push(DiskCheck::Destination {
+                requested: requested.clone(),
+                canonical: canonical.into(),
+            });
+        } else {
+            let disk = files.disk_file(canonical).ok_or(STALE_EDIT)?;
+            if !context.matches_prepared_disk(canonical, disk) {
+                return Err(STALE_EDIT.into());
+            }
+            disk_checks.push(DiskCheck::Resource {
+                requested: requested.clone(),
+                canonical: canonical.into(),
+                hash: disk.hash,
+            });
+        }
+        paths.push((address, canonical.into()));
+    }
+    Ok(VerifiedEdit {
+        paths,
+        disk_checks,
+        drafts,
+    })
+}
+
+pub(super) fn decode_edits(
     edits: Vec<LspTextEdit>,
     text: &TextBuffer,
     encoding: PositionEncoding,
@@ -1581,6 +1942,74 @@ mod diagnostic_tests {
             .is_err()
         );
     }
+    #[test]
+    fn closed_lsp_display_coordinates_refresh_without_rotating_the_jump_key() {
+        let root = tempfile::tempdir().unwrap();
+        let uri = crate::language::lsp::file_uri(&root.path().join("closed.rs"));
+        let mut editor = EditorState::new(root.path().into());
+        let (open, _) = editor.open_text(TextBuffer::from_text(""), None).unwrap();
+        let mut client = LspClient::new();
+        let endpoint = client.replace_edit_source_fixture(
+            "file:///open.rs".into(),
+            (open, editor.buffers[open].text.source_version()),
+            PositionEncoding::Utf16,
+        );
+        let mut owner = Diagnostics::new(10, 10);
+        let mut old_key = None;
+        for (text, line, column) in [("abcdeX", 0, 5), ("ab\ndeX", 1, 2)] {
+            endpoint.publish_disk_diagnostics(
+                &uri,
+                text,
+                vec![LspDiagnostic {
+                    range: LspRange {
+                        start: LspPosition {
+                            line,
+                            character: column,
+                        },
+                        end: LspPosition {
+                            line,
+                            character: column + 1,
+                        },
+                    },
+                    severity: Some(1),
+                    message: "same diagnostic".into(),
+                    source: None,
+                    code: None,
+                    related: vec![],
+                    data: None,
+                }],
+            );
+            let event = client.try_owned_event().unwrap();
+            let LspEvent::Diagnostics { diagnostics, .. } = event.event else {
+                panic!("expected a diagnostic report")
+            };
+            let batch = LspEditSources::diagnostic_batch(
+                &event.context,
+                &client,
+                &editor,
+                (&uri, None, diagnostics),
+                false,
+                10,
+                "fixture",
+            )
+            .unwrap();
+            owner.activate(batch.producer.clone());
+            owner.publish(batch, &editor).unwrap();
+            assert!(
+                owner.projection(&editor).is_some(),
+                "display metadata must refresh"
+            );
+            let (key, row, _) = owner.choices().next().unwrap();
+            assert_eq!(row.range.start, ByteOffset(5));
+            assert_eq!(owner.point(row, &editor), Some((line, column)));
+            if let Some(old) = &old_key {
+                assert!(key.same(old));
+                assert!(owner.resolve(old, &editor).is_some());
+            }
+            old_key = Some(key);
+        }
+    }
+
     #[test]
     fn diagnostic_transport_keeps_encoding_and_quarantines_reused_document_lineage() {
         let root = tempfile::tempdir().unwrap();

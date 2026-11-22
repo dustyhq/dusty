@@ -249,6 +249,21 @@ impl EditorState {
     }
 }
 impl EditorDraft {
+    /// A create preview opens an unsaved document. Its normal save must not
+    /// replace a destination that appeared after preview preparation.
+    pub fn mark_workspace_creates<'a>(&mut self, paths: impl Iterator<Item = &'a std::path::Path>) {
+        for path in paths {
+            if let Some((_, buffer)) = self
+                .state
+                .buffers
+                .iter_mut()
+                .find(|(_, buffer)| buffer.path.as_deref() == Some(path))
+            {
+                buffer.new_file = true;
+            }
+        }
+    }
+
     pub fn check_document_edits<'a>(
         &self,
         files: impl Iterator<Item = (&'a std::path::Path, &'a [u8])>,

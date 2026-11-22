@@ -55,6 +55,7 @@ impl Source {
 struct Preview {
     source: Source,
     proposal: WorkspaceEditProposal,
+    creates: Vec<std::path::PathBuf>,
     resources: Vec<CheckedResourceIntent>,
     origin: Option<OriginKey>,
     all_files: bool,
@@ -283,6 +284,7 @@ impl WorkspaceEdits {
         self.preview = Some(Preview {
             source: p.source,
             proposal,
+            creates: p.creates,
             resources: p.resources,
             origin: p.origin,
             all_files: p.all_files,
@@ -350,6 +352,7 @@ impl WorkspaceEdits {
         editor: &crate::editor::EditorState,
         transaction: crate::editor::TransactionId,
         changes: Vec<BufferPathChange>,
+        disk: Option<crate::app::language::edits::DiskApproval>,
         workspace: &WorkspaceVersion,
         configuration: u64,
     ) -> Result<Option<(EditorDraft, Vec<BufferPathChange>)>, String> {
@@ -357,34 +360,30 @@ impl WorkspaceEdits {
             return Err("workspace approval is already staged".into());
         }
         let (sources, proposal) = self.approval(workspace, configuration)?;
+        let creates = &self.preview.as_ref().expect("checked preview").creates;
         let needs_history = editor.undo_directory.is_some()
             && proposal
                 .files
                 .iter()
                 .any(|file| file.selected && file.base_revision.is_none());
-        if !needs_history {
-            return crate::app::workspace::edits::prepare_workspace_edit(
-                editor,
-                sources,
-                proposal,
-                transaction,
-            )
-            .map(|draft| Some((draft, changes)));
+        if !needs_history && disk.is_none() {
+            return prepare_preview(editor, sources, proposal, transaction, creates)
+                .map(|draft| Some((draft, changes)));
         }
-        // Unopened files restore persistent undo while constructing the draft.
-        // Keep that disk access and parsing off the input thread.
+        // Unopened files restore persistent undo while building the draft. Keep
+        // those reads and validation of selected disk targets off the input thread.
         let editor = editor.clone();
         let sources = sources.clone();
         let proposal = proposal.clone();
+        let creates = creates.clone();
         let worker = std::thread::Builder::new()
             .name("dusty-workspace-edit".into())
             .spawn(move || {
-                crate::app::workspace::edits::prepare_workspace_edit(
-                    &editor,
-                    &sources,
-                    &proposal,
-                    transaction,
-                )
+                let draft = prepare_preview(&editor, &sources, &proposal, transaction, &creates)?;
+                if let Some(disk) = disk {
+                    disk.check()?;
+                }
+                Ok(draft)
             })
             .map_err(|error| error.to_string())?;
         self.pending_approval = Some(PendingApproval { worker, changes });
@@ -622,6 +621,24 @@ fn selected_edits(
         })
         .collect()
 }
+fn prepare_preview(
+    state: &crate::editor::EditorState,
+    sources: &crate::editor::WorkspaceEditSources,
+    proposal: &WorkspaceEditProposal,
+    transaction: crate::editor::TransactionId,
+    creates: &[std::path::PathBuf],
+) -> Result<EditorDraft, String> {
+    let mut draft = prepare_workspace_edit(state, sources, proposal, transaction)?;
+    draft.mark_workspace_creates(
+        proposal
+            .files
+            .iter()
+            .filter(|file| file.selected && creates.contains(&file.canonical_path))
+            .map(|file| file.canonical_path.as_path()),
+    );
+    Ok(draft)
+}
+
 pub(in crate::app) fn prepare_workspace_edit(
     state: &crate::editor::EditorState,
     sources: &crate::editor::WorkspaceEditSources,
@@ -666,6 +683,7 @@ mod draft_tests;
 mod commands;
 
 use crate::app::App;
+use crate::app::language::edits::STALE_EDIT;
 use crate::app::picker::PickerOrigin;
 use crate::app::picker::PickerPayload;
 use crate::editor::text::PositionEncoding;
@@ -682,6 +700,33 @@ impl App {
         reply: crate::app::documents::WorkspaceIoReply,
     ) {
         if self.workspace_edits.owns_preparation_reply(&reply) {
+            if self
+                .workspace_edits
+                .preparing_origin()
+                .is_some_and(|key| self.language.edit_needs_disk_hashes(key))
+                && match reply.result() {
+                    VfsResult::Read {
+                        result: Err(error), ..
+                    }
+                    | VfsResult::CreateTarget {
+                        result: Err(error), ..
+                    }
+                    | VfsResult::ResourceResolved {
+                        result: Err(error), ..
+                    } => match error {
+                        crate::files::VfsError::DestinationExists(_) => true,
+                        crate::files::VfsError::Io { source, .. } => matches!(
+                            source.kind(),
+                            std::io::ErrorKind::NotFound | std::io::ErrorKind::AlreadyExists
+                        ),
+                        _ => false,
+                    },
+                    _ => false,
+                }
+            {
+                self.abort_workspace_edit(STALE_EDIT.into());
+                return;
+            }
             if let VfsResult::ResourceResolved {
                 result: Ok(intent), ..
             } = reply.result()
@@ -700,11 +745,7 @@ impl App {
                 &self.workspace.version(),
                 self.configuration.binding_revision(),
             ) {
-                Ok(()) => {
-                    if self.workspace_edits.files_ready() {
-                        self.finish_workspace_proposal();
-                    }
-                }
+                Ok(()) => self.submit_workspace_preparation(),
                 Err(error) => self.abort_workspace_edit(error),
             }
             return;
@@ -749,7 +790,9 @@ impl App {
             }
         }
         if !self.workspace_edits.resources_pending(proposal)
-            && let Err(error) = self.language.finish_deferred_edit(proposal, &self.state)
+            && let Err(error) =
+                self.language
+                    .finish_deferred_edit(proposal, &self.state, &self.workspace)
         {
             self.show_error(error);
         }
@@ -837,7 +880,9 @@ impl App {
         {
             Ok(plan) => plan,
             Err(error) => {
-                self.show_error(error);
+                if error != STALE_EDIT {
+                    self.show_error(error);
+                }
                 return;
             }
         };
@@ -850,9 +895,13 @@ impl App {
         }) {
             Ok(ticket) => ticket,
             Err(error) => {
-                let _ =
-                    self.language
-                        .finish_edit(&plan.key, false, Some(error.clone()), &self.state);
+                let _ = self.language.finish_edit(
+                    &plan.key,
+                    false,
+                    Some(error.clone()),
+                    &self.state,
+                    &self.workspace,
+                );
                 self.show_error(error);
                 return;
             }
@@ -930,6 +979,20 @@ impl App {
             }
         }
         if self.workspace_edits.files_ready() {
+            if self
+                .workspace_edits
+                .preparing_origin()
+                .is_some_and(|key| self.language.edit_needs_disk_hashes(key))
+            {
+                match self.workspace_edits.hash_prepared_files() {
+                    Ok(false) => return,
+                    Ok(true) => {}
+                    Err(error) => {
+                        self.abort_workspace_edit(error);
+                        return;
+                    }
+                }
+            }
             self.finish_workspace_proposal();
         }
     }
@@ -961,7 +1024,8 @@ impl App {
                 })
             })
             .collect::<Vec<_>>();
-        self.language.check_edit(key, &documents)
+        self.language
+            .check_edit(key, &documents, self.workspace_edits.proposal())
     }
 }
 
@@ -978,13 +1042,19 @@ impl App {
                 .preparing_sources()
                 .ok_or("workspace preparation source missing")?;
             let files = self.workspace_edits.prepared_files()?;
-            self.state
-                .validate_workspace_sources(source, files.paths())?;
             let key = self
                 .workspace_edits
                 .preparing_origin()
                 .ok_or("workspace source origin missing")?;
-            let drafts = self.language.decode_edit(key, files)?;
+            let verify_lsp = self.language.edit_needs_disk_hashes(key);
+            self.state
+                .validate_workspace_sources(source, files.paths())
+                .map_err(|error| if verify_lsp { STALE_EDIT.into() } else { error })?;
+            let drafts = self.language.decode_edit(key, files, &self.state)?;
+            if verify_lsp {
+                self.workspace_edits
+                    .normalize_lsp_alias_snapshots(&self.state)?;
+            }
             self.workspace_edits.finish_preparation(
                 drafts,
                 self.workspace.edit_scope(),
@@ -1028,7 +1098,8 @@ impl App {
         if self.extension.owns_edit(key) {
             self.extension.finish_edit(key)
         } else {
-            self.language.finish_edit(key, applied, reason, &self.state)
+            self.language
+                .finish_edit(key, applied, reason, &self.state, &self.workspace)
         }
     }
 }
@@ -1043,7 +1114,9 @@ impl App {
             let _ = self.finish_workspace_edit_origin(&origin, false, Some(reason.clone()));
         }
         self.close_picker();
-        self.show_error(reason);
+        if reason != STALE_EDIT {
+            self.show_error(reason);
+        }
     }
 }
 
@@ -1073,10 +1146,17 @@ impl App {
         }
         let transaction = self.transaction_id();
         let prepared = (|| {
-            let (source, _) = self.workspace_edits.approval(
+            let (source, proposal) = self.workspace_edits.approval(
                 &self.workspace.version(),
                 self.configuration.binding_revision(),
             )?;
+            let disk = self
+                .workspace_edits
+                .origin()
+                .filter(|key| !self.extension.owns_edit(key))
+                .map(|key| self.language.edit_disk_approval(key, proposal))
+                .transpose()?
+                .flatten();
             let changes = self
                 .workspace_edits
                 .resources()
@@ -1094,6 +1174,7 @@ impl App {
                 &self.state,
                 transaction,
                 changes,
+                disk,
                 &self.workspace.version(),
                 self.configuration.binding_revision(),
             )
@@ -1124,6 +1205,7 @@ impl App {
         }
         match result {
             Ok((draft, changes)) => self.finish_workspace_approval(draft, changes),
+            Err(error) if error == STALE_EDIT => self.abort_workspace_edit(error),
             Err(error) => self.show_error(error),
         }
     }
@@ -1178,26 +1260,28 @@ impl App {
 }
 
 impl App {
-    /// Applies an edit whose positions use `encoding`, the encoding of the server that sent it.
-    pub(in crate::app) fn apply_lsp_workspace_edit(
+    /// Build the transaction against the checked formatter buffer, never a fresh path lookup.
+    pub(in crate::app) fn apply_lsp_formatter_edit(
         &mut self,
+        target: crate::editor::BufferId,
         edit: LspWorkspaceEdit,
         encoding: PositionEncoding,
     ) -> Result<(), String> {
         let id = self.transaction_id();
-        let documents = self
+        let buffer = self
             .state
             .buffers
-            .iter()
-            .filter_map(|(id, buffer)| {
-                Some(crate::app::language::edits::EditDocument {
-                    id,
-                    path: buffer.path.as_deref()?,
-                    text: &buffer.text,
-                    dirty: buffer.dirty,
-                })
-            })
-            .collect::<Vec<_>>();
+            .get(target)
+            .ok_or("formatter buffer closed")?;
+        let documents = [crate::app::language::edits::EditDocument {
+            id: target,
+            path: buffer
+                .path
+                .as_deref()
+                .ok_or("formatter buffer has no path")?,
+            text: &buffer.text,
+            dirty: buffer.dirty,
+        }];
         let transaction = crate::app::language::edits::LspEditSources::completion_transaction(
             edit, encoding, &documents, id,
         )?;
