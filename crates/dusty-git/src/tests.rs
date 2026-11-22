@@ -3453,9 +3453,17 @@ fn conflict_replacement_failure_reports_files_already_written() {
     assert_eq!(std::fs::read(&first).unwrap(), b"ours\n");
     assert!(!second.exists());
     let message = error.to_string();
-    assert!(message.contains(&first.display().to_string()));
-    assert!(message.contains(&second.display().to_string()));
-    assert!(message.contains("Already replaced"));
+    // Compare with the paths the error holds: on Windows they equal `first` and
+    // `second` but can spell the repository root with Git's forward slashes.
+    assert!(
+        message.contains(&error.written[0].display().to_string()),
+        "{message}"
+    );
+    assert!(
+        message.contains(&error.path.display().to_string()),
+        "{message}"
+    );
+    assert!(message.contains("Already replaced"), "{message}");
 }
 
 #[test]
