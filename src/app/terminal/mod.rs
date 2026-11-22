@@ -514,6 +514,7 @@ impl Terminals {
                     TERMINAL_SCROLLBACK_BYTES,
                 ),
                 pending: Some(source.open),
+                launch: TerminalLaunch::AwaitingStart,
                 running: false,
                 stopping: false,
                 exited: false,
@@ -633,6 +634,7 @@ impl Terminals {
             .map_err(|e| e.to_string())?;
         tab.pty = Some(pty);
         tab.pending = None;
+        tab.launch = TerminalLaunch::AwaitingStart;
         self.revision = self.revision.and_then(|r| r.checked_add(1));
         Ok(id)
     }
@@ -704,6 +706,21 @@ impl Terminals {
             self.close(id);
         }
     }
+    pub(in crate::app) fn retain_on_root_activation(
+        &mut self,
+        previous: &WorkspaceVersion,
+        current: &WorkspaceVersion,
+    ) {
+        self.cancel_open();
+        self.preflights.clear();
+        // Leave unfinished launches for drain to close before it reads their PTY events.
+        for tab in self.tabs.values_mut().filter(|tab| &tab.scope == previous) {
+            if tab.launch == TerminalLaunch::AwaitingStart {
+                tab.launch = TerminalLaunch::Cancelled;
+            }
+            tab.rebind_workspace(current);
+        }
+    }
     pub(in crate::app) fn retain_workspace(&mut self, workspace: &Workspace) {
         self.preflights.clear();
         self.cancel_open();
@@ -711,13 +728,16 @@ impl Terminals {
         let pending = self
             .tabs
             .iter()
-            .filter_map(|(id, tab)| tab.pending.is_some().then_some(*id))
+            .filter_map(|(id, tab)| {
+                (tab.pending.is_some() && tab.launch != TerminalLaunch::Cancelled).then_some(*id)
+            })
             .collect::<Vec<_>>();
         for id in pending {
             self.close(id);
         }
+        let current = workspace.version();
         for tab in self.tabs.values_mut() {
-            tab.scope = workspace.version();
+            tab.rebind_workspace(&current);
         }
     }
     /// New terminals open from `policy`; the running ones keep going as they were started.
@@ -892,6 +912,7 @@ impl Terminals {
             let tab = self.tabs.get_mut(&id).expect("located source");
             match event {
                 PtyEvent::Started { .. } => {
+                    tab.launch = TerminalLaunch::Settled;
                     if !tab.stopping {
                         tab.running = true;
                         updates.push(TerminalUpdate::Started(id));
@@ -941,6 +962,7 @@ impl Terminals {
                     {
                         continue;
                     }
+                    tab.launch = TerminalLaunch::Settled;
                     tab.exited = true;
                     tab.running = false;
                     tab.exit_code = code;
@@ -954,6 +976,7 @@ impl Terminals {
                     // A debugged program's output stays to be read until the next run, and how it
                     // exited is the program's business, not a terminal failure.
                     let keep_output = tab.debugger_owned;
+                    tab.launch = TerminalLaunch::Settled;
                     tab.pty = None;
                     tab.io_complete = true;
                     updates.push(TerminalUpdate::IoComplete(id));
@@ -987,6 +1010,7 @@ impl Terminals {
                         continue;
                     }
                     let stopping = tab.stopping;
+                    tab.launch = TerminalLaunch::Settled;
                     tab.pty = None;
                     tab.running = false;
                     tab.failure = Some(message.clone());
@@ -1002,6 +1026,7 @@ impl Terminals {
                         continue;
                     }
                     let stopping = tab.stopping;
+                    tab.launch = TerminalLaunch::Settled;
                     tab.pty = None;
                     tab.running = false;
                     tab.unknown = Some(message.clone());
@@ -1084,6 +1109,14 @@ fn acknowledge_resize(
     current == Some(&expected.source)
 }
 
+// Independent of the tab's display phase: a stop request can precede a launch result.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TerminalLaunch {
+    AwaitingStart,
+    Settled,
+    Cancelled,
+}
+
 struct TerminalRuntime {
     profile: String,
     program: std::path::PathBuf,
@@ -1098,6 +1131,7 @@ struct TerminalRuntime {
     scope: WorkspaceVersion,
     epoch: Arc<()>,
     pending: Option<Open>,
+    launch: TerminalLaunch,
     requested_size: (u16, u16),
     geometry_source: Option<TerminalGeometrySource>,
     next_resize: Option<u64>,
@@ -1164,6 +1198,7 @@ impl Terminals {
                 scope,
                 epoch: self.epoch.clone(),
                 pending: None,
+                launch: TerminalLaunch::Settled,
                 requested_size: (columns as u16, rows as u16),
                 geometry_source: None,
                 next_resize: Some(1),
@@ -1227,6 +1262,13 @@ impl Terminals {
 }
 
 impl TerminalRuntime {
+    fn rebind_workspace(&mut self, current: &WorkspaceVersion) {
+        // A later root operation must not revive a launch already cancelled by activation.
+        if self.launch != TerminalLaunch::Cancelled {
+            self.scope = current.clone();
+        }
+    }
+
     pub(in crate::app) fn feed_bytes(&mut self, bytes: &[u8]) {
         self.screen.feed_bytes_tracked(
             bytes,

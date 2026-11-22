@@ -224,6 +224,172 @@ fn switching_folders_with_open_terminals_warns_before_ending_them() {
 }
 
 #[test]
+fn activation_requires_a_new_warning_to_replace_the_new_active_root() {
+    let (_dirs, mut app) = app();
+    let first = app.workspace.active_root().unwrap();
+    let first_path = app.workspace.roots()[0].identity.canonical_path.clone();
+    let extra = tempdir().unwrap();
+    let identity = crate::files::RootIdentity::capture(extra.path()).unwrap();
+    let second_path = identity.canonical_path.clone();
+    let second = app
+        .workspace
+        .fixture_add_root("second".into(), identity)
+        .unwrap();
+    app.activate_workspace_root(first);
+    let first_tab = PtyId(1);
+    let second_tab = PtyId(2);
+    for (id, cwd) in [(first_tab, first_path), (second_tab, second_path)] {
+        app.terminal_session.fixture(
+            id,
+            TerminalFixture {
+                profile: "shell".into(),
+                screen: PtyScreen::new(80, 24, 100),
+                running: true,
+                exit_code: None,
+                truncated: false,
+            },
+            app.workspace.version(),
+        );
+        app.terminal_session.fixture_cwd(id, cwd);
+    }
+
+    let replacement = tempdir().unwrap();
+    let replacement_path = crate::files::canonicalize(replacement.path()).unwrap();
+    let assert_warning = |app: &App| {
+        assert!(
+            !app.workspace.root_operation_pending(),
+            "a replacement must not begin before its warning"
+        );
+        assert!(
+            app.ui
+                .notification
+                .as_deref()
+                .is_some_and(|text| text.contains("switch again")),
+            "{:?}",
+            app.ui.notification
+        );
+    };
+    app.switch_workspace_root(replacement_path.clone());
+    assert_warning(&app);
+
+    app.activate_workspace_root(second);
+    app.process_pty_events();
+    app.switch_workspace_root(replacement_path.clone());
+    assert_warning(&app);
+    assert_eq!(app.workspace.active_root(), Some(second));
+    assert_eq!(app.terminal_session.running_count(), 2);
+
+    app.switch_workspace_root(replacement_path.clone());
+    wait_root_operation(&mut app);
+    assert_eq!(app.state.workspace_root, replacement_path);
+    assert!(app.terminal_session.contains(first_tab));
+    assert!(!app.terminal_session.contains(second_tab));
+}
+
+#[cfg(unix)]
+#[test]
+fn activating_a_registered_root_keeps_the_original_terminal() {
+    use crate::app::tests::driver::TestSession;
+
+    let mut loaded = crate::config::load_bundled_config();
+    let shell = loaded.config.terminals.profiles.get_mut("shell").unwrap();
+    shell.program = "/bin/sh".into();
+    shell.arguments = vec![
+        "-c".into(),
+        "printf 'READY\\n'; read value; printf 'ACK:%s\\n' \"$value\"; read end".into(),
+    ];
+    let mut driver = TestSession::new(loaded);
+    driver.new_buffer();
+    prepare_trust_identity(driver.application_mut());
+    let first = driver.application_mut().workspace.active_root().unwrap();
+    let extra = tempdir().unwrap();
+    let identity = crate::files::RootIdentity::capture(extra.path()).unwrap();
+    let second_path = identity.canonical_path.clone();
+    let app = driver.application_mut();
+    let second = app
+        .workspace
+        .fixture_add_root("second".into(), identity)
+        .unwrap();
+    app.activate_workspace_root(second);
+    driver.trust_owned_terminal_fixture();
+    driver.terminal_open("shell");
+    let app = driver.application_mut();
+    let id = app
+        .terminal_session
+        .selected()
+        .expect("terminal in second root");
+    let wait_for_output = |app: &mut App, text: &str| {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            app.process_execution_preflight();
+            app.process_pty_events();
+            if app.terminal_session.tabs.get(&id).is_some_and(|tab| {
+                tab.running && tab.screen.lines().iter().any(|line| line.contains(text))
+            }) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "waiting for terminal output: {text}"
+            );
+            thread::yield_now();
+        }
+    };
+    wait_for_output(app, "READY");
+    let pty = app.terminal_session.tabs[&id].pty.expect("running PTY");
+
+    app.process_effect(AppEffect::TerminalOpen(Some("shell".into())));
+    let pending = app.terminal_session.selected().expect("pending terminal");
+    assert_ne!(pending, id);
+    assert_eq!(app.terminal_session.preflight_count(), 1);
+    app.process_effect(AppEffect::WorkspaceRootActivate(first.0));
+    app.process_pty_events();
+    assert_eq!(app.workspace.active_root(), Some(first));
+    assert!(
+        app.terminal_session.contains(id),
+        "activation closed the running tab"
+    );
+    assert_eq!(app.terminal_session.tabs[&id].pty, Some(pty));
+    assert!(!app.terminal_session.contains(pending));
+    assert_eq!(app.terminal_session.preflight_count(), 0);
+    assert_eq!(app.terminal_session.pending(), 1);
+
+    app.switch_workspace_root(second_path);
+    app.process_pty_events();
+    assert_eq!(app.workspace.active_root(), Some(second));
+    assert_eq!(app.terminal_session.tabs[&id].pty, Some(pty));
+    assert!(
+        app.terminal_session
+            .send(id, TerminalInput::Text("hello\n"), &app.workspace)
+            .unwrap()
+    );
+    wait_for_output(app, "ACK:hello");
+
+    // The confirmed switch to a new folder removes the second root, unlike activation.
+    let replacement = tempdir().unwrap();
+    let replacement_path = crate::files::canonicalize(replacement.path()).unwrap();
+    app.switch_workspace_root(replacement_path.clone());
+    assert!(
+        !app.workspace.root_operation_pending(),
+        "replacement needs confirmation"
+    );
+    app.switch_workspace_root(replacement_path.clone());
+    wait_root_operation(app);
+    assert_eq!(app.state.workspace_root, replacement_path);
+    assert!(app.workspace.roots().iter().all(|root| root.id != second));
+    assert!(!app.terminal_session.contains(id));
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while app.terminal_session.pending() != 0 {
+        app.process_pty_events();
+        assert!(
+            Instant::now() < deadline,
+            "replaced root's PTY did not stop"
+        );
+        thread::yield_now();
+    }
+}
+
+#[test]
 fn reloading_terminal_settings_keeps_running_terminals() {
     let (_app_dirs, mut app) = app();
     app.terminal_session.fixture(
@@ -2966,10 +3132,22 @@ pub(in crate::app) fn fixture() -> (tempfile::TempDir, Workspace, Terminals) {
 #[cfg(unix)]
 fn launch_shell(root: &std::path::Path, workspace: &Workspace, session: &mut Terminals) {
     let mut config = TerminalsConfig::default().profiles["shell"].clone();
+    config.program = "/bin/sh".into();
     config.arguments = vec!["-c".into(), "read value; exit 0".into()];
+    launch_test_program(root, workspace, session, config);
+}
+
+#[cfg(unix)]
+fn launch_test_program(
+    root: &std::path::Path,
+    workspace: &Workspace,
+    session: &mut Terminals,
+    config: TerminalProfileConfig,
+) {
+    let executable = config.program.clone();
     session.tabs.get_mut(&PtyId(1)).unwrap().pending = Some(Open {
         request: ExecutionPreflightRequest {
-            executable: "/bin/sh".into(),
+            executable: executable.clone(),
             cwd: root.into(),
             roots: vec![root.into()],
             root_revision: workspace.root_revision(),
@@ -2981,7 +3159,7 @@ fn launch_shell(root: &std::path::Path, workspace: &Workspace, session: &mut Ter
         workspace,
         crate::process::ExecutionPreflightResult {
             id: crate::process::PreflightId(1),
-            executable: "/bin/sh".into(),
+            executable,
             cwd: root.into(),
             root: root.into(),
             root_revision: workspace.root_revision(),
@@ -2990,6 +3168,144 @@ fn launch_shell(root: &std::path::Path, workspace: &Workspace, session: &mut Ter
     session
         .launch(session.key(PtyId(1)).unwrap(), ready, workspace)
         .unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn activation_cancels_a_submitted_terminal_before_started_is_drained() {
+    let (_root, mut workspace, mut session) = fixture();
+    let first = workspace.active_root().unwrap();
+    let first_path = workspace.roots()[0].identity.canonical_path.clone();
+    let extra = tempdir().unwrap();
+    let second = workspace
+        .fixture_add_root(
+            "second".into(),
+            crate::files::RootIdentity::capture(extra.path()).unwrap(),
+        )
+        .unwrap();
+    workspace.set_active_root(first).unwrap();
+    session.retain_workspace(&workspace);
+    launch_shell(&first_path, &workspace, &mut session);
+
+    let id = PtyId(1);
+    assert_eq!(
+        session.tabs[&id].phase(),
+        crate::ui::TerminalPhase::Starting
+    );
+    let before = workspace.version();
+    workspace.set_active_root(second).unwrap();
+    session.retain_on_root_activation(&before, &workspace.version());
+    let updates = session.drain(&workspace, |_| None);
+    assert!(
+        !session.contains(id),
+        "the unfinished launch survived activation"
+    );
+    assert!(updates.contains(&TerminalUpdate::Closed(id)));
+    assert!(!updates.contains(&TerminalUpdate::Started(id)));
+}
+
+#[cfg(unix)]
+#[test]
+fn activation_cancellation_survives_removal_of_an_unrelated_root() {
+    let (_dirs, mut app) = app();
+    prepare_trust_identity(&mut app);
+    let launching_root = app.workspace.active_root().unwrap();
+    let launching_path = app.workspace.roots()[0].identity.canonical_path.clone();
+    let target_dir = tempdir().unwrap();
+    let unrelated_dir = tempdir().unwrap();
+    let target = app
+        .workspace
+        .fixture_add_root(
+            "target".into(),
+            crate::files::RootIdentity::capture(target_dir.path()).unwrap(),
+        )
+        .unwrap();
+    let unrelated = app
+        .workspace
+        .fixture_add_root(
+            "unrelated".into(),
+            crate::files::RootIdentity::capture(unrelated_dir.path()).unwrap(),
+        )
+        .unwrap();
+    app.activate_workspace_root(launching_root);
+    let id = PtyId(1);
+    app.terminal_session.fixture(
+        id,
+        TerminalFixture {
+            profile: "shell".into(),
+            screen: PtyScreen::new(80, 24, 100),
+            running: false,
+            exit_code: None,
+            truncated: false,
+        },
+        app.workspace.version(),
+    );
+    app.terminal_session.fixture_cwd(id, launching_path.clone());
+    launch_shell(&launching_path, &app.workspace, &mut app.terminal_session);
+    assert_eq!(
+        app.terminal_session.tabs[&id].phase(),
+        crate::ui::TerminalPhase::Starting
+    );
+
+    app.activate_workspace_root(target);
+    app.remove_workspace_root(unrelated);
+    assert_eq!(app.workspace.active_root(), Some(target));
+    assert!(
+        app.workspace
+            .roots()
+            .iter()
+            .all(|root| root.id != unrelated)
+    );
+    app.process_pty_events();
+    assert!(
+        !app.terminal_session.contains(id),
+        "removing another root revived the cancelled launch"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn activation_cancellation_silences_a_stopping_launch_failure() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (_root, mut workspace, mut session) = fixture();
+    let first = workspace.active_root().unwrap();
+    let first_path = workspace.roots()[0].identity.canonical_path.clone();
+    let extra = tempdir().unwrap();
+    let second = workspace
+        .fixture_add_root(
+            "second".into(),
+            crate::files::RootIdentity::capture(extra.path()).unwrap(),
+        )
+        .unwrap();
+    workspace.set_active_root(first).unwrap();
+    session.retain_workspace(&workspace);
+
+    let script = first_path.join("broken-shell");
+    let interpreter = first_path.join("missing-interpreter");
+    fs::write(&script, format!("#!{}\n", interpreter.display())).unwrap();
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+    let mut config = TerminalsConfig::default().profiles["shell"].clone();
+    config.program = script;
+    launch_test_program(&first_path, &workspace, &mut session, config);
+    let id = PtyId(1);
+    assert!(session.request_stop(id).unwrap());
+    assert_eq!(
+        session.tabs[&id].phase(),
+        crate::ui::TerminalPhase::Stopping
+    );
+
+    let before = workspace.version();
+    workspace.set_active_root(second).unwrap();
+    session.retain_on_root_activation(&before, &workspace.version());
+    let mut updates = session.drain(&workspace, |_| None);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while session.pending() != 0 {
+        updates.extend(session.drain(&workspace, |_| None));
+        assert!(Instant::now() < deadline, "waiting for the failed PTY");
+        thread::yield_now();
+    }
+    assert_eq!(updates, [TerminalUpdate::Closed(id)]);
 }
 
 #[test]
