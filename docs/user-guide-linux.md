@@ -236,8 +236,9 @@ moves between panes; `j/k` selects rows and moves to the next pane at the edge o
 a list. Source previews and working-tree, staged, commit and stash diffs use
 Dusty's syntax highlighting, with line numbers and separate addition/deletion
 markers. In the preview, `h/l` or Left/Right scroll horizontally while the
-line-number gutter stays fixed. At the left edge, `h` or Left returns to the last
-list. Diffs use the full preview width by default, with tinted additions/deletions.
+line-number gutter stays fixed. On the Git status screen, `h` or Left at the left
+edge of the preview returns to the last list. Diffs use the full preview width by
+default, with tinted additions/deletions.
 `|` in the preview opts into
 aligned before/after columns when there is enough room, or returns to unified view. The Changes tree
 expands/collapses with `l/h`. `H/L` cycles Branches, Worktrees, Remotes and Tags. Enter opens files in

@@ -2795,10 +2795,14 @@ impl GitScreen {
                     return self.github_key(&key);
                 }
                 if key.modifiers.control {
-                    if let Some(direction) = control_direction(&key)
-                        && !self.focus_toward(direction)
-                    {
-                        return ScreenOutcome::Focus(direction);
+                    if key.modifiers.alt && matches!(key.code, KeyCode::Char('l' | 'L')) {
+                        self.focus = 4;
+                    } else if let Some(direction) = control_direction(&key) {
+                        if !self.focus_toward(direction) {
+                            return ScreenOutcome::Focus(direction);
+                        }
+                        // Moving to another Git pane leaves the commit-file view.
+                        self.commit_open = false;
                     }
                 } else {
                     match key.code {
@@ -2858,7 +2862,10 @@ impl GitScreen {
                                 } else {
                                     (-1, SpatialDirection::Up)
                                 };
-                            if !self.move_selection(delta) && !self.focus_toward(direction) {
+                            if !self.move_selection(delta)
+                                && unmodified
+                                && !self.focus_toward(direction)
+                            {
                                 return ScreenOutcome::Focus(direction);
                             }
                         }
@@ -2910,7 +2917,7 @@ impl GitScreen {
                             self.report(result);
                         }
                         KeyCode::Left | KeyCode::Char('h') if self.focus == 4 => {
-                            if self.preview_column == 0 {
+                            if self.preview_column == 0 && unmodified {
                                 self.focus_toward(SpatialDirection::Left);
                             } else {
                                 self.preview.search.leave_match();
@@ -2972,7 +2979,7 @@ impl GitScreen {
                                 self.load_preview();
                             }
                         }
-                        KeyCode::Left | KeyCode::Right | KeyCode::Char('h' | 'l') => {
+                        KeyCode::Left | KeyCode::Right | KeyCode::Char('h' | 'l') if unmodified => {
                             let direction =
                                 if matches!(key.code, KeyCode::Left | KeyCode::Char('h')) {
                                     SpatialDirection::Left
@@ -3254,12 +3261,16 @@ impl GitScreen {
     fn focus_toward(&mut self, direction: SpatialDirection) -> bool {
         use SpatialDirection::{Down, Left, Right, Up};
 
-        // The sidebar stays in this order even when narrow mode shows one pane at a time.
-        // The layout folds an empty Stashes pane down to its "No stashes" label.
+        // Narrow mode shows a full Stashes pane, even when there are no stashes yet.
+        let stashes_collapsed = self.stashes.is_empty()
+            && matches!(
+                self.layout_mode,
+                shell::layout::Mode::Wide | shell::layout::Mode::Medium
+            );
         let next = match (self.focus, direction) {
             (4, Left) => self.last_list,
             (0..=3, Right) => 4,
-            (0..=2, Down) if self.focus != 2 || !self.stashes.is_empty() => self.focus + 1,
+            (0..=2, Down) if self.focus != 2 || !stashes_collapsed => self.focus + 1,
             (1..=3, Up) => self.focus - 1,
             _ => return false,
         };
@@ -3285,9 +3296,15 @@ impl GitScreen {
             .min(row_count.saturating_sub(1));
         if self.focus == 0 && self.file_selection_context() {
             self.extend_file_range();
+            if self.file_selection.active() || !self.file_selection.marked.is_empty() {
+                return true;
+            }
         }
         if self.focus == 2 && self.history_view == 0 {
             self.more_history(delta == isize::MAX);
+            if delta > 0 && row_count != 0 && self.history_loading {
+                return true;
+            }
         }
         row_count != 0 && self.selected[slot] != before
     }

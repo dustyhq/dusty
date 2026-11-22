@@ -384,10 +384,10 @@ impl App {
     pub(in crate::app) fn focus_surface(&mut self, direction: SpatialDirection) {
         self.reconcile_editor_windows();
         if self.focus_within_surface(direction) {
-            return;
+            return true;
         }
         let Some(target) = self.window_session.spatial_target(direction) else {
-            return;
+            return false;
         };
         let dashboard_entry = if self.window_session.native_ids().target_for_window(target)
             == Some(NativeSurfaceTarget::Dashboard)
@@ -410,7 +410,7 @@ impl App {
             .and_then(|plan| self.apply_window_plan(plan));
         if let Err(error) = result {
             self.show_error(error);
-            return;
+            return false;
         }
         if let Some(from) = dashboard_entry {
             self.focus_dashboard_from(direction, from);

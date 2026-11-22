@@ -293,12 +293,12 @@ pub(in crate::app) fn register_commands(
         ),
         (
             "dashboard.select.next",
-            "Move to the next dashboard item",
+            "Move down on the dashboard",
             AppEffect::DashboardSelect(SpatialDirection::Down),
         ),
         (
             "dashboard.select.previous",
-            "Move to the previous dashboard item",
+            "Move up on the dashboard",
             AppEffect::DashboardSelect(SpatialDirection::Up),
         ),
         (
@@ -477,7 +477,9 @@ impl App {
                 self.start_workspace_file_picker();
             }
             AppEffect::Layout(action) => self.apply_layout_action(action),
-            AppEffect::SurfaceFocus(direction) => self.focus_surface(direction),
+            AppEffect::SurfaceFocus(direction) => {
+                self.focus_surface(direction);
+            }
             AppEffect::WindowClone { target, axis } => {
                 if let Err(error) = self.clone_graph_window(&target, axis) {
                     self.show_error(error);

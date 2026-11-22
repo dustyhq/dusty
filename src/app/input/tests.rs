@@ -13,35 +13,500 @@ use crate::ui::PromptKind;
 use std::path::Path;
 
 #[test]
-fn git_focus_outcome_at_the_edge_keeps_git_on_screen() {
+fn git_handoff_allows_two_quick_ctrl_k_presses_to_reach_the_top_pane() {
+    use crate::app::tests::driver::TestSession;
+    use std::time::Duration;
+
+    let mut session = TestSession::new(load_bundled_config());
+    session.resize(100, 36);
+    session.new_buffer();
+    session.reconcile_windows();
+    let top = session.focused_window().unwrap();
+    session.key("ctrl-w");
+    session.key("s");
+    let middle = session.focused_window().unwrap();
+    session.key("ctrl-w");
+    session.key("s");
+    let bottom = session.focused_window().unwrap();
+    assert_ne!(top, middle);
+    assert_ne!(middle, bottom);
+    assert_ne!(top, bottom);
+
+    let app = session.application_mut();
+    let root = &app.state.workspace_root;
+    git2::Repository::init(root).unwrap();
+    let mut screen = crate::git::screen::GitScreen::open(root).unwrap();
+    let config = app.input_render_config().ui.git.clone();
+    screen.window_frame(100, 36, &config);
+    app.git_screen = Some(screen);
+    app.git_screen_visible = true;
+
+    session.key("0");
+    session.key("ctrl-k");
+    assert_eq!(session.focused_window(), Some(middle));
+    assert!(!session.application().git_screen_visible);
+    assert!(session.application().git_screen.is_some());
+
+    // A press-only terminal has no Release event between these taps.
+    session.advance_input(Duration::from_millis(250));
+    session.key("ctrl-k");
+    assert_eq!(session.focused_window(), Some(top));
+}
+
+#[test]
+fn git_handoff_does_not_type_held_stash_key_into_insert_mode() {
+    use crate::app::tests::driver::TestSession;
+    use crate::editor::EditorMode;
+    use crate::editor::input::KeyEvent;
+    use crate::ui::{KeyInputKind, UiEvent};
+    use crate::windows::SpatialDirection;
+    use std::time::Duration;
+
+    for tagged in [false, true] {
+        let mut session = TestSession::new(load_bundled_config());
+        session.resize(100, 30);
+        session.new_buffer();
+        session.reconcile_windows();
+        let upper = session.focused_window().unwrap();
+        session.key("ctrl-w");
+        session.key("s");
+        let lower = session.focused_window().unwrap();
+        assert_ne!(upper, lower);
+        session.key("i");
+        assert_eq!(session.editor_mode(), EditorMode::Insert);
+        let buffer = session.application().state.active_buffer_id().unwrap();
+
+        let app = session.application_mut();
+        assert!(app.focus_surface(SpatialDirection::Up));
+        assert_eq!(app.window_session.graph().focused(), Some(upper));
+        let root = &app.state.workspace_root;
+        git2::Repository::init(root).unwrap();
+        let mut screen = crate::git::screen::GitScreen::open(root).unwrap();
+        let config = app.input_render_config().ui.git.clone();
+        screen.window_frame(100, 30, &config);
+        app.git_screen = Some(screen);
+        app.git_screen_visible = true;
+
+        session.key("5");
+        session.key("j");
+        assert!(!session.application().git_screen_visible);
+        assert_eq!(session.focused_window(), Some(lower));
+        assert_eq!(session.editor_mode(), EditorMode::Insert);
+
+        if tagged {
+            for kind in [KeyInputKind::Repeat, KeyInputKind::Release] {
+                session.application_mut().handle_event(UiEvent::Key {
+                    key: KeyEvent::character('j'),
+                    kind,
+                });
+            }
+        } else {
+            // On a press-only terminal, suppress the initial repeat and the following burst.
+            session.advance_input(Duration::from_millis(550));
+            session.key("j");
+            session.advance_input(Duration::from_millis(30));
+            session.key("j");
+            session.advance_input(Duration::from_millis(110));
+        }
+        assert!(session.application().state.buffers[buffer].text.is_empty());
+
+        session.key("j");
+        assert_eq!(
+            session.application().state.buffers[buffer].text.to_string(),
+            "j"
+        );
+    }
+}
+
+#[test]
+fn git_handoff_to_another_dashboard_box_releases_the_keyboard() {
+    use crate::app::tests::driver::TestSession;
+    use crate::ui::render::dashboard_focus;
+    use crate::ui::{DashboardChange, DashboardChanges, DashboardPanel};
+
+    let mut session = TestSession::new(load_bundled_config());
+    session.resize(120, 36);
+    let app = session.application_mut();
+    let root = &app.state.workspace_root;
+    git2::Repository::init(root).unwrap();
+    let file = root.join("changed.txt");
+    std::fs::write(&file, "change\n").unwrap();
+    app.ui.dashboard_workspace.changes = Some(DashboardChanges {
+        files: vec![DashboardChange {
+            path: file,
+            label: "changed.txt".into(),
+            code: '?',
+            lines: None,
+        }],
+        changed: 0,
+        untracked: 1,
+    });
+    let focused_box = |session: &TestSession| {
+        let app = session.application();
+        dashboard_focus(&app.ui, app.dashboard_panels())
+    };
+    assert_eq!(focused_box(&session), DashboardPanel::Start);
+    let dashboard = session.focused_window().unwrap();
+    for key in ["space", "g", "g"] {
+        session.key(key);
+    }
+    assert!(session.application().git_screen_visible);
+    let app = session.application_mut();
+    let config = app.input_render_config().ui.git.clone();
+    app.git_screen
+        .as_mut()
+        .unwrap()
+        .window_frame(120, 36, &config);
+
+    session.key("0");
+    session.key("ctrl-k");
+    assert_eq!(focused_box(&session), DashboardPanel::Changes);
+    assert_eq!(session.focused_window(), Some(dashboard));
+    assert!(!session.application().git_screen_visible);
+
+    session.key("ctrl-j");
+    assert_eq!(focused_box(&session), DashboardPanel::Start);
+}
+
+#[test]
+fn leader_release_does_not_interrupt_find_files_chord() {
+    use crate::app::tests::driver::TestSession;
+    use crate::ui::{KeyInputKind, PickerSurfaceKind, UiEvent};
+
+    for bind_release in [false, true] {
+        let mut loaded = load_bundled_config();
+        if bind_release {
+            loaded.keymaps.entries.push(
+                toml::from_str(
+                    r#"
+                    id = "user.release-leader"
+                    context = "key_release"
+                    keys = "space"
+                    command = "view.line_numbers.toggle"
+                    "#,
+                )
+                .unwrap(),
+            );
+        }
+        let mut session = TestSession::new(loaded);
+        session.new_buffer();
+        let app = &mut session.application;
+        let original_numbers = app.configuration.settings().editor.line_numbers;
+        for (key, kind) in [
+            ("space", KeyInputKind::Press),
+            ("space", KeyInputKind::Release),
+            ("f", KeyInputKind::Press),
+            ("f", KeyInputKind::Press),
+        ] {
+            app.handle_event(UiEvent::Key {
+                key: key
+                    .parse()
+                    .expect("valid key in the default Find Files chord"),
+                kind,
+            });
+        }
+        assert_eq!(
+            app.configuration.settings().editor.line_numbers != original_numbers,
+            bind_release,
+            "releasing Space must run only an explicit release binding"
+        );
+        assert_eq!(
+            app.ui.picker.as_ref().map(|picker| picker.surface),
+            Some(PickerSurfaceKind::Files),
+            "releasing Space must not stop the Find Files chord (bound release: {bind_release})"
+        );
+    }
+}
+
+#[test]
+fn release_cursor_motion_scrolls_on_match_and_timeout() {
+    use crate::app::tests::driver::TestSession;
+    use crate::editor::text::TextBuffer;
+    use crate::ui::{KeyInputKind, UiEvent};
+    use std::time::Duration;
+
+    for wait_for_timeout in [false, true] {
+        let mut loaded = load_bundled_config();
+        loaded.keymaps.entries.push(
+            toml::from_str(
+                r#"
+                id = "user.release-end"
+                context = "key_release"
+                keys = "f8"
+                command = "view.cursor.move"
+                arguments = { motion = "document_end" }
+                "#,
+            )
+            .unwrap(),
+        );
+        if wait_for_timeout {
+            loaded.keymaps.entries.push(
+                toml::from_str(
+                    r#"
+                    id = "user.release-longer"
+                    context = "key_release"
+                    keys = "f8 f9"
+                    command = "view.line_numbers.toggle"
+                    "#,
+                )
+                .unwrap(),
+            );
+        }
+        let timeout = Duration::from_millis(loaded.config.input.mapping_timeout_ms + 1);
+        let mut session = TestSession::new(loaded);
+        let app = session.application_mut();
+        let (buffer, view) = app
+            .state
+            .open_text(
+                TextBuffer::from_text(&format!("{}last", "line\n".repeat(99))),
+                None,
+            )
+            .unwrap();
+        app.set_dashboard_visibility(false);
+        session.resize(100, 30);
+        let initial_view = &session.application().state.views[view];
+        assert_eq!(initial_view.scroll_line, 0);
+        let initial_cursor = initial_view.cursor;
+
+        session.application_mut().handle_event(UiEvent::Key {
+            key: "f8".parse().unwrap(),
+            kind: KeyInputKind::Release,
+        });
+        if wait_for_timeout {
+            assert_eq!(
+                session.application().state.views[view].cursor,
+                initial_cursor,
+                "the short binding must wait for the timeout"
+            );
+            session.advance_input(timeout);
+        }
+        let app = session.application();
+        let view = &app.state.views[view];
+        let line = app.state.buffers[buffer]
+            .text
+            .byte_to_line(view.cursor)
+            .unwrap();
+        assert_eq!(line, 99, "cursor should move to the last line");
+        let viewport = crate::ui::active_editor_pane_viewport(&app.state, &app.ui)
+            .expect("the test document is visible");
+        let visible_lines = view.scroll_line..view.scroll_line + usize::from(viewport.height);
+        assert!(
+            visible_lines.contains(&line),
+            "viewport should follow the release motion (timed out: {wait_for_timeout})"
+        );
+    }
+}
+
+#[test]
+fn key_release_uses_text_and_unmatched_fallbacks_without_press_replay() {
     use crate::app::tests::driver::TestSession;
     use crate::ui::{KeyInputKind, UiEvent};
 
-    let mut session = TestSession::new(load_bundled_config());
+    let mut loaded = load_bundled_config();
+    loaded
+        .config
+        .input
+        .text_commands
+        .insert("key_release".into(), "edit.insert_text".into());
+    loaded
+        .config
+        .input
+        .unmatched_commands
+        .insert("key_release".into(), "view.line_numbers.toggle".into());
+    loaded.keymaps.entries.push(
+        toml::from_str(
+            r#"
+        id = "user.release-sequence"
+        context = "key_release"
+        keys = "j k"
+        command = "view.line_numbers.toggle"
+    "#,
+        )
+        .unwrap(),
+    );
+    loaded.keymaps.entries.push(
+        toml::from_str(
+            r#"
+        id = "user.press-x"
+        context = "editor"
+        mode = "insert"
+        keys = "x"
+        command = "edit.insert_text"
+        arguments = { text = "press" }
+    "#,
+        )
+        .unwrap(),
+    );
+    let mut session = TestSession::new(loaded);
     session.new_buffer();
+    session.key("i");
     let app = &mut session.application;
-    let press = |app: &mut crate::app::App, key: &str| {
+    let buffer = app.state.active_buffer_id().unwrap();
+    let original_numbers = app.configuration.settings().editor.line_numbers;
+    for key in ["j", "x", "f12"] {
         app.handle_event(UiEvent::Key {
             key: key.parse().unwrap(),
-            kind: KeyInputKind::Press,
+            kind: KeyInputKind::Release,
+        });
+    }
+    assert_eq!(app.state.buffers[buffer].text.to_string(), "jx");
+    assert_ne!(
+        app.configuration.settings().editor.line_numbers,
+        original_numbers
+    );
+}
+
+#[test]
+fn pending_release_prefix_does_not_follow_focus_or_keyboard_capture() {
+    use crate::app::tests::driver::TestSession;
+    use crate::ui::{KeyInputKind, UiEvent};
+    use std::time::Duration;
+
+    let mut loaded = load_bundled_config();
+    loaded
+        .config
+        .input
+        .text_commands
+        .insert("key_release".into(), "edit.insert_text".into());
+    loaded.keymaps.entries.push(
+        toml::from_str(
+            r#"
+        id = "user.release-focus"
+        context = "key_release"
+        keys = "j k"
+        command = "view.line_numbers.toggle"
+    "#,
+        )
+        .unwrap(),
+    );
+    let timeout = Duration::from_millis(loaded.config.input.mapping_timeout_ms + 1);
+    let mut session = TestSession::new(loaded);
+    session.new_buffer();
+    session.key("i");
+    let app = session.application_mut();
+    let buffer = app.state.active_buffer_id().unwrap();
+    let first = app.state.active_view().unwrap();
+    let second = app
+        .state
+        .split_active(crate::windows::TileAxis::Horizontal, 500)
+        .unwrap();
+    session.reconcile_windows();
+    let _ = session.frame();
+
+    let start_prefix = |session: &mut TestSession| {
+        let app = session.application_mut();
+        app.handle_event(UiEvent::Key {
+            key: "j".parse().unwrap(),
+            kind: KeyInputKind::Release,
+        });
+        assert!(app.input.release_keymap.pending.is_some());
+    };
+    start_prefix(&mut session);
+    let app = session.application();
+    assert_eq!(app.state.active_view(), Some(second));
+    let pane =
+        crate::ui::view_pane_viewport(&app.state, &app.ui, first).expect("first split is visible");
+    session.click(pane.x + 6, pane.y);
+    assert_eq!(session.application().state.active_view(), Some(first));
+    assert_eq!(session.context(), "editor.insert");
+    session.advance_input(timeout);
+    assert!(session.application().state.buffers[buffer].text.is_empty());
+
+    start_prefix(&mut session);
+    session.open_command_prompt();
+    session.close_prompt();
+    assert_eq!(session.context(), "editor.insert");
+    session.advance_input(timeout);
+    assert!(session.application().state.buffers[buffer].text.is_empty());
+
+    start_prefix(&mut session);
+    session.advance_input(timeout);
+    assert_eq!(
+        session.application().state.buffers[buffer].text.to_string(),
+        "j"
+    );
+}
+
+#[test]
+fn release_commands_leave_the_press_count_and_register_alone() {
+    use crate::app::tests::driver::TestSession;
+    use crate::editor::text::TextBuffer;
+    use crate::ui::{KeyInputKind, UiEvent};
+
+    let mut loaded = load_bundled_config();
+    loaded.keymaps.entries.push(
+        toml::from_str(
+            r#"
+        id = "user.release-count"
+        context = "key_release"
+        keys = "3"
+        command = "view.line_numbers.toggle"
+    "#,
+        )
+        .unwrap(),
+    );
+    loaded
+        .config
+        .input
+        .unmatched_commands
+        .insert("key_release".into(), "view.line_numbers.toggle".into());
+    let mut session = TestSession::new(loaded);
+    let app = session.application_mut();
+    let (buffer, view) = app
+        .state
+        .open_text(TextBuffer::from_text("one\ntwo\nthree\nfour\nfive"), None)
+        .unwrap();
+    app.set_dashboard_visibility(false);
+    let line_four = app.state.buffers[buffer].text.line_to_byte(3).unwrap();
+    let original_numbers = app.configuration.settings().editor.line_numbers;
+    let release = |session: &mut TestSession, key: &str| {
+        session.application_mut().handle_event(UiEvent::Key {
+            key: key.parse().unwrap(),
+            kind: KeyInputKind::Release,
         });
     };
-    let original = app.window_session.graph().focused().unwrap();
-    press(app, "ctrl-w");
-    press(app, "s");
-    let split = app.window_session.graph().focused().unwrap();
-    assert_ne!(original, split);
 
-    let root = &app.state.workspace_root;
-    git2::Repository::init(root).unwrap();
-    app.git_screen = Some(crate::git::screen::GitScreen::open(root).unwrap());
-    app.git_screen_visible = true;
-    // From the reader, Ctrl-k has no pane above it inside Git. The editor windows are hidden
-    // behind Git, so focus stays put instead of moving to a window the user can't see.
-    press(app, "0");
-    press(app, "ctrl-k");
-    assert!(app.git_screen_visible);
-    assert_eq!(app.window_session.graph().focused(), Some(split));
+    session.key("3");
+    assert_eq!(
+        session
+            .application()
+            .configuration
+            .settings()
+            .editor
+            .line_numbers,
+        original_numbers
+    );
+    release(&mut session, "3");
+    assert_ne!(
+        session
+            .application()
+            .configuration
+            .settings()
+            .editor
+            .line_numbers,
+        original_numbers
+    );
+    session.key("j");
+    assert_eq!(session.application().state.views[view].cursor, line_four);
+
+    session.key("\"");
+    session.key("a");
+    release(&mut session, "f12");
+    assert_eq!(
+        session
+            .application()
+            .configuration
+            .settings()
+            .editor
+            .line_numbers,
+        original_numbers
+    );
+    session.key("y");
+    session.key("y");
+    assert_eq!(
+        session.application().state.registers.get('a').unwrap().text,
+        "four\n"
+    );
 }
 
 #[test]

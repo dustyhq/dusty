@@ -411,9 +411,9 @@ impl GitScreen {
                 self.commit_open = false;
                 return false;
             }
-            KeyCode::Char('j' | 'k') if key.modifiers.control => {
-                self.commit_open = false;
-                return false;
+            KeyCode::Char('j' | 'J' | 'k' | 'K') if key.modifiers.control => {
+                // The status rail can still have a pane above or below the commit files.
+                return control_direction(key).is_none();
             }
             KeyCode::Tab => self.focus = if self.focus == 4 { 0 } else { 4 },
             KeyCode::Char('h') if key.modifiers.control => self.focus = 0,

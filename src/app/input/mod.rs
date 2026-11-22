@@ -2173,8 +2173,19 @@ impl App {
             let outcome = screen.event(event.clone());
             match outcome {
                 crate::git::screen::ScreenOutcome::Continue => {}
-                // Git covers the whole screen, so there is no pane beyond its edge to move to.
-                crate::git::screen::ScreenOutcome::Focus(_) => {}
+                crate::git::screen::ScreenOutcome::Focus(direction) => {
+                    if self.input_render_config().ui.git.placement
+                        == crate::config::GitPlacement::Float
+                        && self.focus_surface(direction)
+                    {
+                        self.git_screen_visible = false;
+                        if let UiEvent::Key { key, kind } = &event
+                            && *kind != KeyInputKind::Release
+                        {
+                            self.guard_handoff_key(key, *kind);
+                        }
+                    }
+                }
                 crate::git::screen::ScreenOutcome::Close => {
                     self.git_screen = None;
                     self.git_screen_visible = false;
@@ -2521,6 +2532,55 @@ impl App {
 }
 
 impl App {
+    fn guard_handoff_key(&mut self, key: &KeyEvent, kind: KeyInputKind) {
+        self.input.handoff_key = Some(HandoffKey {
+            key: key.clone(),
+            return_focus: self.window_session.focus_stamp().clone(),
+            return_capture: self.input.capture_epoch(),
+            // Untagged repeats of a modified focus key can keep moving focus.
+            // Only plain keys need the timer to avoid typing into the next surface.
+            press_deadline: (kind == KeyInputKind::Press && key.modifiers == Default::default())
+                .then(|| self.clock.monotonic() + HANDOFF_FIRST_REPEAT),
+        });
+    }
+
+    fn suppress_handoff_repeat(&mut self, event: &UiEvent) -> bool {
+        let Some(guard) = &mut self.input.handoff_key else {
+            return false;
+        };
+        if !std::sync::Arc::ptr_eq(&guard.return_focus, self.window_session.focus_stamp())
+            || !std::sync::Arc::ptr_eq(&guard.return_capture, &self.input.capture_epoch)
+            || matches!(event, UiEvent::FocusGained | UiEvent::FocusLost)
+        {
+            self.input.handoff_key = None;
+            return false;
+        }
+        let UiEvent::Key { key, kind } = event else {
+            return false;
+        };
+        if *key == guard.key {
+            match kind {
+                KeyInputKind::Repeat => {
+                    guard.press_deadline = None;
+                    return true;
+                }
+                KeyInputKind::Press => {
+                    let now = self.clock.monotonic();
+                    if guard.press_deadline.is_some_and(|deadline| now <= deadline) {
+                        guard.press_deadline = Some(now + HANDOFF_REPEAT_GAP);
+                        return true;
+                    }
+                }
+                KeyInputKind::Release => {}
+            }
+        }
+        // Other held keys may come up while this one is still repeating.
+        if *kind != KeyInputKind::Release || key.code == guard.key.code {
+            self.input.handoff_key = None;
+        }
+        false
+    }
+
     pub(in crate::app) fn keyboard_terminal(&self) -> Option<PtyId> {
         if self.input.capture_context().is_some()
             || self.workspace_edits.proposal().is_some()

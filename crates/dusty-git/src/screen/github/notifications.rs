@@ -616,6 +616,16 @@ impl Workspace {
                 SpatialDirection::Right => true,
             }
         {
+            if direction == SpatialDirection::Right
+                && let Some(thread) = self.selected_thread()
+                && match &thread.target {
+                    NotifyTarget::Item { .. } => true,
+                    NotifyTarget::Run(_) => self.thread_here(&thread),
+                    _ => false,
+                }
+            {
+                return self.open_thread(&thread);
+            }
             self.focus_exit = Some(direction);
             return Ok(None);
         }
