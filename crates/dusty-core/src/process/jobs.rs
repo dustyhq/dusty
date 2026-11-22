@@ -86,18 +86,27 @@ impl Drop for JobSlot {
         self.0.fetch_sub(1, Ordering::AcqRel);
     }
 }
+type Preflight = Box<dyn FnOnce(&Path) -> Result<(), String> + Send>;
+
 struct Submission {
+    preflight: Option<Preflight>,
     root: Option<crate::files::RootIdentity>,
     id: JobId,
     request: JobRequest,
     cancel: Arc<AtomicBool>,
+    output_drain: Arc<OutputDrain>,
     slot: Arc<JobSlot>,
     input: Option<Receiver<Vec<u8>>>,
 }
+struct JobControl {
+    cancel: Arc<AtomicBool>,
+    output_drain: Arc<OutputDrain>,
+}
+
 /// Reserves worker capacity. Filesystem access, spawning and process cleanup run on workers.
 pub struct JobSupervisor {
     next: Option<u64>,
-    jobs: HashMap<JobId, Arc<AtomicBool>>,
+    jobs: HashMap<JobId, JobControl>,
     inputs: HashMap<JobId, SyncSender<Vec<u8>>>,
     sender: SyncSender<Submission>,
     receiver: Option<Receiver<JobEvent>>,
@@ -201,6 +210,15 @@ impl JobSupervisor {
     pub fn start(&mut self, request: JobRequest) -> Result<JobId, JobError> {
         self.reserve()?.submit(request)
     }
+    /// Check the job's canonical working directory on the worker just before spawning.
+    pub fn start_checked(
+        &mut self,
+        request: JobRequest,
+        check: impl FnOnce(&Path) -> Result<(), String> + Send + 'static,
+    ) -> Result<JobId, JobError> {
+        self.reserve()?
+            .submit_inner(request, None, None, Some(Box::new(check)))
+    }
     /// Interactive jobs use raw output chunks and keep stdin open until explicitly closed.
     pub fn start_streaming(
         &mut self,
@@ -210,7 +228,7 @@ impl JobSupervisor {
         let (sender, input) = mpsc::sync_channel(16);
         let id = self
             .reserve()?
-            .submit_inner(request, Some(root), Some(input))?;
+            .submit_inner(request, Some(root), Some(input), None)?;
         self.inputs.insert(id, sender);
         Ok(id)
     }
@@ -281,7 +299,7 @@ impl JobSupervisor {
 }
 impl JobReservation<'_> {
     pub fn submit(self, request: JobRequest) -> Result<JobId, JobError> {
-        self.submit_inner(request, None, None)
+        self.submit_inner(request, None, None, None)
     }
     pub fn submit_scoped(
         self,
@@ -291,13 +309,14 @@ impl JobReservation<'_> {
         if !request.cwd.starts_with(&root.canonical_path) {
             return Err(JobError::InvalidPolicy);
         }
-        self.submit_inner(request, Some(root), None)
+        self.submit_inner(request, Some(root), None, None)
     }
     fn submit_inner(
         self,
         request: JobRequest,
         root: Option<crate::files::RootIdentity>,
         input: Option<Receiver<Vec<u8>>>,
+        preflight: Option<Preflight>,
     ) -> Result<JobId, JobError> {
         check_request(&request, input.is_some())?;
         let supervisor = self.supervisor;
@@ -467,14 +486,19 @@ impl JobEngine {
                 command.arg0(argv0);
             }
         }
+        if let Some(check) = preflight {
+            check(&cwd).map_err(JobError::Preflight)?;
+        }
         let mut child = command.spawn().map_err(JobError::Spawn)?;
+        // The deadline can stop inherited stdin without dropping queued output.
+        let input_cancel = Arc::new(AtomicBool::new(false));
         // Configure all pipes before starting I/O threads, so setup failure still owns the child.
         let pipes = (|| -> io::Result<_> {
             Ok((
                 child
                     .stdin
                     .take()
-                    .map(|pipe| crate::process::CancellablePipe::new(pipe, cancel.clone()))
+                    .map(|pipe| crate::process::CancellablePipe::new(pipe, input_cancel.clone()))
                     .transpose()?,
                 child
                     .stdout

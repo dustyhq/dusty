@@ -260,7 +260,6 @@ impl GitScreen {
 
     pub(super) fn history_rewrite_hints(&self) -> bool {
         !self.branch.is_empty()
-            && self.branch != "detached HEAD"
             && self.history_reference().is_ok_and(|reference| {
                 reference == "HEAD" || reference.strip_prefix("refs/heads/") == Some(&self.branch)
             })
@@ -321,6 +320,7 @@ impl GitScreen {
         let branch = history::ref_label(&plan.reference);
         let id = history::short(target);
         let title = if edit == Edit::Drop {
+            let branch = shell::chrome::ellipsize(branch, 29);
             format!("Drop {id} from {branch}?")
         } else {
             format!("{} · {id} on {branch}?", edit.title())
@@ -356,17 +356,29 @@ impl GitScreen {
                 )
             }
             Op::Undo(undo) => {
+                let Some(run) = undo.run() else {
+                    undo.restore_index(&self.root)?;
+                    self.notice.clear();
+                    let result = self.refresh();
+                    self.refreshing_after_write = result.is_ok();
+                    return result;
+                };
                 // Recheck HEAD and staged changes before running the confirmed plan.
+                if let Some(check) = &run.check {
+                    check.verify(&self.root)?;
+                }
                 if history::undo(&self.root, undo.redo)? != undo {
                     return Err("The reflog changed; cancel and press the key again".into());
                 }
-                let (_, to) = undo.head();
-                let verb = if undo.redo { "Redid" } else { "Undid" };
-                (
-                    vec![undo.run()],
-                    LOCAL,
-                    format!("{verb} {} · HEAD at {to}", undo.entry),
-                )
+                let target = undo
+                    .checkout_destination()
+                    .map_or_else(|| undo.head().1, history::CheckoutTarget::revision);
+                return self.submit_checkout(Checkout {
+                    run,
+                    target: target.into(),
+                    undo: Some(undo),
+                    timeout: CHECKOUT_TIMEOUT,
+                });
             }
             Op::Rewrite(mut plan) => {
                 if let Edit::Reword(message) = &mut plan.edit {
@@ -376,10 +388,17 @@ impl GitScreen {
                     }
                     *message = text.to_owned();
                 }
-                let fresh =
-                    history::rewrite(&self.root, &plan.reference, plan.target, plan.edit.clone())?;
-                if fresh.todo != plan.todo {
-                    return Err("The branch changed; cancel and press the key again".into());
+                history::CheckoutCheck::Rewrite(plan.checkout.clone()).verify(&self.root)?;
+                let reference = plan.checkout.reference().unwrap_or("HEAD");
+                let fresh = history::rewrite(&self.root, reference, plan.target, plan.edit.clone())
+                    .map_err(|error| {
+                        history::CheckoutCheck::Rewrite(plan.checkout.clone())
+                            .verify(&self.root)
+                            .err()
+                            .unwrap_or(error)
+                    })?;
+                if fresh.checkout != plan.checkout || fresh.todo != plan.todo {
+                    return Err(history::CHECKOUT_CHANGED.into());
                 }
                 (plan.runs(), LOCAL, plan.done())
             }
@@ -407,44 +426,143 @@ impl GitScreen {
                 )
             }
         };
+        self.start_runs(runs, timeout, done)
+    }
+
+    pub(super) fn submit_checkout(&mut self, checkout: Checkout) -> Result<(), String> {
+        let detached = matches!(
+            self.form.as_ref().map(|form| &form.action),
+            Some(FormAction::CheckoutDetached(_))
+        );
+        self.start_checkout(move |root| attempt_checkout(root, checkout))?;
+        if detached {
+            self.reflog_submitting = true;
+        } else {
+            self.form = None;
+        }
+        Ok(())
+    }
+
+    pub(super) fn overwrite_ignored(&mut self, plan: OverwriteIgnored) -> Result<(), String> {
+        self.start_checkout(move |root| replace_ignored(root, plan))
+    }
+
+    fn start_checkout(
+        &mut self,
+        operation: impl FnOnce(&Path) -> Result<CheckoutOutcome, String> + Send + 'static,
+    ) -> Result<(), String> {
+        let root = self.root.clone();
+        let (tx, rx) = sync_channel(1);
+        std::thread::Builder::new()
+            .name("dusty-git-checkout".into())
+            .spawn(move || {
+                let _ = tx.send(operation(&root));
+            })
+            .map_err(|_| "Can't start Git")?;
+        self.checkout_reply = Some(rx);
+        self.busy = true;
+        self.notice = "Running Git…".into();
+        Ok(())
+    }
+
+    pub(super) fn poll_checkout(&mut self) -> bool {
+        let Some(reply) = &self.checkout_reply else {
+            return false;
+        };
+        let result = match reply.try_recv() {
+            Ok(result) => result,
+            Err(TryRecvError::Empty) => return false,
+            Err(TryRecvError::Disconnected) => Err("Git stopped before switching".into()),
+        };
+        self.checkout_reply = None;
+        self.busy = false;
+        self.finish_reflog_form(result.is_ok());
+        match result {
+            Ok(CheckoutOutcome::Collision(plan)) => {
+                self.form(
+                    if plan.can_replace() {
+                        "Replace ignored files and switch?"
+                    } else {
+                        "Switch blocked"
+                    },
+                    FormAction::OverwriteIgnored {
+                        plan,
+                        note_top: std::cell::Cell::new(0),
+                    },
+                    Vec::new(),
+                );
+                if let Some(form) = &mut self.form {
+                    form.selected = form.fields.len() + 1;
+                }
+            }
+            Ok(CheckoutOutcome::StashRecovery(message)) => {
+                let refreshed = self.refresh();
+                self.refreshing_after_write = refreshed.is_ok();
+                self.report(refreshed);
+                self.show_action_message("Switch failed", message);
+            }
+            Ok(CheckoutOutcome::Finished(message)) | Err(message) => {
+                self.notice = message.replace(['\r', '\n'], " ");
+                let refreshed = self.refresh();
+                self.refreshing_after_write = refreshed.is_ok();
+                self.report(refreshed);
+            }
+        }
+        true
+    }
+
+    fn start_runs(
+        &mut self,
+        runs: Vec<Run>,
+        timeout: Duration,
+        done: String,
+    ) -> Result<(), String> {
         let mut runs = runs.into_iter();
         let first = runs.next().ok_or("Nothing to run")?;
-        self.jobs
-            .start_write_env(&self.root, first.args, &first.env, timeout)?;
+        self.jobs.start_run(&self.root, first, timeout)?;
         self.busy = true;
         self.notice = "Running Git…".into();
         self.running = Some(Running {
             rest: runs.collect(),
             timeout,
             done,
+            fixup_written: false,
             progress: None,
+            capture_warning: None,
         });
         Ok(())
     }
 
     /// A write finished: start the sheet's next command, if it has one and this one
     /// succeeded. `true` while the sheet keeps running.
-    pub(super) fn next_op_step(&mut self, result: &Result<String, String>) -> bool {
+    pub(super) fn next_op_step(
+        &mut self,
+        result: &mut Result<String, String>,
+        warning: &mut Option<String>,
+    ) -> bool {
         let Some(running) = self.running.as_mut() else {
             return false;
         };
+        if let Some(previous) = running.capture_warning.take() {
+            *warning = Some(match warning.take() {
+                Some(current) if current != previous => format!("{previous} · {current}"),
+                _ => previous,
+            });
+        }
         if result.is_err() || running.rest.is_empty() {
             return false;
         }
         let next = running.rest.remove(0);
+        running.fixup_written |= matches!(&next.check, Some(history::CheckoutCheck::Autosquash(_)));
         let timeout = running.timeout;
         running.progress = None;
-        match self
-            .jobs
-            .start_write_env(&self.root, next.args, &next.env, timeout)
-        {
-            Ok(()) => true,
+        match self.jobs.start_run(&self.root, next, timeout) {
+            Ok(()) => {
+                running.capture_warning = warning.take();
+                true
+            }
             Err(error) => {
-                self.running = None;
-                self.busy = false;
-                self.notice = error;
-                let refreshed = self.refresh();
-                self.report(refreshed);
+                *result = Err(error);
                 false
             }
         }
@@ -454,25 +572,48 @@ impl GitScreen {
     /// waits. `None` when no sheet was running.
     pub(super) fn finish_op(&mut self, result: &Result<String, String>) -> Option<String> {
         let running = self.running.take()?;
-        Some(match result {
-            Ok(_) => running.done,
-            Err(error) => {
-                let state = git2::Repository::open(&self.root)
-                    .map_or(git2::RepositoryState::Clean, |repository| {
-                        repository.state()
-                    });
-                if state != git2::RepositoryState::Clean {
-                    // Git has no skip for a merge (a pull that merges stops as one).
-                    let skip = if state == git2::RepositoryState::Merge {
-                        ""
-                    } else {
-                        "S skips, "
-                    };
-                    format!("Stopped on a conflict · resolve it, then C continues, {skip}X aborts")
-                } else {
-                    error.replace(['\r', '\n'], " ")
-                }
+        let error = match result {
+            Ok(_) => return Some(running.done),
+            Err(error) => error,
+        };
+        let notice = if error == history::CHECKOUT_CHANGED {
+            // Confirmed Git command sheets have closed. Native rewrites keep
+            // their own forms and handle their worker results separately.
+            history::CHECKOUT_CHANGED_AFTER_CLOSE.into()
+        } else {
+            let state = git2::Repository::open(&self.root)
+                .map_or(git2::RepositoryState::Clean, |repository| {
+                    repository.state()
+                });
+            if running.fixup_written
+                && matches!(
+                    state,
+                    git2::RepositoryState::Rebase
+                        | git2::RepositoryState::RebaseInteractive
+                        | git2::RepositoryState::RebaseMerge
+                )
+            {
+                return Some(
+                    "Fixup committed. Resolve conflicts, then C continues, S skips, X aborts."
+                        .into(),
+                );
             }
+            if state != git2::RepositoryState::Clean {
+                // Git has no skip for a merge (a pull that merges stops as one).
+                let skip = if state == git2::RepositoryState::Merge {
+                    ""
+                } else {
+                    "S skips, "
+                };
+                format!("Stopped on a conflict · resolve it, then C continues, {skip}X aborts")
+            } else {
+                error.replace(['\r', '\n'], " ")
+            }
+        };
+        Some(if running.fixup_written {
+            format!("{notice} The fixup commit was written.")
+        } else {
+            notice
         })
     }
 

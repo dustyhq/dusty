@@ -486,12 +486,10 @@ fn context(app: &GitScreen) -> (&'static str, Vec<Group>) {
                         ],
                     ),
                 ),
-                2 => (
-                    "History",
-                    (
-                        "Act",
-                        vec![
-                            ("Enter", "Commit files"),
+                2 => {
+                    let mut keys = vec![("Enter", "Commit files")];
+                    if app.history_rewrite_hints() {
+                        keys.extend([
                             ("A", "Amend with staged (confirm)"),
                             ("W", "Reword"),
                             ("s", "Squash into the commit below"),
@@ -500,11 +498,14 @@ fn context(app: &GitScreen) -> (&'static str, Vec<Group>) {
                             ("e", "Edit: stop the rebase here"),
                             ("J K", "Move down · up"),
                             ("F", "Commit staged as fixup!"),
-                            ("y", "Copy SHA · short SHA · subject · URL"),
-                            ("o", "Open the commit on the forge"),
-                        ],
-                    ),
-                ),
+                        ]);
+                    }
+                    keys.extend([
+                        ("y", "Copy SHA · short SHA · subject · URL"),
+                        ("o", "Open the commit on the forge"),
+                    ]);
+                    ("History", ("Act", keys))
+                }
                 _ => (
                     "Stashes",
                     (
@@ -865,5 +866,46 @@ pub(in crate::screen) fn paint(app: &GitScreen, frame: &mut Frame, width: u16, h
         if x >= right {
             break;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn history_help_only_lists_read_actions_for_another_branch() {
+        use crate::history::tests::{commit, git, repo};
+        use std::time::{Duration, Instant};
+
+        let directory = repo();
+        let root = directory.path();
+        commit(root, "base");
+        git(root, &["switch", "-q", "-c", "topic"]);
+        let topic = commit(root, "topic-change");
+        git(root, &["switch", "-q", "main"]);
+
+        let mut app = GitScreen::open(root).unwrap();
+        app.focus = 2;
+        app.last_list = 2;
+        app.history_target = Some((app.root.clone(), "refs/heads/topic".into()));
+        app.reload_history().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while app.history_loading {
+            assert!(Instant::now() < deadline, "selected History did not load");
+            app.poll();
+            std::thread::yield_now();
+        }
+
+        assert_eq!(app.branch, "main");
+        assert_eq!(app.history_reference().unwrap(), "refs/heads/topic");
+        assert_eq!(app.history.first().unwrap().0, topic.to_string());
+        let (title, groups) = context(&app);
+        let (group, actions) = &groups[0];
+        let keys: Vec<_> = actions.iter().map(|(key, _)| *key).collect();
+        assert_eq!(
+            (title, *group, keys),
+            ("History", "Act", vec!["Enter", "y", "o", "p", "P", "z Z"])
+        );
     }
 }

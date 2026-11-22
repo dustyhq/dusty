@@ -35,17 +35,31 @@ impl GitScreen {
 
     fn rewrite_form(&mut self, kind: Kind) -> Result<(), String> {
         self.allow_write()?;
-        let history_branch = if self.last_list == 2 && self.history_view == 0 {
-            Some(crate::history::history_branch(
-                &self.root,
-                self.history_reference()?,
-            )?)
+        let history_checkout = if self.last_list == 2 && self.history_view == 0 {
+            let selection = self.selected_row().and_then(|row| {
+                row.value
+                    .to_str()
+                    .and_then(|id| git2::Oid::from_str(id).ok())
+            });
+            let checkout =
+                history::history_checkout(&self.root, self.history_reference()?, selection)?;
+            // History dispatches non-tip A/W to a rebase, not this native HEAD form.
+            if self.focus == 2
+                && !self.commit_open
+                && !matches!(kind, Kind::Fixup(_))
+                && selection.is_some_and(|id| id != checkout.tip())
+            {
+                return Err(history::CHECKOUT_CHANGED_AT_CAPTURE.into());
+            }
+            Some(checkout)
         } else {
             None
         };
         let plan = Plan::capture(&self.root, kind)?;
-        if history_branch.is_some() && plan.reference != history_branch {
-            return Err("The checked-out branch changed. Close this and open it again.".into());
+        if history_checkout.is_some_and(|checkout| {
+            checkout.reference() != plan.reference.as_deref() || checkout.tip() != plan.head
+        }) {
+            return Err(history::CHECKOUT_CHANGED_AT_CAPTURE.into());
         }
         let title = match kind {
             Kind::Amend => "Amend HEAD",
@@ -143,7 +157,7 @@ impl GitScreen {
 mod tests {
     use super::*;
 
-    fn screen_with_draft() -> (tempfile::TempDir, GitScreen, git2::Oid) {
+    fn rewrite_repo() -> (tempfile::TempDir, git2::Oid) {
         let directory = tempfile::tempdir().unwrap();
         let repo = git2::Repository::init(directory.path()).unwrap();
         let mut config = repo.config().unwrap();
@@ -162,6 +176,11 @@ mod tests {
         let head = repo
             .commit(Some("HEAD"), &signature, &signature, "Original", &tree, &[])
             .unwrap();
+        (directory, head)
+    }
+
+    fn screen_with_draft() -> (tempfile::TempDir, GitScreen, git2::Oid) {
+        let (directory, head) = rewrite_repo();
         let mut screen = GitScreen::open(directory.path()).unwrap();
         screen.rewrite_form(Kind::Reword).unwrap();
         let field = &mut screen.form.as_mut().unwrap().fields[0];

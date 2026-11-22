@@ -1,5 +1,8 @@
 //! Bounded Git CLI requests for history, previews and operations not owned by a Git worker.
-use crate::process::{JobEvent, JobId, JobPolicy, JobRequest, JobStream, JobSupervisor};
+use crate::history::{CheckoutCheck, Run};
+use crate::process::{
+    AbandonedStreams, JobEvent, JobId, JobPolicy, JobRequest, JobStream, JobSupervisor,
+};
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::path::Path;
@@ -110,19 +113,23 @@ impl Jobs {
         args: Vec<OsString>,
         stdin: Option<Vec<u8>>,
     ) -> Result<(), String> {
-        self.start_full(root, request, args, stdin, &[], Duration::from_secs(30))
+        self.start_full(root, request, args, stdin, None)
     }
 
     /// A write that adds variables to Git's environment (a rebase's todo, a reflog tag)
     /// and may run for minutes (a pull or a push over the network).
-    pub fn start_write_env(
-        &mut self,
-        root: &Path,
-        args: Vec<OsString>,
-        env: &[(String, OsString)],
-        timeout: Duration,
-    ) -> Result<(), String> {
-        self.start_full(root, Request::Write, args, None, env, timeout)
+    pub fn start_run(&mut self, root: &Path, run: Run, timeout: Duration) -> Result<(), String> {
+        self.start_full(
+            root,
+            Request::Write,
+            run.args,
+            None,
+            Some(WriteOptions {
+                env: run.env,
+                timeout,
+                check: run.check,
+            }),
+        )
     }
 
     /// The last line a running write printed on stderr (Git's progress), if any.

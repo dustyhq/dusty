@@ -110,14 +110,17 @@ impl Plan {
             index: bytes,
             tree,
         };
-        plan.validate(&repo)?;
+        plan.validate(&repo, crate::history::CHECKOUT_CHANGED_AT_CAPTURE)?;
         Ok(plan)
     }
-    fn validate(&self, repo: &Repository) -> Result<(), String> {
-        ready(repo)?;
-        if repo.path() != self.gitdir || identity(repo)? != (self.head, self.reference.clone()) {
-            return Err("The checked-out branch changed. Close this and open it again.".into());
+    fn validate(&self, repo: &Repository, checkout_changed: &str) -> Result<(), String> {
+        if repo.path() != self.gitdir
+            || !identity(repo)
+                .is_ok_and(|(head, reference)| head == self.head && reference == self.reference)
+        {
+            return Err(checkout_changed.into());
         }
+        ready(repo)?;
         let bytes = fs::read(&self.index_path).map_err(error)?;
         if <[u8; 32]>::from(Sha256::digest(&bytes)) != self.index_hash {
             return Err("The index changed; cancel and reopen this action".into());
@@ -150,7 +153,7 @@ impl Worker {
         std::thread::Builder::new()
             .name("git-rewrite".into())
             .spawn(move || {
-                let result = execute(plan, message);
+                let result = execute(plan, message, Duration::from_secs(120));
                 let _ = sender.send(result);
             })
             .map_err(error)?;
@@ -189,9 +192,9 @@ impl Drop for IndexLock {
         }
     }
 }
-fn execute(plan: Plan, message: String) -> Result<Outcome, String> {
+fn execute(plan: Plan, message: String, commit_timeout: Duration) -> Result<Outcome, String> {
     let repo = Repository::open(&plan.root).map_err(error)?;
-    plan.validate(&repo)?;
+    plan.validate(&repo, crate::history::CHECKOUT_CHANGED)?;
     // Never delete somebody else's lock, even on failure.
     let lock_path = plan.index_path.with_file_name("index.lock");
     let lock_file = fs::OpenOptions::new()
@@ -208,7 +211,7 @@ fn execute(plan: Plan, message: String) -> Result<Outcome, String> {
     if let Some(reference) = &plan.reference {
         transaction.lock_ref(reference).map_err(error)?;
     }
-    plan.validate(&repo)?;
+    plan.validate(&repo, crate::history::CHECKOUT_CHANGED)?;
     let old = repo.find_commit(plan.head).map_err(error)?;
     let recovery = format!("refs/dusty/rewrite/{}", plan.head);
     // Resolve commit/signing configuration against the original checkout.
@@ -221,7 +224,9 @@ fn execute(plan: Plan, message: String) -> Result<Outcome, String> {
             .map(Into::into)
             .collect(),
         None,
-    )?;
+        Duration::from_secs(120),
+    )?
+    .required_stdout()?;
     let mut overrides = Vec::new();
     let mut has_hooks_path = false;
     for record in effective
@@ -258,7 +263,9 @@ fn execute(plan: Plan, message: String) -> Result<Outcome, String> {
                 .map(Into::into)
                 .collect(),
             None,
-        )?;
+            Duration::from_secs(120),
+        )?
+        .required_stdout()?;
         let path = path
             .strip_suffix(&[0])
             .ok_or("Invalid Git hooks path response")?;
@@ -343,7 +350,7 @@ fn execute(plan: Plan, message: String) -> Result<Outcome, String> {
     // Git owns pre-commit, prepare-commit-msg, commit-msg, post-commit,
     // post-rewrite and signing. Never disables verification or configured signing.
     let input = (!matches!(plan.kind, Kind::Fixup(_))).then(|| message.into_bytes());
-    let command_result = run_git(&plan.root, environment, args, input);
+    let command_result = run_git(&plan.root, environment, args, input, commit_timeout);
     let private_repo = Repository::open(private.path()).map_err(error)?;
     let created = private_repo
         .head()

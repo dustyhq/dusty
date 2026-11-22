@@ -16,14 +16,20 @@ use std::path::Path;
 pub struct Run {
     pub args: Vec<OsString>,
     pub env: Vec<(String, OsString)>,
+    pub(crate) check: Option<CheckoutCheck>,
 }
 
 impl Run {
-    fn new<I: IntoIterator<Item = S>, S: Into<OsString>>(args: I) -> Self {
+    pub(crate) fn new<I: IntoIterator<Item = S>, S: Into<OsString>>(args: I) -> Self {
         Self {
             args: args.into_iter().map(Into::into).collect(),
-            env: Vec::new(),
+            ..Self::default()
         }
+    }
+
+    fn checked(mut self, check: CheckoutCheck) -> Self {
+        self.check = Some(check);
+        self
     }
 
     fn with(mut self, key: &str, value: impl Into<OsString>) -> Self {
@@ -31,7 +37,7 @@ impl Run {
         self
     }
 
-    /// As a sheet shows it: `git reset --keep 1a2b3c4`, hashes shortened.
+    /// The command as shown in a sheet, with shortened commit hashes.
     pub fn display(&self) -> String {
         let words = self
             .args
@@ -364,6 +370,21 @@ fn rebase_step(message: &str) -> Option<&str> {
     head[open + 1..].strip_suffix(')')
 }
 
+// These entries advance or reset HEAD without switching between a branch and a
+// detached commit. Commit moves have a suffix that checkout moves don't.
+fn preserves_checkout(message: &str) -> bool {
+    message.starts_with("commit:")
+        || message.starts_with("commit (")
+        || message.starts_with("reset: moving to ")
+        || message == crate::rewrite::REFLOG_ACTION
+        || is_commit_move_marker(message)
+}
+
+pub(crate) fn is_commit_move_marker(message: &str) -> bool {
+    (message.starts_with(UNDO_ACTION) || message.starts_with(REDO_ACTION))
+        && message.ends_with(UPDATING_HEAD)
+}
+
 /// The action `z` (or `Z`) reverses, walking HEAD's reflog as lazygit does: each
 /// `[dusty undo]` entry skips one more action back, each `[dusty redo]` one less, and a
 /// finished rebase counts as one action from its start to its end.
@@ -420,12 +441,8 @@ pub fn undo(root: &Path, redo: bool) -> Result<Undo, String> {
         let Some(moved) = moved else { continue };
         let noop = match &moved {
             Move::Commit { from, to } => from == to,
-            Move::Checkout {
-                from,
-                from_id,
-                to,
-                to_id,
-            } => from == to && from_id == to_id,
+            Move::Index { .. } => false,
+            Move::Checkout { from, to } => from == to,
         };
         if noop {
             continue;
@@ -443,10 +460,13 @@ pub fn undo(root: &Path, redo: bool) -> Result<Undo, String> {
                 redo,
                 entry: message.trim_end().to_owned(),
                 moved,
+                commit_source: None,
+                skipped_index,
             };
             let head = repository.head().ok().and_then(|head| head.target());
             let unexpected_head = "Undo can't follow the last change to HEAD.";
             match &undo.moved {
+                Move::Index { .. } => {}
                 Move::Commit { from, to } => {
                     let expected_head = if redo { *from } else { *to };
                     if head != Some(expected_head) {
@@ -485,13 +505,15 @@ pub fn undo(root: &Path, redo: bool) -> Result<Undo, String> {
                     };
                     if actual.ok() != Some(target_id) {
                         return Err(format!(
-                            "{target} has moved since you left it. Check it out from Branches instead."
+                            "{} has moved since you left it. Check it out from Branches instead.",
+                            target.label()
                         ));
                     }
                 }
             }
             return Ok(undo);
         }
+        replays.remove(&counter);
         counter -= 1;
     }
     Err(if redo {
@@ -539,12 +561,11 @@ impl Edit {
     }
 }
 
-/// A rebase of the current branch that rewrites one commit.
+/// A rebase of the current checkout that rewrites one commit.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Rewrite {
     pub edit: Edit,
-    /// The full local branch ref approved for the rebase.
-    pub reference: String,
+    pub(crate) checkout: CheckoutTarget,
     pub target: Oid,
     /// `1a2b3c4 subject` of the selected commit.
     pub commit: String,
@@ -570,15 +591,24 @@ pub(crate) fn ref_label(reference: &str) -> &str {
         .unwrap_or(reference)
 }
 
-fn checked_out_history_branch(repository: &Repository, reference: &str) -> Result<String, String> {
+fn checked_out_history(repository: &Repository, reference: &str) -> Result<CheckoutTarget, String> {
     let head = repository.find_reference("HEAD").map_err(failed)?;
-    let checked_out = head
+    if reference == "HEAD"
+        && let Some(tip) = head.target()
+    {
+        return Ok(CheckoutTarget::Detached(tip));
+    }
+    if let Some(name) = head
         .symbolic_target()
-        .filter(|name| name.starts_with("refs/heads/"));
-    if let Some(name) = checked_out
+        .filter(|name| name.starts_with("refs/heads/"))
         && (reference == "HEAD" || name == reference)
     {
-        return Ok(name.to_owned());
+        let tip =
+            CheckoutTarget::local_tip(repository, name).ok_or("The branch has no commits yet")?;
+        return Ok(CheckoutTarget::Branch {
+            reference: name.to_owned(),
+            tip,
+        });
     }
     if let Some(branch) = reference.strip_prefix("refs/heads/") {
         Err(format!("Check out {branch} to change its history."))
@@ -587,19 +617,44 @@ fn checked_out_history_branch(repository: &Repository, reference: &str) -> Resul
     }
 }
 
-pub(crate) fn history_branch(root: &Path, reference: &str) -> Result<String, String> {
-    checked_out_history_branch(&open(root)?, reference)
+pub(crate) fn history_checkout(
+    root: &Path,
+    reference: &str,
+    selection: Option<Oid>,
+) -> Result<CheckoutTarget, String> {
+    let repository = open(root)?;
+    let checkout = checked_out_history(&repository, reference)?;
+    if let Some(selection) = selection {
+        check_detached_selection(&repository, &checkout, selection)?;
+    }
+    Ok(checkout)
+}
+
+fn check_detached_selection(
+    repository: &Repository,
+    checkout: &CheckoutTarget,
+    selection: Oid,
+) -> Result<(), String> {
+    if checkout.reference().is_none()
+        && selection != checkout.tip()
+        && !repository
+            .graph_descendant_of(checkout.tip(), selection)
+            .map_err(failed)?
+    {
+        return Err(COMMIT_OUTSIDE_CHECKOUT.into());
+    }
+    Ok(())
 }
 
 /// Plans `edit` on `target` in the displayed history. The reference must be the
-/// checked-out branch (or `HEAD` for default History), with no merges in the rewrite.
+/// checked-out branch or default History, with no merges in the rewrite.
 pub fn rewrite(root: &Path, reference: &str, target: Oid, edit: Edit) -> Result<Rewrite, String> {
     let repository = open(root)?;
     settled(&repository)?;
-    let reference = checked_out_history_branch(&repository, reference)?;
+    let checkout = checked_out_history(&repository, reference)?;
+    check_detached_selection(&repository, &checkout, target)?;
     let head = repository
-        .find_reference(&reference)
-        .and_then(|head| head.peel_to_commit())
+        .find_commit(checkout.tip())
         .map_err(|_| "The branch has no commits yet")?;
     // Newest first, HEAD down to the target.
     let mut chain = Vec::new();
@@ -622,7 +677,7 @@ pub fn rewrite(root: &Path, reference: &str, target: Oid, edit: Edit) -> Result<
         }
     }
     if chain.last().map(|commit| commit.id()) != Some(target) {
-        return Err("The selected commit is not on the current branch".into());
+        return Err(COMMIT_OUTSIDE_CHECKOUT.into());
     }
     let index = chain.len() - 1;
     let selected = &chain[index];
@@ -690,7 +745,7 @@ pub fn rewrite(root: &Path, reference: &str, target: Oid, edit: Edit) -> Result<
     Ok(Rewrite {
         commit: line(selected),
         edit,
-        reference,
+        checkout,
         target,
         other,
         base,
@@ -723,10 +778,7 @@ impl Rewrite {
             Some(base) => base.to_string().into(),
             None => "--root".into(),
         });
-        Run {
-            args,
-            env: Vec::new(),
-        }
+        Run::new(args)
     }
 
     /// The commands, in order: a rebase whose todo Dusty Git writes through
@@ -748,8 +800,11 @@ impl Rewrite {
         if self.edit == Edit::Amend {
             return vec![
                 Run::new(["commit".into(), format!("--fixup={}", self.target)])
-                    .with("GIT_EDITOR", "true"),
+                    .with("GIT_EDITOR", "true")
+                    .with("GIT_REFLOG_ACTION", "commit")
+                    .checked(CheckoutCheck::Fixup(self.checkout.clone())),
                 self.rebase(true)
+                    .checked(CheckoutCheck::Autosquash(self.checkout.clone()))
                     .with("GIT_SEQUENCE_EDITOR", "true")
                     .with("GIT_EDITOR", "true"),
             ];
@@ -758,6 +813,7 @@ impl Rewrite {
         todo.push('\n');
         vec![editor(
             self.rebase(false)
+                .checked(CheckoutCheck::Rewrite(self.checkout.clone()))
                 .with("GIT_SEQUENCE_EDITOR", "printf '%s' \"$DUSTY_TODO\" >")
                 .with("DUSTY_TODO", todo),
         )]
@@ -1009,7 +1065,7 @@ mod tests {
                 to: amended
             }
         );
-        run(root, &plan.run());
+        run(root, &plan.run().unwrap());
         assert_eq!(head(root), before);
 
         git(
@@ -1039,15 +1095,19 @@ mod tests {
         assert_eq!(
             undo_switch.moved,
             Move::Checkout {
-                from: "main".into(),
-                from_id: a,
-                to: "topic".into(),
-                to_id: a,
+                from: CheckoutTarget::Branch {
+                    reference: "refs/heads/main".into(),
+                    tip: a
+                },
+                to: CheckoutTarget::Branch {
+                    reference: "refs/heads/topic".into(),
+                    tip: a
+                },
             }
         );
-        run(root, &undo_switch.run());
+        run(root, &undo_switch.run().unwrap());
         assert_eq!(git(root, &["branch", "--show-current"]), "main");
-        run(root, &undo(root, true).unwrap().run());
+        run(root, &undo(root, true).unwrap().run().unwrap());
         assert_eq!(git(root, &["branch", "--show-current"]), "topic");
         commit(root, "b");
         let before = commit(root, "c");
@@ -1058,7 +1118,7 @@ mod tests {
         assert_eq!(subjects(root), "b c a");
         let rebase = undo(root, false).unwrap();
         assert!(rebase.entry.starts_with("rebase"), "{}", rebase.entry);
-        run(root, &rebase.run());
+        run(root, &rebase.run().unwrap());
         assert_eq!(head(root), before);
         assert_eq!(subjects(root), "c b a");
     }
@@ -1082,11 +1142,8 @@ mod tests {
 
         git(root, &["branch", "-f", "main", &main.to_string()]);
         let plan = undo(root, false).unwrap();
-        assert_eq!(
-            plan.head_change(),
-            format!("topic → main ({})", short(main))
-        );
-        run(root, &plan.run());
+        assert_eq!(plan.checkout_destination().unwrap().tip(), main);
+        run(root, &plan.run().unwrap());
         assert_eq!(head(root), main);
         assert_eq!(git(root, &["branch", "--show-current"]), "main");
 
