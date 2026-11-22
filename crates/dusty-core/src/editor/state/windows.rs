@@ -187,13 +187,11 @@ impl EditorState {
                 .map_err(layout_error)?;
             let old_buffer = self.views[old].buffer;
             self.remove_view(old)?;
-            let unused = self.buffers.get(old_buffer).is_some_and(|buffer| {
-                buffer.path.is_none()
-                    && !buffer.dirty
-                    && buffer.text.len_bytes() == 0
-                    && buffer.origin == BufferOrigin::FileOrScratch
-            });
-            if unused && !self.views.values().any(|other| other.buffer == old_buffer) {
+            let disposable = self
+                .buffers
+                .get(old_buffer)
+                .is_some_and(Buffer::is_untouched_scratch);
+            if disposable && !self.views.values().any(|other| other.buffer == old_buffer) {
                 self.remove_buffer(old_buffer);
             }
             self.select_editor_window_after_layout_change(window)?;

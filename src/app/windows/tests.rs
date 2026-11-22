@@ -3407,3 +3407,68 @@ fn a_debug_session_shrinks_the_terminal_only_on_a_short_screen_and_gives_it_back
     session.observe_size((80, 24));
     assert_eq!(session.terminal_height(), 12);
 }
+
+#[test]
+fn ctrl_t_does_not_reuse_an_undone_scratch_that_still_has_redo() {
+    use crate::editor::EditorMode;
+    use crate::editor::EditorOperation;
+    use crate::editor::EditorTransaction;
+    use crate::editor::TransactionId;
+    use crate::editor::text::ByteRange;
+    use crate::editor::text::TextEdit;
+    use crate::editor::text::TextEditSet;
+
+    let (_app_dirs, mut app) = app();
+    let path = PathBuf::from("/workspace/a");
+    app.state
+        .open_text(TextBuffer::from_text("a"), Some(path.clone()))
+        .expect("open file");
+    let (scratch, view) = app
+        .state
+        .open_text(TextBuffer::from_text(""), None)
+        .expect("open scratch");
+    let edits = TextEditSet::new(
+        app.state.buffers[scratch].text.revision(),
+        vec![TextEdit::new(ByteRange::empty(ByteOffset(0)), "x")],
+    );
+    app.state
+        .apply_transaction(
+            &EditorTransaction::new(TransactionId(1))
+                .with_operation(EditorOperation::SetMode {
+                    view,
+                    mode: EditorMode::Insert,
+                })
+                .with_operation(EditorOperation::ApplyEdits {
+                    buffer: scratch,
+                    edits,
+                })
+                .with_operation(EditorOperation::SetMode {
+                    view,
+                    mode: EditorMode::Normal,
+                }),
+        )
+        .expect("insert x and return to normal mode");
+    app.state
+        .apply_transaction(
+            &EditorTransaction::new(TransactionId(2))
+                .with_operation(EditorOperation::Undo { buffer: scratch }),
+        )
+        .expect("undo scratch edit");
+    app.state
+        .open_text(TextBuffer::from_text("a"), Some(path))
+        .expect("reopen file");
+    app.set_dashboard_visibility(false);
+
+    app.process_effect(AppEffect::NewTab);
+
+    let active = app.state.active_buffer_id().expect("new tab buffer");
+    assert_ne!(active, scratch, "Ctrl-t reused the scratch that has redo");
+    assert!(app.state.buffers.contains_key(scratch));
+    app.state
+        .apply_transaction(
+            &EditorTransaction::new(TransactionId(3))
+                .with_operation(EditorOperation::Redo { buffer: scratch }),
+        )
+        .expect("redo scratch edit");
+    assert_eq!(app.state.buffers[scratch].text.to_string(), "x");
+}

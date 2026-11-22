@@ -1,6 +1,7 @@
 //! Workspace roots and their trust. Project-defined commands run only in a trusted workspace.
 //! Feature execution payloads remain with their callers, not in this owner.
 mod discovery;
+use crate::editor::BufferOrigin;
 use crate::editor::EditorState;
 use crate::files::RootIdentity;
 use crate::workspace::ExecutionSource;
@@ -1077,7 +1078,13 @@ impl App {
             .filter(|(view, state)| {
                 Some(*view) != front
                     && self.state.buffers.get(state.buffer).is_some_and(|buffer| {
-                        buffer.path.is_none() && !buffer.dirty && buffer.text.len_bytes() == 0
+                        // An empty read-only view (a reset debugger source) is closed as
+                        // before; a scratch closes only if it has no undo or redo to lose.
+                        buffer.is_untouched_scratch()
+                            || (buffer.path.is_none()
+                                && !buffer.dirty
+                                && buffer.text.len_bytes() == 0
+                                && buffer.origin != BufferOrigin::FileOrScratch)
                     })
                     && Some(state.buffer) != self.state.kept_buffer
             })

@@ -144,6 +144,68 @@ fn opening_a_file_removes_only_an_unhosted_empty_scratch() {
 }
 
 #[test]
+fn reopening_a_file_keeps_an_undone_scratch_available_for_redo() {
+    use crate::editor::{EditorMode, EditorOperation, EditorTransaction, TransactionId};
+
+    let mut state = EditorState::new("/workspace".into());
+    let path = PathBuf::from("/workspace/a");
+    let (file, _) = state
+        .open_text(TextBuffer::from_text("a"), Some(path.clone()))
+        .expect("open file");
+    let pane = state.focused_window();
+    let (scratch, view) = state
+        .open_text(TextBuffer::from_text(""), None)
+        .expect("open scratch");
+    let edits = TextEditSet::new(
+        state.buffers[scratch].text.revision(),
+        vec![TextEdit::new(ByteRange::empty(ByteOffset(0)), "x")],
+    );
+    state
+        .apply_transaction(
+            &EditorTransaction::new(TransactionId(1))
+                .with_operation(EditorOperation::SetMode {
+                    view,
+                    mode: EditorMode::Insert,
+                })
+                .with_operation(EditorOperation::ApplyEdits {
+                    buffer: scratch,
+                    edits,
+                })
+                .with_operation(EditorOperation::SetMode {
+                    view,
+                    mode: EditorMode::Normal,
+                }),
+        )
+        .expect("insert x and return to normal mode");
+    state
+        .apply_transaction(
+            &EditorTransaction::new(TransactionId(2))
+                .with_operation(EditorOperation::Undo { buffer: scratch }),
+        )
+        .expect("undo scratch edit");
+    assert_eq!(state.buffers[scratch].text.len_bytes(), 0);
+    assert!(!state.buffers[scratch].dirty);
+
+    state
+        .open_text(TextBuffer::from_text("a"), Some(path))
+        .expect("reopen file");
+    assert_eq!(state.active_buffer_id(), Some(file));
+    assert_eq!(state.focused_window(), pane);
+
+    state
+        .cycle_buffer(&[], -1, true)
+        .expect("cycle to previous buffer");
+    assert_eq!(state.active_buffer_id(), Some(scratch));
+    state
+        .apply_transaction(
+            &EditorTransaction::new(TransactionId(3))
+                .with_operation(EditorOperation::Redo { buffer: scratch }),
+        )
+        .expect("redo scratch edit");
+    assert_eq!(state.buffers[scratch].text.to_string(), "x");
+}
+
+#[test]
 fn canonical_path_identity_reuses_buffer_and_view() {
     let mut state = EditorState::new(PathBuf::from("/workspace"));
     let path = PathBuf::from("/workspace/file.rs");

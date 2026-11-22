@@ -104,6 +104,17 @@ impl Buffer {
         }
     }
 
+    /// An unnamed, clean, empty scratch that was never edited, so nothing is lost by
+    /// reusing or removing it. One that was typed in and undone keeps its redo history.
+    #[must_use]
+    pub fn is_untouched_scratch(&self) -> bool {
+        self.path.is_none()
+            && !self.dirty
+            && self.text.len_bytes() == 0
+            && self.undo.is_empty()
+            && self.origin == BufferOrigin::FileOrScratch
+    }
+
     #[must_use]
     pub fn is_virtual_read_only(&self) -> bool {
         matches!(self.origin, BufferOrigin::VirtualReadOnly { .. })

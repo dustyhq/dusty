@@ -454,12 +454,11 @@ impl App {
             AppEffect::NewTab => {
                 // An untouched [No Name] tab is reused, so ctrl-t never piles up empty tabs;
                 // the file picked from the finder replaces it.
-                let unused = self.state.buffers.iter().find(|(_, buffer)| {
-                    buffer.path.is_none()
-                        && !buffer.dirty
-                        && buffer.text.len_bytes() == 0
-                        && buffer.origin == crate::editor::BufferOrigin::FileOrScratch
-                });
+                let unused = self
+                    .state
+                    .buffers
+                    .iter()
+                    .find(|(_, buffer)| buffer.is_untouched_scratch());
                 match unused.map(|(id, _)| id) {
                     Some(buffer) => {
                         if let Err(error) = self.state.show_buffer(buffer) {
