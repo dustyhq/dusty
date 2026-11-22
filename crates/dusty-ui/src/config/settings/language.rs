@@ -11,6 +11,15 @@ pub enum InlayHintLevel {
     Max,
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InlineDiagnostics {
+    #[default]
+    All,
+    Errors,
+    Off,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct LspConfig {
@@ -20,6 +29,8 @@ pub struct LspConfig {
     pub auto_install: bool,
     pub inlay_hints: bool,
     pub inlay_hint_level: InlayHintLevel,
+    /// Which diagnostic messages appear at the end of source lines.
+    pub inline_diagnostics: InlineDiagnostics,
     /// Open the completion menu while typing, not only on ctrl-space.
     pub auto_completion: bool,
     pub format_on_save: bool,
@@ -34,6 +45,7 @@ impl Default for LspConfig {
             auto_install: true,
             inlay_hints: true,
             inlay_hint_level: InlayHintLevel::Standard,
+            inline_diagnostics: InlineDiagnostics::All,
             auto_completion: true,
             format_on_save: true,
             nix_workspace_fallback: true,

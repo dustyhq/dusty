@@ -15,6 +15,7 @@ use crate::config::Config;
 use crate::config::CursorShape;
 
 use crate::config::ExplorerIconMode;
+use crate::config::InlineDiagnostics;
 
 use crate::config::LineNumbers;
 
@@ -1154,6 +1155,14 @@ pub(super) fn render_editor_view(
         }
         if let Some(diagnostics) = diagnostic_lines.get(&line_index)
             && let Some(diagnostic) = diagnostics.first()
+            && matches!(
+                (config.lsp.inline_diagnostics, diagnostic.severity),
+                (InlineDiagnostics::All, _)
+                    | (
+                        InlineDiagnostics::Errors,
+                        crate::workspace::DiagnosticSeverity::Error
+                    )
+            )
         {
             let text = format!("  ●● {}", diagnostic_label(diagnostic));
             grid.put_text_clipped(

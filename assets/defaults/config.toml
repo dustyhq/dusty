@@ -504,6 +504,7 @@ auto_start = true
 auto_install = true
 inlay_hints = true
 inlay_hint_level = "standard"
+inline_diagnostics = "all"
 auto_completion = true
 # Format with the language server on save, as LazyVim does. <leader>uf turns it off for now.
 format_on_save = true
@@ -1346,6 +1347,8 @@ workspace = "Project"
 "lsp.semantic_tokens" = "Refresh semantic tokens"
 "lsp.inlay_hints" = "Refresh inline inlay hints"
 "lsp.inlay_hints.toggle" = "Toggle inline inlay hints"
+"lsp.inline_diagnostics.toggle" = "Toggle Messages Beside Code"
+"lsp.auto_completion.toggle" = "Toggle Completion While Typing"
 "lsp.code_lens" = "Refresh code lens"
 "lsp.document_highlights" = "Refresh document highlights"
 "lsp.folding_ranges" = "Refresh folding ranges"

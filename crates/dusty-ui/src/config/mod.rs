@@ -83,6 +83,7 @@ pub use settings::GitWindowConfig;
 pub use settings::HighlightDefinition;
 pub use settings::IndentGuideConfig;
 pub use settings::InlayHintLevel;
+pub use settings::InlineDiagnostics;
 pub use settings::InputConfig;
 pub use settings::KeyHintConfig;
 pub use settings::KeymapPolicyConfig;

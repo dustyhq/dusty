@@ -2,6 +2,7 @@
 
 use crate::app::App;
 use crate::app::commands::AppEffect;
+use crate::app::editing::FoldCursorSelection;
 use crate::language::lsp::LspFeature;
 use crate::workspace::DiagnosticOwner;
 
@@ -258,6 +259,16 @@ pub(in crate::app) fn register_commands(
             "lsp.inlay_hints.toggle",
             "Toggle inline inlay hints",
             AppEffect::LspInlayHintsToggle,
+        ),
+        (
+            "lsp.inline_diagnostics.toggle",
+            "Toggle Messages Beside Code",
+            AppEffect::LspInlineDiagnosticsToggle,
+        ),
+        (
+            "lsp.auto_completion.toggle",
+            "Toggle Completion While Typing",
+            AppEffect::LspAutoCompletionToggle,
         ),
         (
             "lsp.inlay_hints",
@@ -608,6 +619,35 @@ impl App {
                     false,
                 );
             }
+            AppEffect::LspInlineDiagnosticsToggle => {
+                let message = if self.configuration.toggle_inline_diagnostics() {
+                    "Messages beside code: on".to_owned()
+                } else if self.problems_panel.is_none()
+                    && let Some(key) = self.input.reachable_key(
+                        self.configuration.keymaps(),
+                        &self.active_input_context(),
+                        "diagnostic.panel.toggle",
+                    )
+                {
+                    let key = key
+                        .split_whitespace()
+                        .map(|key| if key == "space" { "Space" } else { key })
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    format!("Messages beside code: off · {key} opens Problems")
+                } else {
+                    "Messages beside code: off".to_owned()
+                };
+                self.notify_message(message, false);
+            }
+            AppEffect::LspAutoCompletionToggle => {
+                let enabled = self.configuration.toggle_auto_completion();
+                if !enabled && self.language.completion_automatic() {
+                    self.cancel_lsp_completion();
+                }
+                let state = if enabled { "on" } else { "off" };
+                self.notify_message(format!("Completion while typing: {state}"), false);
+            }
             AppEffect::LspRequest(feature) => {
                 if matches!(feature, LspFeature::Completion) {
                     self.mark_lsp_completion_start(false);
@@ -665,7 +705,12 @@ impl App {
                     {
                         fold.collapsed = !fold.collapsed;
                         if fold.collapsed {
-                            self.place_cursor_at_fold_header(view);
+                            let selection = if line.is_some_and(|line| line > fold.start_line) {
+                                FoldCursorSelection::Clear
+                            } else {
+                                FoldCursorSelection::Preserve
+                            };
+                            self.place_cursor_at_fold_header(view, selection);
                         }
                     }
                 }

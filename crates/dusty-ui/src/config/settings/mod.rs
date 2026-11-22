@@ -59,6 +59,7 @@ pub use workspace::WorkspaceConfig;
 pub use workspace::WorkspaceSearchConfig;
 mod language;
 pub use language::InlayHintLevel;
+pub use language::InlineDiagnostics;
 pub use language::LspConfig;
 pub use language::PersistenceConfig;
 pub use language::SyntaxConfig;

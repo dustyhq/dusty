@@ -60,6 +60,31 @@ impl Keymap {
         node.binding.replace(Binding::PassThrough).is_none()
     }
 
+    /// Sequences this layer binds to a command, before higher layers are considered.
+    #[must_use]
+    pub fn command_sequences(&self, command: &str) -> Vec<Vec<KeyEvent>> {
+        fn collect(
+            node: &TrieNode,
+            command: &str,
+            prefix: &mut Vec<KeyEvent>,
+            sequences: &mut Vec<Vec<KeyEvent>>,
+        ) {
+            if matches!(&node.binding, Some(Binding::Command(invocation)) if invocation.id.as_str() == command)
+            {
+                sequences.push(prefix.clone());
+            }
+            for (key, child) in &node.children {
+                prefix.push(key.clone());
+                collect(child, command, prefix, sequences);
+                prefix.pop();
+            }
+        }
+
+        let mut sequences = Vec::new();
+        collect(&self.root, command, &mut Vec::new(), &mut sequences);
+        sequences
+    }
+
     fn lookup(&self, sequence: &[KeyEvent]) -> Lookup {
         let mut node = &self.root;
         for key in sequence {

@@ -456,6 +456,8 @@ pub enum AppEffect {
     LspAttach,
     LspDetach,
     LspInlayHintsToggle,
+    LspInlineDiagnosticsToggle,
+    LspAutoCompletionToggle,
     ViewToggle(crate::app::configuration::ViewToggle),
     Zen,
     LspRequest(crate::language::lsp::LspFeature),
@@ -1314,6 +1316,8 @@ impl App {
             | AppEffect::LspSessionSelect(..)
             | AppEffect::LspLogs
             | AppEffect::LspInlayHintsToggle
+            | AppEffect::LspInlineDiagnosticsToggle
+            | AppEffect::LspAutoCompletionToggle
             | AppEffect::LspRequest(..)
             | AppEffect::LspCompletionDocumentationOpen
             | AppEffect::LspCompletionMove(..)

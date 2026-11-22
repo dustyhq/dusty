@@ -521,43 +521,53 @@ pub fn render_key_hints(
     if editor_width < 12 || available_height < 4 || hints.rows.is_empty() {
         return;
     }
-    let maximum_rows = usize::from(KEY_HINT_MAX_ROWS.min(available_height.saturating_sub(3)));
-    let row_count = hints
+    let max_columns = usize::from(KEY_HINT_MAX_COLUMNS);
+    let rows_with_header = KEY_HINT_MAX_ROWS.min(available_height.saturating_sub(3));
+    // In a short workspace, put the title in the top border to make room for another row.
+    let rows_before_compacting = hints
         .rows
         .len()
-        .min(maximum_rows.saturating_mul(usize::from(KEY_HINT_MAX_COLUMNS)));
-    let columns = usize::from(KEY_HINT_MAX_COLUMNS)
-        .min(row_count.div_ceil(maximum_rows))
-        .max(1);
+        .min(usize::from(rows_with_header) * max_columns);
+    let compact_header =
+        hints.rows.len() > rows_before_compacting && rows_with_header < KEY_HINT_MAX_ROWS;
+    let title_rows = u16::from(!compact_header);
+    let chrome_rows = 2 + title_rows;
+    let maximum_rows =
+        usize::from(KEY_HINT_MAX_ROWS.min(available_height.saturating_sub(chrome_rows)));
+    let row_count = hints.rows.len().min(maximum_rows * max_columns);
+    let columns = max_columns.min(row_count.div_ceil(maximum_rows)).max(1);
     let rows_per_column = row_count.div_ceil(columns);
-    let desired_height = 3usize.saturating_add(rows_per_column);
+    let desired_height = usize::from(chrome_rows).saturating_add(rows_per_column);
     let box_height = u16::try_from(desired_height)
         .unwrap_or(available_height)
         .min(available_height);
     if box_height < 4 {
         return;
     }
+    let entry_width = |grid: &crate::CellGrid, row: &super::KeyHintUiRow| {
+        grid.display_width(&row.next_key)
+            + grid.display_width(&row.label)
+            + row
+                .icon
+                .as_deref()
+                .map_or(0, |icon| grid.display_width(icon) + 1)
+            + 3
+    };
     let widest = hints
         .rows
         .iter()
-        .take(row_count)
-        .map(|row| {
-            frame.grid.display_width(&row.next_key)
-                + frame.grid.display_width(&row.label)
-                + row
-                    .icon
-                    .as_deref()
-                    .map_or(0, |icon| frame.grid.display_width(icon) + 1)
-                + 3
-        })
+        // Extra entries can use the saved row, not increase the box's original width.
+        .take(rows_before_compacting)
+        .map(|row| entry_width(&frame.grid, row))
         .max()
         .unwrap_or(1);
+    let title = format!("Keys: {}", hints.prefix);
+    let horizontal_chrome = usize::from(KEY_HINT_PADDING) * 2 + 2;
     let desired_width = widest
         .saturating_mul(columns)
         .saturating_add(usize::from(KEY_HINT_COLUMN_GAP).saturating_mul(columns.saturating_sub(1)))
-        .saturating_add(usize::from(KEY_HINT_PADDING).saturating_mul(2))
-        .saturating_add(2)
-        .max(frame.grid.display_width(&hints.prefix) + 10);
+        .saturating_add(horizontal_chrome)
+        .max(frame.grid.display_width(&title) + horizontal_chrome);
     let box_width = u16::try_from(desired_width)
         .unwrap_or(KEY_HINT_MAX_WIDTH)
         .min(KEY_HINT_MAX_WIDTH)
@@ -623,8 +633,8 @@ pub fn render_key_hints(
     }
     frame.grid.put_text_clipped(
         inner_left,
-        top.saturating_add(1),
-        &format!("Keys: {}", hints.prefix),
+        top.saturating_add(title_rows),
+        &title,
         Style::KeyHintPrefix,
         inner_right,
     );

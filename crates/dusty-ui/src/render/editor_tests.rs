@@ -336,6 +336,75 @@ fn nonwrapped_cursor_uses_the_painted_inlay_budget_after_horizontal_scrolling() 
 }
 
 #[test]
+fn inline_diagnostics_filter_only_the_message_beside_code() {
+    use crate::Style;
+    use crate::config::InlineDiagnostics;
+    use crate::editor::text::ByteOffset;
+    use crate::editor::text::ByteRange;
+    use crate::editor::text::TextBuffer;
+    use crate::workspace::DiagnosticSeverity;
+
+    let mut state = EditorState::new("/tmp".into());
+    let path = PathBuf::from("/tmp/file");
+    let (buffer, view) = state
+        .open_text(
+            TextBuffer::from_text("abc\ndef\nghi\njkl"),
+            Some(path.clone()),
+        )
+        .unwrap();
+    let mut ui = ui_with_editor_layout(&state);
+    ui.diagnostics = [
+        (0, DiagnosticSeverity::Warning, "mixed line warning"),
+        (1, DiagnosticSeverity::Error, "test error"),
+        (5, DiagnosticSeverity::Warning, "test warning"),
+        (9, DiagnosticSeverity::Information, "test information"),
+        (13, DiagnosticSeverity::Hint, "test hint"),
+    ]
+    .into_iter()
+    .map(|(start, severity, message)| crate::render::UiDiagnostic {
+        buffer: Some(buffer),
+        path: path.clone(),
+        range: ByteRange::new(ByteOffset(start), ByteOffset(start + 1)).unwrap(),
+        severity,
+        source: String::new(),
+        code: None,
+        message: message.into(),
+    })
+    .collect();
+
+    let mut config = crate::config::load_bundled_config().config;
+    config.ui.status_line.enabled = false;
+    let gutter = crate::render::editor_state_gutter_width(
+        &state,
+        &state.buffers[buffer].text,
+        &config.editor,
+        60,
+    );
+
+    assert_eq!(config.lsp.inline_diagnostics, InlineDiagnostics::All);
+    let frame = crate::render::render_editor_view(&state, view, &ui, &config, 60, 5);
+    assert!(frame.grid.row_text(0).contains("●● test error"));
+    assert!(!frame.grid.row_text(0).contains("mixed line warning"));
+    assert!(frame.grid.row_text(1).contains("●● test warning"));
+    assert!(frame.grid.row_text(2).contains("●● test information"));
+    assert!(frame.grid.row_text(3).contains("●● test hint"));
+
+    config.lsp.inline_diagnostics = InlineDiagnostics::Off;
+    let frame = crate::render::render_editor_view(&state, view, &ui, &config, 60, 5);
+    assert!((0..4).all(|line| !frame.grid.row_text(line).contains("●●")));
+    assert_eq!(
+        frame.grid.get(gutter + 1, 0).unwrap().style,
+        Style::DiagnosticError
+    );
+
+    config.lsp.inline_diagnostics = InlineDiagnostics::Errors;
+    let frame = crate::render::render_editor_view(&state, view, &ui, &config, 60, 5);
+    assert!(frame.grid.row_text(0).contains("●● test error"));
+    assert!(!frame.grid.row_text(0).contains("mixed line warning"));
+    assert!((1..4).all(|line| !frame.grid.row_text(line).contains("●●")));
+}
+
+#[test]
 fn expanded_diagnostics_share_painted_mouse_rows() {
     use crate::editor::text::ByteOffset;
     use crate::editor::text::ByteRange;
