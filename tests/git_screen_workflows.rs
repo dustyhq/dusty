@@ -1610,8 +1610,14 @@ fn filtered_partial_hunk_summary_distinguishes_repo_layer_and_remaining_work_wit
     find_first(&mut screen);
     assert_summary(&mut screen, false);
     assert_eq!(git(root, &["ls-files", "--stage"]), index_before);
+    // Unstaging keeps its undo record under refs/worktree/dusty-unstage; no other ref moves.
+    let refs_after = git(root, &["for-each-ref", "--format=%(refname) %(objectname)"]);
     assert_eq!(
-        git(root, &["for-each-ref", "--format=%(refname) %(objectname)"]),
+        refs_after
+            .lines()
+            .filter(|line| !line.starts_with("refs/worktree/dusty-unstage "))
+            .collect::<Vec<_>>()
+            .join("\n"),
         refs_before
     );
     assert_eq!(git(root, &["rev-parse", "HEAD"]), head_before);

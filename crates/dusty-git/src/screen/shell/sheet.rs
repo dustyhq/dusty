@@ -489,7 +489,14 @@ fn primary_label(app: &GitScreen, form: &Form) -> &'static str {
         },
         FormAction::SourceSearch => "Find",
         FormAction::Discard(_) | FormAction::DiscardFiles(_) => "Discard",
-        FormAction::StageAnyway(_) => "Stage anyway",
+        FormAction::StageAnyway(_) | FormAction::StageConflict { .. } => "Stage anyway",
+        FormAction::OverwriteIgnored { plan, .. } if plan.can_replace() => "Replace and switch",
+        FormAction::ActionMessage {
+            checking_removal: true,
+            ..
+        } => "Cancel check",
+        FormAction::OverwriteIgnored { .. } | FormAction::ActionMessage { .. } => "Close",
+        FormAction::RemoveWorktree { reviewed, .. } if reviewed.is_missing() => "Forget",
         FormAction::Reference(Ref::MergeBranch { .. }) => "Merge",
         FormAction::Reference(Ref::RebaseBranch { .. }) => "Rebase",
         FormAction::Stash => "Stash",
@@ -651,12 +658,22 @@ fn field_rows(field: &Field) -> u16 {
 fn generic(app: &GitScreen, frame: &mut Frame, form: &Form, lay: &Layout) {
     let body = lay.body;
     let mut heights = heights(&form.fields);
-    let content = heights.iter().sum::<u16>();
     let status = status_line(app, form);
+    let replace_path = match &form.action {
+        FormAction::Github(super::super::github::Action::ReplaceLog {
+            destination,
+            path_top,
+            ..
+        }) => Some((destination.path().display().to_string(), path_top)),
+        _ => None,
+    };
     // A run sheet says what its confirm does first (`Running jobs stop…`), then a gap.
     let note = match &form.action {
         FormAction::Github(action) => app.github.sheet_note(action, &form.fields),
         FormAction::StageAnyway(plan) => Some(plan.warning.clone()),
+        FormAction::RemoveWorktree { warning, .. } if !warning.is_empty() => Some(warning.clone()),
+        FormAction::OverwriteIgnored { plan, .. } => Some(plan.warning()),
+        FormAction::ActionMessage { message, .. } => Some(message.clone()),
         _ => None,
     };
     let w = (body.w * 6 / 10).clamp(56.min(body.w), 110.min(body.w));
@@ -667,12 +684,80 @@ fn generic(app: &GitScreen, frame: &mut Frame, form: &Form, lay: &Layout) {
         &form.action,
         FormAction::Github(action) if matches!(action.unscoped(), super::super::github::Action::State(..))
     );
-    let w = if short { w.min(72) } else { w };
-    // The note wraps in the interior less its one-column pad (a rerun's second line says why
-    // failed-only is unavailable), then a gap.
-    let note = note
-        .map(|note| wrap_note(&note, usize::from(w.saturating_sub(6))))
-        .unwrap_or_default();
+    let w = if replace_path
+        .as_ref()
+        .is_some_and(|(path, _)| path.width() > usize::from(w.saturating_sub(6)))
+    {
+        body.w.saturating_sub(2).min(110)
+    } else if short {
+        w.min(72)
+    } else {
+        w
+    };
+    // Wrap paths even when they have no spaces. The question's title alone may clip.
+    let cells = usize::from(w.saturating_sub(6));
+    let wrapped: Vec<_> = form
+        .fields
+        .iter()
+        .zip(&mut heights)
+        .map(|(field, height)| {
+            if !field.read_only || !field.multiline {
+                return None;
+            }
+            let lines = wrap_note(&field.input.input, cells);
+            *height = 1 + lines.len() as u16;
+            Some(lines)
+        })
+        .collect();
+    let content = heights.iter().sum::<u16>();
+    let status = status.map(|(text, error)| {
+        let rows = if replace_path.is_some() {
+            wrap_note(&text, cells)
+                .into_iter()
+                .map(|(line, _)| line)
+                .collect::<Vec<_>>()
+        } else {
+            vec![text]
+        };
+        (rows, error)
+    });
+    let status_rows = status.as_ref().map_or(0, |(rows, _)| rows.len() as u16);
+    let marker_path = match &form.action {
+        FormAction::StageConflict { plan, path_top }
+            if form.title.width()
+                > cells.saturating_sub(
+                    usize::from(chrome::width(glyph(Glyph::Warning, app.icon_mode))) + 1,
+                ) =>
+        {
+            Some((plan.policy.file.display().to_string(), path_top))
+        }
+        _ => None,
+    };
+    let title = if marker_path.is_some() {
+        "Conflict markers remain"
+    } else {
+        &form.title
+    };
+    let confirmation_top = match &form.action {
+        FormAction::RemoveWorktree {
+            warning, note_top, ..
+        } if !warning.is_empty() => Some(note_top),
+        FormAction::OverwriteIgnored { note_top, .. }
+        | FormAction::ActionMessage { note_top, .. } => Some(note_top),
+        _ => None,
+    };
+    let (note, path_top) = if let Some((path, top)) = replace_path.or(marker_path) {
+        let rows = wrap_code(&path, cells)
+            .into_iter()
+            .map(|row| (row, true))
+            .collect::<Vec<_>>();
+        (rows, Some(top))
+    } else {
+        (
+            note.map(|note| wrap_note(&note, cells)).unwrap_or_default(),
+            confirmation_top,
+        )
+    };
     let note_rows = if note.is_empty() {
         0
     } else {
@@ -773,7 +858,7 @@ fn generic(app: &GitScreen, frame: &mut Frame, form: &Form, lay: &Layout) {
             inner.right(),
         );
     }
-    let room = fields_bottom.saturating_sub(inner.y + 1 + note_rows);
+    let room = fields_bottom.saturating_sub((inner.y + 1).saturating_add(note_rows));
     // On a short screen a description gives up rows (down to two) before a field below it
     // drops out of view: every field of the Create sheet shows at 100x30.
     let mut over = heights.iter().sum::<u16>().saturating_sub(room);
@@ -805,6 +890,25 @@ fn generic(app: &GitScreen, frame: &mut Frame, form: &Form, lay: &Layout) {
         let focused = form.selected == index;
         if is_toggle(field) {
             checkbox(app, frame, field, inner.x, y, inner.right(), focused);
+            continue;
+        }
+        if let Some(lines) = &wrapped[index] {
+            frame.grid.put_text_clipped(
+                inner.x + 1,
+                y,
+                &field.label,
+                st(GitRole::Muted, SURFACE),
+                inner.right(),
+            );
+            for (row, (line, _)) in lines.iter().enumerate() {
+                frame.grid.put_text_clipped(
+                    inner.x + 1,
+                    y + 1 + row as u16,
+                    line,
+                    st(GitRole::Text, SURFACE),
+                    inner.right(),
+                );
+            }
             continue;
         }
         if field.read_only {

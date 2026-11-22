@@ -284,6 +284,25 @@ pub(in crate::app) fn register_commands(
     )?;
     register(
         registry,
+        "workspace.git.lines.unstage",
+        "Unstage a range of lines from the staged file",
+        ContextRequirement::Workspace,
+        ArgumentSchema::default()
+            .field("start", ArgumentType::Integer, true)
+            .field("end", ArgumentType::Integer, true),
+        |invocation| {
+            let integer = |name: &str| match invocation.arguments.get(name) {
+                Some(crate::editor::CommandValue::Integer(value)) => *value,
+                _ => -1,
+            };
+            AppEffect::GitLinesUnstage {
+                start: integer("start"),
+                end: integer("end"),
+            }
+        },
+    )?;
+    register(
+        registry,
         "workspace.git.hunks.open",
         "Open Git hunks",
         ContextRequirement::Workspace,
@@ -428,6 +447,7 @@ impl App {
                 }
             }
             AppEffect::GitLinesStage { start, end } => self.stage_git_lines(start, end),
+            AppEffect::GitLinesUnstage { start, end } => self.unstage_git_lines(start, end),
             AppEffect::GitWorktreeCreate { branch, path } => {
                 self.create_git_worktree(branch, path);
             }
@@ -452,7 +472,7 @@ impl App {
             AppEffect::GitBrowse { copy } => self.browse_git_line(copy),
             AppEffect::PullRequestList => self.list_pull_requests(),
             AppEffect::PullRequestComments => self.list_review_comments(),
-            AppEffect::PullRequestComment => self.begin_review_comment(),
+            AppEffect::PullRequestComment => self.begin_review_comment_at_cursor(),
             AppEffect::GitChangesLayerSwitch => {
                 // Only the change surface has a layer to switch; elsewhere this does nothing
                 // rather than reporting an error for a key that has no meaning there.

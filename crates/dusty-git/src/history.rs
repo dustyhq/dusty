@@ -1,11 +1,11 @@
 //! Pull, undo and redo, history rewriting and tag push. Each is a plan the
-//! Git tab shows in a confirm sheet, then runs as one `git` command with the arguments and
-//! environment built here. Nothing in this module writes to the repository.
+//! Git tab shows in a confirm sheet. HEAD changes run as native Git commands; an
+//! index-only undo restores its saved snapshot without touching HEAD or the worktree.
 use git2::{
     DiffOptions, FileMode, Index, IndexEntryExtendedFlag, IndexEntryFlag, IndexTime, Oid,
     Repository, RepositoryState,
 };
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::fs;
 use std::io::ErrorKind;
@@ -193,18 +193,207 @@ pub fn pull_run(mode: PullMode) -> Run {
 
 pub const UNDO_ACTION: &str = "[dusty undo]";
 pub const REDO_ACTION: &str = "[dusty redo]";
+pub(crate) const UNSTAGE_ACTION: &str = "unstage: ";
+const DETACHED_CHECKOUT: &str = " (detached checkout)";
+pub(crate) const SKIPPED_INDEX: &str = " [skipped unstage:";
+const UPDATING_HEAD: &str = ": updating HEAD";
+
+pub(crate) const CHECKOUT_CHANGED: &str = "Your checkout changed. Cancel and try again.";
+pub(crate) const CHECKOUT_CHANGED_AFTER_CLOSE: &str =
+    "Your checkout changed. Open the action again.";
+const COMMIT_OUTSIDE_CHECKOUT: &str = "That commit isn't in the history of your checkout.";
+pub(crate) const FIXUP_WITHOUT_HISTORY: &str =
+    "Git isn't recording checkout history. No fixup commit was written.";
+pub(crate) const CHECKOUT_CHANGED_AT_CAPTURE: &str =
+    "The checked-out branch changed. Press the key again.";
+
+/// A local branch at a particular tip, or a commit checked out directly.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CheckoutTarget {
+    Branch { reference: String, tip: Oid },
+    Detached(Oid),
+}
+
+impl CheckoutTarget {
+    fn from_reflog(name: &str, tip: Oid) -> Self {
+        // Git records a detached source as its full hash. A name alone is not
+        // proof of detachment: don't let a tag stand in for a missing branch.
+        if name == tip.to_string() {
+            Self::Detached(tip)
+        } else {
+            Self::Branch {
+                reference: format!("refs/heads/{name}"),
+                tip,
+            }
+        }
+    }
+
+    pub(crate) fn reference(&self) -> Option<&str> {
+        match self {
+            Self::Branch { reference, .. } => Some(reference),
+            Self::Detached(_) => None,
+        }
+    }
+
+    pub(crate) fn tip(&self) -> Oid {
+        match *self {
+            Self::Branch { tip, .. } | Self::Detached(tip) => tip,
+        }
+    }
+
+    pub(crate) fn revision(&self) -> String {
+        self.reference()
+            .map_or_else(|| self.tip().to_string(), str::to_owned)
+    }
+
+    fn label(&self) -> String {
+        self.reference().map_or_else(
+            || short(self.tip()),
+            |reference| ref_label(reference).to_owned(),
+        )
+    }
+
+    fn local_tip(repository: &Repository, reference: &str) -> Option<Oid> {
+        repository.find_reference(reference).ok()?.target()
+    }
+
+    fn matches_head(&self, repository: &Repository) -> bool {
+        self.matches_head_at(repository, self.tip())
+    }
+
+    fn matches_head_at(&self, repository: &Repository, tip: Oid) -> bool {
+        let Ok(head) = repository.find_reference("HEAD") else {
+            return false;
+        };
+        match self {
+            Self::Branch { reference, .. } => {
+                head.symbolic_target() == Some(reference.as_str())
+                    && Self::local_tip(repository, reference) == Some(tip)
+            }
+            Self::Detached(_) => head.target() == Some(tip),
+        }
+    }
+
+    fn still_exists(&self, repository: &Repository) -> bool {
+        match self {
+            Self::Branch { reference, tip } => Self::local_tip(repository, reference) == Some(*tip),
+            Self::Detached(tip) => repository.find_commit(*tip).is_ok(),
+        }
+    }
+
+    fn switch(&self) -> Run {
+        let args = match self {
+            Self::Branch { reference, .. } => [
+                "switch".into(),
+                "--quiet".into(),
+                "--no-guess".into(),
+                "--".into(),
+                ref_label(reference).into(),
+            ],
+            Self::Detached(tip) => [
+                "switch".into(),
+                "--quiet".into(),
+                "--detach".into(),
+                "--".into(),
+                tip.to_string().into(),
+            ],
+        };
+        Run::new(crate::command::protect_checkout(args))
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum CheckoutCheck {
+    Rewrite(CheckoutTarget),
+    Fixup(CheckoutTarget),
+    Autosquash(CheckoutTarget),
+    CommitUndo {
+        source: CheckoutTarget,
+        target: Oid,
+    },
+    Undo {
+        source: CheckoutTarget,
+        destination: CheckoutTarget,
+    },
+}
+
+impl CheckoutCheck {
+    /// Git updates HEAD before invoking post-checkout. Match both the exact
+    /// branch (or detachment) and its tip, including same-commit branch switches.
+    pub(crate) fn undo_landed(&self, root: &Path) -> bool {
+        open(root).is_ok_and(|repository| match self {
+            Self::CommitUndo { source, target } => source.matches_head_at(&repository, *target),
+            Self::Undo { destination, .. } => destination.matches_head(&repository),
+            _ => false,
+        })
+    }
+
+    pub(crate) fn verify(&self, root: &Path) -> Result<(), String> {
+        let repository = open(root).map_err(|_| CHECKOUT_CHANGED)?;
+        let matches = match self {
+            Self::Rewrite(checkout) => checkout.matches_head(&repository),
+            Self::Fixup(checkout) => {
+                let matches = checkout.matches_head(&repository);
+                // Autosquash needs the HEAD log to identify the exact commit left by
+                // this step. A missing log may stay missing if Git isn't logging.
+                if matches
+                    && (!repository.reference_has_log("HEAD").unwrap_or(false)
+                        || repository.reflog("HEAD").is_err())
+                {
+                    return Err(FIXUP_WITHOUT_HISTORY.into());
+                }
+                matches
+            }
+            Self::Autosquash(before) => {
+                // Only accept the commit made by the immediately preceding fixup
+                // step, on the approved checkout. A hook could have switched
+                // branches (even to the same commit) or moved HEAD again.
+                let Some(tip) = repository.reflog("HEAD").ok().and_then(|log| {
+                    let entry = log.get(0)?;
+                    (entry.id_old() == before.tip()
+                        && entry.message()?.starts_with("commit: fixup! "))
+                    .then(|| entry.id_new())
+                }) else {
+                    return Err(CHECKOUT_CHANGED.into());
+                };
+                let mut after = before.clone();
+                match &mut after {
+                    CheckoutTarget::Branch { tip: expected, .. }
+                    | CheckoutTarget::Detached(expected) => *expected = tip,
+                }
+                after.matches_head(&repository)
+            }
+            Self::CommitUndo { source, target } => {
+                if !source.matches_head(&repository) {
+                    return Err(CHECKOUT_CHANGED.into());
+                }
+                settled(&repository)?;
+                return check_staged(&repository, source.tip(), *target);
+            }
+            Self::Undo {
+                source,
+                destination,
+            } => source.matches_head(&repository) && destination.still_exists(&repository),
+        };
+        if matches {
+            Ok(())
+        } else {
+            Err(CHECKOUT_CHANGED.into())
+        }
+    }
+}
 
 /// What one reflog action moved.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Move {
     /// A commit, reset, pull, merge or a whole rebase: HEAD went from one commit to another.
     Commit { from: Oid, to: Oid },
+    /// Unstage changed only the index. HEAD's reflog names its saved snapshots.
+    Index { record: Oid, head: Oid },
     /// A branch switch: from one branch (or detached commit) to another.
     Checkout {
-        from: String,
-        from_id: Oid,
-        to: String,
-        to_id: Oid,
+        from: CheckoutTarget,
+        to: CheckoutTarget,
     },
 }
 
@@ -212,9 +401,13 @@ pub enum Move {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Undo {
     pub redo: bool,
-    /// The reflog line of the action, as Git wrote it.
+    /// The action as shown in the confirmation.
     pub entry: String,
     pub moved: Move,
+    commit_source: Option<CheckoutTarget>,
+    // These entries did not apply when walking back to this action. Record the
+    // skip only when the chosen action runs, so Redo won't replay them.
+    skipped_index: Vec<Oid>,
 }
 
 impl Undo {
@@ -222,53 +415,131 @@ impl Undo {
     pub fn head(&self) -> (String, String) {
         let (from, to) = match &self.moved {
             Move::Commit { from, to } => (short(*from), short(*to)),
-            Move::Checkout { from, to, .. } => (from.clone(), to.clone()),
+            Move::Index { head, .. } => (short(*head), short(*head)),
+            Move::Checkout { from, to } => (from.label(), to.label()),
         };
         if self.redo { (from, to) } else { (to, from) }
     }
 
-    pub(crate) fn head_change(&self) -> String {
-        let (from, to) = self.head();
-        if let Move::Checkout { from_id, to_id, .. } = self.moved {
-            let target_id = if self.redo { to_id } else { from_id };
-            format!("{from} → {to} ({})", short(target_id))
-        } else {
-            format!("{from} → {to}")
-        }
+    fn checkout(&self) -> Option<(&CheckoutTarget, &CheckoutTarget)> {
+        let Move::Checkout { from, to } = &self.moved else {
+            return None;
+        };
+        Some(if self.redo { (from, to) } else { (to, from) })
+    }
+
+    pub(crate) fn checkout_destination(&self) -> Option<&CheckoutTarget> {
+        self.checkout().map(|(_, destination)| destination)
     }
 
     /// Builds the command for display or execution after rechecking the plan with `undo`.
-    /// `reset --keep` protects the working copy, not the index; `checkout` as a branch
-    /// switch also protects staged changes. Tag the reflog entry so `z` can walk back.
-    pub fn run(&self) -> Run {
-        let action = if self.redo { REDO_ACTION } else { UNDO_ACTION };
+    pub fn run(&self) -> Option<Run> {
+        let mut action = self.reflog_action();
         let run = match &self.moved {
+            Move::Index { .. } => return None,
             Move::Commit { from, to } => {
-                let target = if self.redo { to } else { from };
-                Run::new(["reset".into(), "--keep".into(), target.to_string()])
+                let source = self.commit_source.as_ref().expect("commit undo source");
+                let target = if self.redo { *to } else { *from };
+                // A two-tree switch keeps index entries on unchanged paths and
+                // refuses collisions on changed ones. Keep the current HEAD kind.
+                // Keep switch's success chatter out of hook diagnostics.
+                let mut args: Vec<OsString> = vec!["switch".into(), "--quiet".into()];
+                if let Some(branch) = source.reference() {
+                    args.extend(["--no-track", "-C", ref_label(branch)].map(OsString::from));
+                } else {
+                    args.push("--detach".into());
+                }
+                args.push("--".into());
+                args.push(target.to_string().into());
+                action.push_str(UPDATING_HEAD);
+                Run::new(crate::command::protect_checkout(args)).checked(
+                    CheckoutCheck::CommitUndo {
+                        source: source.clone(),
+                        target,
+                    },
+                )
             }
-            Move::Checkout { from, to, .. } => {
-                let target = if self.redo { to } else { from };
-                Run::new([
-                    "checkout".into(),
-                    "--no-guess".into(),
-                    target.clone(),
-                    "--".into(),
-                ])
+            Move::Checkout { .. } => {
+                let (source, destination) = self.checkout()?;
+                destination.switch().checked(CheckoutCheck::Undo {
+                    source: source.clone(),
+                    destination: destination.clone(),
+                })
             }
         };
-        run.with("GIT_REFLOG_ACTION", action)
+        Some(run.with("GIT_REFLOG_ACTION", action))
+    }
+
+    fn reflog_action(&self) -> String {
+        let mut action = if self.redo { REDO_ACTION } else { UNDO_ACTION }.to_owned();
+        if matches!(
+            &self.moved,
+            Move::Checkout {
+                to: CheckoutTarget::Detached(_),
+                ..
+            }
+        ) {
+            action.push_str(DETACHED_CHECKOUT);
+        }
+        if !self.skipped_index.is_empty() {
+            action.push_str(SKIPPED_INDEX);
+            for (i, record) in self.skipped_index.iter().enumerate() {
+                if i != 0 {
+                    action.push(',');
+                }
+                action.push_str(&record.to_string());
+            }
+            action.push(']');
+        }
+        action
+    }
+
+    /// Restore the saved index after rechecking the confirmed history entry.
+    pub(crate) fn restore_index(&self, root: &Path) -> Result<(), String> {
+        let Move::Index { record, head } = self.moved else {
+            return Err("This action doesn't change only the staged files".into());
+        };
+        if undo(root, self.redo)? != *self {
+            return Err("Undo history changed. Open Undo again.".into());
+        }
+        crate::mutation::apply_index_undo(
+            &open(root)?,
+            record,
+            head,
+            self.redo,
+            &self.reflog_action(),
+        )
     }
 }
 
-/// A reset replaces the index even for paths unchanged between the two commits.
-fn check_staged(repository: &Repository, head: Oid) -> Result<(), String> {
+/// Refuse to overwrite staged-only content on paths the commit move can touch.
+fn check_staged(repository: &Repository, head: Oid, target: Oid) -> Result<(), String> {
     let unreadable = "Can't check staged changes. Nothing was changed.";
     let workdir = repository.workdir().ok_or(unreadable)?;
     let tree = repository
         .find_commit(head)
         .and_then(|commit| commit.tree())
         .map_err(|_| unreadable)?;
+    let target = repository
+        .find_commit(target)
+        .and_then(|commit| commit.tree())
+        .map_err(|_| unreadable)?;
+    let changed = repository
+        .diff_tree_to_tree(Some(&tree), Some(&target), None)
+        .map_err(|_| unreadable)?;
+    let touched = changed
+        .deltas()
+        .map(|delta| {
+            delta
+                .new_file()
+                .path()
+                .map(Path::to_owned)
+                .ok_or(unreadable)
+        })
+        .collect::<Result<BTreeSet<_>, _>>()?;
+    if touched.is_empty() {
+        return Ok(());
+    }
     let mut index = repository.index().map_err(|_| unreadable)?;
     // libgit2 can omit added entries marked assume-unchanged from the staged diff.
     // Clear that flag in this read-only snapshot, not in the on-disk index.
@@ -299,6 +570,16 @@ fn check_staged(repository: &Repository, head: Oid) -> Result<(), String> {
     let mut mismatches = BTreeSet::new();
     for delta in staged.deltas() {
         let path = delta.new_file().path().ok_or(unreadable)?;
+        // An ancestor/descendant can also collide in a file/directory replacement.
+        use std::ops::Bound::{Included, Unbounded};
+        if !path.ancestors().any(|parent| touched.contains(parent))
+            && !touched
+                .range::<Path, _>((Included(path), Unbounded))
+                .next()
+                .is_some_and(|p| p.starts_with(path))
+        {
+            continue;
+        }
         let disk = workdir.join(path);
         let entry = index
             .get_path(path, 0)
@@ -392,35 +673,85 @@ pub fn undo(root: &Path, redo: bool) -> Result<Undo, String> {
     let repository = open(root)?;
     settled(&repository)?;
     let reflog = repository.reflog("HEAD").map_err(failed)?;
+    let mut detached_at = repository
+        .find_reference("HEAD")
+        .ok()
+        .and_then(|head| head.target());
     let mut counter = 0i32;
+    let mut skipped_index = Vec::new();
+    let mut past_skips = BTreeMap::<Oid, usize>::new();
+    // At each undo depth, remember the newest replay of that action, in the
+    // original direction. A bare marker can't tell us how HEAD was checked out.
+    let mut replays = BTreeMap::new();
     let mut finish: Option<Oid> = None;
     for entry in reflog.iter() {
-        let message = entry.message().unwrap_or("").to_owned();
+        let message = entry.message().unwrap_or("");
         let (old, new) = (entry.id_old(), entry.id_new());
+        // Follow live detachment back only through a continuous chain of
+        // commits and resets. A switch or an unknown entry breaks that proof.
+        let detached_destination = detached_at == Some(new);
+        detached_at =
+            (detached_destination && preserves_checkout(message.trim_end())).then_some(old);
         let moved = if let Some(to) = finish {
-            if rebase_step(&message) == Some("start") {
+            if rebase_step(message) == Some("start") {
                 finish = None;
                 Some(Move::Commit { from: old, to })
             } else {
                 None
             }
-        } else if message.starts_with(UNDO_ACTION) {
+        } else if let Some(detail) = message.strip_prefix(UNDO_ACTION) {
+            let detail = if let Some((detail, skipped)) = detail.split_once(SKIPPED_INDEX) {
+                if let Some((records, _)) = skipped.split_once(']') {
+                    for record in records.split(',').filter_map(|id| Oid::from_str(id).ok()) {
+                        *past_skips.entry(record).or_default() += 1;
+                    }
+                }
+                detail
+            } else {
+                detail
+            };
             counter += 1;
+            replays
+                .entry(counter)
+                .or_insert_with(|| (detail.trim_end() == DETACHED_CHECKOUT).then_some((new, old)));
             None
-        } else if message.starts_with(REDO_ACTION) {
+        } else if let Some(detail) = message.strip_prefix(REDO_ACTION) {
+            replays
+                .entry(counter)
+                .or_insert_with(|| (detail.trim_end() == DETACHED_CHECKOUT).then_some((old, new)));
             counter -= 1;
             None
-        } else if matches!(rebase_step(&message), Some("finish" | "abort")) {
+        } else if matches!(rebase_step(message), Some("finish" | "abort")) {
             finish = Some(new);
             None
-        } else if rebase_step(&message) == Some("start") {
+        } else if rebase_step(message) == Some("start") {
             return Err("A rebase is in progress: continue or abort it first (C or X)".into());
+        } else if let Some(record) = message.strip_prefix(UNSTAGE_ACTION) {
+            let Ok(record) = Oid::from_str(record) else {
+                continue;
+            };
+            if let Some(skips) = past_skips.get_mut(&record)
+                && *skips != 0
+            {
+                *skips -= 1;
+                continue;
+            }
+            Some(Move::Index { record, head: new })
         } else if let Some(rest) = message.strip_prefix("checkout: moving from ") {
-            rest.split_once(" to ").map(|(from, to)| Move::Checkout {
-                from: from.to_owned(),
-                from_id: old,
-                to: to.trim_end().to_owned(),
-                to_id: new,
+            rest.split_once(" to ").map(|(from, to)| {
+                // Git writes the literal destination (e.g. a tag), not whether it
+                // detached. Require proof from live HEAD or a replay of this
+                // specific move. Never guess based on revision lookup.
+                let detached =
+                    detached_destination || replays.get(&counter) == Some(&Some((old, new)));
+                Move::Checkout {
+                    from: CheckoutTarget::from_reflog(from, old),
+                    to: if detached {
+                        CheckoutTarget::Detached(new)
+                    } else {
+                        CheckoutTarget::from_reflog(to.trim_end(), new)
+                    },
+                }
             })
         } else if message == crate::rewrite::REFLOG_ACTION
             || [
@@ -456,15 +787,38 @@ pub fn undo(root: &Path, redo: bool) -> Result<Undo, String> {
             counter == 0
         };
         if fire {
-            let undo = Undo {
+            let head = repository.head().ok().and_then(|head| head.target());
+            let unexpected_head = "Undo can't follow the last change to HEAD.";
+            if let Move::Index {
+                record,
+                head: expected,
+            } = moved
+            {
+                let matches_head = head.unwrap_or_else(Oid::zero) == expected;
+                let applies =
+                    matches_head && crate::mutation::index_undo_matches(&repository, record, redo)?;
+                if !applies && !redo {
+                    skipped_index.push(record);
+                    continue;
+                }
+                if !matches_head {
+                    return Err(unexpected_head.into());
+                }
+                if !applies {
+                    return Err("The staged changes have changed since unstaging".into());
+                }
+            }
+            let mut undo = Undo {
                 redo,
-                entry: message.trim_end().to_owned(),
+                entry: if matches!(moved, Move::Index { .. }) {
+                    "Unstage changes".into()
+                } else {
+                    message.trim_end().to_owned()
+                },
                 moved,
                 commit_source: None,
                 skipped_index,
             };
-            let head = repository.head().ok().and_then(|head| head.target());
-            let unexpected_head = "Undo can't follow the last change to HEAD.";
             match &undo.moved {
                 Move::Index { .. } => {}
                 Move::Commit { from, to } => {
@@ -475,35 +829,15 @@ pub fn undo(root: &Path, redo: bool) -> Result<Undo, String> {
                     if !redo && from.is_zero() {
                         return Err("The first commit has nothing before it to return to".into());
                     }
-                    check_staged(&repository, expected_head)?;
+                    check_staged(&repository, expected_head, if redo { *to } else { *from })?;
+                    undo.commit_source = Some(checked_out_history(&repository, "HEAD")?);
                 }
-                Move::Checkout {
-                    from,
-                    from_id,
-                    to,
-                    to_id,
-                } => {
-                    let ((source, source_id), (target, target_id)) = if redo {
-                        ((from, *from_id), (to, *to_id))
-                    } else {
-                        ((to, *to_id), (from, *from_id))
-                    };
-                    if head != Some(source_id)
-                        || branch(&repository)?.is_some_and(|current| &current != source)
-                    {
-                        return Err(unexpected_head.into());
+                Move::Checkout { .. } => {
+                    let (source, target) = undo.checkout().expect("checkout action");
+                    if !source.matches_head(&repository) {
+                        return Err("Your current checkout no longer matches that action.".into());
                     }
-                    // Checkout prefers the local branch over a same-named tag. A
-                    // detached checkout can instead be recorded as a commit or tag.
-                    let actual = match repository.find_branch(target, git2::BranchType::Local) {
-                        Ok(branch) => branch.get().peel_to_commit().map(|commit| commit.id()),
-                        Err(error) if error.code() == git2::ErrorCode::NotFound => repository
-                            .revparse_single(target)
-                            .and_then(|object| object.peel_to_commit())
-                            .map(|commit| commit.id()),
-                        Err(error) => Err(error),
-                    };
-                    if actual.ok() != Some(target_id) {
+                    if !target.still_exists(&repository) {
                         return Err(format!(
                             "{} has moved since you left it. Check it out from Branches instead.",
                             target.label()
@@ -882,12 +1216,12 @@ pub fn push_tag(remote: &str, tag: &str) -> Result<Run, String> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::fs;
     use std::process::Command;
 
-    fn git(root: &Path, args: &[&str]) -> String {
+    pub(crate) fn git(root: &Path, args: &[&str]) -> String {
         git_env(root, args, &[])
     }
 
@@ -920,6 +1254,9 @@ mod tests {
     }
 
     fn run(root: &Path, run: &Run) {
+        if let Some(check) = &run.check {
+            check.verify(root).unwrap();
+        }
         let args = run
             .args
             .iter()
@@ -928,7 +1265,7 @@ mod tests {
         git_env(root, &args, &run.env);
     }
 
-    fn repo() -> tempfile::TempDir {
+    pub(crate) fn repo() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         git(root, &["init", "--template=", "-b", "main"]);
@@ -939,19 +1276,182 @@ mod tests {
         dir
     }
 
-    fn commit(root: &Path, name: &str) -> Oid {
+    pub(crate) fn commit(root: &Path, name: &str) -> Oid {
         fs::write(root.join(name), format!("{name}\n")).unwrap();
         git(root, &["add", "--", name]);
         git(root, &["commit", "-q", "-m", name]);
         head(root)
     }
 
-    fn head(root: &Path) -> Oid {
+    pub(crate) fn head(root: &Path) -> Oid {
         Oid::from_str(&git(root, &["rev-parse", "HEAD"])).unwrap()
     }
 
     fn subjects(root: &Path) -> String {
         git(root, &["log", "--format=%s"]).replace('\n', " ")
+    }
+
+    fn unstage_fixture(root: &Path, file: &str) {
+        use crate::mutation::{GitMutationRequestId, git_head_id, git_index_fingerprint};
+        crate::mutation::unstage_paths(
+            GitMutationRequestId(1),
+            root,
+            &[Path::new(file).to_path_buf()].into(),
+            git_index_fingerprint(root).unwrap(),
+            git_head_id(root).unwrap(),
+            &std::sync::atomic::AtomicBool::new(false),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn undo_and_redo_interleave_commits_and_unstage() {
+        let dir = repo();
+        let root = dir.path();
+        let base = commit(root, "edit.txt");
+        fs::write(root.join("edit.txt"), "staged only\n").unwrap();
+        git(root, &["add", "edit.txt"]);
+        fs::write(root.join("edit.txt"), "working copy\n").unwrap();
+        unstage_fixture(root, "edit.txt");
+        let tip = commit(root, "tip");
+
+        let commit_undo = undo(root, false).unwrap();
+        assert_eq!(
+            commit_undo.moved,
+            Move::Commit {
+                from: base,
+                to: tip
+            }
+        );
+        run(root, &commit_undo.run().unwrap());
+        let index_undo = undo(root, false).unwrap();
+        assert!(matches!(index_undo.moved, Move::Index { .. }));
+        index_undo.restore_index(root).unwrap();
+        assert_eq!(git(root, &["show", ":edit.txt"]), "staged only");
+        assert_eq!(head(root), base);
+        assert_eq!(
+            fs::read_to_string(root.join("edit.txt")).unwrap(),
+            "working copy\n"
+        );
+
+        let index_redo = undo(root, true).unwrap();
+        assert_eq!(index_redo.moved, index_undo.moved);
+        index_redo.restore_index(root).unwrap();
+        assert_eq!(git(root, &["show", ":edit.txt"]), "edit.txt");
+        let commit_redo = undo(root, true).unwrap();
+        assert_eq!(commit_redo.moved, commit_undo.moved);
+        run(root, &commit_redo.run().unwrap());
+        assert_eq!(head(root), tip);
+    }
+
+    #[test]
+    fn redo_unstage_after_undoing_and_redoing_an_unrelated_commit() {
+        let dir = repo();
+        let root = dir.path();
+        let base = commit(root, "edit.txt");
+        let tip = commit(root, "tip");
+        fs::write(root.join("edit.txt"), "staged only\n").unwrap();
+        git(root, &["add", "edit.txt"]);
+        fs::write(root.join("edit.txt"), "working copy\n").unwrap();
+        unstage_fixture(root, "edit.txt");
+
+        let index_undo = undo(root, false).unwrap();
+        index_undo.restore_index(root).unwrap();
+        for (redo, expected_head) in [(false, base), (true, tip)] {
+            let plan = undo(root, redo).unwrap();
+            assert_eq!(
+                plan.moved,
+                Move::Commit {
+                    from: base,
+                    to: tip
+                }
+            );
+            run(root, &plan.run().unwrap());
+            assert_eq!(head(root), expected_head);
+            assert_eq!(git(root, &["show", ":edit.txt"]), "staged only");
+        }
+        let index_redo = undo(root, true).unwrap();
+        assert_eq!(index_redo.moved, index_undo.moved);
+        index_redo.restore_index(root).unwrap();
+        assert_eq!(head(root), tip);
+        assert_eq!(git(root, &["show", ":edit.txt"]), "edit.txt");
+        assert_eq!(fs::read(root.join("edit.txt")).unwrap(), b"working copy\n");
+    }
+
+    #[test]
+    fn bulk_unstage_undo_works_before_the_first_commit_and_in_a_linked_worktree() {
+        let dir = repo();
+        let root = dir.path();
+        fs::write(root.join("first.txt"), "staged only\n").unwrap();
+        git(root, &["add", "first.txt"]);
+        fs::write(root.join("first.txt"), "working copy\n").unwrap();
+        unstage_fixture(root, "first.txt");
+        assert!(git(root, &["ls-files", "--", "first.txt"]).is_empty());
+        undo(root, false).unwrap().restore_index(root).unwrap();
+        assert_eq!(git(root, &["show", ":first.txt"]), "staged only");
+        assert_eq!(
+            fs::read_to_string(root.join("first.txt")).unwrap(),
+            "working copy\n"
+        );
+
+        git(root, &["commit", "-m", "First"]);
+        let linked = root.join("linked");
+        git(
+            root,
+            &["worktree", "add", "-b", "other", linked.to_str().unwrap()],
+        );
+        fs::write(linked.join("first.txt"), "linked only\n").unwrap();
+        git(&linked, &["add", "first.txt"]);
+        fs::write(linked.join("first.txt"), "linked working copy\n").unwrap();
+        unstage_fixture(&linked, "first.txt");
+        assert_eq!(git(&linked, &["show", ":first.txt"]), "staged only");
+        undo(&linked, false)
+            .unwrap()
+            .restore_index(&linked)
+            .unwrap();
+        assert_eq!(git(&linked, &["show", ":first.txt"]), "linked only");
+        assert_eq!(git(root, &["show", ":first.txt"]), "staged only");
+    }
+
+    #[test]
+    fn restaging_does_not_block_older_undo_or_poison_redo() {
+        let dir = repo();
+        let root = dir.path();
+        let base = commit(root, "edit.txt");
+        let tip = commit(root, "tip");
+        fs::write(root.join("edit.txt"), "new edit\n").unwrap();
+        git(root, &["add", "edit.txt"]);
+        unstage_fixture(root, "edit.txt");
+        let recovery = undo(root, false).unwrap();
+        let Move::Index { record, .. } = recovery.moved else {
+            panic!("expected an index action");
+        };
+        git(root, &["add", "edit.txt"]);
+
+        let plan = undo(root, false).unwrap();
+        assert_eq!(
+            plan.moved,
+            Move::Commit {
+                from: base,
+                to: tip
+            }
+        );
+        assert_eq!(git(root, &["show", ":edit.txt"]), "new edit");
+        assert!(Repository::open(root).unwrap().find_tree(record).is_ok());
+        run(root, &plan.run().unwrap());
+        assert_eq!(head(root), base);
+        assert_eq!(git(root, &["show", ":edit.txt"]), "new edit");
+
+        let redo = undo(root, true).unwrap();
+        assert_eq!(redo.moved, plan.moved);
+        run(root, &redo.run().unwrap());
+        assert_eq!(head(root), tip);
+        assert_eq!(git(root, &["show", ":edit.txt"]), "new edit");
+        assert_eq!(undo(root, false).unwrap().moved, plan.moved);
+        assert_eq!(
+            fs::read_to_string(root.join("edit.txt")).unwrap(),
+            "new edit\n"
+        );
     }
 
     #[test]
@@ -966,11 +1466,11 @@ mod tests {
         assert_eq!(first.entry, "commit: c");
         assert_eq!(first.head(), (short(c), short(b)));
         assert!(matches!(undo(root, true), Err(message) if message == "Nothing to redo"));
-        run(root, &first.run());
+        run(root, &first.run().unwrap());
         assert_eq!(head(root), b);
         let second = undo(root, false).unwrap();
         assert_eq!(second.moved, Move::Commit { from: a, to: b });
-        run(root, &second.run());
+        run(root, &second.run().unwrap());
         assert_eq!(head(root), a);
         assert!(
             undo(root, false).is_err(),
@@ -978,13 +1478,13 @@ mod tests {
         );
         let again = undo(root, true).unwrap();
         assert_eq!(again.head(), (short(a), short(b)));
-        run(root, &again.run());
+        run(root, &again.run().unwrap());
         assert_eq!(head(root), b);
-        run(root, &undo(root, true).unwrap().run());
+        run(root, &undo(root, true).unwrap().run().unwrap());
         assert_eq!(head(root), c);
         assert!(undo(root, true).is_err());
         // Undo after the redos starts from the newest action again.
-        run(root, &undo(root, false).unwrap().run());
+        run(root, &undo(root, false).unwrap().run().unwrap());
         assert_eq!(head(root), b);
     }
 
@@ -993,18 +1493,24 @@ mod tests {
         let dir = repo();
         let root = dir.path();
         let base = commit(root, "edit.txt");
-        let tip = commit(root, "history.txt");
+        fs::write(root.join("edit.txt"), "tip edit\n").unwrap();
+        fs::write(root.join("new.txt"), "tip new file\n").unwrap();
+        git(root, &["add", "edit.txt", "new.txt"]);
+        git(root, &["commit", "-m", "Touch both paths"]);
+        let tip = head(root);
         // Capture the redo plan's source while the checkout is still clean.
-        run(root, &undo(root, false).unwrap().run());
+        run(root, &undo(root, false).unwrap().run().unwrap());
 
         for (redo, current, target) in [(true, base, tip), (false, tip, base)] {
+            let approved = undo(root, redo).unwrap().run().unwrap();
+            let clean_edit = git(root, &["show", "HEAD:edit.txt"]) + "\n";
             fs::write(root.join("edit.txt"), "staged only\n").unwrap();
             git(root, &["add", "edit.txt"]);
-            fs::write(root.join("edit.txt"), "edit.txt\n").unwrap();
-            assert_eq!(
-                undo(root, redo).unwrap_err(),
-                "Undo would drop staged changes in edit.txt. Commit or unstage them first."
-            );
+            fs::write(root.join("edit.txt"), &clean_edit).unwrap();
+            let refusal =
+                "Undo would drop staged changes in edit.txt. Commit or unstage them first.";
+            assert_eq!(undo(root, redo).unwrap_err(), refusal);
+            assert_eq!(approved.check.unwrap().verify(root).unwrap_err(), refusal);
 
             fs::write(root.join("new.txt"), "new staged file\n").unwrap();
             git(root, &["add", "new.txt"]);
@@ -1018,16 +1524,17 @@ mod tests {
             assert_eq!(fs::read(root.join(".git/index")).unwrap(), index);
             assert_eq!(git(root, &["show", ":edit.txt"]), "staged only");
             assert_eq!(git(root, &["show", ":new.txt"]), "new staged file");
-            assert_eq!(fs::read(root.join("edit.txt")).unwrap(), b"edit.txt\n");
+            assert_eq!(
+                fs::read_to_string(root.join("edit.txt")).unwrap(),
+                clean_edit
+            );
             assert!(!root.join("new.txt").exists());
             assert_eq!(head(root), current);
 
-            // Once the replacement is also on disk, reset may unstage it.
-            git(root, &["reset", "-q", "HEAD", "--", "new.txt"]);
-            fs::write(root.join("edit.txt"), "staged only\n").unwrap();
-            run(root, &undo(root, redo).unwrap().run());
+            // Resolve the collision explicitly before retrying the commit move.
+            git(root, &["reset", "--hard", "HEAD"]);
+            run(root, &undo(root, redo).unwrap().run().unwrap());
             assert_eq!(head(root), target);
-            assert_eq!(fs::read(root.join("edit.txt")).unwrap(), b"staged only\n");
         }
     }
 
@@ -1154,9 +1661,97 @@ mod tests {
         );
         assert_eq!(head(root), main);
         git(root, &["branch", "-f", "topic", &base.to_string()]);
-        run(root, &undo(root, true).unwrap().run());
+        run(root, &undo(root, true).unwrap().run().unwrap());
         assert_eq!(head(root), base);
         assert_eq!(git(root, &["branch", "--show-current"]), "topic");
+    }
+
+    #[test]
+    fn checkout_undo_never_substitutes_a_same_named_tag_for_the_branch() {
+        let dir = repo();
+        let root = dir.path();
+        let original = commit(root, "a");
+        git(root, &["tag", "main"]);
+        git(root, &["switch", "-q", "-c", "topic"]);
+        let approved = undo(root, false).unwrap().run().unwrap();
+        let check = approved.check.as_ref().unwrap();
+        check.verify(root).unwrap();
+
+        git(root, &["branch", "-D", "main"]);
+        assert_eq!(
+            git(root, &["rev-parse", "refs/tags/main"]),
+            original.to_string()
+        );
+        assert_eq!(
+            undo(root, false).unwrap_err(),
+            "main has moved since you left it. Check it out from Branches instead."
+        );
+        assert_eq!(check.verify(root).unwrap_err(), CHECKOUT_CHANGED);
+        assert_eq!(git(root, &["branch", "--show-current"]), "topic");
+    }
+
+    #[test]
+    fn checkout_undo_and_redo_remember_a_named_detachment() {
+        let dir = repo();
+        let root = dir.path();
+        let tagged = commit(root, "a");
+        git(root, &["tag", "v1.0"]);
+        let main = commit(root, "b");
+        git(root, &["checkout", "-q", "v1.0"]);
+        let detached = commit(root, "detached");
+
+        for _ in 0..2 {
+            run(root, &undo(root, false).unwrap().run().unwrap());
+            assert_eq!(git(root, &["branch", "--show-current"]), "");
+            assert_eq!(head(root), tagged);
+
+            run(root, &undo(root, false).unwrap().run().unwrap());
+            assert_eq!(git(root, &["branch", "--show-current"]), "main");
+            assert_eq!(head(root), main);
+
+            // Redo the approved detachment, not a new resolution of the tag.
+            git(root, &["tag", "-f", "v1.0", &main.to_string()]);
+            let plan = undo(root, true).unwrap();
+            assert_eq!(
+                plan.checkout_destination(),
+                Some(&CheckoutTarget::Detached(tagged))
+            );
+            run(root, &plan.run().unwrap());
+            assert_eq!(git(root, &["branch", "--show-current"]), "");
+            assert_eq!(head(root), tagged);
+
+            run(root, &undo(root, true).unwrap().run().unwrap());
+            assert_eq!(git(root, &["branch", "--show-current"]), "");
+            assert_eq!(head(root), detached);
+        }
+    }
+
+    #[test]
+    fn detached_rewrite_checks_ancestry_before_refusing_merges() {
+        let dir = repo();
+        let root = dir.path();
+        let base = commit(root, "base");
+        git(root, &["switch", "-q", "-c", "outside"]);
+        let outside = commit(root, "outside");
+        git(root, &["switch", "-q", "-c", "merged", &base.to_string()]);
+        let merged = commit(root, "merged");
+        git(root, &["switch", "-q", "main"]);
+        commit(root, "main-change");
+        git(root, &["merge", "--no-ff", "-m", "merge topic", "merged"]);
+        let merge = head(root);
+        git(root, &["switch", "-q", "--detach", &merge.to_string()]);
+
+        assert_eq!(
+            rewrite(root, "HEAD", outside, Edit::Drop).unwrap_err(),
+            COMMIT_OUTSIDE_CHECKOUT
+        );
+        assert_eq!(
+            rewrite(root, "HEAD", merged, Edit::Drop).unwrap_err(),
+            format!(
+                "{} is a merge commit: rewriting across merges is not supported",
+                short(merge)
+            )
+        );
     }
 
     #[test]

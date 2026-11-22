@@ -1,5 +1,7 @@
 //! Checked staging, reset and repository change plans.
 
+use std::collections::BTreeSet;
+use std::ffi::OsString;
 use std::hash::Hash;
 use std::hash::Hasher;
 use std::path::Path;
@@ -66,7 +68,7 @@ fn index_entries_fingerprint(
         hash.update(e.flags.to_le_bytes());
         hash.update(e.flags_extended.to_le_bytes());
     }
-    Ok(GitIndexFingerprint(hash.finalize().into()))
+    GitIndexFingerprint(hash.finalize().into())
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct GitMutationRequestId(pub u64);
@@ -209,6 +211,8 @@ pub enum GitMutationKind {
     StageFile,
     /// Whole file in the index back to HEAD; the worktree is untouched.
     UnstageFile,
+    /// A set of files restored together in one index write.
+    UnstageFiles,
     /// One staged hunk in the index back to HEAD; the worktree is untouched.
     UnstageHunk,
     /// An exact line range inside one unstaged hunk, from the worktree into the index.
@@ -243,6 +247,8 @@ pub enum GitMutationError {
     UnsavedDocument,
     #[error("the selected line range is invalid for the captured hunk")]
     InvalidRange,
+    #[error("Select the last line's line ending too")]
+    NeedsLineEnding,
     #[error("nothing was selected")]
     NothingSelected,
     #[error("the operation requires a captured hunk selection")]
@@ -299,16 +305,47 @@ impl GitMutationWorker {
                     && (request.expected_worktree.is_some() || request.selected.new_mode == 0),
                 &request.policy,
             )?,
-            GitMutationRequest::ResetUnstagedHunk(request) => validate_legacy_request(
-                request.maximum_patch_bytes,
-                request.hunk_snapshot_revision,
-                request.policy.layer,
-                request.expected_index.is_some()
-                    && (request.expected_worktree.is_some() || request.selected.new_mode == 0),
-                &request.policy,
-            )?,
+            GitMutationRequest::ResetUnstagedHunk(request) => {
+                validate_legacy_request(
+                    request.maximum_patch_bytes,
+                    request.hunk_snapshot_revision,
+                    request.policy.layer,
+                    request.expected_index.is_some()
+                        && (request.expected_worktree.is_some() || request.selected.new_mode == 0),
+                    &request.policy,
+                )?;
+                validate_reset_selection(&request.selected, &request.selected_lines)?;
+            }
             GitMutationRequest::Plan(plan) => validate_change_plan(plan)?,
         }
+        self.start_with(move |request_id, cancel| match request {
+            GitMutationRequest::StageHunk(request) => stage_hunk(request_id, &request, cancel),
+            GitMutationRequest::ResetUnstagedHunk(request) => {
+                reset_hunk(request_id, &request, cancel)
+            }
+            GitMutationRequest::Plan(plan) => apply_change_plan(request_id, &plan, cancel),
+        })
+    }
+
+    pub(super) fn start_unstage_paths(
+        &mut self,
+        workdir: PathBuf,
+        paths: BTreeSet<PathBuf>,
+        index: GitIndexFingerprint,
+        head: Option<GitHeadId>,
+    ) -> Result<GitMutationRequestId, GitMutationError> {
+        self.start_with(move |id, cancel| unstage_paths(id, &workdir, &paths, index, head, cancel))
+    }
+
+    fn start_with(
+        &mut self,
+        apply: impl FnOnce(
+            GitMutationRequestId,
+            &AtomicBool,
+        ) -> Result<GitMutationResult, GitMutationError>
+        + Send
+        + 'static,
+    ) -> Result<GitMutationRequestId, GitMutationError> {
         self.cancel();
         self.next = self.next.saturating_add(1);
         let request_id = GitMutationRequestId(self.next);
@@ -318,15 +355,7 @@ impl GitMutationWorker {
         thread::Builder::new()
             .name(format!("dusty-git-mutation-{}", request_id.0))
             .spawn(move || {
-                let result = match request {
-                    GitMutationRequest::StageHunk(request) => {
-                        stage_hunk(request_id, &request, &worker)
-                    }
-                    GitMutationRequest::ResetUnstagedHunk(request) => {
-                        reset_hunk(request_id, &request, &worker)
-                    }
-                    GitMutationRequest::Plan(plan) => apply_change_plan(request_id, &plan, &worker),
-                };
+                let result = apply(request_id, &worker);
                 let _ = tx.send(GitMutationEvent::Complete(result));
             })
             .map_err(|_| GitMutationError::Stopped)?;
@@ -511,6 +540,9 @@ impl IndexWrite {
     }
 }
 
+mod index_undo;
+pub(crate) use index_undo::{apply_index_undo, index_undo_matches};
+
 pub(super) fn reset_hunk(
     request_id: GitMutationRequestId,
     r: &GitResetHunkRequest,
@@ -541,42 +573,11 @@ pub(super) fn reset_hunk(
         return Err(GitMutationError::WrongHunk);
     }
     let name = checked_name(&repo_path)?;
-    validate_selected_lines(current, &r.selected_lines)?;
-    let chosen = |index: usize| {
-        r.selected_lines.is_empty() || r.selected_lines.binary_search(&(index as u32)).is_ok()
-    };
-    // Going back: added lines come out and deleted ones return. An addition left alone stays as
-    // context, and a deletion left alone stays gone.
-    let mut body = String::new();
-    let mut emitted = Vec::new();
-    let mut kept_lines = 0u32;
-    for index in lines_in_pairs(current) {
-        let line = &current.lines[index];
-        let mark = match (line.kind, chosen(index)) {
-            (GitDiffLineKind::Context, _) | (GitDiffLineKind::Add, false) => ' ',
-            (GitDiffLineKind::Add, true) => '-',
-            (GitDiffLineKind::Delete, true) => '+',
-            (GitDiffLineKind::Delete, false) => continue,
-        };
-        if mark != '-' {
-            kept_lines += 1;
-        }
-        emitted.push((mark, line.text.as_str()));
-    }
-    append_patch_lines(&mut body, emitted);
-    let target_mode = if current.old_mode == 0 && kept_lines == 0 {
-        0
-    } else if current.new_mode == 0 {
-        current.old_mode
+    let patch = if r.selected_lines.is_empty() {
+        reverse_hunk_patch(name, current)
     } else {
-        current.new_mode
+        selected_lines_patch(name, current, &r.selected_lines, true)?
     };
-    let header = patch_header(name, current.new_mode, target_mode);
-    let target_start = patch_start(current.new_start, current.new_lines, kept_lines);
-    let patch = format!(
-        "{header}@@ -{},{} +{},{} @@\n{body}",
-        current.new_start, current.new_lines, target_start, kept_lines
-    );
     if patch.len() > r.maximum_patch_bytes {
         return Err(GitMutationError::Invalid);
     }
@@ -589,7 +590,7 @@ pub(super) fn reset_hunk(
     if worktree_state(&file)? != before_worktree {
         return Err(GitMutationError::StaleWorktree);
     }
-    let diff = git2::Diff::from_buffer(patch.as_bytes()).map_err(|_| GitMutationError::Backend)?;
+    let diff = git2::Diff::from_buffer(&patch).map_err(|_| GitMutationError::Backend)?;
     verify_patch_paths(&diff, &repo_path)?;
     repo.apply(&diff, git2::ApplyLocation::WorkDir, None)
         .map_err(|_| GitMutationError::Backend)?;
@@ -655,10 +656,7 @@ pub(super) fn stage_hunk(
     if worktree_state(&file)? != worktree {
         return Err(GitMutationError::StaleWorktree);
     }
-    let diff = git2::Diff::from_buffer(&patch).map_err(|_| GitMutationError::Backend)?;
-    verify_patch_paths(&diff, &repo_path)?;
-    repo.apply(&diff, git2::ApplyLocation::Index, None)
-        .map_err(|_| GitMutationError::Backend)?;
+    apply_index_patch(&repo, &repo_path, &patch, GitDiffLayer::Unstaged)?;
     index_write.commit()?;
     let after = git_index_fingerprint(&repository)?;
     if before == after || worktree_state(&file)? != worktree {
@@ -761,6 +759,13 @@ pub(super) fn validate_change_plan(plan: &GitChangePlanRequest) -> Result<(), Gi
             {
                 return Err(GitMutationError::Invalid);
             }
+            selected_line_splice(
+                plan.selected
+                    .as_ref()
+                    .ok_or(GitMutationError::MissingSelection)?,
+                &plan.selected_lines,
+                true,
+            )?;
             Ok(())
         }
         GitMutationKind::StageLines => {
@@ -778,9 +783,18 @@ pub(super) fn validate_change_plan(plan: &GitChangePlanRequest) -> Result<(), Gi
             {
                 return Err(GitMutationError::Invalid);
             }
+            selected_line_splice(
+                plan.selected
+                    .as_ref()
+                    .ok_or(GitMutationError::MissingSelection)?,
+                &plan.selected_lines,
+                false,
+            )?;
             Ok(())
         }
-        GitMutationKind::ResetUnstagedHunk => Err(GitMutationError::Invalid),
+        GitMutationKind::ResetUnstagedHunk | GitMutationKind::UnstageFiles => {
+            Err(GitMutationError::Invalid)
+        }
     }
 }
 
@@ -946,51 +960,17 @@ fn selected_lines_patch(
     selected: &[u32],
     reverse: bool,
 ) -> Result<Vec<u8>, GitMutationError> {
-    validate_selected_lines(hunk, selected)?;
+    if selected.is_empty() {
+        return Err(GitMutationError::NothingSelected);
+    }
     let (old_mode, new_mode, old_start) = if reverse {
         (hunk.new_mode, hunk.old_mode, hunk.new_start)
     } else {
         (hunk.old_mode, hunk.new_mode, hunk.old_start)
     };
-    let mut body = Vec::new();
-    let mut old_lines = 0u32;
-    let mut new_lines = 0u32;
-    let mut applied = 0usize;
-    for index in lines_in_pairs(hunk) {
-        let line = &hunk.lines[index];
-        let chosen = selected.binary_search(&(index as u32)).is_ok();
-        let kind = match (line.kind, reverse) {
-            (GitDiffLineKind::Add, true) => GitDiffLineKind::Delete,
-            (GitDiffLineKind::Delete, true) => GitDiffLineKind::Add,
-            (kind, _) => kind,
-        };
-        match kind {
-            GitDiffLineKind::Context => {
-                body.push((' ', line.text.as_str()));
-                old_lines += 1;
-                new_lines += 1;
-            }
-            GitDiffLineKind::Delete => {
-                body.push((if chosen { '-' } else { ' ' }, line.text.as_str()));
-                old_lines += 1;
-                if chosen {
-                    applied += 1;
-                } else {
-                    new_lines += 1;
-                }
-            }
-            GitDiffLineKind::Add => {
-                if chosen {
-                    body.push(('+', line.text.as_str()));
-                    new_lines += 1;
-                    applied += 1;
-                }
-            }
-        }
-    }
-    if applied == 0 {
-        return Err(GitMutationError::NothingSelected);
-    }
+    let body = selected_line_splice(hunk, selected, reverse)?;
+    let old_lines = body.iter().filter(|(mark, _)| *mark != '+').count() as u32;
+    let new_lines = body.iter().filter(|(mark, _)| *mark != '-').count() as u32;
     let modes = patch_header(
         name,
         old_mode,
@@ -1008,6 +988,56 @@ fn selected_lines_patch(
     );
     append_patch_lines(&mut patch, body);
     Ok(patch.into_bytes())
+}
+
+pub(super) fn validate_reset_selection(
+    hunk: &GitHunk,
+    selected: &[u32],
+) -> Result<(), GitMutationError> {
+    if !selected.is_empty() {
+        selected_line_splice(hunk, selected, true)?;
+    }
+    Ok(())
+}
+
+fn selected_line_splice<'a>(
+    hunk: &'a GitHunk,
+    selected: &[u32],
+    reverse: bool,
+) -> Result<Vec<(char, &'a str)>, GitMutationError> {
+    validate_selected_lines(hunk, selected)?;
+    let mut body = Vec::new();
+    for index in lines_in_pairs(hunk) {
+        let line = &hunk.lines[index];
+        let chosen = selected.binary_search(&(index as u32)).is_ok();
+        let kind = match (line.kind, reverse) {
+            (GitDiffLineKind::Add, true) => GitDiffLineKind::Delete,
+            (GitDiffLineKind::Delete, true) => GitDiffLineKind::Add,
+            (kind, _) => kind,
+        };
+        let mark = match (kind, chosen) {
+            (GitDiffLineKind::Context, _) | (GitDiffLineKind::Delete, false) => ' ',
+            (GitDiffLineKind::Delete, true) => '-',
+            (GitDiffLineKind::Add, true) => '+',
+            (GitDiffLineKind::Add, false) => continue,
+        };
+        body.push((mark, line.text.as_str()));
+    }
+    // An unterminated line must end its own side, not just end a run of patch
+    // records. Otherwise Git can accept the patch and join two intended lines.
+    for skip in ['+', '-'] {
+        let mut at_eof = false;
+        for &(mark, text) in &body {
+            if mark == skip {
+                continue;
+            }
+            if at_eof {
+                return Err(GitMutationError::NeedsLineEnding);
+            }
+            at_eof = !text.ends_with('\n');
+        }
+    }
+    Ok(body)
 }
 
 fn validate_selected_lines(hunk: &GitHunk, selected: &[u32]) -> Result<(), GitMutationError> {
@@ -1179,9 +1209,12 @@ fn stage_whole_file(
 ) -> Result<(), GitMutationError> {
     let mut index = repo.index().map_err(|_| GitMutationError::Backend)?;
     match worktree {
-        WorktreeState::Regular { .. } => index
-            .add_path(repo_path)
-            .map_err(|_| GitMutationError::Backend)?,
+        WorktreeState::Regular { .. } => {
+            check_stage_path(&index, repo_path)?;
+            index
+                .add_path(repo_path)
+                .map_err(|_| GitMutationError::Backend)?;
+        }
         WorktreeState::Missing => index
             .remove_path(repo_path)
             .map_err(|_| GitMutationError::Backend)?,
@@ -1195,11 +1228,7 @@ fn unstage_whole_file(
     scope_prefix: &Path,
 ) -> Result<(), GitMutationError> {
     let mut index = repo.index().map_err(|_| GitMutationError::Backend)?;
-    let tree = match repo.head() {
-        Ok(head) => Some(head.peel_to_tree().map_err(|_| GitMutationError::Backend)?),
-        Err(error) if error.code() == git2::ErrorCode::UnbornBranch => None,
-        Err(_) => return Err(GitMutationError::Backend),
-    };
+    let tree = head_tree(repo)?;
     // A renamed row represents both paths. Restore them under the same index lock,
     // rather than leaving the source deletion staged when the destination is removed.
     let mut paths = vec![repo_path.to_path_buf()];
@@ -1227,6 +1256,167 @@ fn unstage_whole_file(
         restore_index_entry(&mut index, tree.as_ref(), &path)?;
     }
     index.write().map_err(|_| GitMutationError::Backend)
+}
+
+fn head_tree(repo: &git2::Repository) -> Result<Option<git2::Tree<'_>>, GitMutationError> {
+    match repo.head() {
+        Ok(head) => Ok(Some(
+            head.peel_to_tree().map_err(|_| GitMutationError::Backend)?,
+        )),
+        Err(error) if error.code() == git2::ErrorCode::UnbornBranch => Ok(None),
+        Err(_) => Err(GitMutationError::Backend),
+    }
+}
+
+/// Run a native batched restore against a private index. In particular, Git
+/// handles file/directory replacements in a single operation, not one path at a time.
+pub(super) fn unstage_paths(
+    request_id: GitMutationRequestId,
+    workdir: &Path,
+    paths: &BTreeSet<PathBuf>,
+    expected_index: GitIndexFingerprint,
+    expected_head: Option<GitHeadId>,
+    cancel: &AtomicBool,
+) -> Result<GitMutationResult, GitMutationError> {
+    if cancel.load(Ordering::Acquire) {
+        return Err(GitMutationError::Cancelled);
+    }
+    let repo = git2::Repository::open(workdir).map_err(|_| GitMutationError::Backend)?;
+    let write = IndexWrite::start(&repo)?;
+    if git_index_fingerprint(workdir)? != expected_index {
+        return Err(GitMutationError::StaleIndex);
+    }
+    if git_head_id(workdir)? != expected_head {
+        return Err(GitMutationError::StaleHead);
+    }
+
+    if paths.is_empty() {
+        return Err(GitMutationError::NothingSelected);
+    }
+    let paths = paths
+        .iter()
+        .map(|path| {
+            if path.as_os_str().is_empty()
+                || !path
+                    .components()
+                    .all(|c| matches!(c, std::path::Component::Normal(_)))
+            {
+                return Err(GitMutationError::OutsideScope);
+            }
+            repository_relative_path(workdir, workdir, path)
+        })
+        .collect::<Result<BTreeSet<_>, _>>()?;
+    let has_selected_parent = |path: &Path| {
+        path.ancestors()
+            .skip(1)
+            .any(|parent| paths.contains(parent))
+    };
+    // File/directory replacements need just the selected parent pathspec; Git
+    // can reject a redundant child as unmatched.
+    let mut input = Vec::new();
+    for path in paths.iter().filter(|path| !has_selected_parent(path)) {
+        input.extend_from_slice(path.as_os_str().as_encoded_bytes());
+        input.push(0);
+    }
+
+    let mut args: Vec<OsString> = ["--literal-pathspecs", "-c", "core.splitIndex=false"]
+        .map(OsString::from)
+        .into();
+    if let Some(id) = expected_head {
+        let oid = git2::Oid::from_bytes(&id.0).map_err(|_| GitMutationError::Invalid)?;
+        args.extend(["restore", "--staged"].map(OsString::from));
+        args.push(format!("--source={oid}").into());
+    } else {
+        // There is no tree on an unborn branch. The original index still holds
+        // these entries until the undo snapshot is saved and the write commits.
+        args.extend(["rm", "--cached", "--ignore-unmatch", "-r", "-f"].map(OsString::from));
+    }
+    args.extend(["--pathspec-from-file=-", "--pathspec-file-nul"].map(OsString::from));
+    run_index_restore(workdir, &write.temporary, args, input, cancel)?;
+    if cancel.load(Ordering::Acquire) {
+        return Err(GitMutationError::Cancelled);
+    }
+    // Literal parents still recurse. Refuse the private result if it changed
+    // any unselected entry, including a sibling staged as part of a replacement.
+    let selected: BTreeSet<_> = paths
+        .iter()
+        .map(|path| path.as_os_str().as_encoded_bytes())
+        .collect();
+    let outside_selection = |path: &Path| -> Result<_, GitMutationError> {
+        let index = git2::Index::open(path).map_err(|_| GitMutationError::BulkUnstage)?;
+        Ok(index_entries_fingerprint(
+            index
+                .iter()
+                .filter(|entry| !selected.contains(entry.path.as_slice())),
+        ))
+    };
+    if outside_selection(&write.path)? != outside_selection(&write.temporary)? {
+        return Err(GitMutationError::PartialUnstageReplacement);
+    }
+    let after = index_undo::commit_unstage(&repo, &write, workdir, expected_head)?;
+    Ok(GitMutationResult {
+        request_id,
+        kind: GitMutationKind::UnstageFiles,
+        path: PathBuf::new(),
+        before: expected_index,
+        after,
+        hunk: None,
+    })
+}
+
+fn run_index_restore(
+    workdir: &Path,
+    index: &Path,
+    arguments: Vec<OsString>,
+    input: Vec<u8>,
+    cancel: &AtomicBool,
+) -> Result<(), GitMutationError> {
+    use crate::process::{JobEvent, JobPolicy, JobRequest, JobSupervisor};
+    use std::time::Duration;
+
+    let mut environment = crate::command::environment();
+    environment.insert("GIT_INDEX_FILE".into(), index.as_os_str().to_owned());
+    let mut jobs = JobSupervisor::try_new(16).map_err(|_| GitMutationError::BulkUnstage)?;
+    let id = jobs
+        .start(JobRequest {
+            program: crate::process::discover_executable("git")
+                .ok_or(GitMutationError::BulkUnstage)?,
+            argv0: None,
+            arguments,
+            cwd: workdir.to_path_buf(),
+            environment,
+            root_revision: 0,
+            stdin: Some(input),
+            policy: JobPolicy {
+                timeout: Duration::from_secs(30),
+                ..JobPolicy::default()
+            },
+        })
+        .map_err(|_| GitMutationError::BulkUnstage)?;
+    loop {
+        let cancelled = cancel.load(Ordering::Acquire);
+        if cancelled {
+            // Wait for Git to stop before dropping the private index and the real index lock.
+            let _ = jobs.cancel(id);
+        }
+        for event in jobs.poll() {
+            match event {
+                JobEvent::Exited { .. } | JobEvent::Failed { .. } if cancelled => {
+                    return Err(GitMutationError::Cancelled);
+                }
+                JobEvent::Exited {
+                    code: Some(0),
+                    timed_out: false,
+                    ..
+                } => return Ok(()),
+                JobEvent::Exited { .. } | JobEvent::Failed { .. } => {
+                    return Err(GitMutationError::BulkUnstage);
+                }
+                JobEvent::Started { .. } | JobEvent::Output { .. } => {}
+            }
+        }
+        thread::sleep(Duration::from_millis(2));
+    }
 }
 
 fn restore_index_entry(
@@ -1258,7 +1448,7 @@ fn restore_index_entry(
             id: entry.id(),
             flags: 0,
             flags_extended: 0,
-            path: checked_name(repo_path)?.as_bytes().to_vec(),
+            path: repo_path.as_os_str().as_encoded_bytes().to_vec(),
         });
         restored.id = entry.id();
         restored.mode = entry.filemode() as u32;
@@ -1309,6 +1499,7 @@ pub(super) fn apply_change_plan(
         return Err(GitMutationError::StaleIndex);
     }
 
+    let expected_head = git_head_id(&workdir)?;
     let from_worktree = matches!(
         p.kind,
         GitMutationKind::StageFile | GitMutationKind::StageHunk | GitMutationKind::StageLines
@@ -1344,7 +1535,9 @@ pub(super) fn apply_change_plan(
             GitMutationKind::StageLines | GitMutationKind::UnstageLines => Some(
                 captured_hunk_patch(p, &repo_path, Some(&p.selected_lines), cancel)?,
             ),
-            GitMutationKind::ResetUnstagedHunk => return Err(GitMutationError::Invalid),
+            GitMutationKind::ResetUnstagedHunk | GitMutationKind::UnstageFiles => {
+                return Err(GitMutationError::Invalid);
+            }
         };
 
     if cancel.load(Ordering::Acquire) {
@@ -1367,10 +1560,7 @@ pub(super) fn apply_change_plan(
         if patch.len() > p.maximum_patch_bytes {
             return Err(GitMutationError::Invalid);
         }
-        let diff = git2::Diff::from_buffer(&patch).map_err(|_| GitMutationError::Backend)?;
-        verify_patch_paths(&diff, &repo_path)?;
-        repo.apply(&diff, git2::ApplyLocation::Index, None)
-            .map_err(|_| GitMutationError::Backend)?;
+        apply_index_patch(&repo, &repo_path, &patch, p.policy.layer)?;
     } else if p.kind == GitMutationKind::StageFile {
         stage_whole_file(
             &repo,
@@ -1386,8 +1576,12 @@ pub(super) fn apply_change_plan(
         )?;
     }
 
-    index_write.commit()?;
-    let after = git_index_fingerprint(&workdir)?;
+    let after = if from_worktree {
+        index_write.commit()?;
+        git_index_fingerprint(&workdir)?
+    } else {
+        index_undo::commit_unstage(&repo, &index_write, &workdir, expected_head)?
+    };
     if before == after {
         return Err(GitMutationError::NoChange);
     }

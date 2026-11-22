@@ -8,6 +8,7 @@ pub(super) struct ReflogEntry {
 }
 impl ReflogEntry {
     pub fn parse(text: &str) -> Vec<Self> {
+        let mut commit_move_tip = None;
         text.lines()
             .filter_map(|line| {
                 let mut fields = line.splitn(3, '\t');
@@ -18,15 +19,44 @@ impl ReflogEntry {
                 Some((id, date, subject))
             })
             .enumerate()
-            .map(|(index, (id, date, subject))| Self {
-                id: id.into(),
-                label: format!("{} HEAD@{{{index}}} {subject}", &id[..7]),
-                // A refresh can insert a new entry at HEAD@{0}. Preserve the selected event,
-                // rather than silently inspecting whatever now occupies its old ordinal.
-                key: format!("{id}\t{date}\t{subject}").into(),
+            .filter_map(|(index, (id, date, subject))| {
+                // switch -C can log the branch reset immediately before the
+                // same-tip Dusty marker. Keep the marker's real ordinal and key.
+                let duplicate = commit_move_tip == Some(id)
+                    && subject.strip_prefix("branch: Reset to ") == Some(id);
+                commit_move_tip = crate::history::is_commit_move_marker(subject).then_some(id);
+                if duplicate {
+                    return None;
+                }
+                Some(Self {
+                    id: id.into(),
+                    label: format!(
+                        "{} HEAD@{{{index}}} {}",
+                        &id[..7],
+                        reflog_display_subject(subject)
+                    ),
+                    // A refresh can insert a new entry at HEAD@{0}. Preserve the selected event,
+                    // rather than silently inspecting whatever now occupies its old ordinal.
+                    key: format!("{id}\t{date}\t{subject}").into(),
+                })
             })
             .collect()
     }
+}
+
+fn reflog_display_subject(subject: &str) -> std::borrow::Cow<'_, str> {
+    use crate::history::{REDO_ACTION, SKIPPED_INDEX, UNDO_ACTION, UNSTAGE_ACTION};
+
+    if subject.starts_with(UNSTAGE_ACTION) {
+        return "Unstage changes".into();
+    }
+    if (subject.starts_with(UNDO_ACTION) || subject.starts_with(REDO_ACTION))
+        && let Some((label, skip)) = subject.split_once(SKIPPED_INDEX)
+        && let Some((_, suffix)) = skip.split_once(']')
+    {
+        return format!("{label}{suffix}").into();
+    }
+    subject.into()
 }
 
 impl GitScreen {
@@ -302,16 +332,9 @@ impl GitScreen {
         }
         let mut args: Vec<OsString> = vec!["--literal-pathspecs".into()];
         if unstage {
-            if git_head_id(&self.root)
-                .map_err(|error| error.to_string())?
-                .is_some()
-            {
-                args.extend(["restore", "--source=HEAD", "--staged", "--"].map(Into::into));
-            } else {
-                args.extend(["rm", "--cached", "--"].map(Into::into));
-            }
-        } else {
-            args.extend(["add", "--"].map(Into::into));
+            let index = git_index_fingerprint(&self.root).map_err(|error| error.to_string())?;
+            let head = git_head_id(&self.root).map_err(|error| error.to_string())?;
+            return self.unstage_paths([path].into(), index, head, None);
         }
         args.push(path.into_os_string());
         self.write(args)
@@ -365,6 +388,47 @@ impl GitScreen {
             self.notice = "The main worktree cannot be removed".into();
             return;
         }
+        let result = self.branches.start(GitBranchRequest::ReviewRemoval {
+            repository: self.root.clone(),
+            name: worktree.name.clone(),
+            deadline: GitBranchRequest::REMOVAL_STATUS_TIMEOUT,
+        });
+        match result {
+            Ok(_) => self.show_removal_check(),
+            Err(error) => self.notice = error.to_string(),
+        }
+    }
+
+    pub(super) fn confirm_sidebar_worktree_remove(
+        &mut self,
+        name: String,
+        reviewed: crate::GitWorktreeRemoval,
+        change: Option<String>,
+    ) {
+        let (title, warning) = if reviewed.is_missing() {
+            (
+                format!("Forget missing worktree {name}?"),
+                "Its directory is already gone. No branch is deleted.".into(),
+            )
+        } else if reviewed.is_clean() {
+            (
+                format!(
+                    "Remove clean, unlocked worktree {}?",
+                    reviewed.path().display()
+                ),
+                String::new(),
+            )
+        } else {
+            (
+                format!("Remove worktree {name}?"),
+                reviewed.warnings().collect::<Vec<_>>().join("\n"),
+            )
+        };
+        let changed = change.is_some();
+        let warning = match change {
+            Some(change) => format!("{change}\n{warning}"),
+            None => warning,
+        };
         self.form(
             &format!(
                 "Remove clean, unlocked worktree {}?",
@@ -417,5 +481,54 @@ impl GitScreen {
         );
         self.reflog_loading = result.is_ok();
         result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reflog_keeps_one_row_per_commit_undo_or_redo() {
+        let one = "1".repeat(40);
+        let two = "2".repeat(40);
+        let three = "3".repeat(40);
+        let redo = format!("{three}\tHEAD@{{30 +0000}}\t[dusty redo]: updating HEAD");
+        let undo = format!("{two}\tHEAD@{{20 +0000}}\t[dusty undo]: updating HEAD");
+        let separate = format!("{one}\tHEAD@{{10 +0000}}\tbranch: Reset to {one}");
+        let log = format!(
+            "{redo}\n{three}\tHEAD@{{30 +0000}}\tbranch: Reset to {three}\n\
+             {undo}\n{two}\tHEAD@{{20 +0000}}\tbranch: Reset to {two}\n{separate}"
+        );
+        let keys = [redo, undo, separate].map(PathBuf::from);
+        let rows = ReflogEntry::parse(&log);
+        assert_eq!(rows.len(), 3);
+        assert!(rows.iter().zip(keys).all(|(row, key)| row.key == key));
+        assert_eq!(
+            rows[0].label,
+            "3333333 HEAD@{0} [dusty redo]: updating HEAD"
+        );
+        assert_eq!(
+            rows[1].label,
+            "2222222 HEAD@{2} [dusty undo]: updating HEAD"
+        );
+        assert!(
+            rows[2]
+                .label
+                .starts_with("1111111 HEAD@{4} branch: Reset to ")
+        );
+    }
+
+    #[test]
+    fn reflog_hides_skipped_unstage_ids_without_changing_row_identity() {
+        let id = "a".repeat(40);
+        let subject = format!("[dusty undo] [skipped unstage:{id}]: updating HEAD");
+        let entry = format!("{id}\tHEAD@{{0}}\t{subject}");
+        let rows = ReflogEntry::parse(&entry);
+        assert_eq!(
+            rows[0].label,
+            "aaaaaaa HEAD@{0} [dusty undo]: updating HEAD"
+        );
+        assert_eq!(rows[0].key, PathBuf::from(entry));
     }
 }

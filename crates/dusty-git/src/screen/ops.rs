@@ -23,6 +23,8 @@ pub(super) struct Running {
     rest: Vec<Run>,
     timeout: Duration,
     done: String,
+    fixup_written: bool,
+    capture_warning: Option<String>,
     /// The last progress line Git printed, while it runs.
     pub(super) progress: Option<String>,
 }
@@ -58,6 +60,18 @@ impl Op {
                 Edit::Amend => "[ Amend ]",
             },
         }
+    }
+}
+
+fn head_change(undo: &history::Undo) -> String {
+    let (from, to) = undo.head();
+    if let Some(destination) = undo.checkout_destination() {
+        // Leave space for the arrow and destination hash on a compact sheet.
+        let from = shell::chrome::ellipsize(&from, 17);
+        let to = shell::chrome::ellipsize(&to, 17);
+        format!("{from} → {to} ({})", history::short(destination.tip()))
+    } else {
+        format!("{from} → {to}")
     }
 }
 
@@ -211,17 +225,23 @@ impl GitScreen {
     fn undo_form(&mut self, redo: bool) -> Result<(), String> {
         self.allow_write()?;
         let undo = history::undo(&self.root, redo)?;
-        let fields = vec![
-            read_only(if redo { "Redoes" } else { "Undoes" }, undo.entry.clone()),
-            read_only("HEAD", undo.head_change()),
-            read_only("Runs", undo.run().display()),
-        ];
+        let mut fields = vec![read_only(
+            if redo { "Redoes" } else { "Undoes" },
+            undo.entry.clone(),
+        )];
+        if let Some(run) = undo.run() {
+            fields.push(read_only("HEAD", head_change(&undo)));
+            let mut command = read_only("Runs", run.display());
+            command.multiline = true;
+            fields.push(command);
+        }
+        let selected = fields.len();
         let title = if redo {
             "Redo the undone action?"
         } else {
             "Undo the last action?"
         };
-        self.op_form(title.into(), Op::Undo(undo), fields, 3);
+        self.op_form(title.into(), Op::Undo(undo), fields, selected);
         Ok(())
     }
 
@@ -317,7 +337,10 @@ impl GitScreen {
             "Runs",
             runs.last().map(Run::display).unwrap_or_default(),
         ));
-        let branch = history::ref_label(&plan.reference);
+        let branch = plan
+            .checkout
+            .reference()
+            .map_or("detached HEAD", history::ref_label);
         let id = history::short(target);
         let title = if edit == Edit::Drop {
             let branch = shell::chrome::ellipsize(branch, 29);
@@ -662,4 +685,105 @@ pub(super) fn commit_url(root: &Path, id: git2::Oid) -> Result<String, String> {
     } else {
         format!("{base}/commit/{id}")
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use history::tests::{commit, git, head, repo};
+    use std::fs;
+    use std::time::Instant;
+
+    fn amend_through_jobs(root: &Path, target: git2::Oid) -> String {
+        let mut screen = GitScreen::open(root).unwrap();
+        let plan = history::rewrite(root, "refs/heads/main", target, Edit::Amend).unwrap();
+        screen.submit_op(Op::Rewrite(Box::new(plan)), &[]).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while screen.busy {
+            assert!(Instant::now() < deadline, "amend job did not finish");
+            screen.poll();
+            std::thread::yield_now();
+        }
+        screen.notice
+    }
+
+    #[test]
+    fn amend_job_refuses_before_writing_fixup_without_a_head_log() {
+        let directory = repo();
+        let root = directory.path();
+        git(root, &["config", "core.logAllRefUpdates", "false"]);
+        let target = commit(root, "first");
+        let tip = commit(root, "second");
+        fs::write(root.join("first"), "amendment\n").unwrap();
+        git(root, &["add", "first"]);
+        assert!(
+            !git2::Repository::open(root)
+                .unwrap()
+                .reference_has_log("HEAD")
+                .unwrap()
+        );
+
+        assert_eq!(
+            amend_through_jobs(root, target),
+            history::FIXUP_WITHOUT_HISTORY
+        );
+        assert_eq!(head(root), tip);
+        assert_eq!(git(root, &["diff", "--cached", "--name-only"]), "first");
+    }
+
+    #[test]
+    fn autosquash_conflict_reports_fixup_and_recovery_keys_together() {
+        let directory = repo();
+        let root = directory.path();
+        let target = commit(root, "first");
+        fs::write(root.join("first"), "later change\n").unwrap();
+        git(root, &["add", "first"]);
+        git(root, &["commit", "-q", "-m", "Later change"]);
+        fs::write(root.join("first"), "fixup change\n").unwrap();
+        git(root, &["add", "first"]);
+
+        assert_eq!(
+            amend_through_jobs(root, target),
+            "Fixup committed. Resolve conflicts, then C continues, S skips, X aborts."
+        );
+        let repository = git2::Repository::open(root).unwrap();
+        assert!(repository.index().unwrap().has_conflicts());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn amend_does_not_autosquash_after_a_hook_switches_branches() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = repo();
+        let root = directory.path();
+        commit(root, "alpha");
+        let target = commit(root, "bravo");
+        git(root, &["switch", "-q", "-c", "topic"]);
+        fs::write(root.join("bravo"), "topic change\n").unwrap();
+        git(root, &["add", "bravo"]);
+        git(root, &["commit", "-q", "--fixup", &target.to_string()]);
+        let topic = head(root);
+        git(root, &["switch", "-q", "main"]);
+        commit(root, "charlie");
+        fs::write(root.join("alpha"), "main change\n").unwrap();
+        git(root, &["add", "alpha"]);
+
+        git(root, &["config", "core.hooksPath", ".git/hooks"]);
+        fs::create_dir_all(root.join(".git/hooks")).unwrap();
+        let hook = root.join(".git/hooks/post-commit");
+        fs::write(&hook, "#!/bin/sh\ngit switch -q topic\n").unwrap();
+        fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert_eq!(
+            amend_through_jobs(root, target),
+            "Your checkout changed. Open the action again. The fixup commit was written."
+        );
+        assert_eq!(git(root, &["branch", "--show-current"]), "topic");
+        assert_eq!(head(root), topic);
+        assert_eq!(
+            git(root, &["log", "-1", "--format=%s", "main"]),
+            "fixup! bravo"
+        );
+    }
 }

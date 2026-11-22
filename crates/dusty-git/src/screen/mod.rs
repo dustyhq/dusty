@@ -1205,7 +1205,7 @@ impl GitScreen {
                 }
                 (Request::Write, result) => {
                     // A sheet with a second command (an amend's autosquash) runs it now.
-                    if self.next_op_step(&result) {
+                    if self.next_op_step(&mut result, &mut warning) {
                         continue;
                     }
                     let finished = self.finish_op(&result);
@@ -1216,7 +1216,12 @@ impl GitScreen {
                     self.notice = match result {
                         // Silent success: the refreshed panes are the receipt, and a
                         // lingering "completed" line would hide the footer's keys.
-                        Ok(text) if text.trim().is_empty() => String::new(),
+                        Ok(text)
+                            if text.trim().is_empty()
+                                || warning.is_some() && self.receipt.is_some() =>
+                        {
+                            String::new()
+                        }
                         Ok(text) => text.trim().into(),
                         Err(error) => error.replace(['\r', '\n'], " "),
                     };
@@ -1772,53 +1777,43 @@ impl GitScreen {
         };
         let (repository_id, status_revision) = (snapshot.repository_id, snapshot.revision);
         let expected_index = git_index_fingerprint(&self.root).map_err(|e| e.to_string())?;
-        let expected_worktree = if unstage {
-            self.warned_markers = None;
-            None
-        } else {
-            self.check_conflict_markers(&row.value, expected_index)?
-        };
         let kind = if unstage {
             GitMutationKind::UnstageFile
         } else {
             GitMutationKind::StageFile
         };
-        self.mutation
-            .start(GitMutationRequest::Plan(GitChangePlanRequest {
-                kind,
-                policy: GitHunkPolicy {
-                    scope_root: self.root.clone(),
-                    repository_id,
-                    status_revision,
-                    root_revision: 0,
-                    file: row.value,
-                    layer: if unstage {
-                        GitDiffLayer::Staged
-                    } else {
-                        GitDiffLayer::Unstaged
-                    },
-                    maximum_hunks: 10_000,
-                    maximum_lines: 100_000,
-                    maximum_bytes: 8 * 1024 * 1024,
-                    deadline: Duration::from_secs(5),
+        self.stage_file(GitChangePlanRequest {
+            kind,
+            policy: GitHunkPolicy {
+                scope_root: self.root.clone(),
+                repository_id,
+                status_revision,
+                root_revision: 0,
+                file: row.value,
+                layer: if unstage {
+                    GitDiffLayer::Staged
+                } else {
+                    GitDiffLayer::Unstaged
                 },
-                hunk_snapshot_revision: 0,
-                hunk_id: None,
-                selected: None,
-                selected_lines: Vec::new(),
-                expected_index: Some(expected_index),
-                expected_worktree,
-                expected_head: match git_head_id(&self.root).map_err(|e| e.to_string())? {
-                    Some(id) => GitHeadExpectation::At(id),
-                    None => GitHeadExpectation::Unborn,
-                },
-                expected_document_revision: None,
-                unsaved_documents: Vec::new(),
-                maximum_patch_bytes: 1024 * 1024,
-            }))
-            .map_err(|e| e.to_string())?;
-        self.busy = true;
-        Ok(())
+                maximum_hunks: 10_000,
+                maximum_lines: 100_000,
+                maximum_bytes: 8 * 1024 * 1024,
+                deadline: Duration::from_secs(5),
+            },
+            hunk_snapshot_revision: 0,
+            hunk_id: None,
+            selected: None,
+            selected_lines: Vec::new(),
+            expected_index: Some(expected_index),
+            expected_worktree: None,
+            expected_head: match git_head_id(&self.root).map_err(|e| e.to_string())? {
+                Some(id) => GitHeadExpectation::At(id),
+                None => GitHeadExpectation::Unborn,
+            },
+            expected_document_revision: None,
+            unsaved_documents: Vec::new(),
+            maximum_patch_bytes: 1024 * 1024,
+        })
     }
     /// G-COMMIT: refuses to open with nothing staged.
     fn commit_form(&mut self) {
@@ -2406,18 +2401,21 @@ impl GitScreen {
                 self.form = None;
             }
         }
-        if key.code == KeyCode::Enter
-            && (key.modifiers.control
-                || self.form.as_ref().is_some_and(|form| {
-                    matches!(
-                        form.action,
-                        FormAction::Command | FormAction::SourceSearch | FormAction::OperationMenu
-                    ) && form.selected <= form.fields.len()
-                })
-                || self.form.as_ref().is_some_and(|form| {
-                    matches!(&form.action, FormAction::Run(op) if !op.writes())
-                        && form.selected <= form.fields.len()
-                }))
+        if let Some(Form {
+            action:
+                FormAction::StageConflict { path_top, .. }
+                | FormAction::Github(github::Action::ReplaceLog { path_top, .. })
+                | FormAction::OverwriteIgnored {
+                    note_top: path_top, ..
+                }
+                | FormAction::RemoveWorktree {
+                    note_top: path_top, ..
+                }
+                | FormAction::ActionMessage {
+                    note_top: path_top, ..
+                },
+            ..
+        }) = &self.form
         {
             return self.submit();
         }
@@ -2828,6 +2826,7 @@ impl GitScreen {
                         self.commit_open = false;
                     }
                 } else {
+                    let unmodified = key.modifiers == Default::default();
                     match key.code {
                         KeyCode::Char('q') => {
                             if self.tutor.is_some() {
@@ -3667,6 +3666,669 @@ mod context_tests {
         assert_eq!(screen.focus, 0);
     }
 
+    fn press_status_key(screen: &mut GitScreen, key: &str) -> ScreenOutcome {
+        screen.event(UiEvent::Key {
+            key: key.parse().unwrap(),
+            kind: KeyInputKind::Press,
+        })
+    }
+
+    #[test]
+    fn changes_boundary_preserves_visual_range_and_finished_marks() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        git2::Repository::init(root).unwrap();
+        for file in ["a.txt", "b.txt"] {
+            std::fs::write(root.join(file), "change\n").unwrap();
+        }
+        let mut screen = GitScreen::open(root).unwrap();
+        let snapshot = crate::status::read_status(
+            GitStatusRequestId(1),
+            &GitStatusPolicy {
+                root: root.into(),
+                root_revision: 1,
+                maximum_files: 100,
+                maximum_path_bytes: 4096,
+                deadline: Duration::from_secs(10),
+            },
+            &[],
+            &std::sync::atomic::AtomicBool::new(false),
+        )
+        .unwrap();
+        screen.install_status(snapshot, None);
+
+        for key in ["V", "j", "j"] {
+            press_status_key(&mut screen, key);
+        }
+        let expected = BTreeSet::from([PathBuf::from("a.txt"), PathBuf::from("b.txt")]);
+        assert_eq!((screen.focus, screen.selected[0]), (0, 1));
+        assert!(screen.file_selection.active());
+        assert_eq!(screen.file_selection.marked, expected);
+
+        for key in ["V", "k", "k"] {
+            assert_eq!(press_status_key(&mut screen, key), ScreenOutcome::Continue);
+        }
+        assert_eq!((screen.focus, screen.selected[0]), (0, 0));
+        assert!(!screen.file_selection.active());
+        assert_eq!(screen.file_selection.marked, expected);
+    }
+
+    #[test]
+    fn commit_file_focus_prefers_the_local_rail_and_keeps_the_view_at_an_outer_edge() {
+        let directory = tempfile::tempdir().unwrap();
+        git2::Repository::init(directory.path()).unwrap();
+        let mut screen = GitScreen::open(directory.path()).unwrap();
+        screen.frame(120, 36);
+        let newest = "1".repeat(40);
+        let older = "2".repeat(40);
+        let (history, info) = shell::parse_history(&format!(
+            "{newest}\t{older}\tAuthor\t2026-01-02\t\tNewest\n{older}\t\tAuthor\t2026-01-01\t\tOlder"
+        ));
+        screen.set_history(history, info);
+        press_status_key(&mut screen, "4");
+        press_status_key(&mut screen, "j");
+        screen.commit = commit::Commit::parse(
+            &format!("{older}\0Author\u{0}2026-01-01\0\0Older\0\n1\t0\ta.txt\0"),
+            None,
+        );
+        press_status_key(&mut screen, "enter");
+        assert!(screen.commit_open);
+        assert_eq!(screen.focus, 0);
+
+        assert_eq!(
+            press_status_key(&mut screen, "ctrl-k"),
+            ScreenOutcome::Focus(SpatialDirection::Up)
+        );
+        assert!(screen.commit_open);
+        press_status_key(&mut screen, "esc");
+        assert!(!screen.commit_open);
+        assert_eq!(
+            (screen.focus, screen.last_list, screen.selected[5]),
+            (2, 2, 1)
+        );
+        assert_eq!(screen.selected_row().unwrap().value, PathBuf::from(older));
+
+        press_status_key(&mut screen, "enter");
+        assert!(screen.commit_open);
+        assert_eq!(
+            press_status_key(&mut screen, "ctrl-j"),
+            ScreenOutcome::Continue
+        );
+        assert_eq!((screen.focus, screen.last_list), (1, 1));
+        assert!(!screen.commit_open);
+    }
+
+    #[test]
+    fn status_edges_respect_paging_layout_and_key_modifiers() {
+        let directory = tempfile::tempdir().unwrap();
+        git2::Repository::init(directory.path()).unwrap();
+        let mut screen = GitScreen::open(directory.path()).unwrap();
+        screen.window_frame(100, 30, &crate::config::GitWindowConfig::default());
+
+        press_status_key(&mut screen, "3");
+        assert_eq!(
+            press_status_key(&mut screen, "alt-l"),
+            ScreenOutcome::Continue
+        );
+        assert_eq!(screen.focus, 1);
+        press_status_key(&mut screen, "ctrl-alt-l");
+        assert_eq!(screen.focus, 4);
+        press_status_key(&mut screen, "alt-h");
+        assert_eq!(screen.focus, 4);
+
+        let (history, info) = shell::parse_history(
+            "1111111111111111111111111111111111111111\t\tAuthor\t2026-01-01\t\tCommit",
+        );
+        screen.set_history(history, info);
+        press_status_key(&mut screen, "4");
+        screen.history_loading = true;
+        assert_eq!(press_status_key(&mut screen, "j"), ScreenOutcome::Continue);
+        assert_eq!((screen.focus, screen.selected[5]), (2, 0));
+
+        screen.history_loading = false;
+        press_status_key(&mut screen, "ctrl-j");
+        assert_eq!(screen.focus, 3);
+        screen.frame(100, 30);
+        press_status_key(&mut screen, "4");
+        assert_eq!(
+            press_status_key(&mut screen, "ctrl-j"),
+            ScreenOutcome::Focus(SpatialDirection::Down)
+        );
+        assert_eq!(screen.focus, 2);
+    }
+
+    fn discard_fixture() -> (tempfile::TempDir, GitScreen) {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let repository = git2::Repository::init(root).unwrap();
+        let file = Path::new("tracked.txt");
+        std::fs::write(root.join(file), "base\n").unwrap();
+        let mut index = repository.index().unwrap();
+        index.add_path(file).unwrap();
+        index.write().unwrap();
+        let tree = repository.find_tree(index.write_tree().unwrap()).unwrap();
+        let signature = git2::Signature::now("Discard test", "discard@example.invalid").unwrap();
+        repository
+            .commit(Some("HEAD"), &signature, &signature, "Base", &tree, &[])
+            .unwrap();
+        std::fs::write(root.join(file), "unstaged edit\n").unwrap();
+
+        let mut screen = GitScreen::open(root).unwrap();
+        let snapshot = crate::status::read_status(
+            GitStatusRequestId(1),
+            &GitStatusPolicy {
+                root: root.into(),
+                root_revision: 1,
+                maximum_files: 100,
+                maximum_path_bytes: 4096,
+                deadline: Duration::from_secs(10),
+            },
+            &[],
+            &std::sync::atomic::AtomicBool::new(false),
+        )
+        .unwrap();
+        screen.install_status(snapshot, None);
+        screen.set_modal(true);
+        (directory, screen)
+    }
+
+    fn press_confirmation_key(screen: &mut GitScreen, key: &str) -> ScreenOutcome {
+        screen.event(UiEvent::Key {
+            key: key.parse().unwrap(),
+            kind: KeyInputKind::Press,
+        })
+    }
+
+    #[test]
+    fn hidden_discard_ignores_enter_and_ctrl_enter() {
+        let (directory, mut screen) = discard_fixture();
+        let file = directory.path().join("tracked.txt");
+        screen.frame(100, 30);
+        press_confirmation_key(&mut screen, "d");
+        assert!(matches!(
+            screen.form.as_ref().map(|form| &form.action),
+            Some(FormAction::DiscardFiles(_))
+        ));
+        screen.frame(100, 30);
+
+        screen.event(UiEvent::Resize(63, 19));
+        press_confirmation_key(&mut screen, "enter");
+        screen.frame(63, 19);
+        press_confirmation_key(&mut screen, "enter");
+        press_confirmation_key(&mut screen, "ctrl-enter");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "unstaged edit\n");
+        assert!(screen.form.is_some(), "the hidden sheet must not submit");
+        press_confirmation_key(&mut screen, "esc");
+        assert!(screen.form.is_none(), "Esc still closes the hidden sheet");
+    }
+
+    #[test]
+    fn escape_in_a_shrunken_keys_overlay_preserves_the_branch_form() {
+        let (_directory, mut screen) = discard_fixture();
+        screen.frame(100, 30);
+        press_confirmation_key(&mut screen, "3");
+        press_confirmation_key(&mut screen, "n");
+        for letter in "topic-name".chars() {
+            screen.event(UiEvent::Key {
+                key: KeyEvent::character(letter),
+                kind: KeyInputKind::Press,
+            });
+        }
+        press_confirmation_key(&mut screen, "esc");
+        press_confirmation_key(&mut screen, "?");
+        assert!(screen.help, "Keys should be open over the form");
+
+        screen.event(UiEvent::Resize(63, 19));
+        screen.frame(63, 19);
+        assert_eq!(
+            press_confirmation_key(&mut screen, "esc"),
+            ScreenOutcome::Continue
+        );
+        assert!(!screen.help, "Esc should close Keys");
+        let form = screen.form.as_ref().expect("the branch form should remain");
+        assert!(matches!(form.action, FormAction::Branch(None)));
+        assert_eq!(form.fields[0].input.input, "topic-name");
+    }
+
+    #[test]
+    fn escape_in_a_shrunken_diff_reader_returns_to_the_list() {
+        let (_directory, mut screen) = discard_fixture();
+        screen.frame(100, 30);
+        screen.commit_draft = Some(("Keep this subject".into(), String::new()));
+        press_confirmation_key(&mut screen, "0");
+        assert_eq!(screen.focus, 4);
+
+        screen.event(UiEvent::Resize(63, 19));
+        screen.frame(63, 19);
+        assert_eq!(
+            press_confirmation_key(&mut screen, "esc"),
+            ScreenOutcome::Continue
+        );
+        assert_eq!(screen.focus, 0);
+        assert_eq!(
+            screen
+                .commit_draft
+                .as_ref()
+                .map(|(subject, _)| subject.as_str()),
+            Some("Keep this subject")
+        );
+    }
+
+    #[test]
+    fn ctrl_enter_on_discard_cancel_leaves_the_file_unchanged() {
+        let (directory, mut screen) = discard_fixture();
+        screen.frame(100, 30);
+        press_confirmation_key(&mut screen, "d");
+        press_confirmation_key(&mut screen, "tab");
+        assert!(screen.form.as_ref().is_some_and(Form::cancel_focused));
+        screen.frame(100, 30);
+
+        press_confirmation_key(&mut screen, "ctrl-enter");
+        assert!(screen.form.is_none(), "Cancel must close the sheet");
+        assert_eq!(
+            std::fs::read_to_string(directory.path().join("tracked.txt")).unwrap(),
+            "unstaged edit\n"
+        );
+    }
+
+    fn ignored_switch_git(root: &Path, args: &[&str]) -> String {
+        let output = crate::command::git_output(
+            root,
+            &args.iter().copied().map(OsString::from).collect::<Vec<_>>(),
+            &[],
+        )
+        .unwrap();
+        assert!(
+            output.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().into()
+    }
+
+    fn ignored_switch_fixture(path: &str) -> (tempfile::TempDir, String) {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let git = |args: &[&str]| ignored_switch_git(root, args);
+        git(&["init", "-b", "main"]);
+        git(&["config", "user.name", "Checkout test"]);
+        git(&["config", "user.email", "checkout@example.invalid"]);
+        std::fs::write(root.join(".gitignore"), "*.env\n").unwrap();
+        git(&["add", ".gitignore"]);
+        git(&["commit", "-m", "Base"]);
+        git(&["branch", "same-tree"]);
+        git(&["switch", "-c", "topic"]);
+        let file = root.join(path);
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(file, "tracked on topic\n").unwrap();
+        std::fs::write(root.join("ordinary.txt"), "tracked on topic\n").unwrap();
+        git(&["add", "-f", "--", path, "ordinary.txt"]);
+        git(&["commit", "-m", "Track local paths"]);
+        let topic = git(&["rev-parse", "HEAD"]);
+        git(&["tag", "same-tree"]);
+        git(&["switch", "main"]);
+        (directory, topic)
+    }
+
+    fn drain_ignored_switch(screen: &mut GitScreen) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while screen.busy || screen.refreshing_after_write {
+            assert!(std::time::Instant::now() < deadline, "Git did not finish");
+            screen.poll();
+            std::thread::yield_now();
+        }
+    }
+
+    fn submit_ignored_switch(screen: &mut GitScreen, target: &str) {
+        screen.form(
+            &format!("Switch to {target}?"),
+            FormAction::SwitchBranch(Box::new(ops::Checkout::branch(target.into(), false))),
+            Vec::new(),
+        );
+        screen.submit().unwrap();
+        drain_ignored_switch(screen);
+    }
+
+    #[test]
+    fn collision_free_switch_uses_native_branch_lookup_with_split_index() {
+        let (directory, _) = ignored_switch_fixture(".env");
+        let root = directory.path();
+        std::fs::write(root.join(".env"), "local only\n").unwrap();
+        ignored_switch_git(root, &["update-index", "--split-index"]);
+        let mut screen = GitScreen::open(root).unwrap();
+        submit_ignored_switch(&mut screen, "same-tree");
+        assert!(screen.form.is_none(), "{}", screen.notice);
+        assert_eq!(
+            ignored_switch_git(root, &["branch", "--show-current"]),
+            "same-tree"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join(".env")).unwrap(),
+            "local only\n"
+        );
+    }
+
+    #[test]
+    fn switching_renders_the_full_ignored_path_and_preserves_it_until_confirmed() {
+        let path = "config/environments/customer-facing/production/overrides/service-a/local.env";
+        let (directory, _) = ignored_switch_fixture(path);
+        let root = directory.path();
+        let file = root.join(path);
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, "local only\n").unwrap();
+        let mut screen = GitScreen::open(root).unwrap();
+        submit_ignored_switch(&mut screen, "topic");
+        assert!(screen.form.as_ref().is_some_and(Form::cancel_focused));
+        let frame = screen.frame(100, 30);
+        let rows: Vec<_> = (0..frame.grid.height())
+            .map(|row| frame.grid.row_text(row))
+            .collect();
+        let first = rows
+            .iter()
+            .position(|row| row.contains("config/environments/"))
+            .unwrap();
+        let start = rows[first].find("config/environments/").unwrap();
+        // Text to the left of the sheet can take a different number of UTF-8
+        // bytes on each row. Read the continuation at the same grid column.
+        let column = u16::try_from(frame.grid.display_width(&rows[first][..start])).unwrap();
+        let head = rows[first][start..].split_whitespace().next().unwrap();
+        let tail: String = (column..frame.grid.width())
+            .map(|x| {
+                frame
+                    .grid
+                    .get(x, (first + 1) as u16)
+                    .unwrap()
+                    .symbol
+                    .as_str()
+            })
+            .take_while(|symbol| *symbol != " ")
+            .collect();
+        assert_eq!(format!("{head}{tail}"), path);
+        assert!(rows.iter().any(|row| row.contains("Switching to topic")));
+        assert!(rows.iter().any(|row| row.contains("Replace and switch")
+            && row.contains("Cancel")
+            && row.contains("Enter")));
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "local only\n");
+
+        press_confirmation_key(&mut screen, "tab");
+        screen.frame(100, 30);
+        press_confirmation_key(&mut screen, "enter");
+        drain_ignored_switch(&mut screen);
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "tracked on topic\n",
+            "{}",
+            screen.notice
+        );
+        assert_eq!(
+            ignored_switch_git(root, &["show", &format!("stash@{{0}}^3:{path}")]),
+            "local only"
+        );
+    }
+
+    #[test]
+    fn ignored_file_is_restored_when_the_replacement_switch_still_fails() {
+        let (directory, _) = ignored_switch_fixture(".env");
+        let root = directory.path();
+        std::fs::write(root.join(".env"), "local only\n").unwrap();
+        std::fs::write(root.join("ordinary.txt"), "also local\n").unwrap();
+        let mut screen = GitScreen::open(root).unwrap();
+        submit_ignored_switch(&mut screen, "topic");
+        assert!(matches!(
+            screen.form.as_ref().map(|form| &form.action),
+            Some(FormAction::OverwriteIgnored { .. })
+        ));
+        screen.frame(100, 30);
+        press_confirmation_key(&mut screen, "tab");
+        screen.frame(100, 30);
+        press_confirmation_key(&mut screen, "enter");
+        drain_ignored_switch(&mut screen);
+
+        assert!(screen.notice.contains("ordinary.txt"), "{}", screen.notice);
+        assert_eq!(
+            ignored_switch_git(root, &["branch", "--show-current"]),
+            "main"
+        );
+        assert_eq!(
+            ignored_switch_git(root, &["show", "stash@{0}^3:.env"]),
+            "local only"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join(".env")).unwrap(),
+            "local only\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("ordinary.txt")).unwrap(),
+            "also local\n"
+        );
+    }
+
+    #[cfg(unix)]
+    fn install_test_post_checkout(root: &Path, script: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        let hooks = root.join(".git/hooks");
+        std::fs::create_dir_all(&hooks).unwrap();
+        let hook = hooks.join("post-checkout");
+        std::fs::write(&hook, script).unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        ignored_switch_git(root, &["config", "core.hooksPath", hooks.to_str().unwrap()]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn protected_checkout_times_out_a_hung_post_checkout_hook() {
+        let (directory, _) = ignored_switch_fixture(".env");
+        let root = directory.path();
+        install_test_post_checkout(root, "#!/bin/sh\nexec sleep 60\n");
+        let mut screen = GitScreen::open(root).unwrap();
+        screen
+            .submit_checkout(
+                ops::Checkout::branch("topic".into(), false).with_timeout(Duration::from_secs(2)),
+            )
+            .unwrap();
+        drain_ignored_switch(&mut screen);
+        assert_eq!(screen.notice, "Git took too long");
+        // Git updates HEAD before running the hook. The worker must still report its timeout.
+        assert_eq!(
+            ignored_switch_git(root, &["branch", "--show-current"]),
+            "topic"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn switch_failure_shows_the_stash_and_git_reason_in_a_wrapped_sheet() {
+        let (directory, _) = ignored_switch_fixture(".env");
+        let root = directory.path();
+        let file = root.join(".env");
+        std::fs::write(&file, "local only\n").unwrap();
+        install_test_post_checkout(
+            root,
+            "#!/bin/sh\necho 'The post-checkout hook refused to complete because the local setup is incomplete' >&2\nexit 1\n",
+        );
+        let mut screen = GitScreen::open(root).unwrap();
+        submit_ignored_switch(&mut screen, "topic");
+        assert!(screen.form.as_ref().is_some_and(Form::cancel_focused));
+        screen.frame(100, 30);
+        press_confirmation_key(&mut screen, "tab");
+        screen.frame(100, 30);
+        press_confirmation_key(&mut screen, "enter");
+        drain_ignored_switch(&mut screen);
+        assert!(matches!(
+            &screen.form.as_ref().unwrap().action,
+            FormAction::ActionMessage { .. }
+        ));
+        let frame = screen.frame(100, 30);
+        let rows: Vec<_> = (0..frame.grid.height())
+            .map(|row| frame.grid.row_text(row))
+            .collect();
+        assert!(
+            rows.iter().any(|row| row.contains("Stash: stash@{0}.")),
+            "{rows:?}"
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row.contains("local setup is incomplete")),
+            "{rows:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "tracked on topic\n"
+        );
+        assert_eq!(
+            ignored_switch_git(root, &["show", "stash@{0}^3:.env"]),
+            "local only"
+        );
+    }
+
+    #[test]
+    fn detached_checkout_names_the_ignored_collision_and_can_be_cancelled() {
+        let (directory, topic) = ignored_switch_fixture(".env");
+        let root = directory.path();
+        std::fs::write(root.join(".env"), "local only\n").unwrap();
+        let mut screen = GitScreen::open(root).unwrap();
+        screen.form(
+            "Detach HEAD?",
+            FormAction::CheckoutDetached(topic),
+            Vec::new(),
+        );
+        screen.submit().unwrap();
+        drain_ignored_switch(&mut screen);
+        let form = screen
+            .form
+            .as_ref()
+            .expect("ignored collision confirmation");
+        assert!(matches!(&form.action, FormAction::OverwriteIgnored { .. }));
+        assert!(form.cancel_focused());
+        let frame = screen.frame(100, 30);
+        assert!((0..frame.grid.height()).any(|row| frame.grid.row_text(row).contains(".env")));
+        press_confirmation_key(&mut screen, "enter");
+        assert!(screen.form.is_none());
+        assert_eq!(
+            ignored_switch_git(root, &["branch", "--show-current"]),
+            "main"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join(".env")).unwrap(),
+            "local only\n"
+        );
+    }
+
+    #[test]
+    fn standalone_clean_and_missing_worktrees_have_distinct_confirmations() {
+        let (directory, _) = ignored_switch_fixture(".env");
+        let root = directory.path();
+        let outside = tempfile::tempdir().unwrap();
+        let clean = outside.path().join("clean");
+        let missing = outside.path().join("missing");
+        for path in [&clean, &missing] {
+            ignored_switch_git(
+                root,
+                &[
+                    "worktree",
+                    "add",
+                    "--detach",
+                    path.to_str().unwrap(),
+                    "HEAD",
+                ],
+            );
+        }
+        std::fs::remove_dir_all(&missing).unwrap();
+        let mut screen = GitScreen::open(root).unwrap();
+        let repo = git2::Repository::open(root).unwrap();
+        for (path, title) in [
+            (&clean, "Remove clean, unlocked worktree"),
+            (&missing, "Forget missing worktree"),
+        ] {
+            screen.files_view = 1;
+            screen.focus = 0;
+            screen.last_list = 0;
+            let deadline = std::time::Instant::now() + Duration::from_secs(20);
+            while screen.refs_loading {
+                assert!(std::time::Instant::now() < deadline);
+                screen.poll();
+                std::thread::yield_now();
+            }
+            let path = crate::files::canonicalize(outside.path())
+                .unwrap()
+                .join(path.file_name().unwrap());
+            let slot = screen.slot(0);
+            screen.selected[slot] = screen
+                .worktree_rows()
+                .iter()
+                .position(|row| row.value == path)
+                .unwrap();
+            screen.remove_sidebar_worktree();
+            drain_ignored_switch(&mut screen);
+            assert!(screen.form.as_ref().unwrap().title.starts_with(title));
+            screen.frame(100, 30);
+            press_confirmation_key(&mut screen, "enter");
+            drain_ignored_switch(&mut screen);
+            assert!(!path.exists());
+            assert!(
+                repo.find_worktree(path.file_name().unwrap().to_str().unwrap())
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn escape_after_the_removal_check_keeps_the_progress_open() {
+        let (directory, _) = ignored_switch_fixture(".env");
+        let root = directory.path();
+        let outside = tempfile::tempdir().unwrap();
+        let linked = outside.path().join("side");
+        ignored_switch_git(
+            root,
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                linked.to_str().unwrap(),
+                "HEAD",
+            ],
+        );
+        let mut screen = GitScreen::open(root).unwrap();
+        let (deleting, resume) = screen
+            .branches
+            .start_paused_removal(
+                GitBranchRequest::RemoveWorktree {
+                    repository: root.to_path_buf(),
+                    name: "side".into(),
+                    reviewed: None,
+                    deadline: GitBranchRequest::REMOVAL_STATUS_TIMEOUT,
+                },
+                crate::branches::RemovalCheckpoint::BeforeDelete,
+            )
+            .unwrap();
+        screen.show_removal_check();
+        deleting.recv_timeout(Duration::from_secs(20)).unwrap();
+
+        // Deliver Esc even if the UI has not polled the phase transition yet.
+        screen.form_key(&KeyEvent::plain(KeyCode::Escape)).unwrap();
+        assert!(matches!(
+            screen.form.as_ref().unwrap().action,
+            FormAction::RemovingWorktree
+        ));
+        let frame = screen.frame(100, 30);
+        let rows: Vec<_> = (0..frame.grid.height())
+            .map(|row| frame.grid.row_text(row))
+            .collect();
+        assert!(rows.iter().any(|row| row.contains("Removing worktree…")));
+        assert!(
+            !rows
+                .iter()
+                .any(|row| row.contains("Cancel check") || row.contains("cancel check"))
+        );
+        screen.form_key(&KeyEvent::plain(KeyCode::Escape)).unwrap();
+        assert!(screen.form.is_some());
+
+        resume.send(()).unwrap();
+        drain_ignored_switch(&mut screen);
+        assert!(screen.form.is_none());
+        assert!(!linked.exists());
+    }
+
     #[test]
     fn stash_drop_confirmation_refuses_a_replaced_stash() {
         let directory = tempfile::tempdir().unwrap();
@@ -3828,7 +4490,10 @@ mod context_tests {
         bulk(&mut screen);
         wait(&mut screen);
         let staged_edit = indexed("edit.txt").unwrap();
-        assert_ne!(staged_edit, original_edit);
+        assert_eq!(
+            repo.find_blob(staged_edit).unwrap().content(),
+            b"worktree change\n"
+        );
         assert!(indexed("new.txt").is_none());
         assert!(unmerged());
         bulk(&mut screen);
@@ -3859,13 +4524,29 @@ mod context_tests {
         assert!(screen.form.is_none());
         assert_eq!(indexed("edit.txt"), Some(staged_edit));
 
+        // With the worktree back at HEAD, the staged blob is still the only copy.
+        bulk(&mut screen);
+        assert_eq!(
+            screen.form.as_ref().unwrap().title,
+            "Replace staged changes?"
+        );
+        screen.frame(100, 30);
+        press_confirmation_key(&mut screen, "ctrl-enter");
+        wait(&mut screen);
+        assert!(screen.form.is_none());
+        assert_eq!(indexed("edit.txt"), Some(staged_edit));
+
         write("edit.txt", "worktree change\nplus more\n");
         screen.refresh().unwrap();
         wait(&mut screen);
         bulk(&mut screen);
         assert!(screen.form.is_none());
         wait(&mut screen);
-        assert_ne!(indexed("edit.txt"), Some(staged_edit));
+        let staged_with_more = indexed("edit.txt").unwrap();
+        assert_eq!(
+            repo.find_blob(staged_with_more).unwrap().content(),
+            b"worktree change\nplus more\n"
+        );
         assert!(unmerged());
 
         // A deleted working copy also needs consent before replacing the staged blob.
@@ -3881,21 +4562,6 @@ mod context_tests {
         wait(&mut screen);
         assert!(indexed("edit.txt").is_none());
         assert!(unmerged());
-
-        // Single-file staging still works, but only a second attempt accepts unchanged markers.
-        press(&mut screen, KeyCode::Char('/'));
-        screen.event(UiEvent::Paste("conflict.txt".into()));
-        press(&mut screen, KeyCode::Enter);
-        press(&mut screen, KeyCode::Char('s'));
-        assert_eq!(
-            screen.notice,
-            "conflict.txt still has conflict markers. Press again to stage it anyway."
-        );
-        assert!(unmerged());
-        press(&mut screen, KeyCode::Char('s'));
-        wait(&mut screen);
-        assert!(!unmerged(), "{}", screen.notice);
-        assert!(indexed("conflict.txt").is_some());
     }
 
     #[test]

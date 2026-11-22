@@ -106,7 +106,11 @@ fn ctrl(screen: &mut GitScreen, code: KeyCode) {
 }
 
 fn view(screen: &mut GitScreen) -> String {
-    let frame = screen.frame(140, 40);
+    view_at(screen, 140)
+}
+
+fn view_at(screen: &mut GitScreen, width: u16) -> String {
+    let frame = screen.frame(width, 40);
     (0..40)
         .map(|y| frame.grid.row_text(y))
         .collect::<Vec<_>>()
@@ -252,11 +256,24 @@ fn z_undoes_and_shift_z_redoes_with_a_sheet_that_shows_the_move() {
         "Undo the last action?".to_owned(),
         "commit: charlie".to_owned(),
         format!("{} → {}", short(&charlie), short(&bravo)),
-        format!("git reset --keep {}", short(&bravo)),
+        format!(
+            "git switch --no-overwrite-ignore --quiet --no-track -C main -- {}",
+            short(&bravo)
+        ),
         button("Undo"),
     ] {
         assert!(sheet.contains(&text), "{text}:\n{sheet}");
     }
+    let narrow = view_at(&mut screen, 100);
+    let runs = narrow
+        .lines()
+        .skip_while(|line| !line.contains("Runs"))
+        .take_while(|line| !line.contains("[ Undo ]"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(runs.contains("git switch"), "{narrow}");
+    assert!(runs.contains(&format!("-- {}", short(&bravo))), "{narrow}");
+
     confirm(&mut screen);
     assert_eq!(git(root, &["rev-parse", "HEAD"]), bravo);
     shows(&mut screen, "Undid commit: charlie");
@@ -272,11 +289,12 @@ fn z_undoes_and_shift_z_redoes_with_a_sheet_that_shows_the_move() {
     key(&mut screen, KeyCode::Char('Z'));
     shows(&mut screen, "Nothing to redo");
 
-    // `reset --keep` refuses rather than overwrite an uncommitted change to a file it moves.
+    // The commit move still refuses to overwrite an uncommitted change.
     std::fs::write(root.join("charlie.txt"), "draft\n").unwrap();
     key(&mut screen, KeyCode::Char('z'));
     shows(&mut screen, &button("Undo"));
     confirm(&mut screen);
+    shows(&mut screen, "would be overwritten by checkout");
     assert_eq!(git(root, &["rev-parse", "HEAD"]), charlie);
     assert_eq!(
         std::fs::read_to_string(root.join("charlie.txt")).unwrap(),
@@ -294,6 +312,86 @@ fn z_switches_back_after_a_branch_switch() {
     shows(&mut screen, "topic → main");
     confirm(&mut screen);
     assert_eq!(git(root, &["branch", "--show-current"]), "main");
+}
+
+#[cfg(unix)]
+fn install_failing_post_checkout(root: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let hooks = root.join(".git/hooks");
+    std::fs::create_dir_all(&hooks).unwrap();
+    let hook = hooks.join("post-checkout");
+    std::fs::write(
+        &hook,
+        "#!/bin/sh\nprintf '%s\\n' 'setup failed' 'extra hook detail' >&2\nexit 1\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    git(root, &["config", "core.hooksPath", hooks.to_str().unwrap()]);
+}
+
+#[cfg(unix)]
+#[test]
+fn commit_undo_and_redo_report_a_failing_post_checkout_hook_after_the_move() {
+    let dir = repo(&["alpha", "bravo", "charlie"]);
+    let root = dir.path();
+    let bravo = git(root, &["rev-parse", "HEAD~1"]);
+    let charlie = git(root, &["rev-parse", "HEAD"]);
+    install_failing_post_checkout(root);
+    let mut screen = open(root);
+
+    key(&mut screen, KeyCode::Char('z'));
+    shows(&mut screen, "Undo the last action?");
+    confirm(&mut screen);
+    shows(
+        &mut screen,
+        "Undone. The post-checkout hook failed: setup failed",
+    );
+    assert!(!view(&mut screen).contains("extra hook detail"));
+    assert_eq!(git(root, &["rev-parse", "HEAD"]), bravo);
+    assert_eq!(git(root, &["ls-files", "--", "charlie.txt"]), "");
+    assert!(!root.join("charlie.txt").exists());
+
+    key(&mut screen, KeyCode::Char('z'));
+    shows(&mut screen, "Undoes  commit: bravo");
+    key(&mut screen, KeyCode::Escape);
+    key(&mut screen, KeyCode::Char('Z'));
+    shows(&mut screen, "Redo the undone action?");
+    confirm(&mut screen);
+    shows(
+        &mut screen,
+        "Redone. The post-checkout hook failed: setup failed",
+    );
+    assert_eq!(git(root, &["rev-parse", "HEAD"]), charlie);
+    assert_eq!(git(root, &["show", ":charlie.txt"]), "charlie");
+    assert_eq!(
+        std::fs::read_to_string(root.join("charlie.txt")).unwrap(),
+        "charlie\n"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn checkout_undo_with_a_failing_hook_checks_the_branch_even_at_the_same_tip() {
+    let dir = repo(&["alpha", "bravo"]);
+    let root = dir.path();
+    let tip = git(root, &["rev-parse", "HEAD"]);
+    git(root, &["switch", "-q", "-c", "topic"]);
+    install_failing_post_checkout(root);
+    let mut screen = GitScreen::open(root).unwrap();
+    shows(&mut screen, "topic");
+
+    key(&mut screen, KeyCode::Char('z'));
+    shows(&mut screen, "topic → main");
+    confirm(&mut screen);
+    shows(
+        &mut screen,
+        "Undone. The post-checkout hook failed: setup failed",
+    );
+    assert_eq!(git(root, &["branch", "--show-current"]), "main");
+    assert_eq!(git(root, &["rev-parse", "HEAD"]), tip);
+
+    key(&mut screen, KeyCode::Char('z'));
+    shows(&mut screen, "Undoes  commit: bravo");
 }
 
 /// Runs one History key on bravo (the third newest of four) and confirms its sheet.

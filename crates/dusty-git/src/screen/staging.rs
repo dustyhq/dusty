@@ -7,6 +7,23 @@ mod tests;
 
 const CHECK_STAGE: &str = "Couldn't check what is staged";
 const STAGE_CHANGED: &str = "Files changed while you were deciding. Try staging again.";
+const DIRECTORY_SCOPE: &str = "Show the replaced file and all its changed contents before staging.";
+
+#[derive(Clone, Copy)]
+enum StageScope {
+    All,
+    Directory,
+    Marked,
+}
+
+impl StageScope {
+    fn replacement_refusal(self) -> &'static str {
+        match self {
+            Self::Marked => MARKED_DIRECTORY_SCOPE,
+            Self::All | Self::Directory => DIRECTORY_SCOPE,
+        }
+    }
+}
 
 #[derive(Clone)]
 pub(super) struct BulkStage {
@@ -33,7 +50,7 @@ fn unmerged_paths(index: &git2::Index) -> Result<BTreeSet<PathBuf>, git2::Error>
     Ok(paths)
 }
 
-/// Find staged blobs that would disappear because the worktree is back at HEAD or missing.
+/// Find staged blobs that would disappear because the worktree reverted or replaced the file.
 fn staged_only_paths(
     repo: &git2::Repository,
     index: &git2::Index,
@@ -73,6 +90,10 @@ fn staged_only_paths(
                 staged_only.insert(path.clone());
             }
             Err(_) => return Err(git2::Error::from_str("cannot read working tree")),
+            Ok(metadata) if metadata.is_dir() && staged.mode != 0o160000 => {
+                // The directory exists, but Git will remove the staged file it replaced.
+                staged_only.insert(path.clone());
+            }
             Ok(_) if committed.is_some() => {
                 present_in_head.insert(path.clone());
             }
@@ -132,6 +153,11 @@ impl GitScreen {
 
     pub(super) fn stage_all(&mut self) -> Result<(), String> {
         let snapshot = self.snapshot.as_ref().ok_or("Status is loading")?;
+        if snapshot.truncated {
+            return Err(
+                "Too many changed files to stage them all here. Use git add in a terminal.".into(),
+            );
+        }
         let paths = if self.filters[0].active() {
             let paths = self
                 .rows(0)
@@ -156,7 +182,7 @@ impl GitScreen {
         self.stage_bulk(&paths, StageScope::All)
     }
 
-    /// Directory and marked-file staging share the same exact-path safeguards as `a`.
+    /// Marked files share the same exact-path safeguards as directory toggles and `a`.
     pub(super) fn stage_paths(&mut self, selection: &BTreeSet<PathBuf>) -> Result<(), String> {
         self.stage_bulk(selection, StageScope::Marked)
     }
@@ -214,6 +240,7 @@ impl GitScreen {
                 && (!entry.sources.unstaged
                     || (!toggle_all && self.submodule_pointer_matches_index(&entry.relative_path)))
         };
+        // Conflicts aren't part of the write and must not determine which way it goes.
         let all_staged = entries.iter().all(|entry| fully_staged(entry));
         let unstage = match if toggle_all { None } else { self.stage_intent } {
             Some(true) if all_staged => {
@@ -254,15 +281,13 @@ impl GitScreen {
                 paths.insert(original.clone());
             }
         }
-        self.check_stage_paths(&index, &paths, unstage)?;
         let notice = (skipped != 0).then(|| {
             let verb = if unstage { "Unstaged" } else { "Staged" };
             let files = if count == 1 { "file" } else { "files" };
             format!("{verb} {count} {files}. {skip_notice}")
         });
         if unstage {
-            self.check_bulk_stage_state(index_before, head)?;
-            return self.write_stage_paths(paths, true, head.is_some(), notice);
+            return self.unstage_paths(paths, index_before, head, notice);
         }
 
         self.check_stage_paths(&repository, &index, &paths, scope)?;
@@ -295,7 +320,7 @@ impl GitScreen {
             self.form.as_mut().expect("just opened").selected = 1; // Cancel.
             return Ok(());
         }
-        self.write_stage_paths(paths, false, head.is_some(), notice)
+        self.write_stage_paths(paths, notice)
     }
 
     fn bulk_stage_state(&self) -> Result<(GitIndexFingerprint, Option<GitHeadId>), String> {
@@ -340,15 +365,19 @@ impl GitScreen {
         repo: &git2::Repository,
         index: &git2::Index,
         paths: &BTreeSet<PathBuf>,
-        unstage: bool,
+        scope: StageScope,
     ) -> Result<(), String> {
-        // Restoring the index cannot sweep up untracked files from a worktree directory.
-        if unstage {
-            return Ok(());
-        }
+        let mut directories = Vec::new();
         for path in paths {
-            let directory = std::fs::symlink_metadata(self.root.join(path))
-                .is_ok_and(|metadata| metadata.file_type().is_dir());
+            // Adding a descendant also removes any tracked file it replaced.
+            if indexed_file_ancestors(index, path).any(|parent| !paths.contains(parent)) {
+                return Err(scope.replacement_refusal().into());
+            }
+            if !std::fs::symlink_metadata(self.root.join(path))
+                .is_ok_and(|metadata| metadata.file_type().is_dir())
+            {
+                continue;
+            }
             let gitlink = index
                 .get_path(path, 0)
                 .is_some_and(|entry| entry.mode == 0o160000)
@@ -357,13 +386,33 @@ impl GitScreen {
                     .as_ref()
                     .and_then(|refs| refs.submodules.as_ref().ok())
                     .is_some_and(|modules| modules.iter().any(|module| &module.path == path));
-            if directory && !gitlink {
-                // A literal pathspec still recurses into a directory. A file replaced
-                // by a directory must not silently sweep in unmarked/new descendants.
-                return Err(
-                    "A selected file is now a directory; review its changed files before staging"
-                        .into(),
-                );
+            if !gitlink {
+                directories.push(path);
+            }
+        }
+        if directories.is_empty() {
+            return Ok(());
+        }
+
+        // A literal directory still recurses. Check the worktree rather than relying
+        // on the last status snapshot: untracked descendants may not be in it yet.
+        let mut options = git2::DiffOptions::new();
+        options
+            .disable_pathspec_match(true)
+            .include_untracked(true)
+            .recurse_untracked_dirs(true)
+            .include_unreadable(true);
+        for directory in directories {
+            options.pathspec(directory);
+        }
+        let diff = repo
+            .diff_index_to_workdir(Some(index), Some(&mut options))
+            .map_err(|_| CHECK_STAGE)?;
+        for delta in diff.deltas() {
+            let file = delta.new_file();
+            let path = file.path().ok_or(CHECK_STAGE)?;
+            if !paths.contains(path) {
+                return Err(scope.replacement_refusal().into());
             }
         }
         Ok(())
@@ -389,21 +438,12 @@ impl GitScreen {
     fn write_stage_paths(
         &mut self,
         paths: BTreeSet<PathBuf>,
-        unstage: bool,
-        has_head: bool,
         notice: Option<String>,
     ) -> Result<(), String> {
-        let mut args: Vec<OsString> = vec!["--literal-pathspecs".into()];
-        if unstage {
-            if has_head {
-                args.extend(["restore", "--source=HEAD", "--staged"].map(Into::into));
-            } else {
-                // An unborn index has no HEAD entries to restore. --cached never removes disk files.
-                args.extend(["rm", "--cached", "--ignore-unmatch", "-r"].map(Into::into));
-            }
-        } else {
-            args.extend(["add", "--all"].map(Into::into));
-        }
+        let mut args: Vec<OsString> = ["--literal-pathspecs", "add", "--all"]
+            .into_iter()
+            .map(Into::into)
+            .collect();
         // Keep arbitrary/non-UTF8 names literal, and large selections below ARG_MAX.
         // JobRequest bounds stdin; no temporary pathspec or request files are needed.
         args.extend(["--pathspec-from-file=-", "--pathspec-file-nul"].map(Into::into));
@@ -418,19 +458,16 @@ impl GitScreen {
         Ok(())
     }
 
-    pub(super) fn check_conflict_markers(
-        &mut self,
-        path: &Path,
-        expected_index: GitIndexFingerprint,
-    ) -> Result<Option<[u8; 32]>, String> {
-        let warned = self.warned_markers.take();
-        let (repo, index) = self.stage_index()?;
-        if !(1..=3).any(|stage| index.get_path(path, stage).is_some()) {
-            return Ok(None);
+    pub(super) fn stage_file(&mut self, mut plan: GitChangePlanRequest) -> Result<(), String> {
+        if plan.kind != GitMutationKind::StageFile {
+            return self.apply_stage_file(plan);
         }
+        let path = &plan.policy.file;
+        let (repo, index) = self.stage_index()?;
         let file = self.root.join(path);
-        if std::fs::symlink_metadata(&file)
-            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+        if !(1..=3).any(|stage| index.get_path(path, stage).is_some())
+            || std::fs::symlink_metadata(&file)
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
         {
             return self.apply_stage_file(plan);
         }
@@ -445,18 +482,32 @@ impl GitScreen {
             .map_err(|_| "Couldn't check for conflict markers")?
             .and_then(|value| value.parse::<usize>().ok())
             .filter(|size| *size > 0);
+        // The staging worker must apply exactly the bytes checked here, even if
+        // the user decides to keep the markers.
+        plan.expected_worktree = Some(hash);
         if conflicts::has_markers(&String::from_utf8_lossy(&bytes), size) {
-            let capture = (path.to_path_buf(), hash, expected_index);
-            if warned.as_ref() != Some(&capture) {
-                self.warned_markers = Some(capture);
-                return Err(format!(
-                    "{} still has conflict markers. Press again to stage it anyway.",
-                    path.display()
-                ));
-            }
+            self.form = Some(Form {
+                title: format!("Conflict markers remain in {}.", path.display()),
+                action: FormAction::StageConflict {
+                    plan: Box::new(plan),
+                    path_top: std::cell::Cell::new(0),
+                },
+                fields: Vec::new(),
+                selected: 1, // Cancel.
+                focus_moved: false,
+            });
+            self.notice.clear();
+            return Ok(());
         }
-        // The staging worker must apply exactly the bytes that passed the check.
-        Ok(Some(hash))
+        self.apply_stage_file(plan)
+    }
+
+    pub(super) fn apply_stage_file(&mut self, plan: GitChangePlanRequest) -> Result<(), String> {
+        self.mutation
+            .start(GitMutationRequest::Plan(plan))
+            .map_err(|error| error.to_string())?;
+        self.busy = true;
+        Ok(())
     }
 
     pub(super) fn clear_hunks(&mut self) {
@@ -694,6 +745,8 @@ impl GitScreen {
             Vec::new()
         };
         let hunk = snapshot.hunks[hunk_index].clone();
+        crate::mutation::validate_reset_selection(&hunk, &selected_lines)
+            .map_err(|error| error.to_string())?;
         let scope = if exact {
             let first = selected_lines[0] + 1;
             let last = selected_lines[selected_lines.len() - 1] + 1;

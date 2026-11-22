@@ -2,6 +2,7 @@
 use crate::editor::BufferId;
 use crate::editor::EditorState;
 use crate::editor::text::TextVersion;
+use crate::git::GitBranchError;
 use crate::git::GitBranchList;
 use crate::git::GitBranchListRequest;
 use crate::git::GitBranchRequest;
@@ -142,6 +143,7 @@ pub(super) enum GitHunkAction {
     Stage(u32),
     Unstage,
     StageLines(u32, u32),
+    UnstageLines(u32, u32),
     Reset,
 }
 
@@ -818,11 +820,19 @@ impl Git {
             let lines = hunk.changes_on_lines(start, end);
             (!lines.is_empty()).then_some((hunk, lines))
         });
-        let (hunk, lines) = matches
-            .next()
-            .ok_or("no unstaged Git change on those lines")?;
+        let staged = snapshot.layer == GitDiffLayer::Staged;
+        let (hunk, lines) = matches.next().ok_or(if staged {
+            "No staged changes on those lines"
+        } else {
+            "no unstaged Git change on those lines"
+        })?;
         if matches.next().is_some() {
-            return Err("stage lines from one Git hunk at a time".into());
+            return Err(if staged {
+                "Select lines from one staged hunk at a time"
+            } else {
+                "stage lines from one Git hunk at a time"
+            }
+            .into());
         }
         let path = self
             .status_snapshot
@@ -986,7 +996,9 @@ impl Git {
             .ok_or("Git status is not ready; is this a Git repository?")?;
         let layer = if matches!(
             kind,
-            GitMutationKind::UnstageFile | GitMutationKind::UnstageHunk
+            GitMutationKind::UnstageFile
+                | GitMutationKind::UnstageHunk
+                | GitMutationKind::UnstageLines
         ) {
             GitDiffLayer::Staged
         } else {
@@ -1011,7 +1023,10 @@ impl Git {
         };
         if matches!(
             kind,
-            GitMutationKind::StageHunk | GitMutationKind::UnstageHunk | GitMutationKind::StageLines
+            GitMutationKind::StageHunk
+                | GitMutationKind::UnstageHunk
+                | GitMutationKind::StageLines
+                | GitMutationKind::UnstageLines
         ) {
             let (snapshot, hunk, _) = self
                 .selected
@@ -1022,7 +1037,7 @@ impl Git {
             }
             // Unstaging acts on the index, so it must be driven by a staged-layer selection
             // rather than by whatever hunk happens to be selected.
-            if kind == GitMutationKind::UnstageHunk && snapshot.layer != GitDiffLayer::Staged {
+            if layer == GitDiffLayer::Staged && snapshot.layer != GitDiffLayer::Staged {
                 return Err("select a staged Git hunk first".into());
             }
             plan.hunk_snapshot_revision = snapshot.revision;
@@ -1080,15 +1095,21 @@ impl Git {
         if self.branch_request_id.is_some() {
             return Err("a Git worktree request is already running".into());
         }
-        let repo = git2::Repository::open(repository).map_err(|e| e.to_string())?;
-        let worktree = repo.find_worktree(name).map_err(|e| e.to_string())?;
-        let path = crate::files::canonicalize(worktree.path()).map_err(|e| e.to_string())?;
-        if editor.buffers.values().any(|buffer| {
-            buffer.dirty
-                && buffer
-                    .path
-                    .as_ref()
-                    .is_some_and(|file| file.starts_with(&path))
+        let path = if let Some(reviewed) = &reviewed {
+            (!reviewed.is_missing()).then(|| reviewed.path().to_path_buf())
+        } else {
+            let repo = git2::Repository::open(repository).map_err(|e| e.to_string())?;
+            let worktree = repo.find_worktree(name).map_err(|e| e.to_string())?;
+            Some(crate::files::canonicalize(worktree.path()).map_err(|e| e.to_string())?)
+        };
+        if path.as_ref().is_some_and(|path| {
+            editor.buffers.values().any(|buffer| {
+                buffer.dirty
+                    && buffer
+                        .path
+                        .as_ref()
+                        .is_some_and(|file| file.starts_with(path))
+            })
         }) {
             return Err("worktree has unsaved editor changes".into());
         }
@@ -1320,6 +1341,9 @@ impl Git {
                     GitMutationKind::StageFile => GitMutationOutcome::Staged("Git file staged"),
                     GitMutationKind::UnstageFile => GitMutationOutcome::Staged("Git file unstaged"),
                     GitMutationKind::UnstageHunk => GitMutationOutcome::Staged("Git hunk unstaged"),
+                    GitMutationKind::UnstageLines => {
+                        GitMutationOutcome::Staged("Git lines unstaged")
+                    }
                     _ => GitMutationOutcome::Staged("Git hunk staged"),
                 };
                 self.mutation_request_id = None;
@@ -1339,7 +1363,13 @@ impl Git {
             Err(error) => {
                 self.mutation_request_id = None;
                 self.plan_path = None;
-                Err(error.to_string())
+                Err(match error {
+                    GitMutationError::FileDirectoryReplacement => {
+                        "Open Dusty Git and mark the replaced file and all its changed contents."
+                            .into()
+                    }
+                    _ => error.to_string(),
+                })
             }
         }
     }
@@ -2457,6 +2487,102 @@ impl App {
             self.show_error("the primary worktree (main checkout) cannot be removed");
             return;
         }
+        let Some(repository) = self.git_repository() else {
+            return;
+        };
+        match self.git.review_worktree_removal(&repository, name) {
+            Ok(()) => self.show_worktree_check(),
+            Err(error) => self.show_error(error),
+        }
+    }
+
+    fn show_worktree_check(&mut self) {
+        self.open_worktree_message(
+            PromptKind::GitWorktreeCheck,
+            "Checking worktree",
+            "Checking which files would be deleted…".into(),
+            "Cancel check",
+        );
+    }
+
+    pub(in crate::app) fn show_worktree_removing(&mut self) {
+        if self
+            .input
+            .prompt()
+            .and_then(|prompt| prompt.confirmation.as_ref())
+            .is_some_and(|confirmation| confirmation.positive_label.is_empty())
+        {
+            return;
+        }
+        self.input.configure_confirmation_actions(
+            "Worktree".into(),
+            "Removing worktree…".into(),
+            crate::ui::ConfirmationChoice::Yes,
+            "",
+            "",
+            String::new(),
+        );
+        self.project_input_prompt();
+        self.reconcile_editor_windows();
+    }
+
+    fn show_incomplete_worktree_removal(&mut self, message: String) {
+        self.start_git_worktrees();
+        self.open_worktree_message(
+            PromptKind::GitWorktreeNotice,
+            "Worktree removal stopped",
+            message,
+            "Close",
+        );
+    }
+
+    fn show_worktree_removal(
+        &mut self,
+        name: String,
+        reviewed: GitWorktreeRemoval,
+        change: Option<String>,
+    ) {
+        // A finished scan must not replace another prompt or follow the picker to another row.
+        if self.input.prompt().is_some()
+            || !matches!(
+                self.search.selected_picker_payload(),
+                Some(crate::app::picker::PickerPayload::GitWorktree { name: selected, main: false, .. })
+                    if selected == &name
+            )
+        {
+            return;
+        }
+        let (title, mut message) = if reviewed.is_missing() {
+            (
+                "Forget worktree",
+                format!(
+                    "Forget missing worktree {name}? Its directory is already gone. No branch is deleted."
+                ),
+            )
+        } else if reviewed.is_clean() {
+            (
+                "Remove worktree",
+                format!("Remove worktree `{name}` and its directory? No branch is deleted."),
+            )
+        } else {
+            (
+                "Remove worktree",
+                format!("Remove worktree {name}? No branch is deleted."),
+            )
+        };
+        for warning in reviewed.warnings() {
+            message.push('\n');
+            message.push_str(&warning);
+        }
+        let reapproval = change.is_some();
+        if let Some(change) = change {
+            message = format!("{change}\n{message}");
+        }
+        let confirm = if reviewed.is_missing() {
+            "Forget"
+        } else {
+            "Yes"
+        };
         self.git
             .set_pending_destructive(crate::app::git::GitDestructiveAction::RemoveWorktree(
                 name.clone(),
@@ -2628,6 +2754,37 @@ impl App {
 }
 
 impl App {
+    pub(super) fn unstage_git_lines(&mut self, start: i64, end: i64) {
+        self.git.reconcile_hunk_path(&self.state);
+        let range = u32::try_from(start)
+            .ok()
+            .zip(u32::try_from(end).ok())
+            .filter(|&(start, end)| start > 0 && end >= start);
+        let Some((start, end)) = range else {
+            self.show_error("Enter the first and last staged line numbers, starting at 1");
+            return;
+        };
+        if !self.active_git_hunks(GitDiffLayer::Staged) {
+            self.start_git_hunks_with_layer(
+                Some(GitHunkAction::UnstageLines(start, end)),
+                GitDiffLayer::Staged,
+            );
+            return;
+        }
+        let result = self.git.select_lines(start, end).and_then(|lines| {
+            self.git.start_plan(
+                &self.state,
+                GitMutationKind::UnstageLines,
+                self.workspace.root_revision(),
+                self.workspace.trust() == WorkspaceTrust::Trusted,
+                lines,
+            )
+        });
+        if let Err(error) = result {
+            self.show_error(error);
+        }
+    }
+
     pub(in crate::app) fn unstage_selected_git_hunk(&mut self) {
         self.git.reconcile_hunk_path(&self.state);
         use crate::git::GitDiffLayer;
@@ -2644,7 +2801,7 @@ impl App {
         }
         if let Err(error) = self.git.start_plan(
             &self.state,
-            crate::git::GitMutationKind::UnstageHunk,
+            GitMutationKind::UnstageHunk,
             self.workspace.root_revision(),
             self.workspace.trust() == WorkspaceTrust::Trusted,
             Vec::new(),
@@ -2711,6 +2868,9 @@ impl App {
                             unreachable!("staging handled above")
                         }
                         GitHunkAction::Unstage => self.unstage_selected_git_hunk(),
+                        GitHunkAction::UnstageLines(start, end) => {
+                            self.unstage_git_lines(i64::from(start), i64::from(end));
+                        }
                         GitHunkAction::Reset => self.request_reset_selected_git_hunk(),
                     }
                     return;

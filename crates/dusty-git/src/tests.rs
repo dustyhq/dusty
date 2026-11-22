@@ -1409,7 +1409,7 @@ fn plan_template(policy: GitHunkPolicy, kind: GitMutationKind) -> GitChangePlanR
 
 fn run_plan(plan: GitChangePlanRequest) -> Result<GitMutationResult, GitMutationError> {
     let mut service = GitMutationWorker::default();
-    service.start(GitMutationRequest::Plan(plan)).unwrap();
+    service.start(GitMutationRequest::Plan(plan))?;
     let deadline = Instant::now() + WAIT * 2;
     loop {
         match service.poll() {
@@ -2102,6 +2102,7 @@ fn branch_request(
         "remove-worktree" => R::RemoveWorktree {
             repository,
             name: name.into(),
+            reviewed: None,
             deadline,
         },
         _ => panic!("unknown request kind {kind}"),
@@ -2250,6 +2251,7 @@ fn worktree_deadlines_refuse_expired_mutations_and_lists() {
         GitBranchRequest::RemoveWorktree {
             repository: root.clone(),
             name: "side".into(),
+            reviewed: None,
             deadline: Duration::from_nanos(1),
         },
     ];
@@ -4050,6 +4052,160 @@ fn hunk_mutations_quote_paths_and_leave_similarly_named_files_unchanged() {
             "new\n"
         );
         assert_eq!(index_text(dir.path(), "foo"), "old\n");
+    }
+}
+
+#[test]
+fn selected_line_staging_preserves_valid_eof_boundaries() {
+    for (old, new, line) in [
+        ("old\nkeep\nlast", "new\nkeep\nlast", 1),
+        ("keep\nold\n", "keep\nnew", 2),
+        ("keep\nold", "keep\nnew\n", 2),
+    ] {
+        let dir = tempdir().unwrap();
+        let repo = git2::Repository::init(dir.path()).unwrap();
+        let file = dir.path().join("eof.txt");
+        commit(&repo, "eof.txt", old);
+        std::fs::write(&file, new).unwrap();
+        let policy = plan_policy(dir.path(), "eof.txt", GitDiffLayer::Unstaged);
+        let mut plan = captured_plan(dir.path(), policy, GitMutationKind::StageLines, 0);
+        plan.selected_lines = plan.selected.as_ref().unwrap().changes_on_lines(line, line);
+        run_plan(plan).unwrap();
+        assert_eq!(index_text(dir.path(), "eof.txt"), new, "{old:?} → {new:?}");
+        assert_eq!(std::fs::read_to_string(file).unwrap(), new);
+    }
+}
+
+#[test]
+fn selected_lines_cannot_join_an_unterminated_neighbour() {
+    for (kind, old, new) in [
+        (GitMutationKind::StageLines, "a", "A\nb\n"),
+        (GitMutationKind::UnstageLines, "a\nb\n", "A"),
+        (GitMutationKind::ResetUnstagedHunk, "a\nb\n", "A"),
+    ] {
+        let dir = tempdir().unwrap();
+        let repo = git2::Repository::init(dir.path()).unwrap();
+        let file = dir.path().join("eof.txt");
+        commit(&repo, "eof.txt", old);
+        std::fs::write(&file, new).unwrap();
+        let layer = if kind == GitMutationKind::UnstageLines {
+            let mut index = repo.index().unwrap();
+            index.add_path(Path::new("eof.txt")).unwrap();
+            index.write().unwrap();
+            GitDiffLayer::Staged
+        } else {
+            GitDiffLayer::Unstaged
+        };
+        let policy = plan_policy(dir.path(), "eof.txt", layer);
+        let mut plan = captured_plan(dir.path(), policy, kind, 0);
+        let hunk = plan.selected.as_ref().unwrap();
+        plan.selected_lines = vec![
+            hunk.lines
+                .iter()
+                .position(|line| line.text == "b\n")
+                .unwrap() as u32,
+        ];
+        let cancel = AtomicBool::new(false);
+        let id = GitMutationRequestId(1);
+        let result = if kind == GitMutationKind::ResetUnstagedHunk {
+            crate::mutation::reset_hunk(
+                id,
+                &GitResetHunkRequest {
+                    policy: plan.policy,
+                    hunk_snapshot_revision: plan.hunk_snapshot_revision,
+                    hunk_id: hunk.id,
+                    selected: hunk.clone(),
+                    selected_lines: plan.selected_lines,
+                    expected_index: plan.expected_index,
+                    expected_worktree: plan.expected_worktree,
+                    maximum_patch_bytes: plan.maximum_patch_bytes,
+                },
+                &cancel,
+            )
+        } else {
+            assert_eq!(
+                crate::mutation::validate_change_plan(&plan),
+                Err(GitMutationError::NeedsLineEnding)
+            );
+            crate::mutation::apply_change_plan(id, &plan, &cancel)
+        };
+        assert_eq!(result, Err(GitMutationError::NeedsLineEnding), "{kind:?}");
+        assert_eq!(std::fs::read_to_string(file).unwrap(), new);
+        assert_eq!(
+            index_text(dir.path(), "eof.txt"),
+            if layer == GitDiffLayer::Staged {
+                new
+            } else {
+                old
+            }
+        );
+    }
+}
+
+#[test]
+fn undo_unstage_restores_staged_only_content() {
+    for kind in [
+        Some(GitMutationKind::UnstageFile),
+        Some(GitMutationKind::UnstageHunk),
+        Some(GitMutationKind::UnstageLines),
+        None,
+    ] {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        let repo = git2::Repository::init(root).unwrap();
+        let path = Path::new("edit.txt");
+        let file = root.join(path);
+        commit(&repo, "edit.txt", "base\nkeep\n");
+        std::fs::write(&file, "staged-only\nkeep\n").unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(path).unwrap();
+        index.write().unwrap();
+        let before = git_index_fingerprint(root).unwrap();
+        let head = git_head_id(root).unwrap();
+        std::fs::write(&file, "different\nkeep\n").unwrap();
+
+        let policy = plan_policy(root, "edit.txt", GitDiffLayer::Staged);
+        if let Some(kind) = kind {
+            let mut plan = if kind == GitMutationKind::UnstageFile {
+                plan_template(policy, kind)
+            } else {
+                captured_plan(root, policy, kind, 0)
+            };
+            plan.expected_index = Some(before);
+            if kind == GitMutationKind::UnstageLines {
+                plan.selected_lines = vec![0, 1];
+            }
+            run_plan(plan).unwrap();
+        } else {
+            crate::mutation::unstage_paths(
+                GitMutationRequestId(1),
+                root,
+                &[path.to_path_buf()].into(),
+                before,
+                head,
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+        }
+        assert_eq!(index_text(root, "edit.txt"), "base\nkeep\n", "{kind:?}");
+
+        let undo = crate::history::undo(root, false).unwrap();
+        undo.restore_index(root).unwrap();
+        assert_eq!(git_index_fingerprint(root).unwrap(), before);
+        assert_eq!(
+            index_text(root, "edit.txt"),
+            "staged-only\nkeep\n",
+            "{kind:?}"
+        );
+        assert_eq!(git_head_id(root).unwrap(), head);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "different\nkeep\n");
+
+        crate::history::undo(root, true)
+            .unwrap()
+            .restore_index(root)
+            .unwrap();
+        assert_eq!(index_text(root, "edit.txt"), "base\nkeep\n", "{kind:?}");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "different\nkeep\n");
     }
 }
 

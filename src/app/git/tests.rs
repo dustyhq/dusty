@@ -587,6 +587,62 @@ fn explorer_auto_git_status_colors_names_opens_picker_and_idles() {
 }
 
 #[test]
+fn editor_stage_hunk_keeps_the_staged_file_replaced_by_its_directory() {
+    let (_app_dirs, mut app) = app();
+    let root = app.state.workspace_root.clone();
+    let repo = history_fixture(&root, &["Base"]);
+    let config = root.join("config");
+    fs::write(&config, "staged only\n").unwrap();
+    let mut index = repo.index().unwrap();
+    index.add_path(std::path::Path::new("config")).unwrap();
+    index.write().unwrap();
+    fs::remove_file(&config).unwrap();
+    fs::create_dir(&config).unwrap();
+    let path = config.join("app.toml");
+    fs::write(&path, "new config\n").unwrap();
+    fs::write(config.join("other.toml"), "another config\n").unwrap();
+
+    prepare_trust_identity(&mut app);
+    for root in app.workspace.roots().to_vec() {
+        app.workspace.fixture_trust_identity(root.identity.clone());
+    }
+    app.reconcile_workspace_trust();
+    app.start_open(path);
+    wait_vfs(&mut app);
+    app.start_git_status_refresh();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while app.git.status_pending() {
+        app.process_git_status_events();
+        assert!(Instant::now() < deadline, "Git status did not finish");
+        thread::yield_now();
+    }
+
+    app.invoke(
+        crate::editor::CommandInvocation::new("workspace.git.hunk.stage", InvocationSource::Test)
+            .unwrap(),
+    );
+    while app.git.hunks_pending() || app.git.mutation_pending() || app.git.status_pending() {
+        app.process_git_hunk_events();
+        app.process_git_mutation_events();
+        app.process_git_status_events();
+        assert!(Instant::now() < deadline, "Git staging did not finish");
+        thread::yield_now();
+    }
+
+    assert_eq!(index_bytes(&root, "config"), "staged only\n");
+    index.read(true).unwrap();
+    assert!(
+        index
+            .get_path(std::path::Path::new("config/app.toml"), 0)
+            .is_none()
+    );
+    assert_eq!(
+        app.ui.notification.as_deref(),
+        Some("Open Dusty Git and mark the replaced file and all its changed contents.")
+    );
+}
+
+#[test]
 fn trusted_stage_hunk_flow_changes_only_index_and_refreshes_status() {
     let (_app_dirs, mut app) = app();
     let repo = git2::Repository::init(&app.state.workspace_root).unwrap();
@@ -1186,6 +1242,78 @@ fn hunk_unstage_returns_one_staged_hunk_to_head_and_refuses_the_rest() {
 }
 
 #[test]
+fn editor_unstage_hunk_includes_both_changes_but_explicit_lines_do_not() {
+    let (_app_dirs, mut app) = app();
+    let repo = git2::Repository::init(&app.state.workspace_root).unwrap();
+    let path = app.state.workspace_root.join("two.txt");
+    let relative = std::path::Path::new("two.txt");
+    let original = "one\nkeep\nthree\n";
+    let changed = "ONE\nkeep\nTHREE\n";
+    fs::write(&path, original).unwrap();
+    let mut index = repo.index().unwrap();
+    index.add_path(relative).unwrap();
+    index.write().unwrap();
+    let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+    let sig = git2::Signature::now("Dusty", "dusty@example.invalid").unwrap();
+    repo.commit(Some("HEAD"), &sig, &sig, "fixture", &tree, &[])
+        .unwrap();
+
+    fs::write(&path, changed).unwrap();
+    prepare_trust_identity(&mut app);
+    for root in app.workspace.roots().to_vec() {
+        app.workspace.fixture_trust_identity(root.identity.clone());
+    }
+    app.reconcile_workspace_trust();
+    app.start_open(path.clone());
+    wait_vfs(&mut app);
+    let settle = |app: &mut App| {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while app.git.hunks_pending() || app.git.mutation_pending() || app.git.status_pending() {
+            app.process_git_hunk_events();
+            app.process_git_mutation_events();
+            app.process_git_status_events();
+            assert!(Instant::now() < deadline);
+            thread::yield_now();
+        }
+    };
+    let invoke = |app: &mut App, id: &str| {
+        app.invoke(crate::editor::CommandInvocation::new(id, InvocationSource::Test).unwrap());
+    };
+    app.start_git_status_refresh();
+    settle(&mut app);
+    invoke(&mut app, "workspace.git.file.stage");
+    settle(&mut app);
+
+    invoke(&mut app, "workspace.git.hunks.open_staged");
+    settle(&mut app);
+    let staged = app.git.hunks().expect("staged hunks");
+    assert_eq!(staged.hunks.len(), 1);
+    assert_eq!(staged.hunks[0].change_lines(), vec![1, 3]);
+    let view = app.state.active_view().unwrap();
+    app.state.views[view].cursor = ByteOffset(0);
+    invoke(&mut app, "workspace.git.hunk.unstage");
+    settle(&mut app);
+    assert_eq!(index_bytes(&app.state.workspace_root, "two.txt"), original);
+
+    invoke(&mut app, "workspace.git.file.stage");
+    settle(&mut app);
+    let select = crate::editor::CommandInvocation::new(
+        "workspace.git.lines.unstage",
+        InvocationSource::Test,
+    )
+    .unwrap()
+    .with_argument("start", CommandValue::Integer(1))
+    .with_argument("end", CommandValue::Integer(1));
+    app.invoke(select);
+    settle(&mut app);
+    assert_eq!(
+        index_bytes(&app.state.workspace_root, "two.txt"),
+        "one\nkeep\nTHREE\n"
+    );
+    assert_eq!(fs::read_to_string(path).unwrap(), changed);
+}
+
+#[test]
 fn the_unstage_key_undoes_the_hunk_just_staged_under_the_cursor() {
     let (_app_dirs, mut app) = app();
     let repo = git2::Repository::init(&app.state.workspace_root).unwrap();
@@ -1685,6 +1813,218 @@ fn a_locked_worktree_refuses_removal() {
         "a refused removal leaves the worktree and its registration alone"
     );
     assert!(repo.find_branch("locked", git2::BranchType::Local).is_ok());
+}
+
+#[test]
+fn clean_worktree_removal_runs_through_the_editor_confirmation() {
+    let (_app_dirs, mut app) = app();
+    let repo = history_fixture(&app.state.workspace_root, &["base"]);
+    let head = repo.head().unwrap().peel_to_commit().unwrap();
+    let branch = repo
+        .branch("review", &head, false)
+        .unwrap()
+        .into_reference();
+    let outside = tempdir().unwrap();
+    let linked = outside.path().join("review");
+    let mut options = git2::WorktreeAddOptions::new();
+    options.reference(Some(&branch));
+    repo.worktree("review", &linked, Some(&options)).unwrap();
+    app.start_git_status_refresh();
+    drain_worktree_requests(&mut app);
+    app.start_git_worktrees();
+    drain_worktree_requests(&mut app);
+    let index = app
+        .search
+        .picker_projection()
+        .unwrap()
+        .rows
+        .iter()
+        .position(|row| row.id == "git-worktree:linked:review")
+        .unwrap();
+    for _ in 0..index {
+        app.invoke(
+            crate::editor::CommandInvocation::new("picker.next", InvocationSource::Test).unwrap(),
+        );
+    }
+    app.request_git_worktree_remove();
+    drain_worktree_requests(&mut app);
+    assert_eq!(
+        app.input.prompt().unwrap().kind,
+        crate::ui::PromptKind::GitDestructive
+    );
+    assert!(linked.is_dir());
+    app.input
+        .select_confirmation(crate::ui::ConfirmationChoice::Yes);
+    app.submit_prompt();
+    assert_eq!(
+        app.input.prompt().unwrap().kind,
+        crate::ui::PromptKind::GitWorktreeCheck,
+        "confirmation starts a cancellable recheck"
+    );
+    drain_worktree_requests(&mut app);
+    assert!(app.input.prompt().is_none());
+    assert!(!linked.exists());
+    assert!(repo.find_worktree("review").is_err());
+    assert!(repo.find_branch("review", git2::BranchType::Local).is_ok());
+}
+
+fn drain_worktree_requests(app: &mut App) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while app.git.status_pending() || app.git.branch_pending() {
+        app.process_git_status_events();
+        app.process_git_branch_events();
+        assert!(Instant::now() < deadline);
+        thread::yield_now();
+    }
+}
+
+#[test]
+fn changed_worktree_reopens_confirmation_with_cancel_focused_and_names_the_file() {
+    let (_app_dirs, mut app) = app();
+    let repo = history_fixture(&app.state.workspace_root, &["base"]);
+    let outside = tempdir().unwrap();
+    let linked = outside.path().join("review");
+    repo.worktree("review", &linked, None).unwrap();
+    fs::write(repo.path().join("info/exclude"), "data/\n").unwrap();
+    fs::create_dir(linked.join("data")).unwrap();
+    fs::write(linked.join("data/old.db"), "original").unwrap();
+
+    app.start_git_status_refresh();
+    drain_worktree_requests(&mut app);
+    app.start_git_worktrees();
+    drain_worktree_requests(&mut app);
+    let index = app
+        .search
+        .picker_projection()
+        .unwrap()
+        .rows
+        .iter()
+        .position(|row| row.id == "git-worktree:linked:review")
+        .unwrap();
+    for _ in 0..index {
+        app.invoke(
+            crate::editor::CommandInvocation::new("picker.next", InvocationSource::Test).unwrap(),
+        );
+    }
+
+    app.request_git_worktree_remove();
+    drain_worktree_requests(&mut app);
+    fs::write(
+        linked.join("data/new.db"),
+        "added while the dialog was open",
+    )
+    .unwrap();
+    app.input
+        .select_confirmation(crate::ui::ConfirmationChoice::Yes);
+    app.submit_prompt();
+    drain_worktree_requests(&mut app);
+    let prompt = app.input.prompt().expect("reopened removal confirmation");
+    assert_eq!(prompt.kind, crate::ui::PromptKind::GitDestructive);
+    let confirmation = prompt.confirmation.as_ref().unwrap();
+    assert_eq!(confirmation.selected, crate::ui::ConfirmationChoice::No);
+    assert_eq!(confirmation.negative_label, "Cancel");
+    let added = std::path::Path::new("data").join("new.db");
+    assert!(
+        confirmation
+            .message
+            .contains(&format!("{} was added.", added.display()))
+    );
+    app.submit_prompt();
+    assert!(app.input.prompt().is_none());
+    assert!(!app.git.branch_pending());
+    assert!(linked.join("data/new.db").is_file());
+    assert!(repo.find_worktree("review").is_ok());
+}
+
+#[test]
+fn worktree_cleanup_notice_shows_the_full_wrapped_path_after_refresh() {
+    let (_app_dirs, mut app) = app();
+    let repo = history_fixture(&app.state.workspace_root, &["base"]);
+    let outside = tempdir().unwrap();
+    let linked = outside
+        .path()
+        .join(format!("{} leftover worktree", "long folder ".repeat(8)));
+    repo.worktree("review", &linked, None).unwrap();
+
+    app.handle_event(UiEvent::Resize(80, 27));
+    app.start_git_status_refresh();
+    drain_worktree_requests(&mut app);
+    app.start_git_worktrees();
+    drain_worktree_requests(&mut app);
+    let listed = |app: &App| {
+        app.search
+            .picker_projection()
+            .unwrap()
+            .rows
+            .iter()
+            .any(|row| row.id == "git-worktree:linked:review")
+    };
+    assert!(listed(&app));
+
+    // Reproduce the native failure's filesystem outcome without platform-
+    // specific permission behavior. The worker detection has its own test.
+    fs::remove_dir_all(repo.commondir().join("worktrees/review")).unwrap();
+    assert!(linked.join(".git").is_file());
+    let message =
+        crate::git::GitBranchError::RemovalIncomplete(linked.display().to_string()).to_string();
+    app.show_incomplete_worktree_removal(message.clone());
+    drain_worktree_requests(&mut app);
+    assert!(!listed(&app));
+    app.handle_event(UiEvent::FocusLost);
+    app.reconcile_editor_windows();
+
+    let prompt = app
+        .ui
+        .prompt
+        .as_ref()
+        .expect("cleanup notice survives the picker refresh");
+    assert_eq!(prompt.kind, crate::ui::PromptKind::GitWorktreeNotice);
+    assert_eq!(prompt.confirmation.as_ref().unwrap().message, message);
+    let config = app.configuration.settings();
+    let (width, height) = crate::ui::prompt_surface_dimensions(&app.state, &app.ui, 80, 27);
+    let layout = crate::ui::render::confirmation_layout(width, height, config, prompt);
+    assert!(layout.fully_visible);
+    assert!(
+        layout.lines.len() >= 4,
+        "the notice should require wrapping"
+    );
+    let (instruction, path) = message.split_once('\n').unwrap();
+    let instruction_prompt = crate::ui::PromptState {
+        confirmation: Some(crate::ui::ConfirmationState {
+            message: instruction.into(),
+            ..prompt.confirmation.as_ref().unwrap().clone()
+        }),
+        ..prompt.clone()
+    };
+    let instruction_lines =
+        crate::ui::render::confirmation_layout(width, height, config, &instruction_prompt)
+            .lines
+            .len();
+    let visible_path: String = layout.lines[instruction_lines..]
+        .iter()
+        .flat_map(|line| line.units.iter().map(|(text, _)| text.as_str()))
+        .collect();
+    assert_eq!(visible_path, path);
+    let frame = crate::ui::render(
+        &app.state,
+        &app.ui,
+        config,
+        app.configuration.dashboard(),
+        80,
+        27,
+    );
+    for (offset, line) in layout.lines.iter().enumerate() {
+        let text: String = line.units.iter().map(|(text, _)| text.as_str()).collect();
+        let rendered = frame.grid.row_text(layout.geometry.top + 1 + offset as u16);
+        assert!(
+            rendered.contains(text.as_str()),
+            "{text:?} not found in {rendered:?}"
+        );
+    }
+    app.submit_prompt();
+    assert!(app.input.prompt().is_none());
+    assert!(!listed(&app));
+    assert!(linked.is_dir());
 }
 
 #[test]

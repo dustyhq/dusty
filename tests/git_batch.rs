@@ -714,7 +714,10 @@ fn a_marked_file_replaced_by_a_directory_refuses_to_sweep_in_hidden_descendants(
     let index = std::fs::read(root.join(".git/index")).unwrap();
     key(&mut screen, KeyCode::Char('-'));
     assert!(!screen.busy());
-    assert!(view(&mut screen).contains("selected file is now a directory"));
+    assert!(
+        view(&mut screen)
+            .contains("Mark the replaced file and all its changed contents before staging.")
+    );
     assert_eq!(std::fs::read(root.join(".git/index")).unwrap(), index);
     assert_eq!(cached(root), "");
     assert_eq!(

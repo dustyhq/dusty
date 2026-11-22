@@ -146,6 +146,10 @@ pub enum AppEffect {
         start: i64,
         end: i64,
     },
+    GitLinesUnstage {
+        start: i64,
+        end: i64,
+    },
     OpenPrompt {
         kind: PromptKind,
         initial: String,
@@ -1081,6 +1085,7 @@ impl App {
                     | AppEffect::GitHunkStage
                     | AppEffect::GitHunkUnstage
                     | AppEffect::GitLinesStage { .. }
+                    | AppEffect::GitLinesUnstage { .. }
                     | AppEffect::GitConflictStage
                     | AppEffect::GitHunkReset
             )
@@ -1273,6 +1278,7 @@ impl App {
             effect @ (AppEffect::GitFileStage
             | AppEffect::GitFileUnstage
             | AppEffect::GitLinesStage { .. }
+            | AppEffect::GitLinesUnstage { .. }
             | AppEffect::GitWorktreeCreate { .. }
             | AppEffect::GitConflictsOpen
             | AppEffect::GitConflictAccept { .. }
