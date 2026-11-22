@@ -1091,10 +1091,7 @@ impl Workspace {
                     ForgeTarget::repository(&request.host, &request.base_repository),
                     Write::CreatePullRequest((**request).clone()),
                 );
-                self.queue.push_back(Request {
-                    key: Key::Write,
-                    op,
-                });
+                self.queue.push_back(self.request(Key::Write, op));
                 self.notice = if request.push.is_some() {
                     "Pushing the reviewed branch, then creating the PR…"
                 } else {
@@ -1287,10 +1284,10 @@ impl Workspace {
             }
             Action::Checkout(id) => Write::Checkout { number: *id },
             Action::Worktree(id) => {
-                self.queue.push_back(Request {
-                    key: Key::WorktreeWrite(*id),
-                    op: self.write_op(target, Write::Worktree { number: *id }),
-                });
+                self.queue.push_back(self.request(
+                    Key::WorktreeWrite(*id),
+                    self.write_op(target, Write::Worktree { number: *id }),
+                ));
                 self.writing_draft = Some(WritingDraft::Form(draft_key));
                 return Ok(());
             }

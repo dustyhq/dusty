@@ -95,20 +95,21 @@ enum Op {
 struct Request {
     key: Key,
     op: Op,
+    read_scope: Option<ReadScope>,
 }
 
-/// The namespace a deferred edit or read belongs to. Lists outlive detail switches.
+/// The target is in `Request::op`; these complete its identity at enqueue time.
+struct ReadScope {
+    epoch: u64,
+    account: Option<AccountNamespace>,
+}
+
+/// The namespace a cached value belongs to. Lists outlive detail switches.
 #[derive(PartialEq, Eq)]
 enum CacheScope {
     Detail(lanes::Scope),
     List(ForgeTarget),
     Inbox(String),
-}
-
-struct DeferredRead {
-    scope: CacheScope,
-    target: ForgeTarget,
-    read: Read,
 }
 
 struct ReaderPreview {
@@ -139,6 +140,7 @@ impl Request {
         Self {
             key,
             op: Op::Read(ForgeTarget::remote(), Read::Repository),
+            read_scope: None,
         }
     }
 }
@@ -332,7 +334,7 @@ pub(super) struct Workspace {
     ready_form: Option<Form>,
     /// Reads a refresh (`R`) found already on their way: asked again once they land, so the
     /// refresh shows what changed after the first one left.
-    again: HashMap<Key, DeferredRead>,
+    again: HashMap<Key, Request>,
     fresh: fresh::Fresh,
     accounts: accounts::Accounts,
     notify: notifications::Inbox,
@@ -697,6 +699,7 @@ impl Workspace {
             .scope_epoch
             .checked_add(1)
             .expect("GitHub scope generation exhausted");
+        self.discard_stale_reads();
     }
 
     fn clear_projections(&mut self) {
@@ -846,12 +849,19 @@ impl Workspace {
             && self.fresh.meta.is_empty()
         {
             // Initial discovery: there is no old data to retire.
-            self.account = account;
+            self.discover_account(account);
             return true;
         }
         self.reset_account(account);
         self.ensure(false);
         false
+    }
+
+    fn discover_account(&mut self, account: Option<AccountNamespace>) {
+        if self.account != account {
+            self.account = account;
+            self.discard_stale_reads();
+        }
     }
 
     /// Opens item `id` on page 1 (issues) or 2 (pull requests) as Enter on its row would,
@@ -883,14 +893,92 @@ impl Workspace {
                 .as_deref()
                 .is_some_and(|repo| repo.eq_ignore_ascii_case(&self.repo))
     }
+    fn list_target(&self) -> ForgeTarget {
+        ForgeTarget::repository(&self.host, self.list_repository())
+    }
+
     fn read(&self, read: Read) -> Op {
         let target = if matches!(read, Read::List { .. }) {
-            ForgeTarget::repository(&self.host, self.list_repository())
+            self.list_target()
         } else {
             self.target()
         };
         Op::Read(target, read)
     }
+    fn is_repository_read(key: &Key, read: &Read) -> bool {
+        !matches!(key, Key::Repository | Key::Inbox(..))
+            && !matches!(
+                read,
+                Read::Search { .. } | Read::Viewer | Read::Notifications { .. }
+            )
+    }
+
+    fn read_repository(&self, key: &Key) -> &str {
+        if matches!(key, Key::List(..) | Key::RowChecks(_)) {
+            self.list_repository()
+        } else {
+            &self.repo
+        }
+    }
+
+    fn read_target_is_current(&self, key: &Key, target: &ForgeTarget) -> bool {
+        target.host.as_deref() == Some(self.host.as_str())
+            && target
+                .repo
+                .as_deref()
+                .is_some_and(|repo| repo.eq_ignore_ascii_case(self.read_repository(key)))
+    }
+
+    fn request(&self, key: Key, op: Op) -> Request {
+        let read_scope = match &op {
+            Op::Read(_, read) if Self::is_repository_read(&key, read) => Some(ReadScope {
+                epoch: self.scope_epoch,
+                account: self.account.clone(),
+            }),
+            _ => None,
+        };
+        Request {
+            key,
+            op,
+            read_scope,
+        }
+    }
+
+    fn request_is_current(&self, request: &Request) -> bool {
+        let Some(scope) = &request.read_scope else {
+            return true;
+        };
+        let Op::Read(target, _) = &request.op else {
+            return false;
+        };
+        scope.epoch == self.scope_epoch
+            && scope.account == self.account
+            && self.read_target_is_current(&request.key, target)
+    }
+
+    /// Remove stale reads before they can hold a key needed by this repository or account.
+    fn discard_stale_reads(&mut self) {
+        let mut queue = std::mem::take(&mut self.queue);
+        queue.retain(|request| {
+            if self.request_is_current(request) {
+                return true;
+            }
+            self.fresh.uncheck(&request.key);
+            false
+        });
+        self.queue = queue;
+        let abandoned: Vec<_> = self
+            .active
+            .requests()
+            .filter(|request| !self.request_is_current(request))
+            .map(|request| request.key.clone())
+            .collect();
+        for key in abandoned {
+            self.active.cancel(&key);
+            self.fresh.uncheck(&key);
+        }
+    }
+
     fn enqueue(&mut self, key: Key, op: Op, refresh: bool) {
         // A memory miss is filled from disk and painted at once; stale entries are
         // revalidated in the background while they stay on screen. The disk is read by a
@@ -934,34 +1022,25 @@ impl Workspace {
             }
             return;
         }
-        self.fresh.implicit.remove(&key);
+        let request = self.request(key, op);
+        if !self.request_is_current(&request) {
+            return;
+        }
+        self.fresh.implicit.remove(&request.key);
         // Already on its way, it may answer with what was there before the refresh.
         if refresh
-            && let Op::Read(target, read) = &op
-            && (self.active.contains(&key) || self.fresh.warm_pending(&key))
+            && matches!(request.op, Op::Read(..))
+            && (self.active.contains(&request.key) || self.warm_pending(&request.key))
         {
-            let scope = self.cache_scope(&key);
-            self.again.insert(
-                key.clone(),
-                DeferredRead {
-                    scope,
-                    target: target.clone(),
-                    read: read.clone(),
-                },
-            );
+            self.again.insert(request.key.clone(), request);
+            return;
         }
-        self.enqueue_refresh(key, op);
+        self.enqueue_request(request);
     }
     /// The read a refresh joined has landed: ask for it once more (`again`).
     fn ask_again(&mut self, key: &Key) {
-        if let Some(DeferredRead {
-            scope,
-            target,
-            read,
-        }) = self.again.remove(key)
-            && scope == self.cache_scope(key)
-        {
-            self.enqueue_refresh(key.clone(), Op::Read(target, read));
+        if let Some(request) = self.again.remove(key) {
+            self.enqueue_request(request);
         }
     }
     fn write_op(&self, target: ForgeTarget, write: Write) -> Op {
@@ -985,15 +1064,17 @@ impl Workspace {
         self.enqueue(Key::Write, op, false);
     }
     fn enqueue_refresh(&mut self, key: Key, op: Op) {
-        // The warm worker already asks for it: one request, two consumers.
-        if self.fresh.warm_pending(&key) {
+        self.enqueue_request(self.request(key, op));
+    }
+
+    fn enqueue_request(&mut self, request: Request) {
+        if !self.request_is_current(&request) || self.warm_pending(&request.key) {
             return;
         }
-        self.fresh.drop_warm(&key);
-        if self.pending(&key) {
-            return;
+        self.fresh.drop_warm(&request.key);
+        if !self.pending(&request.key) {
+            self.queue.push_back(request);
         }
-        self.queue.push_back(Request { key, op });
     }
     fn value(&self, key: &Key) -> Option<&Value> {
         self.cache.get(key)?.as_ref().ok().map(|reply| &reply.value)
@@ -1326,22 +1407,22 @@ impl Workspace {
             Key::RowChecks(_) => false,
         }
     }
+    fn wanted_read(&self, request: &Request) -> bool {
+        self.request_is_current(request) && self.wanted(&request.key)
+    }
+
     fn reconcile_reads(&mut self) {
         let mut queue = std::mem::take(&mut self.queue);
         let dropped = queue
             .iter()
-            .filter(|request| !self.wanted(&request.key))
+            .filter(|request| !self.wanted_read(request))
             .map(|request| request.key.clone())
             .collect::<Vec<_>>();
         for key in dropped {
             // A dropped background check is asked again when the screen comes back to it.
-            if self.fresh.implicit.remove(&key)
-                && let Some(meta) = self.fresh.meta.get_mut(&key)
-            {
-                meta.checked = None;
-            }
+            self.fresh.uncheck(&key);
         }
-        queue.retain(|request| self.wanted(&request.key));
+        queue.retain(|request| self.wanted_read(request));
         // A detail read for a row the cursor has left is abandoned: its lane takes the
         // next read as soon as its worker stops instead of after a stale answer.
         let abandoned = self
@@ -1357,17 +1438,13 @@ impl Workspace {
                         | Key::Diff(_)
                         | Key::Viewed(_)
                         | Key::Commit(_)
-                ) && !self.wanted(&request.key)
+                ) && !self.wanted_read(request)
             })
             .map(|request| request.key.clone())
             .collect::<Vec<_>>();
         for key in abandoned {
             self.active.cancel(&key);
-            if self.fresh.implicit.remove(&key)
-                && let Some(meta) = self.fresh.meta.get_mut(&key)
-            {
-                meta.checked = None;
-            }
+            self.fresh.uncheck(&key);
         }
         // Stable ordering keeps writes safe and lets the visible body/source win
         // over list refreshes, activity, threads and viewed-state annotations.
@@ -1631,25 +1708,7 @@ impl Workspace {
                 }
                 ForgeReply::Fetched(_, routing_host, result, account) => {
                     changed = true;
-                    let protect_projection = self.protects_read(&request.key)
-                        || self.fresh.implicit.contains(&request.key) && self.has_read_projection();
-                    if !self.accept_read_account(
-                        routing_host.is_some(),
-                        account,
-                        result.as_ref().err(),
-                        protect_projection,
-                    ) {
-                        continue;
-                    }
-                    self.accounts.observe(&self.host, result.as_ref().err());
-                    let key = request.key.clone();
-                    self.apply(
-                        request,
-                        routing_host,
-                        result.map_err(|error| error.to_string()),
-                        false,
-                    );
-                    self.ask_again(&key);
+                    self.apply(request, routing_host, result, account, false);
                 }
                 _ => {}
             }
@@ -1679,6 +1738,12 @@ impl Workspace {
                 break;
             }
             let request = &self.queue[at];
+            if !self.request_is_current(request) {
+                let request = self.queue.remove(at).expect("in range");
+                self.fresh.uncheck(&request.key);
+                changed = true;
+                continue;
+            }
             if matches!(request.op, Op::Write(..)) {
                 if !self.active.idle() || free < self.active.count() {
                     break;
@@ -2628,8 +2693,9 @@ mod list_tests {
             }],
             ..Default::default()
         };
+        let list_request = app.github.request(key, op);
         app.github.active.answer_for_test(
-            Request { key, op },
+            list_request,
             scope.clone(),
             ForgeReply::Fetched(read, None, Ok(Fetched::payload(Payload::Rows(rows))), None),
         );

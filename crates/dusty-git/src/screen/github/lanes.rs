@@ -218,11 +218,13 @@ mod tests {
         Request {
             key,
             op: Op::Read(ForgeTarget::remote(), Read::Repository),
+            read_scope: None,
         }
     }
 
     fn write(number: u64) -> Request {
         Request {
+            read_scope: None,
             key: Key::Write,
             op: Op::Write(
                 ForgeTarget::remote(),

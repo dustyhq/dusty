@@ -12,7 +12,7 @@ use crate::forge::merge;
 use crate::forge::model::Fingerprint;
 use crate::forge::provider::{Conditional, Fetched};
 use crate::forge::records;
-use crate::forge::request::Payload;
+use crate::forge::request::{ForgeError, Payload};
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
@@ -69,7 +69,7 @@ pub(super) struct LiveRows {
     pub(super) divider: String,
 }
 
-type Scope = (String, String, u64);
+type WarmScope = (String, String, u64, Option<AccountNamespace>);
 /// One optimistic change to a cached value.
 type Edit = Box<dyn Fn(&mut Value)>;
 
@@ -80,9 +80,9 @@ pub(super) struct Fresh {
     pub(super) implicit: HashSet<Key>,
     warm: ForgeJobs,
     warm_next: u64,
-    warm_active: Option<(Request, Scope)>,
+    warm_active: Option<Request>,
     warm_queue: VecDeque<Request>,
-    warmed: Option<Scope>,
+    warmed: Option<WarmScope>,
     idle_since: Option<Instant>,
     sweep: Instant,
     /// Row identities that changed in the last merge; highlighted for one repaint.
@@ -160,14 +160,6 @@ impl Fresh {
         self.warm_queue.push_front(request);
     }
 
-    /// Whether the warm worker holds (queued or running) a read whose key matches.
-    pub(super) fn warm_has(&self, matches: impl Fn(&Key) -> bool) -> bool {
-        self.warm_active
-            .as_ref()
-            .is_some_and(|(request, _)| matches(&request.key))
-            || self.warm_queue.iter().any(|request| matches(&request.key))
-    }
-
     pub(super) fn enabled(&self) -> bool {
         self.cache.is_some()
     }
@@ -195,10 +187,18 @@ impl Fresh {
         self.undo.clear();
     }
 
-    pub(super) fn warm_pending(&self, key: &Key) -> bool {
-        self.warm_active
-            .as_ref()
-            .is_some_and(|(request, _)| &request.key == key)
+    pub(super) fn uncheck(&mut self, key: &Key) {
+        if self.implicit.remove(key)
+            && let Some(meta) = self.meta.get_mut(key)
+        {
+            meta.checked = None;
+        }
+    }
+
+    pub(super) fn retain_list_metadata(&mut self) {
+        self.meta
+            .retain(|key, _| matches!(key, Key::Repository | Key::List(..) | Key::Inbox(..)));
+        self.prefetched.clear();
     }
 
     pub(super) fn drop_warm(&mut self, key: &Key) {
@@ -308,6 +308,22 @@ pub(super) fn matches(row: &Value, query: &str, state: &str) -> bool {
 }
 
 impl Workspace {
+    pub(super) fn warm_pending(&self, key: &Key) -> bool {
+        self.fresh
+            .warm_active
+            .as_ref()
+            .is_some_and(|request| &request.key == key && self.request_is_current(request))
+    }
+
+    /// Whether the warm worker holds a current read whose key matches.
+    pub(super) fn warm_has(&self, matches: impl Fn(&Key) -> bool) -> bool {
+        self.fresh
+            .warm_active
+            .iter()
+            .chain(&self.fresh.warm_queue)
+            .any(|request| matches(&request.key) && self.request_is_current(request))
+    }
+
     /// The cache entry a read lands in: the target's host and repository, or the remote's.
     fn cache_key(&mut self, op: &Op) -> Option<CacheKey> {
         let Op::Read(target, read) = op else {
@@ -328,8 +344,9 @@ impl Workspace {
         let host = HostKey::new(&host);
         if self.account.is_none() && !self.skip_remembered_account {
             self.skip_remembered_account = true;
-            self.account =
-                crate::forge::host_state::remembered_account(&host).map(|(account, _)| account);
+            self.discover_account(
+                crate::forge::host_state::remembered_account(&host).map(|(account, _)| account),
+            );
         }
         let account = self.account.as_ref()?;
         (host == *account.host()).then(|| CacheKey::for_read(account, repo.as_deref(), read))
@@ -383,7 +400,7 @@ impl Workspace {
             .disk_until
             .get_or_insert_with(|| Instant::now() + DISK_BUDGET);
         let loaded = self.fresh.disk.wait(key, until)?;
-        if loaded.epoch != epoch {
+        if !self.disk_read_is_current(&loaded) {
             // An answer for the scope before: ask again for this one.
             self.fresh
                 .disk
@@ -393,7 +410,7 @@ impl Workspace {
         Some(self.apply_disk(
             &loaded.key,
             &loaded.read,
-            &loaded.routing_host,
+            loaded.cache_key.account.host(),
             loaded.found,
         ))
     }
@@ -409,13 +426,13 @@ impl Workspace {
         let mut answered = false;
         for loaded in self.fresh.disk.replies() {
             answered = true;
-            if loaded.epoch != self.scope_epoch || self.cache.contains_key(&loaded.key) {
+            if !self.disk_read_is_current(&loaded) || self.cache.contains_key(&loaded.key) {
                 continue;
             }
             painted |= self.apply_disk(
                 &loaded.key,
                 &loaded.read,
-                &loaded.routing_host,
+                loaded.cache_key.account.host(),
                 loaded.found,
             );
         }
@@ -424,6 +441,22 @@ impl Workspace {
             self.ensure(false);
         }
         painted
+    }
+
+    fn disk_read_is_current(&self, loaded: &super::disk::Loaded) -> bool {
+        if loaded.epoch != self.scope_epoch {
+            return false;
+        }
+        if !Self::is_repository_read(&loaded.key, &loaded.read) {
+            return true;
+        }
+        let cache_key = &loaded.cache_key;
+        self.account.as_ref() == Some(&cache_key.account)
+            && cache_key.account.host() == &HostKey::new(&self.host)
+            && cache_key
+                .repo
+                .as_deref()
+                .is_some_and(|repo| repo.eq_ignore_ascii_case(self.read_repository(&loaded.key)))
     }
 
     /// What a disk read of `key` needs, when the memory misses it and the cache is on.
@@ -437,10 +470,12 @@ impl Workspace {
         if self.fresh.disk_absent.1.contains(key) {
             return None;
         }
-        let Op::Read(_, read) = op else {
+        let Op::Read(target, read) = op else {
             return None;
         };
-        if matches!(read, Read::Fingerprint(_)) {
+        if matches!(read, Read::Fingerprint(_))
+            || Self::is_repository_read(key, read) && !self.read_target_is_current(key, target)
+        {
             return None;
         }
         let cache_key = self.cache_key(op)?;
@@ -548,7 +583,7 @@ impl Workspace {
 
     /// Queue a background check of a cached entry; the cached value stays on screen.
     pub(super) fn revalidate(&mut self, key: Key, op: Op) {
-        if self.pending(&key) || self.fresh.warm_pending(&key) {
+        if self.pending(&key) || self.warm_pending(&key) {
             return;
         }
         self.fresh.drop_warm(&key);
@@ -565,12 +600,16 @@ impl Workspace {
             }
             (_, op) => op,
         };
+        let request = self.request(key, op);
+        if !self.request_is_current(&request) {
+            return;
+        }
         // Asked now: a failing forge is not asked again before the entry's budget runs out.
-        if let Some(meta) = self.fresh.meta.get_mut(&key) {
+        if let Some(meta) = self.fresh.meta.get_mut(&request.key) {
             meta.checked = Some(Instant::now());
         }
-        self.fresh.implicit.insert(key.clone());
-        self.queue.push_back(Request { key, op });
+        self.fresh.implicit.insert(request.key.clone());
+        self.queue.push_back(request);
     }
 
     /// What the forge is told it may answer 304 to.
@@ -600,10 +639,50 @@ impl Workspace {
         }
     }
 
-    /// Apply one read's answer: the interactive worker's, or the warm worker's (`background`).
+    /// Apply a reply only while its original read still belongs to this scope.
     pub(super) fn apply(
         &mut self,
         request: Request,
+        routing_host: Option<HostKey>,
+        fetched: Result<Fetched, ForgeError>,
+        account: Option<AccountNamespace>,
+        background: bool,
+    ) {
+        if !self.request_is_current(&request)
+            || request.read_scope.is_some()
+                && routing_host
+                    .as_ref()
+                    .is_some_and(|host| *host != HostKey::new(&self.host))
+        {
+            return;
+        }
+        let protect_projection = self.protects_read(&request.key)
+            || (background || self.fresh.implicit.contains(&request.key))
+                && self.has_read_projection();
+        if !self.accept_read_account(
+            routing_host.is_some(),
+            account,
+            fetched.as_ref().err(),
+            protect_projection,
+        ) {
+            return;
+        }
+        if !background {
+            self.accounts.observe(&self.host, fetched.as_ref().err());
+        }
+        let key = request.key.clone();
+        self.apply_read(
+            request,
+            routing_host,
+            fetched.map_err(|error| error.to_string()),
+            background,
+        );
+        self.ask_again(&key);
+    }
+
+    fn apply_read(
+        &mut self,
+        mut request: Request,
         routing_host: Option<HostKey>,
         fetched: Result<Fetched, String>,
         background: bool,
@@ -641,17 +720,16 @@ impl Workspace {
                     == Some(&fingerprint);
                 if same {
                     self.confirmed(&request.key);
-                } else if let Key::Item(page, number) = request.key {
-                    let read = if page == 1 {
-                        Read::Issue(number)
+                } else if let (Key::Item(page, number), Op::Read(_, read)) =
+                    (&request.key, &mut request.op)
+                {
+                    *read = if *page == 1 {
+                        Read::Issue(*number)
                     } else {
-                        Read::PullRequest(number)
+                        Read::PullRequest(*number)
                     };
                     self.fresh.implicit.insert(request.key.clone());
-                    self.queue.push_front(Request {
-                        key: request.key,
-                        op: self.read(read),
-                    });
+                    self.queue.push_front(request);
                 }
                 self.ensure(false);
                 return;
@@ -850,7 +928,7 @@ impl Workspace {
             return None;
         }
         let meta = self.fresh.meta.get(key)?;
-        let busy = self.pending(key) || self.fresh.warm_pending(key);
+        let busy = self.pending(key) || self.warm_pending(key);
         let age = ago(meta.age());
         // One string at every width: a border too narrow for it drops the label whole
         // rather than shortening `updated just now` to `now`.
@@ -926,41 +1004,27 @@ impl Workspace {
             if event.request_id != self.fresh.warm_next {
                 continue;
             }
-            let Some((request, scope)) = self.fresh.warm_active.take() else {
+            let Some(request) = self.fresh.warm_active.take() else {
                 continue;
             };
-            if scope != (self.host.clone(), self.repo.clone(), self.scope_epoch) {
-                continue;
-            }
             let ForgeReply::Fetched(_, routing_host, result, account) = event.reply else {
                 continue;
             };
             changed = true;
-            let protect_projection = self.protects_read(&request.key) || self.has_read_projection();
-            if !self.accept_read_account(
-                routing_host.is_some(),
-                account,
-                result.as_ref().err(),
-                protect_projection,
-            ) {
-                continue;
-            }
-            let key = request.key.clone();
-            self.apply(
-                request,
-                routing_host,
-                result.map_err(|error| error.to_string()),
-                true,
-            );
-            self.ask_again(&key);
+            self.apply(request, routing_host, result, account, true);
         }
         changed |= self.poll_live();
         if self.repo.is_empty() {
             return changed;
         }
-        let scope = (self.host.clone(), self.repo.clone(), self.scope_epoch);
+        let scope = (
+            self.host.clone(),
+            self.repo.clone(),
+            self.scope_epoch,
+            self.account.clone(),
+        );
         if self.fresh.warmed.as_ref() != Some(&scope) {
-            self.fresh.warmed = Some(scope.clone());
+            self.fresh.warmed = Some(scope);
             self.fresh.warm_queue.clear();
             // Startup: everything a first keypress can show.
             let mut warm = vec![
@@ -990,19 +1054,24 @@ impl Workspace {
             // the first keys.
             self.fresh.warm_disk.clear();
             for (key, op) in warm {
-                match self.load_disk_soon(&key, &op) {
+                let cached = self.load_disk_soon(&key, &op);
+                let request = self.request(key, op);
+                match cached {
                     Some(cached) => {
-                        if !cached || self.needs_check(&key) {
-                            self.fresh.warm_queue.push_back(Request { key, op });
+                        if !cached || self.needs_check(&request.key) {
+                            self.fresh.warm_queue.push_back(request);
                         }
                     }
-                    None => self.fresh.warm_disk.push(Request { key, op }),
+                    None => self.fresh.warm_disk.push(request),
                 }
             }
             changed = true;
         }
         if !self.fresh.warm_disk.is_empty() {
             for request in std::mem::take(&mut self.fresh.warm_disk) {
+                if !self.request_is_current(&request) {
+                    continue;
+                }
                 if self.disk_loading(&request.key) {
                     self.fresh.warm_disk.push(request);
                 } else if !self.cache.contains_key(&request.key) || self.needs_check(&request.key) {
@@ -1052,7 +1121,8 @@ impl Workspace {
                     if !self.read_only()
                         && (!self.cache.contains_key(&key) || self.needs_check(&key))
                     {
-                        self.fresh.warm_queue.push_back(Request { key, op });
+                        let request = self.request(key, op);
+                        self.fresh.warm_queue.push_back(request);
                     }
                 }
             }
@@ -1086,7 +1156,8 @@ impl Workspace {
             && std::env::var("DUSTY_FORGE_WARM").as_deref() != Ok("0")
         {
             while let Some(request) = self.fresh.warm_queue.pop_front() {
-                if self.pending(&request.key)
+                if !self.request_is_current(&request)
+                    || self.pending(&request.key)
                     || self.cache.get(&request.key).is_some_and(Result::is_ok)
                         && !self.needs_check(&request.key)
                 {
@@ -1114,7 +1185,7 @@ impl Workspace {
                     if let Some(meta) = self.fresh.meta.get_mut(&request.key) {
                         meta.checked = Some(Instant::now());
                     }
-                    self.fresh.warm_active = Some((request, scope));
+                    self.fresh.warm_active = Some(request);
                     changed = true;
                 }
                 break;
@@ -1189,7 +1260,8 @@ impl Workspace {
             if cached {
                 self.fresh.implicit.insert(key.clone());
             }
-            self.queue.push_front(Request { key, op });
+            let request = self.request(key, op);
+            self.queue.push_front(request);
         }
         true
     }
@@ -1444,6 +1516,61 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn warm_row_checks_belong_to_the_list_repository() {
+        use crate::forge::model::CiState;
+        use crate::forge::records::ItemRecord;
+
+        let mut ws = Workspace::new(PathBuf::new());
+        ws.fresh = Fresh::with(None);
+        ws.host = "codeberg.org".into();
+        ws.repo = "alpha/one".into();
+        ws.page = 2;
+        let row = json!({ "number": 7 });
+        ws.cache.insert(
+            ws.list_key(),
+            Ok(Reply {
+                text: String::new(),
+                value: json!([row.clone()]),
+            }),
+        );
+        ws.follow(open::parse("https://codeberg.org/beta/two/pulls/7").unwrap());
+        assert_eq!(ws.repo, "beta/two");
+        assert_eq!(ws.list_repository(), "alpha/one");
+
+        ws.fresh.rows.show(vec![7]);
+        ws.poll_row_checks();
+        let request = ws.fresh.warm_queue.pop_front().expect("visible row check");
+        let key = Key::RowChecks(vec![7]);
+        assert_eq!(request.key, key);
+        assert!(matches!(
+            &request.op,
+            Op::Read(target, Read::Fingerprints(numbers))
+                if *target == ForgeTarget::repository("codeberg.org", "alpha/one") && numbers.as_slice() == [7]
+        ));
+
+        let other = ws.request(
+            key.clone(),
+            Op::Read(ws.target(), Read::Fingerprints(vec![7])),
+        );
+        let fetched = |rollup| {
+            Ok(Fetched::payload(Payload::Fingerprints(vec![(
+                7,
+                Fingerprint {
+                    rollup: Some(rollup),
+                    ..Default::default()
+                },
+            )])))
+        };
+        ws.apply(other, None, fetched(CiState::Failed), None, true);
+        assert!(ws.value(&key).is_none(), "B's check must not reach A's row");
+        ws.apply(request, None, fetched(CiState::Passed), None, true);
+        assert!(ws.poll_row_checks());
+        let mut record = ItemRecord::from_row(&row);
+        ws.fresh.rows.overlay(ws.list_repository(), &mut record);
+        assert_eq!(record.ci(), Some(CiState::Passed));
+    }
+
+    #[test]
     fn repository_metadata_keeps_the_remote_port_on_disk_and_wire() {
         let root = tempfile::tempdir().unwrap();
         let repo = git2::Repository::init(root.path()).unwrap();
@@ -1477,12 +1604,10 @@ mod tests {
                     ));
                 } else {
                     workspace.apply(
-                        Request {
-                            key: Key::Repository,
-                            op: Op::Read(target.clone(), read.clone()),
-                        },
+                        workspace.request(Key::Repository, Op::Read(target.clone(), read.clone())),
                         Some(host.clone()),
                         Ok(Fetched::payload(payload)),
+                        None,
                         false,
                     );
                 }

@@ -374,7 +374,7 @@ fn wrap_advice(lines: Vec<(String, Tone)>, width: usize) -> Vec<(String, Tone)> 
 
 #[cfg(test)]
 mod tests {
-    use super::super::{Key, Op, Request, Workspace};
+    use super::super::{Key, Op, Workspace};
 
     #[test]
     fn recheck_retires_same_host_reads_but_refuses_a_queued_write() {
@@ -398,10 +398,9 @@ mod tests {
             workspace.target(),
             crate::forge::request::Write::MarkAllRead,
         );
-        workspace.queue.push_back(Request {
-            key: Key::Write,
-            op: write,
-        });
+        workspace
+            .queue
+            .push_back(workspace.request(Key::Write, write));
         workspace.accounts.open = true;
         let recheck =
             crate::editor::input::KeyEvent::plain(crate::editor::input::KeyCode::Char('r'));
@@ -417,10 +416,7 @@ mod tests {
             "alice",
         );
         workspace.active.answer_for_test(
-            Request {
-                key: key.clone(),
-                op: Op::Read(workspace.target(), read.clone()),
-            },
+            workspace.request(key.clone(), Op::Read(workspace.target(), read.clone())),
             previous,
             crate::forge::ForgeReply::Fetched(
                 read,
@@ -624,10 +620,10 @@ mod tests {
             Some("Rate limited")
         );
         // A retry in flight is loading again.
-        workspace.queue.push_back(Request {
-            key: Key::Repository,
-            op: Op::Read(ForgeTarget::remote(), Read::Repository),
-        });
+        workspace.queue.push_back(workspace.request(
+            Key::Repository,
+            Op::Read(ForgeTarget::remote(), Read::Repository),
+        ));
         assert_eq!(workspace.blocked(&list), None);
     }
 }

@@ -222,19 +222,16 @@ impl Workspace {
         if self.repo.eq_ignore_ascii_case(&repo) {
             return;
         }
-        self.scope_epoch = self
-            .scope_epoch
-            .checked_add(1)
-            .expect("GitHub scope generation exhausted");
         self.repo = self
             .known_repository_spelling(&repo)
             .map_or(repo, str::to_owned);
-        self.again
-            .retain(|key, _| matches!(key, Key::List(..) | Key::Inbox(..)));
+        self.advance_scope();
+        self.again.retain(|key, _| matches!(key, Key::Inbox(..)));
         // Repository metadata belongs to home; inbox creation/develop are disabled.
         // Lists have independent identities; only number-keyed detail state is evicted.
         self.cache
             .retain(|key, _| matches!(key, Key::Repository | Key::List(..) | Key::Inbox(..)));
+        self.fresh.retain_list_metadata();
         self.queue.retain(|request| {
             matches!(
                 request.key,
@@ -620,6 +617,101 @@ mod tests {
         assert!(workspace.active.idle());
     }
 
+    fn pull_reply(title: &str) -> ForgeReply {
+        use crate::forge::model::{ItemRow, PullRequest};
+        use crate::forge::provider::Fetched;
+        use crate::forge::request::Payload;
+
+        let pull = PullRequest {
+            row: ItemRow {
+                number: 7,
+                title: title.into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        ForgeReply::Fetched(
+            Read::PullRequest(7),
+            None,
+            Ok(Fetched::payload(Payload::PullRequest(Box::new(pull)))),
+            None,
+        )
+    }
+
+    #[test]
+    fn queued_detail_keeps_its_repository_when_dispatched_late() {
+        let mut ws = workspace(PathBuf::new());
+        ws.fresh = fresh::Fresh::with(None);
+        ws.active = lanes::Lanes::dry();
+        ws.queue.clear();
+        let key = Key::Item(2, 7);
+        ws.enqueue(key.clone(), ws.read(Read::PullRequest(7)), true);
+        let queued_for_alpha = ws.queue.pop_front().unwrap();
+
+        ws.selected[1] = 1;
+        ws.ensure(false);
+        assert_eq!(ws.repo, "beta/two");
+        let late_scope = (ws.host.clone(), ws.repo.clone(), ws.scope_epoch);
+        // Model a late dispatch that labels the lane with B's current scope.
+        // The request itself still belongs to A and must not populate B's reader.
+        ws.active
+            .answer_for_test(queued_for_alpha, late_scope.clone(), pull_reply("Alpha PR"));
+        assert!(ws.poll());
+        assert!(ws.value(&key).is_none());
+
+        // A refresh joined to B's in-flight read is still asked for once more.
+        ws.enqueue(key.clone(), ws.read(Read::PullRequest(7)), true);
+        let beta = ws.active.finish(&key).expect("current detail read started");
+        ws.active
+            .answer_for_test(beta, late_scope, pull_reply("Beta PR"));
+        assert!(ws.poll());
+        assert_eq!(string(ws.value(&key).unwrap(), "title"), "Beta PR");
+        assert!(ws.active.requests().any(|request| {
+            request.key == key
+                && matches!(&request.op, Op::Read(target, Read::PullRequest(7)) if target == &ws.target())
+        }));
+    }
+
+    #[test]
+    fn deferred_refresh_does_not_start_after_switching_repositories() {
+        let mut ws = workspace(PathBuf::new());
+        ws.fresh = fresh::Fresh::with(None);
+        ws.active = lanes::Lanes::dry_with(1);
+        ws.queue.clear();
+        ws.ensure(false);
+        let key = Key::Item(2, 7);
+
+        assert!(ws.start_reads());
+        assert!(ws.active.contains(&key));
+        assert_eq!(ws.repo, "alpha/one");
+        ws.ensure(true);
+        assert!(
+            ws.again.contains_key(&key),
+            "refresh must join A's active read"
+        );
+
+        ws.selected[1] = 1;
+        ws.ensure(false);
+        assert_eq!(ws.repo, "beta/two");
+        assert!(ws.start_reads());
+        let beta = ws
+            .active
+            .finish(&key)
+            .expect("B's same-number read started");
+        assert!(
+            matches!(&beta.op, Op::Read(target, Read::PullRequest(7)) if target == &ws.target())
+        );
+        let scope = (ws.host.clone(), ws.repo.clone(), ws.scope_epoch);
+        ws.active
+            .answer_for_test(beta, scope, pull_reply("Beta PR"));
+        assert!(ws.poll());
+        assert_eq!(string(ws.value(&key).unwrap(), "title"), "Beta PR");
+        assert!(
+            !ws.pending(&key),
+            "B's reply must not restart A's deferred refresh"
+        );
+    }
+
     #[test]
     fn a_link_uses_its_repository_for_preview_and_returns_to_the_original_list() {
         let mut workspace = workspace(PathBuf::new());
@@ -818,12 +910,9 @@ mod tests {
         assert_eq!(string(ws.value(&key).unwrap(), "state"), "CLOSED");
 
         let scope = (ws.host.clone(), ws.repo.clone(), ws.scope_epoch);
-        let op = ws.read(Read::Issue(7));
+        let read = ws.request(key.clone(), ws.read(Read::Issue(7)));
         ws.active.answer_for_test(
-            Request {
-                key: key.clone(),
-                op,
-            },
+            read,
             scope,
             ForgeReply::Fetched(
                 Read::Issue(7),
@@ -845,8 +934,8 @@ mod tests {
             "the linked issue's detail was evicted"
         );
         assert_eq!(string(ws.list_item().unwrap(), "title"), "local/root seven");
-        // A later completion for the local reader must not restart the linked read.
-        assert!(ws.active.finish(&key).is_some());
+        // The linked read was abandoned; a local reply must not restart it.
+        assert!(ws.active.finish(&key).is_none());
         ws.queue.clear();
         ws.ask_again(&key);
         assert!(!ws.pending(&key));

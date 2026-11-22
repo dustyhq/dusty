@@ -735,21 +735,25 @@ fn list(
     // GitHub's row: the title row ends in fixed columns, the CI mark (pull
     // requests), the linked pull requests or issues, the comment count, so each column's
     // marks line up down the list and every title clips at one column.
+    let checks_repo = workspace.checkout_pr_list_repository();
+    let list_record = |value: &Value| {
+        let mut record = ItemRecord::from_row(value);
+        if let Some(repo) = checks_repo {
+            workspace.fresh.rows.overlay(repo, &mut record);
+        }
+        record
+    };
     let shown_records = entries
         .iter()
         .skip(offset)
         .take(visible)
         .filter_map(|entry| match entry {
-            Entry::Record(value) if !value["dustyGone"].is_string() => {
-                let mut record = ItemRecord::from_row(value);
-                workspace.fresh.rows.overlay(&mut record);
-                Some(record)
-            }
+            Entry::Record(value) if !value["dustyGone"].is_string() => Some(list_record(value)),
             _ => None,
         })
         .collect::<Vec<_>>();
-    if pull {
-        // The rows on screen are the ones whose check marks are asked for (`row_checks`).
+    if checks_repo.is_some() {
+        // The checkout rows on screen are the ones whose checks are asked for (`row_checks`).
         workspace
             .fresh
             .rows
@@ -845,8 +849,7 @@ fn list(
                 frame.cursor = Some((inner.x, top, SetCursorStyle::SteadyBar));
             }
         }
-        let mut record = ItemRecord::from_row(value);
-        workspace.fresh.rows.overlay(&mut record);
+        let record = list_record(value);
         let gone = value["dustyGone"].as_str();
         let flashed = flash.contains(&workspace.row_identity(value));
         let (mark, tone) = if gone.is_some() {
@@ -3049,5 +3052,96 @@ fn word_cut(text: &str, cells: usize) -> String {
             format!("{}…", body[..at].trim_end())
         }
         _ => cut,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::forge::model::{CiState, Fingerprint};
+    use crate::forge::request::Payload;
+    use serde_json::json;
+
+    #[test]
+    fn checkout_check_marks_do_not_paint_same_number_inbox_rows() {
+        let mode = ExplorerIconMode::Unicode;
+        let failed = glyph(Glyph::CheckFailed, mode);
+        let paint = |ws: &mut Workspace, layout_mode| {
+            let rect = Rect::new(0, 0, 76, 23);
+            let mut frame = Frame {
+                grid: CellGrid::new(rect.w, rect.h),
+                cursor: None,
+            };
+            list(&mut frame, ws, rect, None, mode, layout_mode, None);
+            (0..rect.h)
+                .map(|y| frame.grid.row_text(y))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let put_list = |ws: &mut Workspace, value: Value| {
+            ws.cache.insert(
+                ws.list_key(),
+                Ok(Reply {
+                    text: value.to_string(),
+                    value,
+                }),
+            );
+        };
+
+        let mut ws = Workspace::new(PathBuf::new());
+        ws.fresh = fresh::Fresh::with(None);
+        ws.host = "codeberg.org".into();
+        ws.repo = "alpha/one".into();
+        ws.page = 2;
+        put_list(
+            &mut ws,
+            json!([{ "number": 7, "title": "Alpha PR", "state": "OPEN" }]),
+        );
+        let fingerprints = Payload::Fingerprints(vec![(
+            7,
+            Fingerprint {
+                rollup: Some(CiState::Failed),
+                ..Default::default()
+            },
+        )]);
+        ws.cache.insert(
+            Key::RowChecks(vec![7]),
+            Ok(Reply {
+                value: json!(fingerprints),
+                text: String::new(),
+            }),
+        );
+        assert!(ws.poll_row_checks());
+        for layout in [Mode::Narrow, Mode::Wide] {
+            let screen = paint(&mut ws, layout);
+            assert!(
+                screen.contains("Alpha PR") && screen.contains(failed),
+                "{screen}"
+            );
+        }
+
+        ws.toggle_inbox().unwrap();
+        put_list(
+            &mut ws,
+            json!([{
+                "number": 7,
+                "title": "Beta PR",
+                "state": "OPEN",
+                "repository": { "nameWithOwner": "beta/two" },
+                "url": "https://codeberg.org/beta/two/pull/7"
+            }]),
+        );
+        ws.ensure(false);
+        assert_eq!(ws.repo, "beta/two");
+        for layout in [Mode::Narrow, Mode::Wide] {
+            let screen = paint(&mut ws, layout);
+            assert!(
+                screen.contains("Beta PR") && !screen.contains(failed),
+                "{screen}"
+            );
+        }
+
+        ws.toggle_inbox().unwrap();
+        assert!(paint(&mut ws, Mode::Wide).contains(failed));
     }
 }
