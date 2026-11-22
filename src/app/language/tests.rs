@@ -1157,7 +1157,10 @@ fn completion_documentation_is_typed_and_exact_request_owned() {
     assert_eq!(popup.kind, DocumentationPopupKind::Completion);
     assert_eq!(popup.provider, "fake-server");
     assert_eq!(popup.sections[0].markup, DocumentationMarkupKind::Markdown);
-    app.handle_key_in_context("key_release", "a".parse::<KeyEvent>().unwrap());
+    app.handle_event(crate::ui::UiEvent::Key {
+        key: KeyEvent::character('a'),
+        kind: crate::ui::KeyInputKind::Release,
+    });
     assert!(
         app.ui.documentation_popup.is_some(),
         "releasing a key must not dismiss the selected completion's documentation"

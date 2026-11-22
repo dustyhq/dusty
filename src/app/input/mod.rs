@@ -36,12 +36,71 @@ use std::collections::VecDeque;
 use std::time::Duration;
 use std::time::Instant;
 
+// Legacy key streams can report both the initial hold and subsequent repeats as presses.
+const HANDOFF_FIRST_REPEAT: Duration = Duration::from_millis(650);
+const HANDOFF_REPEAT_GAP: Duration = Duration::from_millis(100);
+
+struct HandoffKey {
+    key: KeyEvent,
+    return_focus: std::sync::Arc<()>,
+    return_capture: std::sync::Arc<()>,
+    // Once a real Repeat arrives, only real Repeats should be suppressed.
+    press_deadline: Option<Instant>,
+}
+
+type EditorKeymapLayer = (Option<(String, String)>, Keymap);
+
+#[derive(Default)]
+struct ReleaseKeymap {
+    sequence: KeymapSequence,
+    pending: Option<PendingReleaseKeymap>,
+}
+
+struct PendingReleaseKeymap {
+    revision: u64,
+    deadline: Instant,
+    focus: std::sync::Arc<()>,
+    capture: std::sync::Arc<()>,
+}
+
+impl ReleaseKeymap {
+    fn cancel(&mut self) {
+        self.pending = None;
+        self.sequence.cancel();
+    }
+}
+
 struct PendingKeymap {
     context: String,
     prefix: String,
     started_at: Instant,
     deadline: Option<Instant>,
     binding_revision: u64,
+    key_kinds: MappingKeyKinds,
+}
+
+/// Track repeat metadata alongside the pending sequence; bindings compare only the keys.
+#[derive(Default)]
+struct MappingKeyKinds {
+    len: usize,
+    repeats: Vec<usize>,
+}
+
+impl MappingKeyKinds {
+    fn push(&mut self, kind: KeyInputKind) {
+        if kind == KeyInputKind::Repeat {
+            self.repeats.push(self.len);
+        }
+        self.len += 1;
+    }
+
+    fn kind_at(&self, index: usize) -> KeyInputKind {
+        if self.repeats.contains(&index) {
+            KeyInputKind::Repeat
+        } else {
+            KeyInputKind::Press
+        }
+    }
 }
 
 /// Runtime input state is separate from immutable compiled configuration bindings.
@@ -167,6 +226,8 @@ impl InputState {
             pending_input: None,
             held_input: VecDeque::new(),
             sequence: KeymapSequence::default(),
+            release_keymap: ReleaseKeymap::default(),
+            handoff_key: None,
             pending: None,
             hints: None,
             prompt: None,
@@ -2184,6 +2245,12 @@ impl App {
 
 impl App {
     pub(in crate::app) fn handle_event(&mut self, event: UiEvent) {
+        if matches!(event, UiEvent::FocusGained | UiEvent::FocusLost) {
+            self.input.release_keymap.cancel();
+        }
+        if self.suppress_handoff_repeat(&event) {
+            return;
+        }
         if self.input.command_pending() && !matches!(event, UiEvent::Resize(_, _)) {
             self.input
                 .held_input
