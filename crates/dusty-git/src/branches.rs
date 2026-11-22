@@ -16,7 +16,9 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 use std::time::Instant;
-use std::time::UNIX_EPOCH;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use crate::files::RootIdentity;
 
 use sha2::{Digest, Sha256};
 
@@ -42,12 +44,12 @@ pub enum GitBranchRequest {
     },
     ReviewRemoval {
         repository: PathBuf,
-        name: String,
+        target: GitWorktreeTarget,
         deadline: Duration,
     },
     RemoveWorktree {
         repository: PathBuf,
-        name: String,
+        target: GitWorktreeTarget,
         /// The local-only files shown in the removal confirmation.
         reviewed: Option<GitWorktreeRemoval>,
         deadline: Duration,
@@ -85,6 +87,9 @@ pub struct GitWorktreeEntry {
     pub operation: Option<String>,
     pub locked: bool,
     pub main: bool,
+    /// The linked registration as listed, never looked up again just by name.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub removal_target: Option<GitWorktreeTarget>,
 }
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct GitSubmoduleEntry {
@@ -144,6 +149,8 @@ pub enum GitBranchError {
     RemovalSubmodules,
     #[error("The worktree's files changed")]
     RemovalChanged,
+    #[error("The worktree changed. Refresh and try again.")]
+    RemovalTargetChanged,
     #[error("worktree `{0}` is locked")]
     RefusedLockedWorktree(String),
     #[error("worktree `{0}` has a Git operation in progress: {1}")]
@@ -419,17 +426,18 @@ fn valid_request(request: &GitBranchRequest) -> bool {
         }
         GitBranchRequest::ReviewRemoval {
             repository,
-            name,
+            target,
             deadline,
         }
         | GitBranchRequest::RemoveWorktree {
             repository,
-            name,
+            target,
             deadline,
             ..
         } => {
             return !repository.as_os_str().is_empty()
-                && !name.trim().is_empty()
+                && !target.0.name.trim().is_empty()
+                && target.path().is_absolute()
                 && !deadline.is_zero()
                 && *deadline <= GitBranchRequest::REMOVAL_STATUS_TIMEOUT;
         }
@@ -502,7 +510,7 @@ fn checkout_options(cancel: &AtomicBool, expires: Instant) -> git2::build::Check
 /// One linked worktree as read for attribution: name, path, branch and lock state.
 struct WorktreeRef {
     name: String,
-    path: PathBuf,
+    worktree: git2::Worktree,
     branch: Option<String>,
     locked: bool,
 }
@@ -524,20 +532,21 @@ fn worktree_branches(
         let Ok(worktree) = repository.find_worktree(name) else {
             continue;
         };
-        let path = worktree.path().to_path_buf();
-        let branch = git2::Repository::open(&path).ok().and_then(|opened| {
-            opened
-                .head()
-                .ok()
-                .filter(|head| head.is_branch())
-                .and_then(|head| head.shorthand().map(str::to_owned))
-        });
+        let branch = git2::Repository::open(worktree.path())
+            .ok()
+            .and_then(|opened| {
+                opened
+                    .head()
+                    .ok()
+                    .filter(|head| head.is_branch())
+                    .and_then(|head| head.shorthand().map(str::to_owned))
+            });
         let locked = worktree
             .is_locked()
             .is_ok_and(|status| !matches!(status, git2::WorktreeLockStatus::Unlocked));
         found.push(WorktreeRef {
             name: name.to_owned(),
-            path,
+            worktree,
             branch,
             locked,
         });
@@ -603,10 +612,14 @@ fn read_list(
         operation: operation_name(main.state()),
         locked: false,
         main: true,
+        removal_target: None,
     }];
     for linked in worktree_branches(&repository, cancel, expires)? {
         check_request(cancel, expires)?;
-        let opened = git2::Repository::open(&linked.path).ok();
+        let removal_target =
+            GitWorktreeTarget::from_worktree(&repository, &linked.worktree, &linked.name).ok();
+        let path = linked.worktree.path().to_path_buf();
+        let opened = git2::Repository::open(&path).ok();
         let (dirty, operation) = match &opened {
             Some(opened) => (
                 if opened.path() == repository.path() {
@@ -620,12 +633,13 @@ fn read_list(
         };
         worktrees.push(GitWorktreeEntry {
             name: linked.name,
-            path: linked.path,
+            path,
             branch: linked.branch,
             dirty,
             operation,
             locked: linked.locked,
             main: false,
+            removal_target,
         });
     }
     let mut branches = Vec::new();
@@ -978,7 +992,7 @@ fn checked_out_path(
     Ok(worktree_branches(repository, cancel, expires)?
         .into_iter()
         .find(|linked| linked.branch.as_deref() == Some(name))
-        .map(|linked| linked.path))
+        .map(|linked| linked.worktree.path().to_path_buf()))
 }
 
 /// Where a new worktree's HEAD points.
@@ -1230,35 +1244,34 @@ fn run_with_removal_check(
             Ok(GitBranchResult::Changed)
         }
         GitBranchRequest::ReviewRemoval {
-            repository, name, ..
+            repository, target, ..
         } => {
-            let repository = open(repository)?;
-            let worktree = removal_target(&repository, name)?;
-            let reviewed =
-                removal_inventory(&repository, &worktree, name, cancel, expires, removal_check)?;
+            let repository = open(repository).map_err(|_| GitBranchError::RemovalTargetChanged)?;
+            target.verify(&repository)?;
+            let reviewed = removal_inventory(target, cancel, expires, removal_check)?;
             check_cancel(cancel)?;
+            target.verify(&repository)?;
             Ok(GitBranchResult::RemovalReview {
-                name: name.clone(),
+                name: target.0.name.clone(),
                 reviewed,
                 change: None,
             })
         }
         GitBranchRequest::RemoveWorktree {
             repository,
-            name,
+            target,
             reviewed,
             ..
         } => {
-            let repository = open(repository)?;
-            let worktree = removal_target(&repository, name)?;
-            let actual = match removal_inventory(
-                &repository,
-                &worktree,
-                name,
-                cancel,
-                expires,
-                removal_check,
-            ) {
+            if reviewed
+                .as_ref()
+                .is_some_and(|reviewed| reviewed.target() != target)
+            {
+                return Err(GitBranchError::RemovalTargetChanged);
+            }
+            let repository = open(repository).map_err(|_| GitBranchError::RemovalTargetChanged)?;
+            target.verify(&repository)?;
+            let actual = match removal_inventory(target, cancel, expires, removal_check) {
                 Err(GitBranchError::RefusedDirtyWorktree(_)) if reviewed.is_some() => {
                     return Err(GitBranchError::RemovalChanged);
                 }
@@ -1267,14 +1280,15 @@ fn run_with_removal_check(
             check_cancel(cancel)?;
             match reviewed {
                 Some(reviewed) if *reviewed != actual => {
+                    target.verify(&repository)?;
                     return Ok(GitBranchResult::RemovalReview {
-                        name: name.clone(),
+                        name: target.0.name.clone(),
                         change: Some(reviewed.change_notice(&actual)),
                         reviewed: actual,
                     });
                 }
                 None if !actual.is_clean() => {
-                    return Err(GitBranchError::RefusedDirtyWorktree(name.clone()));
+                    return Err(GitBranchError::RefusedDirtyWorktree(target.0.name.clone()));
                 }
                 _ => {}
             }
@@ -1283,14 +1297,21 @@ fn run_with_removal_check(
             removal_check.start_removing()?;
             #[cfg(test)]
             removal_check.pause_at(RemovalCheckpoint::BeforeDelete);
+            let worktree = target.verify(&repository)?;
             if actual.is_missing() {
                 // Prune just this registration, not all stale worktrees in the repository.
                 worktree.prune(None).map_err(backend)?;
             } else {
-                remove_registered_worktree(&repository, name, worktree.path(), |cwd, args| {
-                    crate::command::git_output(cwd, args, &[])
-                        .is_ok_and(|output| output.status.success())
-                })?;
+                target.open_checkout()?;
+                remove_registered_worktree(
+                    &repository,
+                    &target.0.name,
+                    target.path(),
+                    |cwd, args| {
+                        crate::command::git_output(cwd, args, &[])
+                            .is_ok_and(|output| output.status.success())
+                    },
+                )?;
             }
             Ok(GitBranchResult::Changed)
         }
@@ -1331,26 +1352,128 @@ fn remove_registered_worktree(
     Err(GitBranchError::RemovalFailed)
 }
 
-fn removal_target(
-    repository: &git2::Repository,
-    name: &str,
-) -> Result<git2::Worktree, GitBranchError> {
-    let worktree = repository
-        .find_worktree(name)
-        .map_err(|_| GitBranchError::UnknownWorktree(name.into()))?;
-    if !matches!(
-        worktree.is_locked().map_err(backend)?,
-        git2::WorktreeLockStatus::Unlocked
-    ) {
-        return Err(GitBranchError::RefusedLockedWorktree(name.into()));
+/// The exact linked checkout (or missing checkout's registration) shown to the user.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct GitWorktreeTarget(Box<WorktreeIdentity>);
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+struct WorktreeIdentity {
+    name: String,
+    repository: RootIdentity,
+    registration: RootIdentity,
+    // The registration directory inode can be reused. Its stable backlink is
+    // rewritten by Git when it creates the registration again.
+    registered_at: SystemTime,
+    #[serde(with = "crate::files::path_encoding")]
+    path: PathBuf,
+    checkout: Option<RootIdentity>,
+}
+
+impl GitWorktreeTarget {
+    /// Resolve a name-only request once, before showing its confirmation.
+    ///
+    /// # Errors
+    /// Refuses if the registration or checkout identity cannot be read.
+    pub fn capture(repository: &Path, name: &str) -> Result<Self, GitBranchError> {
+        let repository = open(repository)?;
+        let worktree = repository
+            .find_worktree(name)
+            .map_err(|_| GitBranchError::UnknownWorktree(name.into()))?;
+        Self::from_worktree(&repository, &worktree, name)
     }
-    Ok(worktree)
+
+    fn from_worktree(
+        repository: &git2::Repository,
+        worktree: &git2::Worktree,
+        name: &str,
+    ) -> Result<Self, GitBranchError> {
+        let repository = RootIdentity::capture(repository.commondir())
+            .map_err(|_| GitBranchError::RemovalInventory)?;
+        let registration =
+            RootIdentity::capture(&repository.canonical_path.join("worktrees").join(name))
+                .map_err(|_| GitBranchError::RemovalInventory)?;
+        let registered_at = registration
+            .canonical_path
+            .join("gitdir")
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .map_err(|_| GitBranchError::RemovalInventory)?;
+        let registered = worktree.path();
+        let checkout = match registered.symlink_metadata() {
+            Ok(_) => Some(
+                RootIdentity::capture(registered).map_err(|_| GitBranchError::RemovalInventory)?,
+            ),
+            Err(error) if error.kind() == ErrorKind::NotFound => None,
+            Err(_) => return Err(GitBranchError::RemovalInventory),
+        };
+        let path = match &checkout {
+            Some(checkout) => checkout.canonical_path.clone(),
+            None => registered
+                .ancestors()
+                .skip(1)
+                .find_map(|ancestor| {
+                    let existing = crate::files::canonicalize(ancestor).ok()?;
+                    Some(existing.join(registered.strip_prefix(ancestor).ok()?))
+                })
+                .ok_or(GitBranchError::RemovalInventory)?,
+        };
+        Ok(Self(Box::new(WorktreeIdentity {
+            name: name.into(),
+            repository,
+            registration,
+            registered_at,
+            path,
+            checkout,
+        })))
+    }
+
+    /// The canonical checkout path, including the location of a missing checkout.
+    pub fn path(&self) -> &Path {
+        &self.0.path
+    }
+
+    /// Whether only the registration remains.
+    pub fn is_missing(&self) -> bool {
+        self.0.checkout.is_none()
+    }
+
+    fn open_checkout(&self) -> Result<git2::Repository, GitBranchError> {
+        let canonical = |path: &Path| {
+            crate::files::canonicalize(path).map_err(|_| GitBranchError::RemovalTargetChanged)
+        };
+        let opened = open(self.path()).map_err(|_| GitBranchError::RemovalTargetChanged)?;
+        if !opened.is_worktree()
+            || opened.workdir().map(canonical).transpose()?.as_deref() != Some(self.path())
+            || canonical(opened.path())? != self.0.registration.canonical_path
+        {
+            return Err(GitBranchError::RemovalTargetChanged);
+        }
+        Ok(opened)
+    }
+
+    fn verify(&self, repository: &git2::Repository) -> Result<git2::Worktree, GitBranchError> {
+        let worktree = repository
+            .find_worktree(&self.0.name)
+            .map_err(|_| GitBranchError::RemovalTargetChanged)?;
+        if !Self::from_worktree(repository, &worktree, &self.0.name)
+            .is_ok_and(|actual| actual == *self)
+        {
+            return Err(GitBranchError::RemovalTargetChanged);
+        }
+        if !matches!(
+            worktree.is_locked().map_err(backend)?,
+            git2::WorktreeLockStatus::Unlocked
+        ) {
+            return Err(GitBranchError::RefusedLockedWorktree(self.0.name.clone()));
+        }
+        Ok(worktree)
+    }
 }
 
 /// The selected checkout and its local-only paths at the time of review.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GitWorktreeRemoval {
-    path: PathBuf,
+    target: GitWorktreeTarget,
     inventory: Option<Arc<RemovalInventory>>,
 }
 
@@ -1390,12 +1513,17 @@ impl TreeDigest {
 impl GitWorktreeRemoval {
     /// The checkout path, even if its directory has already been deleted.
     pub fn path(&self) -> &Path {
-        &self.path
+        self.target.path()
+    }
+
+    /// The linked checkout whose files were reviewed.
+    pub fn target(&self) -> &GitWorktreeTarget {
+        &self.target
     }
 
     /// A missing checkout can only have its worktree registration pruned.
     pub fn is_missing(&self) -> bool {
-        self.inventory.is_none()
+        self.target.is_missing()
     }
 
     /// Whether no local-only paths were found.
@@ -1500,52 +1628,36 @@ impl GitWorktreeRemoval {
 }
 
 fn removal_inventory(
-    repository: &git2::Repository,
-    worktree: &git2::Worktree,
-    name: &str,
+    target: &GitWorktreeTarget,
     cancel: &AtomicBool,
     expires: Instant,
     check: &RemovalCheck,
 ) -> Result<GitWorktreeRemoval, GitBranchError> {
     check_request(cancel, expires)?;
-    let registered = worktree.path();
-    match registered.symlink_metadata() {
-        Ok(_) => {}
-        Err(error) if error.kind() == ErrorKind::NotFound => {
-            return Ok(GitWorktreeRemoval {
-                path: registered.into(),
-                inventory: None,
-            });
-        }
-        Err(_) => return Err(GitBranchError::RemovalInventory),
+    if target.is_missing() {
+        return Ok(GitWorktreeRemoval {
+            target: target.clone(),
+            inventory: None,
+        });
     }
-    let canonical =
-        |p: &Path| crate::files::canonicalize(p).map_err(|_| GitBranchError::RemovalInventory);
-    let path = canonical(registered)?;
-    let opened = open(&path).map_err(|_| GitBranchError::RemovalInventory)?;
-    let gitdir = repository.commondir().join("worktrees").join(name);
-    if !opened.is_worktree()
-        || opened.workdir().map(canonical).transpose()?.as_ref() != Some(&path)
-        || canonical(opened.path())? != canonical(&gitdir)?
-    {
-        return Err(GitBranchError::RemovalInventory);
-    }
+    let path = target.path();
+    let opened = target.open_checkout()?;
     if let Some(operation) = operation_name(opened.state()) {
         return Err(GitBranchError::RefusedActiveOperation(
-            name.into(),
+            target.0.name.clone(),
             operation,
         ));
     }
     let started = Instant::now();
     let policy = crate::status::GitStatusPolicy {
-        root: path.clone(),
+        root: path.to_path_buf(),
         root_revision: 0,
         maximum_files: check.display_limit,
         maximum_path_bytes: 16 * 1024 * 1024,
         deadline: expires.saturating_duration_since(started),
     };
     let (output, truncated) = crate::status::status_command(
-        &path,
+        path,
         &[
             "status",
             "--porcelain=v1",
@@ -1565,14 +1677,9 @@ fn removal_inventory(
     // The superproject's status does not list ignored files inside initialized
     // submodules. Do not force-remove a checkout containing unreviewed submodule data.
     if opened.path().join("modules").is_dir() || path.join(".gitmodules").is_file() {
-        let (submodules, truncated) = crate::status::status_command(
-            &path,
-            &["submodule", "status"],
-            &policy,
-            started,
-            cancel,
-        )
-        .map_err(removal_status_error)?;
+        let (submodules, truncated) =
+            crate::status::status_command(path, &["submodule", "status"], &policy, started, cancel)
+                .map_err(removal_status_error)?;
         if truncated
             || submodules
                 .split(|byte| *byte == b'\n')
@@ -1592,7 +1699,7 @@ fn removal_inventory(
         } else if let Some(path) = entry.strip_prefix(b"?? ") {
             (false, path)
         } else {
-            return Err(GitBranchError::RefusedDirtyWorktree(name.into()));
+            return Err(GitBranchError::RefusedDirtyWorktree(target.0.name.clone()));
         };
         let directory = relative.ends_with(b"/");
         let relative =
@@ -1610,10 +1717,10 @@ fn removal_inventory(
     let mut samples = BTreeMap::new();
     let trees = summary
         .iter()
-        .map(|entry| digest_removal_tree(&path, entry, &mut samples, cancel, check))
+        .map(|entry| digest_removal_tree(path, entry, &mut samples, cancel, check))
         .collect::<Result<_, _>>()?;
     Ok(GitWorktreeRemoval {
-        path,
+        target: target.clone(),
         inventory: Some(Arc::new(RemovalInventory {
             summary,
             trees,
@@ -1802,7 +1909,7 @@ mod exclude_tests {
                 GitBranchRequestId(2),
                 &GitBranchRequest::RemoveWorktree {
                     repository: main.path().into(),
-                    name: "review".into(),
+                    target: GitWorktreeTarget::capture(main.path(), "review").unwrap(),
                     reviewed,
                     deadline,
                 },
@@ -1820,7 +1927,7 @@ mod exclude_tests {
                 GitBranchRequestId(3),
                 &GitBranchRequest::ReviewRemoval {
                     repository: main.path().into(),
-                    name: "review".into(),
+                    target: GitWorktreeTarget::capture(main.path(), "review").unwrap(),
                     deadline,
                 },
                 &cancel,
@@ -1911,7 +2018,7 @@ mod exclude_tests {
             GitBranchRequestId(1),
             &GitBranchRequest::ReviewRemoval {
                 repository: main.path().into(),
-                name: "review".into(),
+                target: GitWorktreeTarget::capture(main.path(), "review").unwrap(),
                 deadline,
             },
             &cancel,
@@ -1934,7 +2041,7 @@ mod exclude_tests {
         assert_eq!(inventory.samples.len(), REMOVAL_SAMPLES);
         let request = GitBranchRequest::RemoveWorktree {
             repository: main.path().into(),
-            name: "review".into(),
+            target: reviewed.target().clone(),
             reviewed: Some(reviewed),
             deadline,
         };
@@ -1943,6 +2050,71 @@ mod exclude_tests {
             Ok(GitBranchResult::Changed)
         );
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn removal_refuses_a_worktree_recreated_at_the_reviewed_path() {
+        use crate::history::tests::git;
+
+        let main = tempfile::tempdir().unwrap();
+        let destination = tempfile::tempdir().unwrap();
+        let path = destination.path().join("review");
+        let repository = repository_with_commit(main.path());
+        let root = main.path();
+        let path_arg = path.to_str().unwrap();
+        let add = || git(root, &["worktree", "add", "--detach", path_arg, "HEAD"]);
+        add();
+        let deadline = GitBranchRequest::REMOVAL_STATUS_TIMEOUT;
+        let target = GitWorktreeTarget::capture(root, "review").unwrap();
+        let GitBranchResult::RemovalReview { reviewed, .. } = run(
+            GitBranchRequestId(1),
+            &GitBranchRequest::ReviewRemoval {
+                repository: root.into(),
+                target: target.clone(),
+                deadline,
+            },
+            &AtomicBool::new(false),
+        )
+        .unwrap() else {
+            panic!("expected a removal confirmation");
+        };
+        let mut worker = GitBranchWorker::default();
+        let (deleting, resume) = worker
+            .start_paused_removal(
+                GitBranchRequest::RemoveWorktree {
+                    repository: root.into(),
+                    target,
+                    reviewed: Some(reviewed),
+                    deadline,
+                },
+                RemovalCheckpoint::BeforeDelete,
+            )
+            .unwrap();
+        deleting.recv_timeout(Duration::from_secs(20)).unwrap();
+        git(root, &["worktree", "remove", "--", path_arg]);
+        add();
+        let replacement = repository.find_worktree("review").unwrap();
+        assert_eq!(
+            crate::files::canonicalize(replacement.path()).unwrap(),
+            crate::files::canonicalize(&path).unwrap(),
+        );
+        resume.send(()).unwrap();
+
+        let expires = Instant::now() + Duration::from_secs(20);
+        loop {
+            match worker.poll() {
+                Ok(None) => {
+                    assert!(Instant::now() < expires, "removal check did not finish");
+                    thread::yield_now();
+                }
+                result => {
+                    assert_eq!(result, Err(GitBranchError::RemovalTargetChanged));
+                    break;
+                }
+            }
+        }
+        assert!(path.join("tracked.txt").is_file());
+        assert!(repository.find_worktree("review").is_ok());
     }
 
     #[test]
@@ -1961,7 +2133,7 @@ mod exclude_tests {
             GitBranchRequestId(1),
             &GitBranchRequest::ReviewRemoval {
                 repository: main.path().into(),
-                name: "review".into(),
+                target: GitWorktreeTarget::capture(main.path(), "review").unwrap(),
                 deadline,
             },
             &AtomicBool::new(false),
@@ -1974,7 +2146,7 @@ mod exclude_tests {
             .start_paused_removal(
                 GitBranchRequest::RemoveWorktree {
                     repository: main.path().into(),
-                    name: "review".into(),
+                    target: reviewed.target().clone(),
                     reviewed: Some(reviewed),
                     deadline,
                 },

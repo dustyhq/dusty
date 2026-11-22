@@ -1,6 +1,7 @@
-//! Pull, undo and redo, history rewriting and tag push. Each is a plan the
+//! Pull, push, undo and redo, and history rewriting. Each is a plan the
 //! Git tab shows in a confirm sheet. HEAD changes run as native Git commands; an
 //! index-only undo restores its saved snapshot without touching HEAD or the worktree.
+use crate::files::RootIdentity;
 use git2::{
     DiffOptions, FileMode, Index, IndexEntryExtendedFlag, IndexEntryFlag, IndexTime, Oid,
     Repository, RepositoryState,
@@ -10,6 +11,8 @@ use std::ffi::OsString;
 use std::fs;
 use std::io::ErrorKind;
 use std::path::Path;
+
+use sha2::{Digest, Sha256};
 
 /// One `git` invocation: its arguments and the variables it adds to Git's environment.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -100,7 +103,7 @@ fn branch(repository: &Repository) -> Result<Option<String>, String> {
 }
 
 // ---------------------------------------------------------------------------------------
-// Pull
+// Pull and branch push
 
 /// How `git pull` joins the fetched branch to the local one.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -126,33 +129,134 @@ impl PullMode {
     }
 }
 
+/// An attached checkout and the reviewed remote ref or short destination name.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct NetworkTarget {
+    checkout: RootIdentity,
+    git_dir: RootIdentity,
+    pub(crate) branch: String,
+    pub(crate) remote: String,
+    pub(crate) reference: String,
+    endpoints: EndpointFingerprint,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RemoteUse {
+    Fetch,
+    Push,
+}
+
+// Git's output can contain credentials. Keep only a fingerprint, never the URL.
+type EndpointFingerprint = [u8; 32];
+
+fn remote_endpoints(root: &Path, remote: &str, usage: RemoteUse) -> Option<EndpointFingerprint> {
+    let mut args = vec!["remote", "get-url"];
+    if usage == RemoteUse::Push {
+        args.extend(["--push", "--all"]);
+    }
+    args.extend(["--", remote]);
+    let run = |args: &[&str]| {
+        crate::command::git_output(
+            root,
+            &args.iter().copied().map(OsString::from).collect::<Vec<_>>(),
+            &[],
+        )
+        .ok()
+        .filter(|output| output.status.success() && !output.stdout.is_empty())
+    };
+    let output = run(&args).or_else(|| {
+        if remote != "." {
+            return None;
+        }
+        // An unnamed local remote (branch.<name>.remote = .) still uses Git's
+        // URL rules. Temporarily give it a URL so get-url can resolve it.
+        let mut local = vec!["-c", "remote...url=."];
+        local.extend(args);
+        run(&local)
+    })?;
+    Some(Sha256::digest(&output.stdout).into())
+}
+
+impl NetworkTarget {
+    fn capture(
+        repository: &Repository,
+        branch: String,
+        remote: String,
+        reference: String,
+        endpoints: EndpointFingerprint,
+    ) -> Result<Self, String> {
+        let checkout = repository.workdir().ok_or("Open a checkout first.")?;
+        Ok(Self {
+            checkout: RootIdentity::capture(checkout).map_err(|_| "Can't check the checkout.")?,
+            git_dir: RootIdentity::capture(repository.path())
+                .map_err(|_| "Can't check the checkout.")?,
+            branch,
+            remote,
+            reference,
+            endpoints,
+        })
+    }
+
+    pub(crate) fn checkout(&self) -> &Path {
+        &self.checkout.canonical_path
+    }
+
+    pub(crate) fn other_branch(&self) -> String {
+        let name = self
+            .reference
+            .strip_prefix("refs/heads/")
+            .unwrap_or(&self.reference);
+        if self.remote == "." {
+            name.into()
+        } else {
+            format!("{}/{name}", self.remote)
+        }
+    }
+}
+
+fn branch_merge_ref(config: &git2::Config, branch: &str) -> Option<String> {
+    let mut entries = config
+        .multivar(&format!("branch.{branch}.merge"), None)
+        .ok()?;
+    let reference = entries.next()?.ok()?.value()?.to_owned();
+    (entries.next().is_none() && git2::Reference::is_valid_name(&reference)).then_some(reference)
+}
+
+fn config_snapshot(repository: &Repository) -> Result<git2::Config, String> {
+    repository
+        .config()
+        .and_then(|mut config| config.snapshot())
+        .map_err(failed)
+}
+
+fn configured_remote(repository: &Repository, remote: &str) -> bool {
+    remote == "." || git2::Remote::is_valid_name(remote) && repository.find_remote(remote).is_ok()
+}
+
 /// `p`: the branch, its upstream and the mode its configuration asks for.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Pull {
-    pub branch: String,
-    pub upstream: String,
+    pub(crate) target: NetworkTarget,
     pub mode: PullMode,
 }
 
 /// The pull the current branch is configured for: `branch.<name>.rebase`, then
 /// `pull.rebase`, then `pull.ff = only`, as `git pull` reads them.
 pub fn pull(root: &Path) -> Result<Pull, String> {
-    let repository = open(root)?;
-    settled(&repository)?;
-    let branch = branch(&repository)?.ok_or("Pull needs a branch: HEAD is detached")?;
-    let upstream = repository
-        .branch_upstream_name(&format!("refs/heads/{branch}"))
-        .map_err(|_| format!("{branch} has no upstream · u on the branch sets one"))?;
-    let upstream = upstream.as_str().unwrap_or_default();
-    let upstream = upstream
-        .strip_prefix("refs/remotes/")
-        .or_else(|| upstream.strip_prefix("refs/heads/"))
-        .unwrap_or(upstream)
-        .to_owned();
-    let config = repository
-        .config()
-        .and_then(|mut config| config.snapshot())
-        .map_err(failed)?;
+    pull_plan(&open(root)?)
+}
+
+fn pull_plan(repository: &Repository) -> Result<Pull, String> {
+    settled(repository)?;
+    let branch = branch(repository)?.ok_or("Pull needs a branch: HEAD is detached")?;
+    let config = config_snapshot(repository)?;
+    let no_upstream = || format!("{branch} has no upstream · u on the branch sets one");
+    let remote = config
+        .get_string(&format!("branch.{branch}.remote"))
+        .ok()
+        .filter(|remote| configured_remote(repository, remote))
+        .ok_or_else(no_upstream)?;
+    let reference = branch_merge_ref(&config, &branch).ok_or_else(no_upstream)?;
     let rebase = |key: &str| {
         config.get_string(key).ok().map(|value| {
             !matches!(
@@ -171,21 +275,183 @@ pub fn pull(root: &Path) -> Result<Pull, String> {
         }
         _ => PullMode::Merge,
     };
+    let checkout = repository.workdir().ok_or("Open a checkout first.")?;
+    let endpoints = remote_endpoints(checkout, &remote, RemoteUse::Fetch)
+        .ok_or("Can't confirm where this pull will come from.")?;
     Ok(Pull {
-        branch,
-        upstream,
+        target: NetworkTarget::capture(repository, branch, remote, reference, endpoints)?,
         mode,
     })
 }
 
-/// `git pull` in a mode, with progress on stderr and no editor for a merge message.
-pub fn pull_run(mode: PullMode) -> Run {
+/// Pull the reviewed remote ref into the reviewed branch.
+pub fn pull_run(plan: Pull, mode: PullMode) -> Run {
     let flags: &[&str] = match mode {
         PullMode::Merge => &["--no-rebase"],
         PullMode::Rebase => &["--rebase", "--autostash"],
         PullMode::FastForward => &["--ff-only"],
     };
-    Run::new(["pull", "--progress"].iter().chain(flags).copied()).with("GIT_EDITOR", "true")
+    let target = plan.target;
+    Run::new(
+        ["pull", "--progress"]
+            .into_iter()
+            .chain(flags.iter().copied())
+            .chain(["--", &target.remote, &target.reference]),
+    )
+    .with("GIT_EDITOR", "true")
+    .checked(CheckoutCheck::Pull(target))
+}
+
+pub(crate) const NETWORK_TARGET_CHANGED: &str =
+    "The checkout, branch, or remote changed. Reopen this action.";
+const NO_PUSH_TARGET: &str = "Can't confirm where this push will go. Use Git to push.";
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct Push {
+    pub(crate) target: NetworkTarget,
+    force: bool,
+    set_upstream: bool,
+}
+
+impl Push {
+    pub(crate) fn run(self) -> Run {
+        let mut args = vec![
+            "push".into(),
+            "--progress".into(),
+            "--no-follow-tags".into(),
+        ];
+        if self.set_upstream {
+            args.push("--set-upstream".into());
+        }
+        let target = &self.target;
+        let force = if self.force { "+" } else { "" };
+        args.extend([
+            "--".to_owned(),
+            target.remote.clone(),
+            format!("{force}refs/heads/{}:{}", target.branch, target.reference),
+        ]);
+        Run::new(args).checked(CheckoutCheck::Push(self))
+    }
+}
+
+/// A default push can name several refs. Only offer the branch sheet if Git's
+/// configuration picks one destination for the current branch.
+pub(crate) fn push(root: &Path) -> Result<Push, String> {
+    push_plan(&open(root)?)
+}
+
+fn push_plan(repository: &Repository) -> Result<Push, String> {
+    let branch = branch(repository)?.ok_or("Switch to a branch before pushing.")?;
+    let config = config_snapshot(repository)?;
+    let remotes = repository.remotes().map_err(failed)?;
+    let default_remote = if remotes.len() == 1 {
+        remotes.get(0).unwrap_or("origin")
+    } else {
+        "origin"
+    };
+    let fetch_remote = config
+        .get_string(&format!("branch.{branch}.remote"))
+        .unwrap_or_else(|_| default_remote.to_owned());
+    let remote = config
+        .get_string(&format!("branch.{branch}.pushRemote"))
+        .or_else(|_| config.get_string("remote.pushDefault"))
+        .unwrap_or_else(|_| fetch_remote.clone());
+    if !configured_remote(repository, &remote)
+        || config
+            .get_bool(&format!("remote.{remote}.mirror"))
+            .unwrap_or(false)
+    {
+        return Err(NO_PUSH_TARGET.into());
+    }
+    let source = format!("refs/heads/{branch}");
+    let checkout = repository.workdir().ok_or("Open a checkout first.")?;
+    let endpoints = remote_endpoints(checkout, &remote, RemoteUse::Push).ok_or(NO_PUSH_TARGET)?;
+    let mut force = false;
+    let mut set_upstream = false;
+    let mut specs = config
+        .multivar(&format!("remote.{remote}.push"), None)
+        .map_err(failed)?;
+    let spec = specs.next().transpose().map_err(failed)?;
+    let reference = if let Some(spec) = spec {
+        let spec = spec.value().ok_or(NO_PUSH_TARGET)?.to_owned();
+        if specs.next().is_some() {
+            return Err(NO_PUSH_TARGET.into());
+        }
+        force = spec.starts_with('+');
+        let unforced = spec.strip_prefix('+').unwrap_or(&spec);
+        let (from, to) = unforced
+            .split_once(':')
+            .unwrap_or((unforced, source.as_str()));
+        let short_source = from == branch
+            && repository
+                .find_reference(&format!("refs/tags/{from}"))
+                .is_err();
+        if from != source && from != "HEAD" && !short_source {
+            return Err(NO_PUSH_TARGET.into());
+        }
+        push_destination(repository, &remote, to).ok_or(NO_PUSH_TARGET)?
+    } else {
+        let upstream = branch_merge_ref(&config, &branch);
+        let auto_setup = config.get_entry(&format!("branch.{branch}.merge")).is_err()
+            && config.get_bool("push.autoSetupRemote").unwrap_or(false);
+        let mode = config
+            .get_string("push.default")
+            .unwrap_or_else(|_| "simple".into());
+        let reference = match mode.as_str() {
+            "simple" if remote != fetch_remote => source,
+            "current" => {
+                set_upstream = auto_setup;
+                source
+            }
+            "simple" | "upstream" | "tracking" if remote == fetch_remote => {
+                set_upstream = auto_setup;
+                let destination = if auto_setup {
+                    source.clone()
+                } else {
+                    upstream.ok_or(NO_PUSH_TARGET)?
+                };
+                if mode == "simple" && destination != source {
+                    return Err(NO_PUSH_TARGET.into());
+                }
+                destination
+            }
+            _ => return Err(NO_PUSH_TARGET.into()),
+        };
+        if !full_ref(&reference) {
+            return Err(NO_PUSH_TARGET.into());
+        }
+        reference
+    };
+    Ok(Push {
+        target: NetworkTarget::capture(repository, branch, remote, reference, endpoints)?,
+        force,
+        set_upstream,
+    })
+}
+
+fn full_ref(reference: &str) -> bool {
+    reference.starts_with("refs/") && git2::Reference::is_valid_name(reference)
+}
+
+/// A remote-tracking branch can qualify a short destination. A local tag
+/// says nothing about the remote; without a tracking branch, let Git resolve it.
+fn push_destination(repository: &Repository, remote: &str, name: &str) -> Option<String> {
+    if name.starts_with("refs/") {
+        return full_ref(name).then(|| name.to_owned());
+    }
+    let branch = format!("refs/heads/{name}");
+    if !full_ref(&branch) {
+        return None;
+    }
+    let tracking = format!("refs/remotes/{remote}/{name}");
+    if repository
+        .find_reference(&tracking)
+        .is_ok_and(|reference| reference.target().is_some())
+    {
+        Some(branch)
+    } else {
+        Some(name.into())
+    }
 }
 
 // ---------------------------------------------------------------------------------------
@@ -304,6 +570,8 @@ impl CheckoutTarget {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum CheckoutCheck {
+    Pull(NetworkTarget),
+    Push(Push),
     Rewrite(CheckoutTarget),
     Fixup(CheckoutTarget),
     Autosquash(CheckoutTarget),
@@ -331,6 +599,20 @@ impl CheckoutCheck {
     pub(crate) fn verify(&self, root: &Path) -> Result<(), String> {
         let repository = open(root).map_err(|_| CHECKOUT_CHANGED)?;
         let matches = match self {
+            Self::Pull(expected) => {
+                return pull_plan(&repository)
+                    .ok()
+                    .filter(|plan| plan.target == *expected)
+                    .map(|_| ())
+                    .ok_or_else(|| NETWORK_TARGET_CHANGED.into());
+            }
+            Self::Push(expected) => {
+                return push_plan(&repository)
+                    .ok()
+                    .filter(|plan| plan == expected)
+                    .map(|_| ())
+                    .ok_or_else(|| NETWORK_TARGET_CHANGED.into());
+            }
             Self::Rewrite(checkout) => checkout.matches_head(&repository),
             Self::Fixup(checkout) => {
                 let matches = checkout.matches_head(&repository);
@@ -1847,6 +2129,110 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn push_destination_expands_only_the_named_remote_tracking_branch() {
+        let dir = repo();
+        let root = dir.path();
+        let tip = commit(root, "base").to_string();
+        git(root, &["remote", "add", "origin", "."]);
+        git(root, &["update-ref", "refs/remotes/origin/review", &tip]);
+        git(root, &["update-ref", "refs/tags/release", &tip]);
+        git(root, &["update-ref", "refs/remotes/origin/shared", &tip]);
+        git(root, &["update-ref", "refs/tags/shared", &tip]);
+        git(root, &["update-ref", "refs/remotes/other/unknown", &tip]);
+
+        for (configured, expected) in [
+            ("refs/heads/explicit", "refs/heads/explicit"),
+            ("refs/tags/release", "refs/tags/release"),
+            ("review", "refs/heads/review"),
+            ("release", "release"),
+            ("shared", "refs/heads/shared"),
+            ("unknown", "unknown"),
+        ] {
+            git(
+                root,
+                &[
+                    "config",
+                    "remote.origin.push",
+                    &format!("HEAD:{configured}"),
+                ],
+            );
+            let plan = push(root).unwrap();
+            assert_eq!(plan.target.reference, expected, "{configured}");
+            assert_eq!(
+                plan.run().args.last(),
+                Some(&OsString::from(format!("refs/heads/main:{expected}"))),
+                "{configured}",
+            );
+        }
+    }
+
+    #[test]
+    fn push_destination_ignores_a_local_tag_when_the_remote_has_a_branch() {
+        let dir = repo();
+        let root = dir.path();
+        commit(root, "base");
+        let remote = tempfile::tempdir().unwrap();
+        git(
+            remote.path(),
+            &["init", "--template=", "--bare", "-b", "main"],
+        );
+        let url = remote.path().to_str().unwrap();
+        // Seed the remote branch before adding origin so no tracking ref is recorded.
+        git(root, &["push", url, "HEAD:refs/heads/review"]);
+        git(root, &["remote", "add", "origin", url]);
+        git(root, &["config", "remote.origin.push", "HEAD:review"]);
+        git(root, &["tag", "review"]);
+        let tip = commit(root, "next");
+
+        let plan = push(root).unwrap();
+        assert_eq!(plan.target.reference, "review");
+        run(root, &plan.run());
+        assert_eq!(
+            git(remote.path(), &["rev-parse", "refs/heads/review"]),
+            tip.to_string(),
+        );
+        assert_eq!(
+            git(remote.path(), &["for-each-ref", "refs/tags/review"]),
+            "",
+            "a local-only tag must not change the remote destination",
+        );
+    }
+
+    #[test]
+    fn generic_push_pins_the_configured_remote_and_branch() {
+        let directory = repo();
+        let root = directory.path();
+        commit(root, "one");
+        git(root, &["remote", "add", "origin", "."]);
+        git(root, &["remote", "add", "review", "."]);
+        git(root, &["config", "branch.main.remote", "origin"]);
+        git(root, &["config", "branch.main.merge", "refs/heads/main"]);
+        assert_eq!(
+            push(root).unwrap().run().display(),
+            "git push --progress --no-follow-tags -- origin refs/heads/main:refs/heads/main"
+        );
+        git(root, &["config", "branch.main.pushRemote", "review"]);
+        git(
+            root,
+            &[
+                "config",
+                "remote.review.push",
+                "refs/heads/main:refs/heads/approved",
+            ],
+        );
+
+        let run = push(root).unwrap().run();
+        assert_eq!(
+            run.display(),
+            "git push --progress --no-follow-tags -- review refs/heads/main:refs/heads/approved"
+        );
+        let check = run.check.unwrap();
+        assert!(check.verify(root).is_ok());
+        git(root, &["config", "branch.main.pushRemote", "origin"]);
+        assert_eq!(check.verify(root).unwrap_err(), NETWORK_TARGET_CHANGED);
+    }
+
+    #[test]
     fn pull_reads_the_branch_then_the_pull_configuration() {
         let dir = repo();
         let root = dir.path();
@@ -1861,7 +2247,10 @@ pub(crate) mod tests {
         git(root, &["push", "-q", "-u", "origin", "main"]);
         let plan = pull(root).unwrap();
         assert_eq!(
-            (plan.branch.as_str(), plan.upstream.as_str()),
+            (
+                plan.target.branch.as_str(),
+                plan.target.other_branch().as_str()
+            ),
             ("main", "origin/main")
         );
         assert_eq!(plan.mode, PullMode::Merge);

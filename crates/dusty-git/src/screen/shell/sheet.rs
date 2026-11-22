@@ -133,6 +133,33 @@ fn wrap_note(note: &str, cells: usize) -> Vec<(String, bool)> {
     rows
 }
 
+fn ellipsize_middle(text: &str, cells: usize) -> String {
+    if text.width() <= cells || cells <= 1 {
+        return chrome::ellipsize(text, cells);
+    }
+    let head = chrome::ellipsize(text, cells / 2 + 1);
+    let tail = chrome::ellipsize_start(text, cells - cells / 2);
+    format!("{head}{}", tail.strip_prefix('…').unwrap_or(&tail))
+}
+
+fn target_rows(value: &str, cells: usize, limit: usize) -> Vec<(String, bool)> {
+    let mut lines = wrap_note(value, cells);
+    if lines.len() <= limit {
+        return lines;
+    }
+    if limit <= 1 {
+        return vec![(ellipsize_middle(value, cells), true)];
+    }
+    let tail = lines.split_off(lines.len() - limit / 2);
+    lines.truncate(limit - tail.len());
+    if let Some((end, _)) = lines.last_mut() {
+        end.push('…');
+        *end = chrome::ellipsize(end, cells);
+    }
+    lines.extend(tail);
+    lines
+}
+
 /// One labelled input. `rows` is the input height (1 for single-line fields).
 pub(in crate::screen) fn input(frame: &mut Frame, field: &Field, rect: Rect, focused: bool) {
     let surface = if focused {
@@ -682,6 +709,11 @@ fn generic(app: &GitScreen, frame: &mut Frame, form: &Form, lay: &Layout) {
     let body = lay.body;
     let mut heights = heights(&form.fields);
     let status = status_line(app, form);
+    let remote_action = matches!(
+        &form.action,
+        FormAction::Run(op)
+            if matches!(op.as_ref(), super::super::ops::Op::Pull(_) | super::super::ops::Op::Push(_))
+    );
     let replace_path = match &form.action {
         FormAction::Github(super::super::github::Action::ReplaceLog {
             destination,
@@ -719,6 +751,13 @@ fn generic(app: &GitScreen, frame: &mut Frame, form: &Form, lay: &Layout) {
     };
     // Wrap paths even when they have no spaces. The question's title alone may clip.
     let cells = usize::from(w.saturating_sub(6));
+    // Reserve room for the frame, buttons, the field's label, and any notice.
+    // Even a very long target must fit on screen when its field has focus.
+    let target_row_limit = usize::from(
+        body.h
+            .saturating_sub(7 + u16::from(status.is_some()))
+            .clamp(1, 4),
+    );
     let wrapped: Vec<_> = form
         .fields
         .iter()
@@ -727,7 +766,11 @@ fn generic(app: &GitScreen, frame: &mut Frame, form: &Form, lay: &Layout) {
             if !field.read_only || !field.multiline {
                 return None;
             }
-            let lines = wrap_note(&field.input.input, cells);
+            let lines = if remote_action {
+                target_rows(&field.input.input, cells, target_row_limit)
+            } else {
+                wrap_note(&field.input.input, cells)
+            };
             *height = 1 + lines.len() as u16;
             Some(lines)
         })
@@ -852,7 +895,12 @@ fn generic(app: &GitScreen, frame: &mut Frame, form: &Form, lay: &Layout) {
     } else {
         usize::from(chrome::width(&position)) + 3
     };
-    let title = cut_title(title, cells.saturating_sub(glyph_cells + position_cells));
+    let title_cells = cells.saturating_sub(glyph_cells + position_cells);
+    let title = if remote_action {
+        ellipsize_middle(title, title_cells)
+    } else {
+        cut_title(title, title_cells)
+    };
     let spans = if run_sheet {
         vec![(title, bold(GitRole::Text, SURFACE))]
     } else {
@@ -921,12 +969,17 @@ fn generic(app: &GitScreen, frame: &mut Frame, form: &Form, lay: &Layout) {
             checkbox(app, frame, field, inner.x, y, inner.right(), focused);
             continue;
         }
+        let read_only_label = if remote_action && focused {
+            bold(GitRole::Focus, SURFACE)
+        } else {
+            st(GitRole::Muted, SURFACE)
+        };
         if let Some(lines) = &wrapped[index] {
             frame.grid.put_text_clipped(
                 inner.x + 1,
                 y,
                 &field.label,
-                st(GitRole::Muted, SURFACE),
+                read_only_label,
                 inner.right(),
             );
             for (row, (line, _)) in lines.iter().enumerate() {
@@ -945,14 +998,20 @@ fn generic(app: &GitScreen, frame: &mut Frame, form: &Form, lay: &Layout) {
                 inner.x + 1,
                 y,
                 &format!("{}  ", field.label),
-                st(GitRole::Muted, SURFACE),
+                read_only_label,
                 inner.right(),
             );
             let value = field.input.input.lines().next().unwrap_or_default();
+            let available = usize::from(inner.right().saturating_sub(x));
+            let value = if remote_action {
+                ellipsize_middle(value, available)
+            } else {
+                chrome::ellipsize(value, available)
+            };
             frame.grid.put_text_clipped(
                 x,
                 y,
-                &chrome::ellipsize(value, usize::from(inner.right().saturating_sub(x))),
+                &value,
                 if field.label == "Target" {
                     bold(GitRole::Ref, SURFACE)
                 } else {

@@ -2100,8 +2100,8 @@ fn branch_request(
             deadline,
         },
         "remove-worktree" => R::RemoveWorktree {
+            target: crate::GitWorktreeTarget::capture(&repository, name).unwrap(),
             repository,
-            name: name.into(),
             reviewed: None,
             deadline,
         },
@@ -2199,7 +2199,7 @@ fn worktree_list_reports_detached_heads_without_a_branch() {
 fn worktree_mutations_keep_their_completion_until_polled() {
     let dir = tempdir().unwrap();
     let mut service = GitBranchWorker::default();
-    let request = branch_request(dir.path(), "remove-worktree", "missing", "");
+    let request = branch_request(dir.path(), "worktree", "missing", "unused");
     service.start(request.clone()).unwrap();
     service.cancel();
     assert_eq!(service.start(request.clone()), Err(GitBranchError::Busy));
@@ -2250,7 +2250,7 @@ fn worktree_deadlines_refuse_expired_mutations_and_lists() {
         },
         GitBranchRequest::RemoveWorktree {
             repository: root.clone(),
-            name: "side".into(),
+            target: crate::GitWorktreeTarget::capture(&root, "side").unwrap(),
             reviewed: None,
             deadline: Duration::from_nanos(1),
         },

@@ -104,7 +104,6 @@ enum FormAction {
     CheckoutDetached(String),
     DetachedWorktree(String),
     RemoveWorktree {
-        name: String,
         reviewed: crate::GitWorktreeRemoval,
         warning: String,
         note_top: std::cell::Cell<usize>,
@@ -1160,15 +1159,13 @@ impl GitScreen {
                 changed = true;
             }
             Ok(Some(GitBranchResult::RemovalReview {
-                name,
-                reviewed,
-                change,
+                reviewed, change, ..
             })) => {
-                let (name, reviewed, change) = (name.clone(), reviewed.clone(), change.clone());
+                let (reviewed, change) = (reviewed.clone(), change.clone());
                 self.branch_mutation = false;
                 self.busy = false;
                 if reviewing_removal {
-                    self.confirm_sidebar_worktree_remove(name, reviewed, change);
+                    self.confirm_sidebar_worktree_remove(reviewed, change);
                 }
                 changed = true;
             }
@@ -2384,11 +2381,11 @@ impl GitScreen {
                 self.busy = true;
                 self.branch_mutation = true;
             }
-            FormAction::RemoveWorktree { name, reviewed, .. } => {
+            FormAction::RemoveWorktree { reviewed, .. } => {
                 self.branches
                     .start(GitBranchRequest::RemoveWorktree {
                         repository: self.root.clone(),
-                        name: name.clone(),
+                        target: reviewed.target().clone(),
                         reviewed: Some(reviewed.clone()),
                         deadline: GitBranchRequest::REMOVAL_STATUS_TIMEOUT,
                     })
@@ -3412,11 +3409,10 @@ impl GitScreen {
                                 );
                             }
                         }
-                        KeyCode::Char('P') => self.form(
-                            "Push current branch to its configured upstream?",
-                            FormAction::Confirm(vec!["push".into()]),
-                            Vec::new(),
-                        ),
+                        KeyCode::Char('P') => {
+                            let result = self.push_form();
+                            self.report(result);
+                        }
                         KeyCode::Char(code @ ('d' | 'D'))
                             if self.focus == 0 && self.files_view == 0 =>
                         {
@@ -4597,7 +4593,7 @@ mod context_tests {
             .start_paused_removal(
                 GitBranchRequest::RemoveWorktree {
                     repository: root.to_path_buf(),
-                    name: "side".into(),
+                    target: crate::GitWorktreeTarget::capture(root, "side").unwrap(),
                     reviewed: None,
                     deadline: GitBranchRequest::REMOVAL_STATUS_TIMEOUT,
                 },

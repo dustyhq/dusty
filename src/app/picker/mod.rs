@@ -55,12 +55,12 @@ pub(in crate::app) enum PickerPayload {
         local: Option<PathBuf>,
     },
     GitWorktree {
-        name: String,
         main: bool,
         /// Carried so the open and close commands act on the row's own worktree instead of
         /// re-deriving a path from display text.
         #[allow(dead_code)]
         path: std::path::PathBuf,
+        removal_target: Option<crate::git::GitWorktreeTarget>,
     },
     Theme(crate::app::configuration::ThemeKey),
     WorkspaceSearch(String),

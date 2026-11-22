@@ -391,9 +391,13 @@ impl GitScreen {
             self.notice = "The main worktree cannot be removed".into();
             return;
         }
+        let Some(target) = worktree.removal_target.clone() else {
+            self.notice = crate::GitBranchError::RemovalTargetChanged.to_string();
+            return;
+        };
         let result = self.branches.start(GitBranchRequest::ReviewRemoval {
             repository: self.root.clone(),
-            name: worktree.name.clone(),
+            target,
             deadline: GitBranchRequest::REMOVAL_STATUS_TIMEOUT,
         });
         match result {
@@ -404,40 +408,30 @@ impl GitScreen {
 
     pub(super) fn confirm_sidebar_worktree_remove(
         &mut self,
-        name: String,
         reviewed: crate::GitWorktreeRemoval,
         change: Option<String>,
     ) {
-        let (title, warning) = if reviewed.is_missing() {
-            (
-                format!("Forget missing worktree {name}?"),
-                "Its directory is already gone. No branch is deleted.".into(),
-            )
-        } else if reviewed.is_clean() {
-            (
-                format!(
-                    "Remove clean, unlocked worktree {}?",
-                    reviewed.path().display()
-                ),
-                String::new(),
-            )
-        } else {
-            (
-                format!("Remove worktree {name}?"),
-                reviewed.warnings().collect::<Vec<_>>().join("\n"),
-            )
-        };
+        let path = reviewed.path().display();
+        let mut notes = Vec::new();
         let changed = change.is_some();
-        let warning = match change {
-            Some(change) => format!("{change}\n{warning}"),
-            None => warning,
+        if let Some(change) = change {
+            notes.push(change);
+        }
+        notes.push(format!("Checkout: {path}"));
+        let title = if reviewed.is_missing() {
+            notes.push("Its directory is already gone. No branch is deleted.".into());
+            "Forget missing worktree?"
+        } else if reviewed.is_clean() {
+            "Remove clean, unlocked worktree?"
+        } else {
+            notes.extend(reviewed.warnings());
+            "Remove worktree?"
         };
         self.form(
-            &title,
+            title,
             FormAction::RemoveWorktree {
-                name,
                 reviewed,
-                warning,
+                warning: notes.join("\n"),
                 note_top: std::cell::Cell::new(0),
             },
             Vec::new(),

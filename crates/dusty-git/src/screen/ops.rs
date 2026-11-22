@@ -1,11 +1,11 @@
-//! Pull, undo and redo, history rewriting and tag push on the Git tab:
+//! Pull, push, undo and redo, and history rewriting on the Git tab:
 //! each opens a sheet that shows what will move and the command, then runs as a write job.
 use super::*;
 use crate::command::{CHECKOUT_TIMEOUT, GitOutput, supervised_git_output};
 use crate::history::{self, Edit, PullMode, Run};
 use std::sync::mpsc::{Receiver, TryRecvError, sync_channel};
 
-/// A network write (pull, tag push) may take minutes; a local rebase far less.
+/// A network write may take minutes; a local rebase far less.
 const NETWORK: Duration = Duration::from_secs(300);
 const LOCAL: Duration = Duration::from_secs(120);
 
@@ -305,7 +305,8 @@ fn replace_ignored(root: &Path, plan: OverwriteIgnored) -> Result<CheckoutOutcom
 /// What a confirmed sheet runs.
 #[derive(Clone)]
 pub(super) enum Op {
-    Pull,
+    Pull(history::Pull),
+    Push(history::Push),
     Undo(history::Undo),
     Rewrite(Box<history::Rewrite>),
     PushTag(String),
@@ -340,7 +341,8 @@ impl Op {
     /// The confirm button of the older painter, bracketed.
     pub(super) fn button(&self) -> &'static str {
         match self {
-            Self::Pull => "[ Pull ]",
+            Self::Pull(_) => "[ Pull ]",
+            Self::Push(_) => "[ Push ]",
             Self::Undo(undo) if undo.redo => "[ Redo ]",
             Self::Undo(_) => "[ Undo ]",
             Self::PushTag(_) => "[ Push tag ]",
@@ -374,6 +376,12 @@ fn read_only(label: &str, value: String) -> Field {
     let mut field = Field::new(label, value);
     field.read_only = true;
     field.input.cursor = 0;
+    field
+}
+
+fn wrapped_read_only(label: &str, value: String) -> Field {
+    let mut field = read_only(label, value);
+    field.multiline = true;
     field
 }
 
@@ -503,17 +511,45 @@ impl GitScreen {
             .iter()
             .map(|mode| mode.label().to_owned())
             .collect();
+        let target = &plan.target;
         let fields = vec![
-            read_only("Branch", plan.branch.clone()),
-            read_only("From", plan.upstream.clone()),
+            read_only("Branch", target.branch.clone()),
+            wrapped_read_only("From", format!("{} {}", target.remote, target.reference)),
             mode,
+            wrapped_read_only(
+                "Checkout",
+                crate::command::display_paths([target.checkout()]),
+            ),
         ];
-        // Enter pulls in the configured mode; Tab reaches the mode, Up/Down changes it.
+        let selected = fields.len();
+        // Enter pulls in the configured mode; Up/Down changes the mode when focused.
         self.op_form(
-            format!("Pull {} into {}?", plan.upstream, plan.branch),
-            Op::Pull,
+            format!("Pull {} into {}?", target.other_branch(), target.branch),
+            Op::Pull(plan),
             fields,
-            3,
+            selected,
+        );
+        Ok(())
+    }
+
+    pub(super) fn push_form(&mut self) -> Result<(), String> {
+        self.allow_write()?;
+        let plan = history::push(&self.root)?;
+        let target = &plan.target;
+        let fields = vec![
+            read_only("Branch", target.branch.clone()),
+            wrapped_read_only("To", format!("{} {}", target.remote, target.reference)),
+            wrapped_read_only(
+                "Checkout",
+                crate::command::display_paths([target.checkout()]),
+            ),
+        ];
+        let selected = fields.len();
+        self.op_form(
+            format!("Push {} to {}?", target.branch, target.other_branch()),
+            Op::Push(plan),
+            fields,
+            selected,
         );
         Ok(())
     }
@@ -657,22 +693,26 @@ impl GitScreen {
     /// The confirmed sheet's commands, built from its fields.
     pub(super) fn submit_op(&mut self, op: Op, values: &[String]) -> Result<(), String> {
         let (runs, timeout, done) = match op {
-            Op::Pull => {
+            Op::Pull(plan) => {
                 let mode = values
                     .get(2)
                     .and_then(|label| PullMode::parse(label))
                     .ok_or("Choose merge, rebase or fast-forward only with Up/Down")?;
-                let plan = history::pull(&self.root)?;
-                (
-                    vec![history::pull_run(mode)],
-                    NETWORK,
-                    format!(
-                        "Pulled {} into {} ({})",
-                        plan.upstream,
-                        plan.branch,
-                        mode.label()
-                    ),
-                )
+                let done = format!(
+                    "Pulled {} into {} ({})",
+                    plan.target.other_branch(),
+                    plan.target.branch,
+                    mode.label()
+                );
+                (vec![history::pull_run(plan, mode)], NETWORK, done)
+            }
+            Op::Push(plan) => {
+                let done = format!(
+                    "Pushed {} to {}",
+                    plan.target.branch,
+                    plan.target.other_branch()
+                );
+                (vec![plan.run()], NETWORK, done)
             }
             Op::Undo(undo) => {
                 let Some(run) = undo.run() else {
@@ -899,6 +939,8 @@ impl GitScreen {
             // Confirmed Git command sheets have closed. Native rewrites keep
             // their own forms and handle their worker results separately.
             history::CHECKOUT_CHANGED_AFTER_CLOSE.into()
+        } else if error == history::NETWORK_TARGET_CHANGED {
+            error.clone()
         } else {
             let state = git2::Repository::open(&self.root)
                 .map_or(git2::RepositoryState::Clean, |repository| {
@@ -993,6 +1035,330 @@ mod tests {
     use history::tests::{commit, git, head, repo};
     use std::fs;
     use std::time::Instant;
+
+    #[test]
+    fn pull_sheet_refuses_a_branch_switch_before_submit() {
+        let upstream = repo();
+        let base = commit(upstream.path(), "base");
+        let local = tempfile::tempdir().unwrap();
+        git(
+            local.path(),
+            &["clone", "-q", upstream.path().to_str().unwrap(), "local"],
+        );
+        let root = local.path().join("local");
+        git(&root, &["branch", "--track", "other", "origin/main"]);
+        let latest = commit(upstream.path(), "new");
+        let mut screen = GitScreen::open(&root).unwrap();
+
+        screen.pull_form().unwrap();
+        git(&root, &["switch", "other"]);
+        screen.submit().unwrap();
+        drain_write(&mut screen);
+        assert_eq!(screen.notice, history::NETWORK_TARGET_CHANGED);
+        assert_eq!(head(&root), base);
+
+        git(&root, &["switch", "main"]);
+        screen.pull_form().unwrap();
+        screen.submit().unwrap();
+        drain_write(&mut screen);
+        assert_eq!(head(&root), latest);
+    }
+
+    #[test]
+    fn pull_sheet_refuses_fetch_url_rewrite_drift() {
+        let upstream = repo();
+        let base = commit(upstream.path(), "base");
+        let local = tempfile::tempdir().unwrap();
+        git(
+            local.path(),
+            &["clone", "-q", upstream.path().to_str().unwrap(), "work"],
+        );
+        let root = local.path().join("work");
+        let other = tempfile::tempdir().unwrap();
+        git(
+            other.path(),
+            &["clone", "-q", upstream.path().to_str().unwrap(), "other"],
+        );
+        let other = other.path().join("other");
+        git(&other, &["config", "user.name", "History"]);
+        git(&other, &["config", "user.email", "history@example.invalid"]);
+        git(&other, &["config", "commit.gpgsign", "false"]);
+        commit(&other, "different");
+        let alias = "fetch-alias:project";
+        let key = format!("url.{}.insteadOf", upstream.path().display());
+        git(&root, &["remote", "set-url", "origin", alias]);
+        git(&root, &["config", &key, alias]);
+        let mut screen = GitScreen::open(&root).unwrap();
+        screen.pull_form().unwrap();
+
+        git(&root, &["config", "--unset", &key]);
+        git(
+            &root,
+            &[
+                "config",
+                &format!("url.{}.insteadOf", other.display()),
+                alias,
+            ],
+        );
+        screen.submit().unwrap();
+        drain_write(&mut screen);
+        assert_eq!(screen.notice, history::NETWORK_TARGET_CHANGED);
+        assert_eq!(head(&root), base);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn opening_pull_and_push_sheets_does_not_start_a_transport() {
+        let local = repo();
+        let root = local.path();
+        commit(root, "base");
+        let remote = tempfile::tempdir().unwrap();
+        git(remote.path(), &["init", "-q", "--bare", "-b", "main"]);
+        git(
+            root,
+            &["remote", "add", "origin", remote.path().to_str().unwrap()],
+        );
+        for service in ["uploadpack", "receivepack"] {
+            git(
+                root,
+                &[
+                    "config",
+                    &format!("remote.origin.{service}"),
+                    "touch .git/transport-attempted; false",
+                ],
+            );
+        }
+        git(root, &["config", "branch.main.remote", "origin"]);
+        git(root, &["config", "branch.main.merge", "refs/heads/main"]);
+        git(root, &["config", "remote.origin.push", "HEAD:review"]);
+        let mut screen = GitScreen::open(root).unwrap();
+
+        screen.pull_form().unwrap();
+        let push = screen.push_form();
+        assert!(
+            !root.join(".git/transport-attempted").exists(),
+            "opening a sheet must not start upload-pack or receive-pack",
+        );
+        push.unwrap();
+        assert_eq!(
+            screen.form.as_ref().unwrap().fields[1].input.input,
+            "origin review"
+        );
+        assert!(!screen.busy);
+    }
+
+    #[test]
+    fn push_sheet_uses_a_tracked_short_branch_and_refuses_push_url_drift() {
+        let local = repo();
+        let root = local.path();
+        let base = commit(root, "base").to_string();
+        let targets = tempfile::tempdir().unwrap();
+        let [approved, other] = ["approved.git", "other.git"].map(|name| {
+            git(
+                targets.path(),
+                &["clone", "-q", "--bare", root.to_str().unwrap(), name],
+            );
+            let target = targets.path().join(name);
+            git(&target, &["update-ref", "refs/heads/review", &base]);
+            target
+        });
+        let alias = "write-alias:project";
+        let key = format!("url.{}.pushInsteadOf", approved.display());
+        // The fetch and push URLs differ. Only the latter is relevant to this sheet.
+        git(root, &["remote", "add", "origin", alias]);
+        git(
+            root,
+            &[
+                "config",
+                &format!("url.{}.insteadOf", other.display()),
+                alias,
+            ],
+        );
+        git(root, &["config", &key, alias]);
+        git(root, &["config", "remote.origin.push", "HEAD:review"]);
+        git(root, &["update-ref", "refs/remotes/origin/review", &base]);
+
+        let first = commit(root, "first").to_string();
+        let mut screen = GitScreen::open(root).unwrap();
+        screen.push_form().unwrap();
+        screen.submit().unwrap();
+        drain_write(&mut screen);
+        assert_eq!(git(&approved, &["rev-parse", "refs/heads/review"]), first);
+        assert_eq!(git(&approved, &["rev-parse", "refs/heads/main"]), base);
+        assert_eq!(git(&other, &["rev-parse", "refs/heads/review"]), base);
+
+        commit(root, "second");
+        screen.push_form().unwrap();
+        git(root, &["config", "--unset", &key]);
+        git(
+            root,
+            &[
+                "config",
+                &format!("url.{}.pushInsteadOf", other.display()),
+                alias,
+            ],
+        );
+        screen.submit().unwrap();
+        drain_write(&mut screen);
+        assert_eq!(screen.notice, history::NETWORK_TARGET_CHANGED);
+        assert_eq!(git(&other, &["rev-parse", "refs/heads/review"]), base);
+        assert_eq!(git(&approved, &["rev-parse", "refs/heads/review"]), first);
+    }
+
+    #[test]
+    fn network_sheets_show_long_targets_at_100_columns() {
+        let dirs = tempfile::tempdir().unwrap();
+        let parent = dirs
+            .path()
+            .join(format!("{}-CHECKOUT-tail", "long".repeat(20)));
+        let root = parent.join("work");
+        fs::create_dir_all(&root).unwrap();
+        git(&root, &["init", "-q", "--template=", "-b", "main"]);
+        git(&root, &["config", "user.name", "History"]);
+        git(&root, &["config", "user.email", "history@example.invalid"]);
+        git(&root, &["config", "commit.gpgsign", "false"]);
+        commit(&root, "base");
+        git(&root, &["remote", "add", "origin", "."]);
+        git(&root, &["config", "branch.main.remote", "origin"]);
+        let fetch = format!("refs/heads/{}-FROM-tail", "long".repeat(25));
+        let push = format!("refs/heads/{}-TO-tail", "long".repeat(25));
+        git(&root, &["config", "branch.main.merge", &fetch]);
+        git(
+            &root,
+            &["config", "remote.origin.push", &format!("HEAD:{push}")],
+        );
+
+        let mut screen = GitScreen::open(&root).unwrap();
+        for (open, label, tail) in [
+            (
+                GitScreen::pull_form as fn(&mut GitScreen) -> Result<(), String>,
+                "From",
+                "FROM-tail",
+            ),
+            (GitScreen::push_form, "To", "TO-tail"),
+        ] {
+            open(&mut screen).unwrap();
+            let frame = screen.frame(100, 30);
+            let grid = &frame.grid;
+            let rows = (0..grid.height())
+                .map(|row| grid.row_text(row))
+                .collect::<Vec<_>>();
+            for (label, tail) in [(label, tail), ("Checkout", "CHECKOUT-tail")] {
+                let values = wrapped_sheet_value(grid, &rows, label);
+                assert!(
+                    values.contains(tail),
+                    "{tail} not visible after {label}:\n{}",
+                    rows.join("\n")
+                );
+            }
+        }
+    }
+
+    fn wrapped_sheet_value(grid: &crate::ui::CellGrid, rows: &[String], label: &str) -> String {
+        let label_row = (0..grid.height())
+            .find(|&y| {
+                rows[usize::from(y)]
+                    .split('│')
+                    .any(|text| text.trim() == label)
+            })
+            .unwrap();
+        // The dialog is centered. Use its own borders, not the background
+        // pane borders that may also be present on these rows.
+        let is_edge = |x, y| grid.get(x, y).is_some_and(|cell| cell.symbol == "│");
+        let middle = grid.width() / 2;
+        let left = (0..middle).rev().find(|&x| is_edge(x, label_row)).unwrap();
+        let right = (middle..grid.width())
+            .find(|&x| is_edge(x, label_row))
+            .unwrap();
+        (label_row + 1..grid.height())
+            .take_while(|&y| is_edge(left, y) && is_edge(right, y))
+            .map(|y| {
+                (left + 1..right)
+                    .filter_map(|x| grid.get(x, y))
+                    .filter(|cell| !cell.continuation)
+                    .map(|cell| cell.symbol.as_str())
+                    .collect::<String>()
+            })
+            .fold(String::new(), |mut values, row| {
+                values.push_str(row.trim());
+                values
+            })
+    }
+
+    #[test]
+    fn network_sheets_distinguish_shared_branch_prefixes_and_show_the_focused_checkout() {
+        let dir = repo();
+        let root = dir.path();
+        commit(root, "base");
+        git(root, &["remote", "add", "origin", "."]);
+        git(
+            root,
+            &["config", "remote.origin.push", "HEAD:refs/heads/shared"],
+        );
+        let mut screen = GitScreen::open(root).unwrap();
+        for suffix in ["alpha", "bravo"] {
+            let name = format!("topic-{}-{suffix}", "long".repeat(20));
+            git(root, &["switch", "-c", &name]);
+            git(
+                root,
+                &["config", &format!("branch.{name}.remote"), "origin"],
+            );
+            git(
+                root,
+                &[
+                    "config",
+                    &format!("branch.{name}.merge"),
+                    "refs/heads/shared",
+                ],
+            );
+            for open in [
+                GitScreen::pull_form as fn(&mut GitScreen) -> Result<(), String>,
+                GitScreen::push_form,
+            ] {
+                open(&mut screen).unwrap();
+                let frame = screen.frame(100, 30);
+                let rows: Vec<_> = (0..30).map(|y| frame.grid.row_text(y)).collect();
+                assert!(
+                    rows.iter()
+                        .flat_map(|row| row.split('│'))
+                        .map(str::trim)
+                        .any(|part| {
+                            part.starts_with("Branch  topic-")
+                                && part.contains('…')
+                                && part.ends_with(suffix)
+                        }),
+                    "branch {suffix} is not distinguishable in the sheet body:\n{}",
+                    rows.join("\n"),
+                );
+
+                // Exercise layout without needing a filesystem that permits this path length.
+                let form = screen.form.as_mut().unwrap();
+                let checkout = form.fields.len() - 1;
+                form.fields[checkout].input.input =
+                    format!("/checkout-head/{}/checkout-tail", "directory/".repeat(165));
+                form.move_focus(checkout);
+                let frame = screen.frame(100, 30);
+                let rows: Vec<_> = (0..30).map(|y| frame.grid.row_text(y)).collect();
+                let checkout = wrapped_sheet_value(&frame.grid, &rows, "Checkout");
+                assert!(
+                    checkout.starts_with("/checkout-head/")
+                        && checkout.contains('…')
+                        && checkout.contains("/checkout-tail"),
+                    "focused checkout lost its distinguishing text:\n{}",
+                    rows.join("\n"),
+                );
+            }
+        }
+    }
+
+    fn drain_write(screen: &mut GitScreen) {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while screen.busy || screen.refreshing_after_write {
+            assert!(Instant::now() < deadline, "Git job did not finish");
+            screen.poll();
+            std::thread::yield_now();
+        }
+    }
 
     fn amend_through_jobs(root: &Path, target: git2::Oid) -> String {
         let mut screen = GitScreen::open(root).unwrap();

@@ -1550,8 +1550,8 @@ fn a_previewed_replacement_writes_nothing_until_it_is_confirmed() {
             },
             crate::app::picker::PickerPayload::GitWorktree {
                 main: false,
-                name: "missing-worktree".into(),
                 path: root.join("missing-worktree"),
+                removal_target: None,
             },
         )],
     );
@@ -2585,10 +2585,7 @@ fn a_previewed_replacement_writes_nothing_until_it_is_confirmed_slot5() {
     let replacement = app.git.take_pending_replacement().unwrap();
     app.git.set_pending_replacement(replacement.clone());
     app.git
-        .set_pending_destructive(crate::app::git::GitDestructiveAction::RemoveWorktree(
-            "missing".into(),
-            None,
-        ));
+        .set_pending_destructive(crate::app::git::GitDestructiveAction::RemoveWorktree(None));
     assert!(!app.git.has_pending_replacement());
     app.git.set_pending_replacement(replacement);
     assert!(app.git.take_pending_destructive().is_none());
@@ -2598,10 +2595,7 @@ fn a_previewed_replacement_writes_nothing_until_it_is_confirmed_slot5() {
         "Escape cancels the replacement"
     );
     app.git
-        .set_pending_destructive(crate::app::git::GitDestructiveAction::RemoveWorktree(
-            "missing".into(),
-            None,
-        ));
+        .set_pending_destructive(crate::app::git::GitDestructiveAction::RemoveWorktree(None));
     app.open_confirmation(
         crate::ui::PromptKind::GitDestructive,
         "Remove worktree".into(),
