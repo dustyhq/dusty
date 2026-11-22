@@ -5,6 +5,7 @@
 //! body, so a refresh of something unchanged costs a header exchange. The store is per process
 //! and bounded; a body is kept only when it is small enough to be worth it.
 
+use crate::transport::AccountNamespace;
 use crate::transport::ApiRequest;
 use crate::transport::ApiResponse;
 use crate::transport::Method;
@@ -27,7 +28,7 @@ struct Stored {
 #[derive(Default)]
 struct Store {
     clock: u64,
-    entries: HashMap<String, Stored>,
+    entries: HashMap<CacheKey, Stored>,
 }
 
 fn store() -> &'static Mutex<Store> {
@@ -44,7 +45,13 @@ pub fn revalidated() -> u64 {
 
 /// The store key of a request that may be revalidated: REST GETs whose caller did not set its
 /// own `If-None-Match` (a read that turns a 304 into `Fetched::NotModified` does).
-pub fn key(api_base: &str, request: &ApiRequest) -> Option<String> {
+pub(crate) type CacheKey = (AccountNamespace, String);
+
+pub(crate) fn key(
+    account: &AccountNamespace,
+    api_base: &str,
+    request: &ApiRequest,
+) -> Option<CacheKey> {
     if request.method != Method::Get
         || !matches!(request.target, Target::Rest(_) | Target::Absolute(_))
         || request
@@ -54,14 +61,17 @@ pub fn key(api_base: &str, request: &ApiRequest) -> Option<String> {
     {
         return None;
     }
-    Some(format!(
-        "{api_base}|{:?}|{:?}|{:?}",
-        request.target, request.query, request.accept
+    Some((
+        account.clone(),
+        format!(
+            "{api_base}|{:?}|{:?}|{:?}",
+            request.target, request.query, request.accept
+        ),
     ))
 }
 
 /// Attach `If-None-Match` when an answer is stored.
-pub fn prepare(key: &str, request: &mut ApiRequest) {
+pub(crate) fn prepare(key: &CacheKey, request: &mut ApiRequest) {
     let store = store().lock().unwrap_or_else(|error| error.into_inner());
     if let Some(stored) = store.entries.get(key) {
         request
@@ -71,7 +81,7 @@ pub fn prepare(key: &str, request: &mut ApiRequest) {
 }
 
 /// Turn a 304 into the stored answer; remember a fresh one that carries an ETag.
-pub fn settle(key: &str, response: ApiResponse) -> ApiResponse {
+pub(crate) fn settle(key: &CacheKey, response: ApiResponse) -> ApiResponse {
     let mut store = store().lock().unwrap_or_else(|error| error.into_inner());
     store.clock += 1;
     let clock = store.clock;
@@ -139,11 +149,19 @@ mod tests {
     #[test]
     fn a_304_returns_the_stored_answer() {
         let request = ApiRequest::get("repos/o/r/actions/runs").query("per_page", 20);
-        let key = key("https://etag.test/api/v3", &request).unwrap();
+        let host = crate::transport::HostKey::new("etag.test:443");
+        let a = AccountNamespace::signed_in(host.clone(), "alice").unwrap();
+        let b = AccountNamespace::signed_in(host, "bob").unwrap();
+        let key = key(&a, "https://etag.test/api/v3", &request).unwrap();
         let mut first = request.clone();
         prepare(&key, &mut first);
         assert!(first.headers.is_empty());
         settle(&key, response(200, Some("\"a\""), "[1]"));
+        let other = super::key(&b, "https://etag.test/api/v3", &request).unwrap();
+        let mut bob = request.clone();
+        prepare(&other, &mut bob);
+        assert!(bob.headers.is_empty());
+        assert_eq!(settle(&other, response(304, None, "")).status, 304);
         let mut second = request.clone();
         prepare(&key, &mut second);
         assert_eq!(
@@ -152,9 +170,17 @@ mod tests {
         );
         let answer = settle(&key, response(304, None, ""));
         assert_eq!((answer.status, answer.body.as_slice()), (200, &b"[1]"[..]));
-        assert!(super::key("x", &ApiRequest::get("p").header("If-None-Match", "\"z\"")).is_none());
         assert!(
             super::key(
+                &a,
+                "x",
+                &ApiRequest::get("p").header("If-None-Match", "\"z\"")
+            )
+            .is_none()
+        );
+        assert!(
+            super::key(
+                &a,
                 "x",
                 &ApiRequest::graphql("query A { a }", serde_json::json!({}))
             )

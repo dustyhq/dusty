@@ -1,19 +1,69 @@
 //! The pending review: inline comments held for the next review of a
 //! pull request. They are kept under the forge state directory (never in the repository),
-//! per host, repository and pull request, so a restart keeps them until the review is sent
-//! or they are deleted. `V` in the Files reader marks the first line of a range; `c` on the
+//! per host, account, repository and pull request, so a restart keeps them until the review
+//! is sent or they are deleted. `V` in the Files reader marks the first line of a range; `c` on the
 //! last line comments on the whole range.
 use super::super::shell::glyphs::{Glyph, glyph};
 use super::lines::Line;
 use super::prose::{Rich, role, strong};
 use super::*;
 use crate::config::ExplorerIconMode;
+use crate::forge::host_state::{self, LegacyAccess};
 use crate::forge::model::Side;
 use crate::forge::request::InlineDraft;
 use crate::ui::{Emphasis, GitChip, GitRole, GitSurface, Style};
 use unicode_width::UnicodeWidthStr;
 
-pub(super) type Drafts = BTreeMap<u64, Vec<(InlineDraft, String)>>;
+pub(super) type Drafts = BTreeMap<u64, Vec<PendingDraft>>;
+
+// Keep a snapshot per directory so edits and deletes go back to the file that was loaded.
+#[derive(Default)]
+struct SavedDrafts(BTreeMap<PathBuf, Drafts>);
+
+impl SavedDrafts {
+    fn matches(&self, drafts: &Drafts) -> bool {
+        let mut count = 0;
+        for saved in self.0.values() {
+            for (number, comments) in saved {
+                count += comments.len();
+                if !drafts
+                    .get(number)
+                    .is_some_and(|current| comments.iter().all(|comment| current.contains(comment)))
+                {
+                    return false;
+                }
+            }
+        }
+        count == drafts.values().map(Vec::len).sum::<usize>()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct PendingDraft {
+    pub(super) id: String,
+    pub(super) comment: InlineDraft,
+    pub(super) head: String,
+}
+
+impl PendingDraft {
+    pub(super) fn new(comment: InlineDraft, head: String) -> Self {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let time = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let process = std::process::id();
+        let sequence = NEXT.fetch_add(1, Ordering::Relaxed);
+        Self {
+            id: format!("{process}-{time}-{sequence}"),
+            comment,
+            head,
+        }
+    }
+}
 
 const SCHEMA: u64 = 1;
 
@@ -47,35 +97,93 @@ fn segment(text: &str) -> String {
     escaped
 }
 
-/// `<state>/drafts/<host>/<repository>/`; `None` when there is no state directory.
-pub(super) fn directory(host: &str, repo: &str) -> Option<PathBuf> {
+fn directories(account: Option<&AccountNamespace>, host: &str, repo: &str) -> Vec<PathBuf> {
     let env = crate::forge::credential::Env::process();
     // Unit tests never touch the real state directory.
     if cfg!(any(test, feature = "test-support")) && env.get("DUSTY_FORGE_STATE_DIR").is_none() {
-        return None;
+        return Vec::new();
     }
-    let state = crate::forge::detect::hosts_path(&env)?
-        .parent()?
-        .to_path_buf();
-    Some(state.join("drafts").join(segment(host)).join(segment(repo)))
+    let Some(hosts) = crate::forge::detect::hosts_path(&env) else {
+        return Vec::new();
+    };
+    let Some(state) = hosts.parent() else {
+        return Vec::new();
+    };
+    let access = host_state::legacy_access(&HostKey::new(host), account);
+    directories_in(state, account, host, repo, access)
+}
+
+fn directories_in(
+    state: &std::path::Path,
+    account: Option<&AccountNamespace>,
+    host: &str,
+    repo: &str,
+    access: LegacyAccess,
+) -> Vec<PathBuf> {
+    let host_dir = state.join("drafts").join(segment(host));
+    let name = segment(repo);
+    let mut paths = match account {
+        Some(account) if *account.host() == HostKey::new(host) => repository_directories(
+            crate::forge::cache::account_directory(&host_dir, account).join(&name),
+        ),
+        None if access == LegacyAccess::Unclaimed => {
+            return repository_directories(host_dir.join(name));
+        }
+        _ => return Vec::new(),
+    };
+    if access == LegacyAccess::Owner {
+        // The claim gives this account exclusive access to the original files. Keep them
+        // in place so edits and sent-review retirement can use their real stored spelling.
+        paths.extend(
+            repository_directories(host_dir.join(name))
+                .into_iter()
+                .filter(|path| path.is_dir()),
+        );
+    }
+    paths
+}
+
+/// Discover stored spellings by their actual directory entries. An insensitive filesystem
+/// lists one entry even if both spellings work as lookups. The write directory comes first.
+fn repository_directories(preferred: PathBuf) -> Vec<PathBuf> {
+    let Some((parent, name)) = preferred.parent().zip(preferred.file_name()) else {
+        return vec![preferred];
+    };
+    let mut paths: Vec<_> = std::fs::read_dir(parent)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|entry| entry.file_name().eq_ignore_ascii_case(name))
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir())
+        .collect();
+    paths.sort();
+    if let Some(index) = paths.iter().position(|path| *path == preferred) {
+        paths.swap(0, index);
+    } else if paths.len() != 1 || !preferred.is_dir() {
+        // If the sole entry already resolves by the preferred path, use its actual spelling.
+        paths.insert(0, preferred);
+    }
+    paths
 }
 
 fn side_name(side: Side) -> &'static str {
     side.as_github()
 }
 
-pub(super) fn encode(drafts: &[(InlineDraft, String)]) -> Value {
+fn encode(drafts: &[PendingDraft]) -> Value {
     serde_json::json!({
         "schema": SCHEMA,
         "drafts": drafts
             .iter()
-            .map(|(draft, head)| {
+            .map(|PendingDraft { id, comment, head }| {
                 serde_json::json!({
-                    "path": draft.path,
-                    "line": draft.line,
-                    "start_line": draft.start_line,
-                    "side": side_name(draft.side),
-                    "body": draft.body,
+                    "id": id,
+                    "path": comment.path,
+                    "line": comment.line,
+                    "start_line": comment.start_line,
+                    "side": side_name(comment.side),
+                    "body": comment.body,
                     "head": head,
                 })
             })
@@ -824,23 +932,332 @@ mod tests {
     }
 
     #[test]
+    fn drafts_stay_loaded_during_a_same_login_recheck() {
+        let state = tempfile::tempdir().unwrap();
+        let mut ws = Workspace::new(PathBuf::new());
+        ws.host = "forge.test:8443".into();
+        ws.repo = "o/r".into();
+        let host = super::super::HostKey::new(&ws.host);
+        let account = super::super::AccountNamespace::signed_in(host, "alice").unwrap();
+        let directory = |selected: Option<&super::super::AccountNamespace>, _: &str, _: &str| {
+            (selected == Some(&account))
+                .then(|| state.path().join("alice"))
+                .into_iter()
+                .collect()
+        };
+        let pending = draft(14, None, "Saved before re-check");
+        save_in(
+            &state.path().join("alice"),
+            7,
+            std::slice::from_ref(&pending),
+        )
+        .unwrap();
+        assert!(ws.accept_read_account(true, Some(account.clone()), None, true));
+        ws.sync_drafts_with(&directory);
+        assert_eq!(ws.review_drafts(7), std::slice::from_ref(&pending));
+
+        ws.accounts.open = true;
+        assert!(matches!(
+            ws.accounts_key(&KeyEvent::character('r')),
+            Some(Ok(None))
+        ));
+        ws.sync_drafts_with(&directory);
+        assert_eq!(ws.review_drafts(7), std::slice::from_ref(&pending));
+        assert!(ws.accept_read_account(true, Some(account.clone()), None, true));
+        ws.sync_drafts_with(&directory);
+        assert_eq!(ws.review_drafts(7), &[pending]);
+    }
+
+    #[test]
+    fn a_review_receipt_keeps_same_number_drafts_in_the_other_repository() {
+        let mut ws = Workspace::new(PathBuf::new());
+        ws.host = "github.com".into();
+        ws.repo = "Home/Root".into();
+        ws.sync_drafts();
+        let same_draft = draft(14, None, "Name this");
+        let unsent = draft(25, None, "Keep this one");
+        ws.inline_drafts
+            .insert(7, vec![same_draft.clone(), unsent.clone()]);
+        let linked = ForgeTarget::repository(&ws.host, "linked/other");
+        let sent = SentReview {
+            ids: BTreeSet::from([same_draft.id.clone()]),
+            account: None,
+            repo: "Home/Root".into(),
+        };
+        ws.clear_sent_review_drafts(&linked, 7, &sent).unwrap();
+        assert_eq!(ws.review_drafts(7), &[same_draft.clone(), unsent.clone()]);
+        let same_repo = ForgeTarget::repository(&ws.host, "home/root");
+        ws.clear_sent_review_drafts(&same_repo, 7, &sent).unwrap();
+        assert_eq!(ws.review_drafts(7), &[unsent]);
+    }
+
+    #[test]
+    fn inbox_keeps_mixed_case_review_and_form_drafts_in_their_local_scope() {
+        let state = tempfile::tempdir().unwrap();
+        let directory = |_: Option<&super::super::AccountNamespace>, _: &str, repo: &str| {
+            repository_directories(state.path().join(segment(repo)))
+        };
+        let mut ws = Workspace::new(PathBuf::new());
+        ws.host = "github.com".into();
+        ws.repo = "Acme/Widget".into();
+        ws.page = 2;
+        ws.states = ["open".into(), "open".into()];
+        let home_row = serde_json::json!({
+            "number": 7, "title": "Home PR", "state": "OPEN",
+            "url": "https://github.com/acme/widget/pull/7",
+            "repository": {"nameWithOwner": "acme/widget"}
+        });
+        let inbox_rows = serde_json::json!([home_row.clone(), {
+            "number": 7, "title": "Other PR", "state": "OPEN",
+            "url": "https://github.com/other/repo/pull/7",
+            "repository": {"nameWithOwner": "other/repo"}
+        }]);
+        let head = "a".repeat(40);
+        let item = serde_json::json!({"headRefOid": head, "number": 7});
+        let inbox = Key::Inbox(
+            ws.host.clone(),
+            2,
+            "open".into(),
+            "review-requested:@me".into(),
+        );
+        let reply = |value: Value| {
+            Ok(Reply {
+                text: value.to_string(),
+                value,
+            })
+        };
+        ws.cache
+            .insert(ws.list_key(), reply(serde_json::json!([home_row])));
+        ws.cache.insert(inbox, reply(inbox_rows));
+        ws.cache.insert(Key::Item(2, 7), reply(item.clone()));
+        ws.cache.insert(Key::Diff(7), reply(item.clone()));
+        ws.sync_drafts_with(&directory);
+
+        let range = ws
+            .activate(Action::InlineRange {
+                number: 7,
+                path: "src/lib.rs".into(),
+                start: 10,
+                line: 12,
+                side: "RIGHT",
+                head,
+            })
+            .unwrap()
+            .unwrap();
+        let action = |form: &Form| match &form.action {
+            FormAction::Github(action) => action.clone(),
+            _ => panic!("a GitHub sheet was expected"),
+        };
+        let range_action = action(&range);
+        assert_eq!(
+            ws.sheet_note(&range_action, &range.fields).as_deref(),
+            Some("Starts a review · held as pending until you submit it (r)")
+        );
+        ws.submit(range_action, vec!["Pending local draft".into()])
+            .unwrap();
+        ws.flush_drafts_with(&directory);
+
+        let pending = ws.activate(Action::Draft(7, 0)).unwrap().unwrap();
+        assert_eq!(
+            ws.sheet_note(&action(&pending), &pending.fields).as_deref(),
+            Some("Only you see pending comments until the review is submitted")
+        );
+
+        let comment = ws.event(&KeyEvent::character('C'), None).unwrap().unwrap();
+        ws.save_draft(&action(&comment), vec!["Unsent local comment".into()]);
+        for (ch, repo) in [
+            ('i', "Acme/Widget"),
+            ('j', "other/repo"),
+            ('k', "Acme/Widget"),
+        ] {
+            ws.event(&KeyEvent::character(ch), None).unwrap();
+            assert_eq!(ws.repo, repo);
+            ws.sync_drafts_with(&directory);
+        }
+        assert!(ws.inbox.enabled);
+        assert_eq!(ws.repo, "Acme/Widget");
+        assert_eq!(ws.review_drafts(7)[0].comment.body, "Pending local draft");
+        let directories: Vec<_> = std::fs::read_dir(state.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        assert_eq!(directories, ["Acme%2FWidget"]);
+        assert!(state.path().join("Acme%2FWidget/7.json").is_file());
+        let reopened = ws.event(&KeyEvent::character('C'), None).unwrap().unwrap();
+        assert_eq!(reopened.fields[0].input.input, "Unsent local comment");
+
+        ws.cache.insert(Key::Item(2, 7), reply(item));
+        let review = ws.event(&KeyEvent::character('r'), None).unwrap().unwrap();
+        ws.submit(action(&review), vec!["Comment".into(), String::new()])
+            .unwrap();
+        assert!(ws.queue.iter().any(|request| matches!(
+            &request.op,
+            Op::Write(target, Write::SubmitReview { number: 7, drafts, .. }, _)
+                if *target == ForgeTarget::repository("github.com", "Acme/Widget")
+                    && drafts.len() == 1 && drafts[0].body == "Pending local draft"
+        )));
+    }
+
+    #[test]
+    fn review_receipt_retires_drafts_from_each_stored_spelling() {
+        let state = tempfile::tempdir().unwrap();
+        let directory = |_: Option<&super::super::AccountNamespace>, _: &str, repo: &str| {
+            repository_directories(state.path().join(segment(repo)))
+        };
+        let mixed = state.path().join("Acme%2FWidget");
+        let lower = state.path().join("acme%2Fwidget");
+        let mut ws = Workspace::new(PathBuf::new());
+        ws.host = "github.com".into();
+        ws.repo = "Acme/Widget".into();
+
+        // Pre-ID drafts from HEAD. The same row in two distinct files is two comments.
+        let sent = draft(14, None, "Send this");
+        let held = draft(15, None, "Keep this");
+        let write_old = |path: &std::path::Path, drafts: &[PendingDraft]| {
+            std::fs::create_dir(path).unwrap();
+            let mut value = encode(drafts);
+            for row in value["drafts"].as_array_mut().unwrap() {
+                row.as_object_mut().unwrap().remove("id");
+            }
+            std::fs::write(path.join("7.json"), value.to_string()).unwrap();
+        };
+        write_old(&lower, &[sent.clone(), held.clone()]);
+        ws.sync_drafts_with(&directory);
+        assert_eq!(ws.review_drafts(7).len(), 2);
+
+        let distinct = !mixed.is_dir();
+        if distinct {
+            ws.repo = "other/repo".into();
+            ws.sync_drafts_with(&directory);
+            write_old(&mixed, std::slice::from_ref(&sent));
+            ws.repo = "Acme/Widget".into();
+            ws.sync_drafts_with(&directory);
+        }
+
+        let expected_sent = if distinct { 2 } else { 1 };
+        let sent_ids: BTreeSet<_> = ws
+            .review_drafts(7)
+            .iter()
+            .filter(|draft| draft.comment == sent.comment)
+            .map(|draft| draft.id.clone())
+            .collect();
+        assert_eq!(sent_ids.len(), expected_sent);
+        assert_eq!(ws.review_drafts(7).len(), expected_sent + 1);
+        let confirmed = SentReview {
+            ids: sent_ids,
+            account: None,
+            repo: ws.repo.clone(),
+        };
+        let new_draft = draft(16, None, "Added after confirming");
+        ws.inline_drafts
+            .get_mut(&7)
+            .unwrap()
+            .push(new_draft.clone());
+        ws.flush_drafts_with(&directory);
+        assert!(load_from(&mixed)[&7].contains(&new_draft));
+        if distinct {
+            assert!(!load_from(&lower)[&7].contains(&new_draft));
+        }
+
+        ws.repo = "other/repo".into();
+        ws.sync_drafts_with(&directory);
+        let target = ForgeTarget::repository(&ws.host, "acme/widget");
+        ws.clear_sent_review_drafts_with(&target, 7, &confirmed, &directory)
+            .unwrap();
+
+        // Reopening via the lowercase spelling finds the same surviving drafts, once.
+        ws.repo = "acme/widget".into();
+        ws.sync_drafts_with(&directory);
+        let remaining = ws.review_drafts(7);
+        assert_eq!(remaining.len(), 2);
+        assert!(remaining.contains(&new_draft));
+        assert!(remaining.iter().any(|draft| draft.comment == held.comment));
+        if distinct {
+            assert_eq!(load_from(&mixed)[&7], [new_draft]);
+            let legacy = load_from(&lower);
+            assert_eq!(legacy[&7].len(), 1);
+            assert_eq!(legacy[&7][0].comment, held.comment);
+        }
+    }
+
+    #[test]
+    fn a_failed_draft_save_stays_unsaved_and_the_next_flush_retries_it() {
+        let scratch = tempfile::tempdir().unwrap();
+        let state = scratch.path().join("drafts");
+        let directory =
+            |_: Option<&super::super::AccountNamespace>, _: &str, _: &str| vec![state.clone()];
+        std::fs::create_dir(&state).unwrap();
+        // A directory at one draft's filename prevents only that draft from being saved.
+        let blocked = state.join("7.json");
+        std::fs::create_dir(&blocked).unwrap();
+        let mut ws = Workspace::new(PathBuf::new());
+        ws.host = "github.com".into();
+        ws.repo = "home/root".into();
+        ws.sync_drafts_with(&directory);
+        ws.inline_drafts
+            .insert(7, vec![draft(14, None, "Retry this")]);
+        ws.inline_drafts
+            .insert(8, vec![draft(15, None, "Save now")]);
+
+        assert!(ws.flush_drafts_with(&directory));
+        assert!(ws.notice_error);
+        assert_eq!(ws.notice, "Couldn't save review drafts");
+        let saved = &ws.review.saved.0[&state];
+        assert!(!saved.contains_key(&7));
+        assert_eq!(saved.get(&8), ws.inline_drafts.get(&8));
+
+        ws.notice.clear();
+        assert!(!ws.flush_drafts_with(&directory));
+        assert!(ws.notice.is_empty(), "the same failure was shown again");
+        std::fs::remove_dir(&blocked).unwrap();
+        ws.flush_drafts_with(&directory);
+        assert!(ws.review.saved.matches(&ws.inline_drafts));
+        assert_eq!(load_from(&state), ws.inline_drafts);
+    }
+
+    #[test]
+    fn drafts_without_a_state_directory_stay_in_memory_by_repository() {
+        let directory = |_: Option<&super::super::AccountNamespace>, _: &str, _: &str| Vec::new();
+        let mut ws = Workspace::new(PathBuf::new());
+        ws.host = "github.com".into();
+        ws.repo = "home/root".into();
+        ws.sync_drafts_with(&directory);
+        let held = draft(14, None, "Keep this in memory");
+        ws.inline_drafts.insert(7, vec![held.clone()]);
+        assert!(ws.flush_drafts_with(&directory));
+        assert_eq!(ws.notice, "Review drafts aren't saved between sessions.");
+        assert!(ws.review.saved.0.is_empty());
+
+        ws.repo = "home/other".into();
+        ws.sync_drafts_with(&directory);
+        assert!(ws.inline_drafts.is_empty());
+        ws.repo = "home/root".into();
+        ws.sync_drafts_with(&directory);
+        assert_eq!(ws.review_drafts(7), &[held]);
+        assert!(ws.review.saved.0.is_empty());
+    }
+
+    #[test]
     fn drafts_round_trip_through_their_file_format() {
         let drafts = vec![
             draft(14, None, "Name this"),
             draft(22, Some(18), "Split this block\nin two"),
         ];
-        assert_eq!(decode(&encode(&drafts)), drafts);
+        assert_eq!(decode(&encode(&drafts), "example%2Fdemo"), drafts);
         // An unknown schema reads as nothing rather than as wrong drafts.
         let mut other = encode(&drafts);
         other["schema"] = 9.into();
-        assert!(decode(&other).is_empty());
+        assert!(decode(&other, "example%2Fdemo").is_empty());
     }
 
     #[test]
     fn a_range_reads_as_lines_and_a_single_line_as_line() {
-        assert_eq!(anchor_text(&draft(22, Some(18), "x").0), "lines 18–22");
-        assert_eq!(anchor_text(&draft(22, None, "x").0), "line 22");
-        assert_eq!(anchor_text(&draft(22, Some(22), "x").0), "line 22");
+        assert_eq!(
+            anchor_text(&draft(22, Some(18), "x").comment),
+            "lines 18–22"
+        );
+        assert_eq!(anchor_text(&draft(22, None, "x").comment), "line 22");
+        assert_eq!(anchor_text(&draft(22, Some(22), "x").comment), "line 22");
     }
 
     #[test]

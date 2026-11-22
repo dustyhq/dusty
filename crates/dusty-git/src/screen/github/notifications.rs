@@ -326,7 +326,12 @@ impl Workspace {
                 Op::Write(
                     target,
                     write @ (Write::MarkRead(_) | Write::MarkAllRead | Write::Unsubscribe(_)),
-                ) if target.host.as_deref() == Some(self.host.as_str()) => Some(write),
+                    account,
+                ) if target.host.as_deref() == Some(self.host.as_str())
+                    && account == &self.account =>
+                {
+                    Some(write)
+                }
                 _ => None,
             });
         threads.retain(|thread| {
@@ -1018,12 +1023,13 @@ impl Workspace {
     pub(super) fn notification_write_error(&self, write: &Write, error: &str) -> Option<String> {
         let action = match write {
             Write::MarkRead(_) => "Couldn't mark it read",
-            Write::MarkAllRead => "Couldn't mark all notifications read",
+            Write::MarkAllRead => MARK_ALL_FAILURE,
             Write::Unsubscribe(_) => "Couldn't unsubscribe",
             _ => return None,
         };
         let head = error.split(" · ").next().unwrap_or_default();
         Some(match head {
+            crate::forge::ACCOUNT_CHANGED | crate::forge::UNVERIFIED_SIGN_IN => head.into(),
             "No permission"
             | "Rate limited"
             | "Network error"

@@ -350,7 +350,7 @@ impl Workspace {
             return self.cache.contains_key(key);
         };
         let found = super::disk::read(&cache, key, &cache_key);
-        self.apply_disk(key, &read, found)
+        self.apply_disk(key, &read, cache_key.account.host(), found)
     }
 
     /// `load_disk` on the disk worker: the entry is painted when it lands (`poll_disk`), and
@@ -390,7 +390,12 @@ impl Workspace {
                 .load(&cache, key.clone(), read, cache_key, epoch);
             return None;
         }
-        Some(self.apply_disk(&loaded.key, &loaded.read, loaded.found))
+        Some(self.apply_disk(
+            &loaded.key,
+            &loaded.read,
+            &loaded.routing_host,
+            loaded.found,
+        ))
     }
 
     /// Whether the disk is being read for `key`.
@@ -407,7 +412,12 @@ impl Workspace {
             if loaded.epoch != self.scope_epoch || self.cache.contains_key(&loaded.key) {
                 continue;
             }
-            painted |= self.apply_disk(&loaded.key, &loaded.read, loaded.found);
+            painted |= self.apply_disk(
+                &loaded.key,
+                &loaded.read,
+                &loaded.routing_host,
+                loaded.found,
+            );
         }
         // The rows' handling waited for the disk: the forge is asked now if it must be.
         if painted || answered && !self.cursor_moving() {
@@ -439,7 +449,13 @@ impl Workspace {
     }
 
     /// Put what the disk held for `key` in memory. Returns whether the key is now cached.
-    fn apply_disk(&mut self, key: &Key, read: &Read, found: super::disk::Found) -> bool {
+    fn apply_disk(
+        &mut self,
+        key: &Key,
+        read: &Read,
+        routing_host: &HostKey,
+        found: super::disk::Found,
+    ) -> bool {
         let envelope = match found {
             super::disk::Found::Payload(envelope) => envelope,
             super::disk::Found::Missing(envelope) => {
@@ -456,7 +472,8 @@ impl Workspace {
                         verified: false,
                     },
                 );
-                self.cache.insert(key.clone(), Err(envelope.data));
+                self.cache
+                    .insert(key.clone(), Err(crate::forge::redact(&envelope.data)));
                 return true;
             }
             super::disk::Found::Nothing => {
@@ -515,6 +532,11 @@ impl Workspace {
         if meta.offline {
             let wait = (meta.age() / 4).clamp(CONFIRM_AFTER, Duration::from_secs(300));
             return meta.checked.is_none_or(|checked| checked.elapsed() >= wait);
+        }
+        // Check the remembered identity in the background even when the repository body
+        // is fresh. The warm namespace is only provisional until a live request answers.
+        if *key == Key::Repository && !meta.verified && meta.checked.is_none() {
+            return true;
         }
         if let Some(checked) = meta.checked
             && checked.elapsed() < meta.ttl.clamp(CONFIRM_AFTER, Duration::from_secs(3600))
@@ -909,12 +931,26 @@ impl Workspace {
             if scope != (self.host.clone(), self.repo.clone(), self.scope_epoch) {
                 continue;
             }
-            let ForgeReply::Fetched(_, result) = event.reply else {
+            let ForgeReply::Fetched(_, routing_host, result, account) = event.reply else {
                 continue;
             };
             changed = true;
+            let protect_projection = self.protects_read(&request.key) || self.has_read_projection();
+            if !self.accept_read_account(
+                routing_host.is_some(),
+                account,
+                result.as_ref().err(),
+                protect_projection,
+            ) {
+                continue;
+            }
             let key = request.key.clone();
-            self.apply(request, result.map_err(|error| error.to_string()), true);
+            self.apply(
+                request,
+                routing_host,
+                result.map_err(|error| error.to_string()),
+                true,
+            );
             self.ask_again(&key);
         }
         changed |= self.poll_live();
@@ -1060,15 +1096,17 @@ impl Workspace {
                 };
                 self.fresh.warm_next += 1;
                 let conditional = self.conditional(&request.key, read);
+                let account = self.validation_account(&request.key);
                 if self
                     .fresh
                     .warm
-                    .fetch(
+                    .fetch_as(
                         self.root.clone(),
                         self.fresh.warm_next,
                         target.clone(),
                         read.clone(),
-                        conditional,
+                        (account, conditional),
+                        true,
                     )
                     .is_ok()
                 {
@@ -1181,9 +1219,9 @@ impl Workspace {
                     .for_each(&mut add);
             }
         }
-        if let Some(cache) = &self.fresh.cache {
+        if let (Some(cache), Some(account)) = (&self.fresh.cache, &self.account) {
             let kind = kind_of(page);
-            for envelope in cache.scan::<Payload>(&self.host, Some(&self.repo), "list") {
+            for envelope in cache.scan::<Payload>(account, Some(&self.repo), "list") {
                 let listed = serde_json::from_str::<Read>(&envelope.key).is_ok_and(
                     |read| matches!(read, Read::List { kind: listed, .. } if listed == kind),
                 );

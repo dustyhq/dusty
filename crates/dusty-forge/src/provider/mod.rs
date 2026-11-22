@@ -89,12 +89,26 @@ pub struct ForgeContext {
     pub repo: Option<RepoRef>,
     pub viewer: Option<User>,
     transport: Mutex<Arc<dyn Transport>>,
+    account: Option<transport::AccountNamespace>,
     deadline: Mutex<Option<Instant>>,
     fell_back: AtomicBool,
     /// Work nobody is waiting for (the warm worker, a cached entry's check): its requests are
     /// sent as `Class::Background`, so they take few of the in-flight slots and stop once the
     /// quota's reserve is reached (half the small quota while anonymous).
     background: AtomicBool,
+}
+
+pub(crate) fn account_of(
+    host: &HostKey,
+    transport: &dyn Transport,
+) -> Option<transport::AccountNamespace> {
+    if transport.kind().anonymous() {
+        Some(transport::AccountNamespace::anonymous(host.clone()))
+    } else {
+        transport
+            .verified_login()
+            .and_then(|login| transport::AccountNamespace::signed_in(host.clone(), login))
+    }
 }
 
 impl ForgeContext {
@@ -107,6 +121,7 @@ impl ForgeContext {
     ) -> Self {
         Self {
             root,
+            account: account_of(&endpoints.host, transport.as_ref()),
             endpoints,
             options,
             repo,
@@ -166,6 +181,11 @@ impl ForgeContext {
             repo,
             Arc::new(Offline),
         )
+    }
+
+    /// The principal fixed to this context; unverified authenticated connections have none.
+    pub fn account(&self) -> Option<&transport::AccountNamespace> {
+        self.account.as_ref()
     }
 
     pub fn host(&self) -> &HostKey {
@@ -311,6 +331,11 @@ impl ForgeContext {
         let Some(next) = next else {
             return result;
         };
+        // The request may carry an account's validators, or be part of a write.
+        // Never retry it under a different principal.
+        if self.account.is_some() && account_of(self.host(), next.as_ref()) != self.account {
+            return result;
+        }
         *self
             .transport
             .lock()

@@ -1447,8 +1447,10 @@ pub fn search_request(kind: ItemKind, filter: &Filter, page: Page, me: Option<&s
 // ------------------------------------------------------------------------------ process memos
 
 /// `@me` per host: one `GET user` per process.
-fn viewers() -> &'static Mutex<HashMap<String, String>> {
-    static VIEWERS: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+type Viewers = Mutex<HashMap<crate::transport::AccountNamespace, String>>;
+
+fn viewers() -> &'static Viewers {
+    static VIEWERS: OnceLock<Viewers> = OnceLock::new();
     VIEWERS.get_or_init(Default::default)
 }
 
@@ -1682,18 +1684,22 @@ impl GitLab {
 
     /// The signed-in username for `@me` filters.
     fn me(ctx: &ForgeContext, cancel: &AtomicBool) -> Result<String, ForgeError> {
-        let host = ctx.host().to_string();
-        if let Some(login) = lock(viewers()).get(&host) {
-            return Ok(login.clone());
-        }
         if ctx.anonymous() {
             return Err(ctx.sign_in_to("filter by @me"));
+        }
+        if let Some(login) = ctx
+            .account()
+            .and_then(|account| lock(viewers()).get(account).cloned())
+        {
+            return Ok(login);
         }
         let login = user(&ctx.json(&ApiRequest::get("user"), cancel)?).login;
         if login.is_empty() {
             return Err(ForgeError::BadResponse("GET user has no username".into()));
         }
-        lock(viewers()).insert(host, login.clone());
+        if let Some(account) = ctx.account() {
+            lock(viewers()).insert(account.clone(), login.clone());
+        }
         Ok(login)
     }
 
@@ -1958,7 +1964,9 @@ impl GitLab {
             }
             Read::Viewer => {
                 let viewer = user(&ctx.json(&requests[0], cancel)?);
-                lock(viewers()).insert(ctx.host().to_string(), viewer.login.clone());
+                if let Some(account) = ctx.account().filter(|account| account.login().is_some()) {
+                    lock(viewers()).insert(account.clone(), viewer.login.clone());
+                }
                 Payload::User(viewer)
             }
             Read::Labels => Payload::Labels(labels(&Value::Array(

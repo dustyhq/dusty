@@ -99,7 +99,10 @@ impl Lanes {
         &mut self,
         root: PathBuf,
         request: Request,
-        conditional: Conditional,
+        validation: (
+            Option<crate::forge::transport::AccountNamespace>,
+            Conditional,
+        ),
         scope: Scope,
         background: bool,
     ) -> Result<(), (Request, String)> {
@@ -121,11 +124,11 @@ impl Lanes {
                 id,
                 target.clone(),
                 read.clone(),
-                conditional,
+                validation,
                 background,
             ),
-            Op::Write(target, write) => {
-                self.jobs[lane].write(root, id, target.clone(), write.clone())
+            Op::Write(target, write, account) => {
+                self.jobs[lane].write(root, id, target.clone(), write.clone(), account.clone())
             }
         };
         match started {
@@ -228,6 +231,7 @@ mod tests {
                     number,
                     body: "hello".into(),
                 },
+                None,
             ),
         }
     }
@@ -360,7 +364,7 @@ mod tests {
         let first = workspace.active.finish(&Key::Write).unwrap();
         assert!(matches!(
             first.op,
-            Op::Write(_, Write::Comment { number: 1, .. })
+            Op::Write(_, Write::Comment { number: 1, .. }, _)
         ));
         workspace.start_reads();
         assert_eq!(running(&workspace), vec![Key::Write]);
@@ -368,7 +372,7 @@ mod tests {
         let second = workspace.active.finish(&Key::Write).unwrap();
         assert!(matches!(
             second.op,
-            Op::Write(_, Write::Comment { number: 2, .. })
+            Op::Write(_, Write::Comment { number: 2, .. }, _)
         ));
         workspace.start_reads();
         assert_eq!(running(&workspace), vec![Key::Item(2, 2)]);

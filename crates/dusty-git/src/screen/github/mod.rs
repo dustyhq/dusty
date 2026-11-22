@@ -38,6 +38,7 @@ use crate::editor::input::{KeyCode, KeyEvent};
 use crate::forge::legacy::Shape;
 use crate::forge::model::ItemKind;
 use crate::forge::request::{Filter, Page, Read, RunFilter, StateFilter, Write};
+use crate::forge::transport::{AccountNamespace, HostKey};
 use crate::forge::{ForgeReply, ForgeTarget};
 pub(super) use actions::Action;
 pub(super) use prose::configure_tables;
@@ -631,6 +632,116 @@ impl Workspace {
         if let Some((page, id)) = self.deep_link.take() {
             self.open_link(page, id);
         }
+    }
+
+    fn retire_account(&mut self, account: Option<AccountNamespace>) {
+        self.retire_review_drafts();
+        self.account = account;
+        self.notify = notifications::Inbox::default();
+        self.accounts = accounts::Accounts::default();
+        self.drafts.clear();
+        self.writing_draft = None;
+        self.close_with_comment = None;
+    }
+
+    fn recheck_account(&mut self) {
+        // Return from a foreign detail without throwing away the checkout's list.
+        if self.foreign_item() {
+            if self.inbox.enabled {
+                let _ = self.toggle_inbox();
+            } else {
+                self.return_to_list();
+            }
+        }
+        self.accounts = accounts::Accounts::default();
+        self.notice.clear();
+        self.notice_error = false;
+        self.advance_scope();
+        self.account_recheck = Some(self.scope_epoch);
+        self.again.clear();
+        self.queue.clear(); // The Accounts popover refuses re-checks while writing.
+        self.fresh.abandon_checks();
+        let running: Vec<_> = self
+            .active
+            .requests()
+            .map(|request| request.key.clone())
+            .collect();
+        for key in running {
+            self.active.cancel(&key);
+        }
+
+        // Keep rows and parked forms tied to their present account until a new login
+        // is verified. A refresh error is displayed over the existing rows.
+        if !self.repo.is_empty() && self.repo.eq_ignore_ascii_case(self.list_repository()) {
+            self.enqueue(Key::Repository, self.read(Read::Repository), true);
+        }
+        self.ensure(true);
+    }
+
+    fn reset_account(&mut self, account: Option<AccountNamespace>) {
+        self.retire_account(account);
+        self.restore_checkout_for_account_reset();
+        self.clear_projections();
+    }
+
+    fn has_read_projection(&self) -> bool {
+        self.cache.values().any(Result::is_ok)
+    }
+
+    fn protects_read(&self, key: &Key) -> bool {
+        self.cache.get(key).is_some_and(Result::is_ok)
+            || self.account_recheck == Some(self.scope_epoch) && self.has_read_projection()
+    }
+
+    fn validation_account(&self, key: &Key) -> Option<AccountNamespace> {
+        self.account
+            .as_ref()
+            .filter(|_| self.protects_read(key))
+            .cloned()
+    }
+
+    /// Accept only the account reported by this read's own connection. If it changed,
+    /// retire the old projections before scheduling the new account's reads.
+    fn accept_read_account(
+        &mut self,
+        connected: bool,
+        account: Option<AccountNamespace>,
+        error: Option<&crate::forge::request::ForgeError>,
+        protect_projection: bool,
+    ) -> bool {
+        if !connected || self.account == account {
+            return true;
+        }
+        if self
+            .account
+            .as_ref()
+            .and_then(AccountNamespace::login)
+            .is_some()
+            && account.as_ref().and_then(AccountNamespace::login).is_none()
+        {
+            // Errors keep painted rows. A miss may instead start a separate scope, but
+            // never merge the reply into this account or load its remembered cache again.
+            if error.is_some() || protect_projection {
+                return error.is_some();
+            }
+            self.skip_remembered_account = true;
+        }
+        if account.is_none() && error.is_some() {
+            return true;
+        }
+        if self.account.is_none()
+            && self.cache.is_empty()
+            && self.drafts.is_empty()
+            && self.inline_drafts.is_empty()
+            && self.fresh.meta.is_empty()
+        {
+            // Initial discovery: there is no old data to retire.
+            self.account = account;
+            return true;
+        }
+        self.reset_account(account);
+        self.ensure(false);
+        false
     }
 
     /// Opens item `id` on page 1 (issues) or 2 (pull requests) as Enter on its row would,
@@ -1471,11 +1582,18 @@ impl Workspace {
             };
             let scope = (self.host.clone(), self.repo.clone(), self.scope_epoch);
             let background = self.fresh.implicit.contains(&request.key);
-            if let Err((request, error)) =
-                self.active
-                    .start(self.root.clone(), request, conditional, scope, background)
-            {
-                if self.cache.get(&request.key).is_some_and(Result::is_ok) {
+            let account = self.validation_account(&request.key);
+            if let Err((request, error)) = self.active.start(
+                self.root.clone(),
+                request,
+                (account, conditional),
+                scope,
+                background,
+            ) {
+                if let Op::Write(target, write, _) = &request.op {
+                    // A write that never started still has to settle its draft and cache state.
+                    self.written(write, Err(error), target);
+                } else if self.cache.get(&request.key).is_some_and(Result::is_ok) {
                     let age = self
                         .fresh
                         .meta

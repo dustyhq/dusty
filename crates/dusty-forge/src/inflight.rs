@@ -1,7 +1,7 @@
 //! In-flight coalescing: identical reads that overlap share one fetch. The
 //! interactive worker and the warm worker both read through here, so a prefetch the warm
 //! worker already started is joined by the screen that opens the same item instead of being
-//! sent twice. Identity is the forge (API base), the repository, the `Read` and its
+//! sent twice. Identity is the account, forge API base, repository, `Read` and its
 //! `Conditional`; the first caller fetches and every caller that arrives before it finishes
 //! receives a clone of the same result.
 
@@ -11,6 +11,7 @@ use crate::provider::ForgeContext;
 use crate::provider::Provider;
 use crate::request::ForgeError;
 use crate::request::Read;
+use crate::transport::AccountNamespace;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Condvar;
@@ -32,8 +33,10 @@ struct Slot {
     followers: AtomicUsize,
 }
 
-fn flights() -> &'static Mutex<HashMap<String, Arc<Slot>>> {
-    static FLIGHTS: OnceLock<Mutex<HashMap<String, Arc<Slot>>>> = OnceLock::new();
+type FlightKey = (AccountNamespace, String);
+
+fn flights() -> &'static Mutex<HashMap<FlightKey, Arc<Slot>>> {
+    static FLIGHTS: OnceLock<Mutex<HashMap<FlightKey, Arc<Slot>>>> = OnceLock::new();
     FLIGHTS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -44,26 +47,32 @@ pub fn joined() -> u64 {
     JOINED.load(Ordering::Relaxed)
 }
 
-fn key(ctx: &ForgeContext, read: &Read, cond: &Conditional) -> String {
-    format!(
-        "{}|{}|{}|{:?}",
-        ctx.endpoints.api_base,
-        ctx.repo
-            .as_ref()
-            .map(|repo| repo.full())
-            .unwrap_or_default(),
-        read.cache_key(),
-        cond
-    )
+fn key(ctx: &ForgeContext, read: &Read, cond: &Conditional) -> Option<FlightKey> {
+    Some((
+        ctx.account()?.clone(),
+        format!(
+            "{}|{}|{}|{:?}",
+            ctx.endpoints.api_base,
+            ctx.repo
+                .as_ref()
+                .map(|repo| repo.full())
+                .unwrap_or_default(),
+            read.cache_key(),
+            cond
+        ),
+    ))
 }
 
 /// How many callers are waiting on the fetch of this read that is on its way now (0 when
 /// none is). Unlike `joined`, which counts the whole process, it sees one flight only.
 pub fn followers(ctx: &ForgeContext, read: &Read, cond: &Conditional) -> usize {
+    let Some(key) = key(ctx, read, cond) else {
+        return 0;
+    };
     flights()
         .lock()
         .unwrap_or_else(|error| error.into_inner())
-        .get(&key(ctx, read, cond))
+        .get(&key)
         .map_or(0, |slot| slot.followers.load(Ordering::Acquire))
 }
 
@@ -75,7 +84,9 @@ pub fn read(
     cond: &Conditional,
     cancel: &AtomicBool,
 ) -> Shared {
-    let key = key(ctx, read, cond);
+    let Some(key) = key(ctx, read, cond) else {
+        return provider.read(ctx, read, cond, cancel);
+    };
     let (slot, leader) = {
         let mut flights = flights().lock().unwrap_or_else(|error| error.into_inner());
         match flights.get(&key) {

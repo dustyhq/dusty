@@ -57,7 +57,7 @@ pub fn prepare(
     if cond.since.is_some() || !provider.incremental(ctx, read) {
         return (cond, None);
     }
-    let identity = format!("{}|{:?}|{}", key.host, key.repo, key.key);
+    let identity = format!("{:?}|{:?}|{}", key.account, key.repo, key.key);
     if full_refresh(&identity) {
         return (cond, None);
     }

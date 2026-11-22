@@ -38,7 +38,7 @@ use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
 /// Bumped whenever `Envelope` or `Payload` stops round-tripping; older files become misses.
-pub const CACHE_SCHEMA: u32 = 1;
+pub const CACHE_SCHEMA: u32 = 2;
 pub const REPO_CAP: u64 = 64 * 1024 * 1024;
 pub const HOST_CAP: u64 = 256 * 1024 * 1024;
 /// Logs and diffs above this are served from the network only.
@@ -254,7 +254,7 @@ pub fn poll_interval(payload: &Payload) -> Option<Duration> {
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub struct CacheKey {
-    pub host: String,
+    pub account: crate::transport::AccountNamespace,
     /// `owner/name` (owner may be a nested group); `None` for host-wide entries.
     pub repo: Option<String>,
     pub kind: &'static str,
@@ -262,13 +262,21 @@ pub struct CacheKey {
 }
 
 impl CacheKey {
-    pub fn new(host: &HostKey, repo: Option<&RepoRef>, read: &Read) -> Self {
-        Self::for_read(&host.to_string(), repo.map(RepoRef::full).as_deref(), read)
+    pub fn new(
+        account: &crate::transport::AccountNamespace,
+        repo: Option<&RepoRef>,
+        read: &Read,
+    ) -> Self {
+        Self::for_read(account, repo.map(RepoRef::full).as_deref(), read)
     }
 
-    pub fn for_read(host: &str, repo: Option<&str>, read: &Read) -> Self {
+    pub fn for_read(
+        account: &crate::transport::AccountNamespace,
+        repo: Option<&str>,
+        read: &Read,
+    ) -> Self {
         Self {
-            host: host.trim().trim_end_matches('.').to_ascii_lowercase(),
+            account: account.clone(),
             repo: if host_wide(read) {
                 None
             } else {
@@ -280,9 +288,14 @@ impl CacheKey {
     }
 
     /// A key outside the `Read` vocabulary (tests, `dusty-git forge cache`).
-    pub fn named(host: &str, repo: Option<&str>, kind: &'static str, key: &str) -> Self {
+    pub fn named(
+        account: &crate::transport::AccountNamespace,
+        repo: Option<&str>,
+        kind: &'static str,
+        key: &str,
+    ) -> Self {
         Self {
-            host: host.into(),
+            account: account.clone(),
             repo: repo.map(str::to_owned),
             kind,
             key: key.into(),
@@ -293,7 +306,7 @@ impl CacheKey {
     /// answer at once instead of `Loading…` until the forge says it again.
     pub fn missing(&self) -> Self {
         Self {
-            host: self.host.clone(),
+            account: self.account.clone(),
             repo: self.repo.clone(),
             kind: "missing",
             key: format!("{}|{}", self.kind, self.key),
@@ -307,7 +320,7 @@ impl CacheKey {
 
     /// The entry's directory, below the cache root.
     pub fn directory(&self, root: &Path) -> PathBuf {
-        let mut path = root.join(segment(&self.host));
+        let mut path = account_directory(&host_directory(root, self.account.host()), &self.account);
         match &self.repo {
             Some(repo) => {
                 for part in repo.split('/').filter(|part| !part.is_empty()) {
@@ -325,6 +338,27 @@ impl CacheKey {
 
     pub fn file(&self, root: &Path) -> PathBuf {
         self.directory(root).join(self.relative())
+    }
+}
+
+pub(crate) fn host_directory(root: &Path, host: &HostKey) -> PathBuf {
+    let name = segment(&host.host);
+    match host.port {
+        Some(port) => root.join(format!("{name}~{port}")),
+        None => root.join(name),
+    }
+}
+
+/// Below a host, a new directory shape keeps legacy entries out. Hex encoding is
+/// lossless on case-insensitive filesystems and never treats a login as a path.
+pub fn account_directory(host: &Path, account: &crate::transport::AccountNamespace) -> PathBuf {
+    let directory = host.join("_accounts");
+    match account.login() {
+        Some(login) => {
+            let encoded: String = login.bytes().map(|byte| format!("{byte:02x}")).collect();
+            directory.join(format!("user-{encoded}"))
+        }
+        None => directory.join("anonymous"),
     }
 }
 
@@ -668,11 +702,11 @@ impl Cache {
     /// for local search.
     pub fn scan<T: DeserializeOwned>(
         &self,
-        host: &str,
+        account: &crate::transport::AccountNamespace,
         repo: Option<&str>,
         kind: &'static str,
     ) -> Vec<Envelope<T>> {
-        let directory = CacheKey::named(host, repo, kind, "")
+        let directory = CacheKey::named(account, repo, kind, "")
             .directory(&self.root)
             .join(kind);
         let Ok(entries) = std::fs::read_dir(&directory) else {
@@ -781,7 +815,7 @@ impl Cache {
     /// cap, to 90 %, least recently used first, never touching `NEVER_EVICT` kinds.
     fn evict(&self, key: &CacheKey, directory: &Path) {
         let index = self.index(directory);
-        let host_directory = self.root.join(segment(&key.host));
+        let host_directory = host_directory(&self.root, key.account.host());
         let host_total = host_total(&host_directory);
         let over_repo = index.total_bytes.saturating_sub(self.caps.repo);
         let over_host = host_total.saturating_sub(self.caps.host);
@@ -1030,12 +1064,14 @@ mod tests {
     use crate::request::Filter;
     use crate::request::Page;
     use crate::request::StateFilter;
+    use crate::transport::AccountNamespace;
 
     #[test]
     fn the_answer_to_the_later_question_wins_whichever_lands_first() {
         let root = tempfile::tempdir().unwrap();
         let cache = Cache::at(root.path());
-        let key = CacheKey::named("example.com", Some("a/b"), "item", "pr-1");
+        let account = AccountNamespace::anonymous(HostKey::new("example.com"));
+        let key = CacheKey::named(&account, Some("a/b"), "item", "pr-1");
         let ttl = Duration::from_secs(60);
         assert!(cache.store_since(&key, "newer", ttl, None, None, 2_000));
         // A slower fetch that started before it finishes after it: kept out.
@@ -1058,10 +1094,10 @@ mod tests {
 
     #[test]
     fn keys_place_host_wide_reads_apart_and_never_escape_the_root() {
-        let host = HostKey::new("GitHub.com");
+        let account = AccountNamespace::anonymous(HostKey::new("GitHub.com"));
         let repo = RepoRef::parse("orbit/team/orbit").unwrap();
         let list = CacheKey::new(
-            &host,
+            &account,
             Some(&repo),
             &Read::List {
                 kind: ItemKind::PullRequest,
@@ -1072,10 +1108,10 @@ mod tests {
         let root = Path::new("/cache");
         assert!(
             list.file(root)
-                .starts_with("/cache/github.com/orbit/team/orbit/list")
+                .starts_with("/cache/github.com/_accounts/anonymous/orbit/team/orbit/list")
         );
         let search = CacheKey::new(
-            &host,
+            &account,
             Some(&repo),
             &Read::Search {
                 kind: ItemKind::Issue,
@@ -1089,11 +1125,45 @@ mod tests {
         assert!(
             search
                 .file(root)
-                .starts_with("/cache/github.com/_host/search")
+                .starts_with("/cache/github.com/_accounts/anonymous/_host/search")
         );
-        let hostile = CacheKey::named("..", Some("../../etc"), "list", "k");
-        assert!(hostile.file(root).starts_with("/cache/_.._"));
+        let hostile_account = AccountNamespace::anonymous(HostKey::new(".."));
+        let hostile = CacheKey::named(&hostile_account, Some("../../etc"), "list", "k");
+        assert!(hostile.file(root).starts_with(root));
         assert!(!hostile.file(root).to_string_lossy().contains("/../"));
+    }
+
+    #[test]
+    fn disk_namespaces_survive_a_restart_without_sharing_bodies_or_misses() {
+        let root = tempfile::tempdir().unwrap();
+        let host = HostKey::new("git.test:8443");
+        let a = AccountNamespace::signed_in(host.clone(), "alice").unwrap();
+        let b = AccountNamespace::signed_in(host.clone(), "bob").unwrap();
+        let public = AccountNamespace::anonymous(host.clone());
+        let named_anonymous = AccountNamespace::signed_in(host, "anonymous").unwrap();
+        let other_port =
+            AccountNamespace::signed_in(HostKey::new("git.test:9443"), "alice").unwrap();
+        let key = |account| CacheKey::new(account, None, &Read::Viewer);
+        let ttl = Duration::from_secs(60);
+        let cache = Cache::at(root.path());
+        assert!(cache.store(&key(&a), "private", ttl, Some("a-tag".into()), None));
+        assert!(cache.store(&key(&a).missing(), "missing", ttl, None, None));
+        assert!(cache.store(&key(&public), "public", ttl, None, None));
+        drop(cache);
+
+        let restarted = Cache::at(root.path());
+        for other in [&b, &named_anonymous, &other_port] {
+            assert!(restarted.get::<String>(&key(other)).is_none());
+            assert!(restarted.get::<String>(&key(other).missing()).is_none());
+        }
+        assert_eq!(
+            restarted.get::<String>(&key(&public)).unwrap().data,
+            "public"
+        );
+        assert_eq!(
+            restarted.get::<String>(&key(&a)).unwrap().etag.as_deref(),
+            Some("a-tag")
+        );
     }
 
     #[test]

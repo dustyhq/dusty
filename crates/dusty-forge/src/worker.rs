@@ -20,6 +20,7 @@ use crate::request::Read;
 use crate::request::Receipt;
 use crate::request::Write;
 use crate::transport;
+use crate::transport::AccountNamespace;
 use crate::transport::ConnectOptions;
 use crate::transport::HostKey;
 use std::path::Path;
@@ -144,8 +145,11 @@ pub fn fetch_through(
     conditional: Conditional,
     cancel: &AtomicBool,
 ) -> Result<Fetched, ForgeError> {
+    let Some(account) = ctx.account() else {
+        return provider.read(ctx, read, &Conditional::default(), cancel);
+    };
     let cache = cache::Cache::shared();
-    let key = cache::CacheKey::new(ctx.host(), ctx.repo.as_ref(), read);
+    let key = cache::CacheKey::new(account, ctx.repo.as_ref(), read);
     let (conditional, base) = match &cache {
         Some(cache) => crate::incremental::prepare(provider, ctx, cache, &key, read, conditional),
         None => (conditional, None),
@@ -175,7 +179,7 @@ pub fn fetch_through(
                 // prefetch is a cache hit.
                 for (read, value, fingerprint) in cache::items_of(value) {
                     cache.store_since(
-                        &cache::CacheKey::new(ctx.host(), ctx.repo.as_ref(), &read),
+                        &cache::CacheKey::new(account, ctx.repo.as_ref(), &read),
                         &value,
                         budget(ctx, &read, &value),
                         None,
@@ -219,11 +223,16 @@ pub enum Served {
     Network,
 }
 
-/// The cached entry for `read` when it is still fresh, without connecting.
-pub fn cached_fresh(host: &HostKey, repo: Option<&RepoRef>, read: &Read) -> Option<Payload> {
+/// A fresh cache hit in the remembered namespace; no credentials are consulted here.
+pub(crate) fn remembered_read(
+    host: &HostKey,
+    repo: Option<&RepoRef>,
+    read: &Read,
+) -> Option<(Payload, provider::ProviderKind)> {
+    let (account, kind) = crate::host_state::remembered_account(host)?;
     let cache = cache::Cache::shared()?;
-    let envelope = cache.get::<Payload>(&cache::CacheKey::new(host, repo, read))?;
-    envelope.fresh().then_some(envelope.data)
+    let envelope = cache.get::<Payload>(&cache::CacheKey::new(&account, repo, read))?;
+    envelope.fresh().then_some((envelope.data, kind))
 }
 
 /// A read for a one-shot caller (`dusty-git forge`): a fresh cache entry answers without a
@@ -236,8 +245,12 @@ pub fn cached_read(
     cancel: &AtomicBool,
 ) -> Result<(Payload, Served), ForgeError> {
     let cache = cache::Cache::shared();
-    let key = cache::CacheKey::new(ctx.host(), ctx.repo.as_ref(), read);
-    let cached = cache.as_ref().and_then(|cache| cache.get::<Payload>(&key));
+    let cached = cache
+        .as_ref()
+        .zip(ctx.account())
+        .and_then(|(cache, account)| {
+            cache.get::<Payload>(&cache::CacheKey::new(account, ctx.repo.as_ref(), read))
+        });
     if let Some(envelope) = &cached
         && envelope.fresh()
         && !refresh
@@ -266,6 +279,14 @@ pub fn cached_read(
     }
 }
 
+pub const ACCOUNT_CHANGED: &str = "Forge account changed. Confirm the change again.";
+pub const UNVERIFIED_SIGN_IN: &str = "Couldn't verify your sign-in. Check it before trying again.";
+
+pub(super) enum Confirmation<'a> {
+    Captured(Option<&'a AccountNamespace>),
+    Immediate,
+}
+
 /// Run one write against its provider and drop what it made stale from the cache.
 /// Porcelain acts locally; a PR creation pushes first when asked and remembers its base
 /// (`branch.<head>.gh-merge-base`).
@@ -274,9 +295,36 @@ pub fn write_through(
     root: &Path,
     target: &ForgeTarget,
     write: &Write,
+    account: Option<&AccountNamespace>,
+) -> Result<Receipt, ForgeError> {
+    write_connected(
+        commands,
+        root,
+        target,
+        write,
+        Confirmation::Captured(account),
+    )
+}
+
+/// A one-shot command connects and acts without an intervening queue or confirmation form.
+pub(crate) fn write_now(
+    commands: &ForgeCommands<'_>,
+    root: &Path,
+    target: &ForgeTarget,
+    write: &Write,
+) -> Result<Receipt, ForgeError> {
+    write_connected(commands, root, target, write, Confirmation::Immediate)
+}
+
+fn write_connected(
+    commands: &ForgeCommands<'_>,
+    root: &Path,
+    target: &ForgeTarget,
+    write: &Write,
+    confirmation: Confirmation<'_>,
 ) -> Result<Receipt, ForgeError> {
     if write.porcelain() {
-        return commands.porcelain(root, target, write);
+        return commands.porcelain(root, target, write, confirmation);
     }
     let target = match write {
         Write::CreatePullRequest(request) => {
@@ -358,9 +406,9 @@ pub fn local_write(kind: provider::ProviderKind, write: &Write) -> bool {
 
 /// What a confirmed write changed is revalidated by the next reader.
 pub fn invalidate(ctx: &ForgeContext, reads: &[Read]) {
-    if let Some(cache) = cache::Cache::shared() {
+    if let (Some(cache), Some(account)) = (cache::Cache::shared(), ctx.account()) {
         for read in reads {
-            cache.invalidate(&cache::CacheKey::new(ctx.host(), ctx.repo.as_ref(), read));
+            cache.invalidate(&cache::CacheKey::new(account, ctx.repo.as_ref(), read));
         }
     }
 }
@@ -387,32 +435,64 @@ impl ForgeJobs {
         conditional: Conditional,
     ) -> Result<(), String> {
         let background = self.warming();
-        self.fetch_as(root, request_id, target, read, conditional, background)
+        self.fetch_as(
+            root,
+            request_id,
+            target,
+            read,
+            (None, conditional),
+            background,
+        )
     }
 
-    /// `fetch`, as background work when nobody waits for the answer (a cached entry being
-    /// checked): its requests then yield to the ones somebody does wait for.
+    /// Fetch a read, optionally in the background (yielding to reads someone waits for).
+    /// The validation account is the owner of already painted data being checked, not
+    /// merely a remembered login. An uncached read can use a credential without a login.
     pub fn fetch_as(
         &mut self,
         root: PathBuf,
         request_id: u64,
         target: ForgeTarget,
         read: Read,
-        conditional: Conditional,
+        validation: (Option<AccountNamespace>, Conditional),
         background: bool,
     ) -> Result<(), String> {
         self.spawn(root, request_id, move |root, commands| {
-            let result = connect(root, &target, commands.cancelled).and_then(|(provider, ctx)| {
-                ctx.set_background(background);
-                fetch_through(
-                    provider.as_ref(),
-                    &ctx,
-                    &read,
-                    conditional,
-                    commands.cancelled,
-                )
-            });
-            ForgeReply::Fetched(read, result)
+            let (host, result, account) = match connect(root, &target, commands.cancelled) {
+                Ok((provider, ctx)) => {
+                    let account = ctx.account().cloned();
+                    let (expected, mut conditional) = validation;
+                    // Only revalidation of a signed-in projection needs a verified login.
+                    // On a miss, fetch_through uses the live namespace (or no cache at all).
+                    if expected
+                        .as_ref()
+                        .and_then(AccountNamespace::login)
+                        .is_some()
+                        && account.as_ref().and_then(AccountNamespace::login).is_none()
+                    {
+                        return ForgeReply::Fetched(
+                            read,
+                            Some(ctx.host().clone()),
+                            Err(ForgeError::Failed(UNVERIFIED_SIGN_IN.into())),
+                            account,
+                        );
+                    }
+                    if account.is_none() || account != expected {
+                        conditional = Conditional::default();
+                    }
+                    ctx.set_background(background);
+                    let result = fetch_through(
+                        provider.as_ref(),
+                        &ctx,
+                        &read,
+                        conditional,
+                        commands.cancelled,
+                    );
+                    (Some(ctx.host().clone()), result, account)
+                }
+                Err(error) => (None, Err(error), None),
+            };
+            ForgeReply::Fetched(read, host, result, account)
         })
     }
 
@@ -423,10 +503,149 @@ impl ForgeJobs {
         request_id: u64,
         target: ForgeTarget,
         write: Write,
+        account: Option<AccountNamespace>,
     ) -> Result<(), String> {
         self.spawn(root, request_id, move |root, commands| {
-            let result = write_through(commands, root, &target, &write);
+            let result = write_through(commands, root, &target, &write, account.as_ref());
             ForgeReply::Written(write, result)
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct RecordingTransport {
+        login: Option<&'static str>,
+        anonymous: bool,
+        requests: AtomicUsize,
+    }
+
+    impl transport::Transport for RecordingTransport {
+        fn kind(&self) -> transport::TransportKind {
+            if self.anonymous {
+                transport::TransportKind::Anonymous
+            } else {
+                transport::TransportKind::Http {
+                    credential_source: crate::credential::CredentialSource::GhAuthToken,
+                }
+            }
+        }
+
+        fn verified_login(&self) -> Option<&str> {
+            self.login
+        }
+
+        fn graphql_batching(&self) -> bool {
+            false
+        }
+
+        fn send(
+            &self,
+            _: &HostKey,
+            _: &transport::ApiRequest,
+            _: &AtomicBool,
+        ) -> Result<transport::ApiResponse, transport::TransportError> {
+            self.requests.fetch_add(1, Ordering::Relaxed);
+            Ok(transport::ApiResponse {
+                status: 201,
+                headers: Vec::new(),
+                body: b"{}".to_vec(),
+            })
+        }
+    }
+
+    fn connection(
+        kind: provider::ProviderKind,
+        login: Option<&'static str>,
+        anonymous: bool,
+    ) -> (ForgeContext, Arc<RecordingTransport>) {
+        let transport = Arc::new(RecordingTransport {
+            login,
+            anonymous,
+            requests: AtomicUsize::new(0),
+        });
+        let ctx = ForgeContext::new(
+            std::env::temp_dir(),
+            detect::endpoints_for(
+                kind,
+                &HostKey::new("forge.test:8443"),
+                None,
+                &crate::credential::Env::from_pairs::<&str, &str>([]),
+            ),
+            ConnectOptions::default(),
+            RepoRef::parse("o/r"),
+            transport.clone(),
+        );
+        (ctx, transport)
+    }
+
+    #[test]
+    fn dispatch_does_not_push_or_write_with_a_different_or_unverifiable_login() {
+        let kind = provider::ProviderKind::GitHub;
+        let provider = provider::build(kind).unwrap();
+        let cancel = AtomicBool::new(false);
+        for (login, anonymous, message) in [
+            (Some("bob"), false, ACCOUNT_CHANGED),
+            (None, false, UNVERIFIED_SIGN_IN),
+            (None, true, UNVERIFIED_SIGN_IN),
+        ] {
+            let (ctx, transport) = connection(kind, login, anonymous);
+            let a = AccountNamespace::signed_in(ctx.host().clone(), "alice").unwrap();
+            let pushed = std::cell::Cell::new(false);
+            let write = Write::CreatePullRequest(super::super::pull_request::CreatePullRequest {
+                host: ctx.host().to_string(),
+                base_repository: "o/r".into(),
+                base_branch: "main".into(),
+                head_repository: "o/r".into(),
+                head_branch: "feature".into(),
+                title: "A new PR".into(),
+                body: String::new(),
+                draft: false,
+                push: Some(super::super::pull_request::PullRequestPush {
+                    remote: "origin".into(),
+                    commit: "a".repeat(40),
+                    ssh_host_alias: None,
+                }),
+            });
+            let result = dispatch_write(
+                provider.as_ref(),
+                &ctx,
+                &write,
+                Confirmation::Captured(Some(&a)),
+                &cancel,
+                |_| {
+                    pushed.set(true);
+                    Ok(())
+                },
+            );
+            assert!(matches!(result, Err(ForgeError::Failed(text)) if text == message));
+            assert!(!pushed.get());
+            assert_eq!(transport.requests.load(Ordering::Relaxed), 0);
+        }
+    }
+
+    #[test]
+    fn dispatch_sends_a_write_when_the_login_was_never_verified() {
+        let kind = provider::ProviderKind::Gitea;
+        let provider = provider::build(kind).unwrap();
+        let (ctx, transport) = connection(kind, None, false);
+        let result = dispatch_write(
+            provider.as_ref(),
+            &ctx,
+            &Write::Comment {
+                kind: crate::model::ItemKind::Issue,
+                number: 7,
+                body: "Comment without read:user".into(),
+            },
+            Confirmation::Captured(None),
+            &AtomicBool::new(false),
+            |_| panic!("posting a comment does not push"),
+        );
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(transport.requests.load(Ordering::Relaxed), 1);
     }
 }

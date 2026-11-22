@@ -175,15 +175,25 @@ fn draft_file(repo: &str, number: u64) -> Option<PathBuf> {
         .unwrap_or_else(|| {
             PathBuf::from(std::env::var_os("XDG_STATE_HOME").unwrap()).join("dusty/forge")
         });
-    std::fs::read_dir(state.join("drafts"))
-        .ok()?
-        .flatten()
-        .map(|host| {
-            host.path()
-                .join(repo.replace('/', "%2F"))
-                .join(format!("{number}.json"))
-        })
-        .find(|path| path.is_file())
+    // `drafts/<host>/<repository>/` or, for a signed-in account,
+    // `drafts/<host>/_accounts/<account>/<repository>/`.
+    let name = repo.replace('/', "%2F");
+    let mut pending = vec![state.join("drafts")];
+    while let Some(directory) = pending.pop() {
+        let file = directory.join(&name).join(format!("{number}.json"));
+        if file.is_file() {
+            return Some(file);
+        }
+        pending.extend(
+            std::fs::read_dir(&directory)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .map(|entry| entry.path())
+                .filter(|path| path.is_dir()),
+        );
+    }
+    None
 }
 
 // ----------------------------------------------------------------------------- Create
@@ -857,10 +867,11 @@ fn github_range_drafts_survive_a_restart_and_send_as_one_review() {
 }
 
 const SUGGESTED_FILE: &str = "fn alpha() {}\nfn beta() {}\nfn gamma() {}\nfn delta() {}\n";
+const OTHER_SUGGESTION_DIFF: &str = "diff --git a/src/nested/other.rs b/src/nested/other.rs\n--- a/src/nested/other.rs\n+++ b/src/nested/other.rs\n@@ -1 +1,2 @@\n-old\n+fn inserted() {}\n+fn untouched() {}\n";
 
 /// GitHub: a ```suggestion block reads as the change it suggests, in a review thread and in a
 /// pending comment, and `Commit suggestion` writes it to the head branch. Fixture
-/// only: the contents API of the fake forge.
+/// only: the fake forge's Contents API and head-checked commit mutation.
 #[test]
 fn github_suggestions_read_as_diffs_and_commit_to_the_head_branch() {
     let Some(repo) = child_repo() else {
@@ -877,12 +888,32 @@ fn github_suggestions_read_as_diffs_and_commit_to_the_head_branch() {
                 "diffHunk": "@@ -1 +1,4 @@\n-fn before() {}\n+fn alpha() {}\n+fn beta() {}\n+fn gamma() {}",
             }] },
         });
+        let second = json!({
+            "id": "THREAD_S2",
+            "isResolved": false,
+            "comments": { "nodes": [{
+                "author": { "login": "maya" },
+                "body": "Rename this independently.\n```suggestion\nfn renamed() {}\n```",
+                "path": "src/nested/other.rs",
+                "line": 2,
+                "originalLine": 1,
+                "diffHunk": "@@ -1 +1 @@\n-old\n+fn untouched() {}",
+            }] },
+        });
+        let after_first = RANGE_DIFF.replace("+1,4", "+1,3").replace(
+            "+fn beta() {}\n+fn gamma() {}\n",
+            "+fn beta_and_gamma() {}\n",
+        );
         let world = World::with_state(
             Forge::GitHub,
             json!({
-                "diff": RANGE_DIFF,
-                "contents": { "example.rs": SUGGESTED_FILE },
-                "review_threads": { "example/demo#9": [thread] },
+                "diff": format!("{RANGE_DIFF}{OTHER_SUGGESTION_DIFF}"),
+                "diff_after_suggestion": format!("{after_first}{OTHER_SUGGESTION_DIFF}"),
+                "contents": {
+                    "example.rs": SUGGESTED_FILE,
+                    "src/nested/other.rs": "fn inserted() {}\nfn untouched() {}\n"
+                },
+                "review_threads": { "example/demo#9": [thread, second] },
             }),
         );
         git(
@@ -895,24 +926,43 @@ fn github_suggestions_read_as_diffs_and_commit_to_the_head_branch() {
             |_| {},
         );
         let requests = world.requests();
-        let put = requests
+        let commit = requests
             .iter()
-            .find(|request| {
-                request["method"] == "PUT"
-                    && request["path"]
-                        .as_str()
-                        .is_some_and(|path| path.ends_with("contents/example.rs"))
-            })
+            .find(|request| request["operation"] == "CommitReviewSuggestion")
             .unwrap_or_else(|| panic!("no commit: {requests:?}"));
-        let body = body_of(put);
-        assert_eq!(body["branch"], "feature/native", "{body}");
+        let input = &commit["variables"]["input"];
+        assert_eq!(input["branch"]["branchName"], "feature/native", "{input}");
+        assert_eq!(input["expectedHeadOid"], "a".repeat(40), "{input}");
         assert_eq!(
-            body["message"], "Apply suggestion from code review",
-            "{body}"
+            input["message"]["headline"], "Apply suggestion from code review",
+            "{input}"
         );
+        assert!(requests.iter().any(|request| {
+            request["method"] == "GET"
+                && request["path"]
+                    .as_str()
+                    .is_some_and(|path| path.ends_with("contents/example.rs"))
+                && request["query"]["ref"] == input["expectedHeadOid"]
+        }));
         assert_eq!(
             world.state()["contents"]["example.rs"],
             "fn alpha() {}\nfn beta_and_gamma() {}\nfn delta() {}\n"
+        );
+        let second = requests
+            .iter()
+            .find(|request| {
+                request["operation"] == "CommitReviewSuggestion"
+                    && request["variables"]["input"]["fileChanges"]["additions"][0]["path"]
+                        == "src/nested/other.rs"
+            })
+            .expect("the second suggestion is still offered after the head advances");
+        assert_eq!(
+            second["variables"]["input"]["expectedHeadOid"],
+            "c".repeat(40)
+        );
+        assert_eq!(
+            world.state()["contents"]["src/nested/other.rs"],
+            "fn inserted() {}\nfn renamed() {}\n"
         );
         // Nothing reached the forge for the pending comment.
         assert!(
@@ -977,10 +1027,29 @@ fn github_suggestions_read_as_diffs_and_commit_to_the_head_branch() {
     );
     control(&mut screen, KeyCode::Enter);
     wait_request(&mut screen, "commit", |request| {
-        request["method"] == "PUT"
-            && request["path"]
-                .as_str()
-                .is_some_and(|path| path.ends_with("contents/example.rs"))
+        request["operation"] == "CommitReviewSuggestion"
+    });
+    settle(&mut screen, 300);
+
+    key(&mut screen, KeyCode::Char('f'));
+    wait(&mut screen, "Choose changed file");
+    key(&mut screen, KeyCode::Down);
+    control(&mut screen, KeyCode::Enter);
+    wait(&mut screen, "fn untouched()");
+    key(&mut screen, KeyCode::Home);
+    cursor_to(&mut screen, "Rename this independently.");
+    let second = wait(&mut screen, "› Commit suggestion");
+    assert!(
+        second.contains("− fn untouched() {}") && second.contains("› Commit suggestion"),
+        "{second}"
+    );
+    cursor_to(&mut screen, "› Commit suggestion");
+    key(&mut screen, KeyCode::Enter);
+    wait(&mut screen, "Commit suggestion to src/nested/other.rs:2");
+    control(&mut screen, KeyCode::Enter);
+    wait_request(&mut screen, "second suggestion commit", |request| {
+        request["operation"] == "CommitReviewSuggestion"
+            && request["variables"]["input"]["expectedHeadOid"] == "c".repeat(40)
     });
     settle(&mut screen, 300);
 }

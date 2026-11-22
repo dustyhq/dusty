@@ -8,6 +8,7 @@
 use crate::credential::CredentialSource;
 use crate::provider::ProviderKind;
 use crate::request::ForgeError;
+use crate::transport::AccountNamespace;
 use crate::transport::Cli;
 use crate::transport::Endpoints;
 use crate::transport::HostKey;
@@ -459,32 +460,47 @@ fn update(host: &HostKey, kind: Option<ProviderKind>, change: impl FnOnce(&mut A
 pub fn observe_account(endpoints: &Endpoints, source: &CredentialSource, login: Option<String>) {
     update(&endpoints.host, Some(endpoints.kind), |account| {
         account.source = Some(source.clone());
-        if login.is_some() {
-            account.login = login.clone();
-        }
+        account.login = login.clone();
         account.state = HostState::Ready {
             transport: TransportKind::Http {
                 credential_source: source.clone(),
             },
-            account: login.or_else(|| account.login.clone()),
+            account: login,
         };
     });
 }
 
 /// A transport was chosen for the host.
 pub fn observe_transport(endpoints: &Endpoints, transport: TransportKind) {
+    observe_transport_kind(endpoints, transport, None);
+}
+
+pub(crate) fn observe_connection(
+    endpoints: &Endpoints,
+    transport: &dyn crate::transport::Transport,
+) {
+    observe_transport_kind(endpoints, transport.kind(), transport.sign_in_advice());
+    if let Some(login) = transport.verified_login() {
+        update(&endpoints.host, Some(endpoints.kind), |account| {
+            account.login = Some(login.to_owned());
+            if let HostState::Ready { account, .. } = &mut account.state {
+                *account = Some(login.to_owned());
+            }
+        });
+    }
+}
+
+fn observe_transport_kind(endpoints: &Endpoints, transport: TransportKind, advice: Option<&str>) {
     update(&endpoints.host, Some(endpoints.kind), |account| {
         if transport.anonymous() {
-            if !matches!(account.state, HostState::Anonymous { .. }) {
+            if let HostState::Anonymous { hint, .. } = &mut account.state {
+                *hint = anonymous_hint(endpoints, advice);
+            } else {
                 account.source = None;
-                account.state = anonymous_state(endpoints);
+                account.login = None;
+                account.state = anonymous_state(endpoints, advice);
             }
             return;
-        }
-        if let TransportKind::Cli(Cli::Tea) = transport
-            && account.source.is_none()
-        {
-            account.source = endpoints_tea_login(endpoints);
         }
         account.state = HostState::Ready {
             account: account.login.clone(),

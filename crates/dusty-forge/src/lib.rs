@@ -113,10 +113,12 @@ pub enum ForgeReply {
     Comments(Result<Vec<ReviewComment>, String>),
     CommentTarget(Result<ReviewCommentTarget, String>),
     Commented(Result<(), String>),
-    /// A provider-layer read.
+    /// A provider-layer read, its resolved routing authority, and its verified account.
     Fetched(
         request::Read,
+        Option<transport::HostKey>,
         Result<provider::Fetched, request::ForgeError>,
+        Option<transport::AccountNamespace>,
     ),
     /// A provider-layer write, porcelain included.
     Written(

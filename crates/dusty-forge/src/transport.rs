@@ -425,12 +425,43 @@ impl std::fmt::Display for HostKey {
     }
 }
 
+/// The non-secret principal of a verified connection. Anonymous is distinct from a login
+/// named "anonymous", and a host's port is part of the identity.
+#[derive(Clone, Debug, Eq, PartialEq, Hash, Ord, PartialOrd)]
+pub struct AccountNamespace {
+    host: HostKey,
+    login: Option<String>,
+}
+
+impl AccountNamespace {
+    pub fn anonymous(host: HostKey) -> Self {
+        Self { host, login: None }
+    }
+
+    pub fn signed_in(host: HostKey, login: &str) -> Option<Self> {
+        let login = login.trim();
+        (!login.is_empty()).then(|| Self {
+            host,
+            login: Some(login.to_owned()),
+        })
+    }
+
+    pub fn host(&self) -> &HostKey {
+        &self.host
+    }
+
+    pub fn login(&self) -> Option<&str> {
+        self.login.as_deref()
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TransportError {
     Network(String),
     Timeout,
     Cancelled,
     TooLarge(usize),
+    IncompleteOutput(dusty_core::process::JobStream),
     Insecure(String),
     Spawn(String),
     /// The CLI failed without an HTTP response to show for it.
@@ -487,6 +518,16 @@ pub trait Transport: Send + Sync {
         cancel: &AtomicBool,
     ) -> Result<ApiResponse, TransportError>;
     fn graphql_batching(&self) -> bool;
+
+    /// Login returned by the forge for a fixed sign-in, not a config hint.
+    fn verified_login(&self) -> Option<&str> {
+        None
+    }
+
+    /// More useful than the default login command when an existing sign-in couldn't be used.
+    fn sign_in_advice(&self) -> Option<&str> {
+        None
+    }
 }
 
 /// Where a host's API lives. F1 derives it from the host; F2's `detect.rs`
@@ -769,6 +810,10 @@ fn read_only_query(request: &ApiRequest) -> bool {
 }
 
 impl Transport for ReadOnly {
+    fn verified_login(&self) -> Option<&str> {
+        self.0.verified_login()
+    }
+
     fn kind(&self) -> TransportKind {
         self.0.kind()
     }

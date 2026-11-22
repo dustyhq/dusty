@@ -248,12 +248,12 @@ impl Workspace {
                 self.accounts.open = false
             }
             KeyCode::Char('r') => {
+                if self.writing() {
+                    self.accounts.open = false;
+                    return Some(Err("Wait for the running change to finish first.".into()));
+                }
                 host_state::recheck();
-                self.accounts.state = None;
-                self.accounts.open = false;
-                self.notice.clear();
-                self.notice_error = false;
-                self.ensure(true);
+                self.recheck_account();
             }
             _ => {}
         }

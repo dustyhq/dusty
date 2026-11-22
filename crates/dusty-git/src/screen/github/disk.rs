@@ -6,6 +6,7 @@ use super::Key;
 use crate::forge::cache::{Cache, CacheKey, Envelope};
 use crate::forge::request::Payload;
 use crate::forge::request::Read;
+use crate::forge::transport::HostKey;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -41,6 +42,7 @@ pub(super) struct Loaded {
     pub key: Key,
     pub read: Read,
     pub epoch: u64,
+    pub routing_host: HostKey,
     pub found: Found,
 }
 
@@ -82,6 +84,7 @@ impl Disk {
                             key,
                             read: asked,
                             epoch,
+                            routing_host: cache_key.account.host().clone(),
                             found,
                         };
                         if sender.send(answer).is_err() {
