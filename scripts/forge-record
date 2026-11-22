@@ -20,6 +20,7 @@ Fixture format (read by tests/fixtures/forge/server.py):
 import argparse
 import datetime as dt
 import hashlib
+import ipaddress
 import json
 import os
 import pathlib
@@ -30,6 +31,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from http.client import InvalidURL
 
 CAST = ["maya", "alex", "sam", "leo", "nina"]
 CAP = 256 * 1024
@@ -94,15 +96,44 @@ def make_key(method, path, query=None, body=None, graphql_op=None):
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, *args, **kwargs):
-        return None
+    def http_error_302(self, request, response, code, message, headers):
+        # Give the recorder the raw Location before urllib tries to parse it.
+        return response
+
+    http_error_301 = http_error_303 = http_error_307 = http_error_308 = http_error_302
 
 
 OPENER = urllib.request.build_opener(NoRedirect)
 
 
+def request_origin(url, *, error_message="Use a valid HTTP or HTTPS URL."):
+    try:
+        parts = urllib.parse.urlsplit(url)
+        scheme, host, port = parts.scheme, parts.hostname, parts.port
+    except ValueError:
+        raise SystemExit(error_message) from None
+    if scheme not in ("http", "https") or not host:
+        raise SystemExit(error_message)
+    return scheme, host, port if port is not None else (443 if scheme == "https" else 80)
+
+
+def is_loopback(host):
+    if host in ("localhost", "localhost."):
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def require_https_for_token(scheme, has_token):
+    if has_token and scheme != "https":
+        raise SystemExit("Credentials require HTTPS.")
+
+
 def http(method, url, headers, data=None, timeout=150):
     request = urllib.request.Request(url, data=data, method=method, headers=headers)
+    require_https_for_token(request.type, request.has_header("Authorization"))
     try:
         with OPENER.open(request, timeout=timeout) as response:
             return response.status, {k.lower(): v for k, v in response.headers.items()}, response.read()
@@ -112,6 +143,10 @@ def http(method, url, headers, data=None, timeout=150):
 
 class Recorder:
     def __init__(self, provider, host, repo, token, api_base, delay, auth_scheme):
+        scheme, api_host, _ = request_origin(api_base)
+        require_https_for_token(scheme, bool(token))
+        if scheme == "http" and not is_loopback(api_host):
+            raise SystemExit("Use an HTTPS API URL unless you are recording from a local test server.")
         self.provider, self.host, self.repo = provider, host, repo
         self.token, self.api_base, self.delay = token, api_base.rstrip("/"), delay
         self.auth_scheme = auth_scheme
@@ -138,15 +173,34 @@ class Recorder:
         if self.token:
             headers["Authorization"] = f"{self.auth_scheme} {self.token}"
         status, response_headers, body = self._send("GET", url, headers)
-        redirected = False
+        redirect_note = None
         if status in (301, 302, 303, 307, 308) and "location" in response_headers:
-            # Blob redirects (job logs, artifacts): follow once without the token.
-            target = urllib.parse.urljoin(url, response_headers["location"])
-            plain = {"User-Agent": headers["User-Agent"], "Accept": "*/*"}
+            # Job logs and artifacts may be served from a different origin.
+            invalid_redirect = "The server sent an invalid redirect URL."
+            try:
+                target = urllib.parse.urljoin(url, response_headers["location"])
+            except ValueError:
+                raise SystemExit(invalid_redirect) from None
+            source = request_origin(url)
+            destination = request_origin(target, error_message=invalid_redirect)
+            if source[0] == "https" and destination[0] == "http":
+                raise SystemExit("Refusing to follow a redirect from HTTPS to HTTP.")
+            # Preserve the old Accept rule independently of the credential check.
+            follow_headers = {"User-Agent": headers["User-Agent"], "Accept": "*/*"}
             if urllib.parse.urlparse(target).netloc == urllib.parse.urlparse(url).netloc:
-                plain = headers
-            status, response_headers, body = self._send("GET", target, plain)
-            redirected = True
+                follow_headers["Accept"] = headers["Accept"]
+            if source == destination and "Authorization" in headers:
+                follow_headers["Authorization"] = headers["Authorization"]
+            try:
+                status, response_headers, body = self._send("GET", target, follow_headers)
+            except InvalidURL:
+                raise SystemExit(invalid_redirect) from None
+            if "Authorization" in follow_headers:
+                redirect_note = "followed a redirect and sent the token again to the same server"
+            elif "Authorization" in headers:
+                redirect_note = "followed a redirect without forwarding the token"
+            else:
+                redirect_note = "followed a redirect; no token was used"
         truncated = text and len(body) > CAP  # logs and diffs only; JSON stays whole
         if truncated:
             body = body[:CAP]
@@ -157,8 +211,8 @@ class Recorder:
             entry["kind"] = kind
         if part:
             entry["part"] = part
-        if redirected:
-            entry["note"] = "followed a blob redirect without the token"
+        if redirect_note:
+            entry["note"] = redirect_note
         if record:
             self.entries.append(entry)
         try:
