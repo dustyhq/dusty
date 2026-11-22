@@ -152,13 +152,9 @@ pub(super) fn render_explorer_window(
             .and_then(|row| u16::try_from(row).ok())
             .map(|row| {
                 (
-                    // The margin left of the tree, so the cursor doesn't cover its lines.
-                    rect.x
-                        + if panel_width <= NARROW_EXPLORER_WIDTH {
-                            panel_width
-                        } else {
-                            0
-                        },
+                    // The first column of the selected row: the margin left of the
+                    // tree, or the row's first cell when a narrow explorer drops it.
+                    rect.x,
                     body.y.saturating_add(row),
                     cursor_style(config.ui.cursor.normal),
                 )

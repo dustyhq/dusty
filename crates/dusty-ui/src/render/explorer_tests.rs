@@ -235,6 +235,14 @@ fn explorer_is_a_persistent_left_dock_that_reflows_the_editor() {
         20,
     );
     assert!(editor_frame.cursor.is_some_and(|(x, _, _)| x > panel));
+    let narrow_panel =
+        crate::render::explorer_panel_width(&loaded.config, 20).expect("narrow explorer");
+    let narrow = render(&state, &ui, &loaded.config, &loaded.dashboard, 20, 10);
+    assert!(
+        narrow.cursor.is_some_and(|(x, _, _)| x < narrow_panel),
+        "the cursor stays inside a narrow explorer, left of its border at {narrow_panel}: {:?}",
+        narrow.cursor
+    );
 
     let mut ascii = loaded.config.clone();
     ascii.ui.explorer.icon_mode = crate::config::ExplorerIconMode::Ascii;
