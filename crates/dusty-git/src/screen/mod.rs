@@ -79,6 +79,8 @@ struct Row {
     directory: bool,
     /// Indentation in terminal cells, after compacting directory chains.
     indent: usize,
+    /// Position of this commit in the full History, for its graph and decorations.
+    history_index: Option<usize>,
 }
 impl Row {
     fn plain(label: String, value: PathBuf) -> Self {
@@ -87,6 +89,7 @@ impl Row {
             value,
             directory: false,
             indent: 0,
+            history_index: None,
         }
     }
 }
@@ -120,6 +123,10 @@ enum FormAction {
     Reference(refs::Action),
     Confirm(Vec<OsString>),
     StageAnyway(Box<staging::BulkStage>),
+    StageConflict {
+        plan: Box<GitChangePlanRequest>,
+        path_top: std::cell::Cell<usize>,
+    },
     ConfirmStash {
         action: &'static str,
         reference: String,
@@ -803,8 +810,10 @@ impl GitScreen {
             2 => self
                 .history
                 .iter()
-                .map(|(sha, title)| {
-                    plain(
+                .enumerate()
+                .map(|(index, (sha, title))| Row {
+                    history_index: Some(index),
+                    ..plain(
                         format!("{} {}", &sha[..sha.len().min(7)], title),
                         sha.into(),
                     )
@@ -1270,8 +1279,9 @@ impl GitScreen {
                     }
                     let finished = self.finish_op(&result);
                     self.receipt = result.as_ref().ok().and_then(|text| commit_receipt(text));
-                    self.finish_reflog_form(result.is_ok());
-                    let stage_notice = self.stage_notice.take().filter(|_| result.is_ok());
+                    let succeeded = result.is_ok();
+                    self.finish_reflog_form(succeeded);
+                    let stage_notice = self.stage_notice.take().filter(|_| succeeded);
                     self.busy = false;
                     self.notice = match result {
                         // Silent success: the refreshed panes are the receipt, and a
@@ -2457,24 +2467,22 @@ impl GitScreen {
             modal::BoxKey::Pass => key,
         };
         if key.code == KeyCode::Escape {
-            if self.form.as_ref().is_some_and(|form| {
-                matches!(
+            return self.cancel_form();
+        }
+        if key.code == KeyCode::Enter {
+            let form = self.form.as_ref().expect("checked form");
+            if form.cancel_focused() && (!key.modifiers.control || form.focus_moved) {
+                return self.cancel_form();
+            }
+            if key.modifiers.control
+                || form.selected == form.fields.len()
+                || matches!(
                     form.action,
                     FormAction::Github(github::Action::ConfirmPullRequest(_))
                 )
-            }) {
-                self.form = self.github.activate(github::Action::CreatePullRequest)?;
-            } else {
-                if self
-                    .form
-                    .as_ref()
-                    .is_some_and(|form| matches!(form.action, FormAction::Rewrite(_)))
-                {
-                    self.rewrite_diagnostic = None;
-                    self.notice.clear();
-                }
-                self.save_form_draft();
-                self.form = None;
+                || matches!(&form.action, FormAction::Run(op) if !op.writes())
+            {
+                return self.submit();
             }
         }
         if let Some(Form {
@@ -2493,7 +2501,17 @@ impl GitScreen {
             ..
         }) = &self.form
         {
-            return self.submit();
+            match key.code {
+                KeyCode::Up => {
+                    path_top.set(path_top.get().saturating_sub(1));
+                    return Ok(());
+                }
+                KeyCode::Down => {
+                    path_top.set(path_top.get().saturating_add(1));
+                    return Ok(());
+                }
+                _ => {}
+            }
         }
         // The copy menu is a list: j and k move through it as Down and Up do.
         if let Some(form) = self.form.as_ref()
@@ -3496,6 +3514,19 @@ impl GitScreen {
         ScreenOutcome::Continue
     }
     pub fn frame(&mut self, width: u16, height: u16) -> Frame {
+        let forge_tutor = self
+            .tutor
+            .as_ref()
+            .filter(|tutor| self.page != 0 && tutor.forge_pages());
+        let banner = forge_tutor.and_then(|tutor| tutor.banner(height));
+        let forge_tutor = forge_tutor.is_some();
+        let content_height = if banner.is_some() {
+            height - tutor::BANNER_ROWS
+        } else {
+            height
+        };
+        self.layout_mode = shell::layout::mode(width, content_height);
+        self.input_suspended = self.layout_mode == shell::layout::Mode::TooSmall;
         self.restore_rewrite_diagnostic();
         // A modal screen's footers leave the mode chip its columns (`modal.rs`).
         shell::chrome::set_footer_inset(self.mode_chip_width(width));

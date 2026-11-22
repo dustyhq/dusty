@@ -243,10 +243,10 @@ pub(super) fn paint(app: &mut GitScreen, frame: &mut Frame, pane: usize, rect: R
         return;
     }
     let graph_width = if pane == 2 && app.history_view == 0 {
-        app.history_graph
-            .iter()
+        rows.iter()
             .skip(offset)
             .take(visible)
+            .filter_map(|row| app.history_graph.get(row.history_index?))
             .map(|row| row.cells.len())
             .max()
             .unwrap_or(0)
@@ -334,7 +334,7 @@ pub(super) fn paint(app: &mut GitScreen, frame: &mut Frame, pane: usize, rect: R
                 );
             }
             2 if app.history_view == 0 => {
-                history_row(app, frame, index, row_rect, surface, graph_width)
+                history_row(app, frame, row, row_rect, surface, graph_width)
             }
             3 => stash_row(app, frame, row, row_rect, surface),
             _ => {
@@ -672,7 +672,7 @@ fn branch_row(
 fn history_row(
     app: &GitScreen,
     frame: &mut Frame,
-    index: usize,
+    row: &super::super::Row,
     rect: Rect,
     surface: GitSurface,
     graph_width: u16,
@@ -681,7 +681,10 @@ fn history_row(
     let grid = &mut frame.grid;
     let y = rect.y;
     let right = rect.right();
-    let Some((id, subject)) = app.history.get(index) else {
+    let Some((index, id)) = row.history_index.zip(row.value.to_str()) else {
+        return;
+    };
+    let Some((_, subject)) = app.history.get(index) else {
         return;
     };
     let info = app.history_info.get(index);
@@ -693,18 +696,25 @@ fn history_row(
     let merge = info.is_some_and(|info| info.parents.len() > 1);
     let mut x = rect.x + 2;
     if let Some(graph) = app.history_graph.get(index) {
-        for (cell_index, cell) in graph
-            .cells
-            .iter()
-            .enumerate()
-            .take(usize::from(graph_width))
-        {
+        // Filtered rows may not be neighbours in the full graph. Keep the column
+        // width, but show just the commit's own marker, not a false connection.
+        let cells: &[_] = if app.filters[app.slot(2)].active() {
+            graph
+                .cells
+                .iter()
+                .find(|cell| matches!(cell, Some((super::graph::NODE, _))))
+                .map(std::slice::from_ref)
+                .unwrap_or_default()
+        } else {
+            &graph.cells
+        };
+        for (cell_index, cell) in cells.iter().enumerate().take(usize::from(graph_width)) {
             let at = x + cell_index as u16;
             let Some((symbol, colour)) = *cell else {
                 continue;
             };
             let clipped = cell_index + 1 == usize::from(graph_width)
-                && graph.cells.len() > usize::from(graph_width);
+                && cells.len() > usize::from(graph_width);
             let text = if clipped {
                 lane('…', mode)
             } else if symbol == super::graph::NODE {
@@ -1068,6 +1078,119 @@ fn remote_name(label: &str) -> Option<&str> {
         .split_once("  ")
         .filter(|(_, url)| url.contains("://") || url.contains(['@', '/', '\\']))
         .map(|(name, _)| name)
+}
+
+#[cfg(test)]
+mod history_tests {
+    use super::*;
+    use crate::editor::input::{KeyCode, KeyEvent};
+    use crate::history::{self, Edit};
+    use crate::screen::{FormAction, ops::Op};
+    use crate::ui::{CellGrid, KeyInputKind, UiEvent};
+
+    #[test]
+    fn filtered_history_rail_and_actions_use_the_same_commit() {
+        let directory = tempfile::tempdir().unwrap();
+        let repo = git2::Repository::init(directory.path()).unwrap();
+        let tree_id = repo.treebuilder(None).unwrap().write().unwrap();
+        let tree = repo.find_tree(tree_id).unwrap();
+        let commit = |order: i64, subject, parents: &[&git2::Commit<'_>]| {
+            let time = git2::Time::new(1_700_000_000 + order, 0);
+            let signature =
+                git2::Signature::new("History test", "history@example.invalid", &time).unwrap();
+            let id = repo
+                .commit(None, &signature, &signature, subject, &tree, parents)
+                .unwrap();
+            repo.find_commit(id).unwrap()
+        };
+        // Git's date order is M, T, F, S, B. The query keeps only M and S,
+        // but M's second parent is T and S is on a separate branch from B.
+        let base = commit(1, "Base", &[]);
+        let side_subject = "Side release";
+        let side = commit(2, side_subject, &[&base]);
+        let fork = commit(3, "Fork", &[&base]);
+        let topic = commit(4, "Topic", &[&fork]);
+        let merge_subject = "Merge release";
+        let merge = commit(5, merge_subject, &[&fork, &topic]);
+        repo.reference("refs/heads/main", merge.id(), false, "test merge")
+            .unwrap();
+        // Use S as HEAD so Drop can plan the selected commit without crossing M.
+        repo.reference("refs/heads/side", side.id(), false, "test side branch")
+            .unwrap();
+        repo.set_head("refs/heads/side").unwrap();
+
+        let mut app = GitScreen::open(directory.path()).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while app.history_loading {
+            assert!(std::time::Instant::now() < deadline, "History did not load");
+            app.poll();
+            std::thread::yield_now();
+        }
+        let target = side.id();
+        let expected_order =
+            [merge.id(), topic.id(), fork.id(), target, base.id()].map(|id| id.to_string());
+        assert!(
+            app.history.iter().map(|(id, _)| id).eq(&expected_order),
+            "unexpected History order: {:?}",
+            app.history
+        );
+        let press = |app: &mut GitScreen, code| {
+            app.event(UiEvent::Key {
+                key: KeyEvent::plain(code),
+                kind: KeyInputKind::Press,
+            });
+        };
+        press(&mut app, KeyCode::Char('4'));
+        press(&mut app, KeyCode::Char('/'));
+        app.event(UiEvent::Paste("release".into()));
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Down);
+
+        let target_id = target.to_string();
+        assert_eq!(app.commit.as_ref().unwrap().id, target_id);
+        let rect = Rect::new(0, 0, 42, 10);
+        let mut frame = Frame {
+            grid: CellGrid::new(rect.w, rect.h),
+            cursor: None,
+        };
+        paint(&mut app, &mut frame, 2, rect);
+        let (x, y, _) = frame.cursor.expect("History has a highlighted row");
+        let assert_row = |y, id, node, reference: &str, subject: &str| {
+            let line: String = (x + 2..rect.right())
+                .map(|x| frame.grid.get(x, y).unwrap().symbol.as_str())
+                .collect();
+            let node = glyph(node, app.icon_mode);
+            let short = history::short(id);
+            // Keep the three-cell graph column and one space before the hash.
+            assert!(line.starts_with(&format!("{node}   {short}")), "{line:?}");
+            assert!(
+                line.contains(reference) && line.contains(subject),
+                "{line:?}"
+            );
+        };
+        assert_row(y - 1, merge.id(), Glyph::CommitMerge, "main", merge_subject);
+        assert_row(y, target, Glyph::CommitHead, "side", side_subject);
+
+        press(&mut app, KeyCode::Char('y'));
+        let Some(FormAction::Run(copy)) = app.form.as_ref().map(|form| &form.action) else {
+            panic!("Copy did not open: {}", app.notice);
+        };
+        let Op::Copy(items) = copy.as_ref() else {
+            panic!("Expected the Copy sheet");
+        };
+        assert_eq!(items[0].1, target_id);
+
+        press(&mut app, KeyCode::Escape);
+        press(&mut app, KeyCode::Char('d'));
+        let Some(FormAction::Run(drop)) = app.form.as_ref().map(|form| &form.action) else {
+            panic!("Drop did not open: {}", app.notice);
+        };
+        let Op::Rewrite(plan) = drop.as_ref() else {
+            panic!("Expected the Drop sheet");
+        };
+        assert_eq!(plan.edit, Edit::Drop);
+        assert_eq!(plan.target, target);
+    }
 }
 
 #[cfg(test)]

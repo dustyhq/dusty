@@ -61,6 +61,7 @@ fn append(
                 value: path.clone(),
                 directory: true,
                 indent: depth * 2,
+                history_index: None,
             });
             if !closed {
                 append(node, &path, depth + 1, collapsed, rows);
@@ -83,7 +84,11 @@ fn append(
                 value: path,
                 directory: false,
                 indent: depth * 2,
+                history_index: None,
             });
+            if let Some(prefix) = child_prefix {
+                append(node, &prefix, depth + 1, collapsed, rows);
+            }
         }
     }
 }
