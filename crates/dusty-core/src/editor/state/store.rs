@@ -114,6 +114,7 @@ pub struct EditorState {
     pub kept_buffer: Option<BufferId>,
     pub(super) window_revision: u64,
     window_revision_exhausted: bool,
+    layout_revision: Option<u64>,
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -142,6 +143,7 @@ impl Clone for EditorState {
             kept_buffer: self.kept_buffer,
             window_revision: self.window_revision,
             window_revision_exhausted: self.window_revision_exhausted,
+            layout_revision: self.layout_revision,
         }
     }
 }
@@ -179,6 +181,7 @@ impl EditorState {
             kept_buffer: None,
             window_revision: 0,
             window_revision_exhausted: false,
+            layout_revision: Some(0),
         }
     }
 
@@ -228,6 +231,19 @@ impl EditorState {
         }
     }
 
+    /// Editor pane and tab changes, independent of native surfaces and dirty indicators.
+    #[must_use]
+    pub const fn layout_revision(&self) -> Option<u64> {
+        self.layout_revision
+    }
+
+    pub(super) fn mark_layout_changed(&mut self) {
+        self.layout_revision = self
+            .layout_revision
+            .and_then(|revision| revision.checked_add(1));
+        self.mark_window_changed();
+    }
+
     pub fn set_buffer_dirty(&mut self, buffer: BufferId, dirty: bool) -> bool {
         let Some(target) = self.buffers.get_mut(buffer) else {
             return false;
@@ -248,10 +264,13 @@ impl EditorState {
         let Some(target) = self.buffers.get_mut(buffer) else {
             return false;
         };
-        let changed = target.path != path || target.dirty != dirty;
+        let path_changed = target.path != path;
+        let dirty_changed = target.dirty != dirty;
         target.path = path;
         target.dirty = dirty;
-        if changed {
+        if path_changed {
+            self.mark_layout_changed();
+        } else if dirty_changed {
             self.mark_window_changed();
         }
         true
@@ -291,7 +310,9 @@ impl EditorState {
             revision,
             path: target.path.clone(),
         });
-        if target.path != before_path || target.dirty != before_dirty {
+        if target.path != before_path {
+            self.mark_layout_changed();
+        } else if target.dirty != before_dirty {
             self.mark_window_changed();
         } else {
             self.mark_editor_changed();

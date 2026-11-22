@@ -1,11 +1,14 @@
 //! Persistence I/O, history, session capture and pending restores.
 //! Dispatch composes other owners' snapshots and consumes checked editor/window plans.
+use crate::persistence::HISTORY_LIMIT;
+use crate::persistence::HistoryWrite;
 use crate::persistence::PersistedState;
 use crate::persistence::PersistenceError;
 use crate::persistence::PersistenceEvent;
 use crate::persistence::PersistenceId;
 use crate::persistence::PersistencePolicy;
 use crate::persistence::PersistenceWorker;
+use crate::persistence::SessionWrite;
 use std::path::PathBuf;
 
 pub(in crate::app) const RECENT_FILE_LIMIT: usize = 256;
@@ -25,9 +28,43 @@ pub(in crate::app) use session::RestoreUpdate;
 #[cfg(test)]
 pub(in crate::app) use session::capture_persisted_layout;
 
+#[derive(Default)]
+struct HistoryEdits {
+    commands: Vec<String>,
+    searches: Vec<String>,
+}
+impl HistoryEdits {
+    fn trim(history: &mut Vec<String>) {
+        let excess = history.len().saturating_sub(HISTORY_LIMIT);
+        history.drain(..excess);
+    }
+
+    fn prepend(&mut self, mut earlier: Self) {
+        earlier.commands.append(&mut self.commands);
+        earlier.searches.append(&mut self.searches);
+        Self::trim(&mut earlier.commands);
+        Self::trim(&mut earlier.searches);
+        *self = earlier;
+    }
+}
+
+#[derive(Clone, Copy)]
+enum AuxiliaryWrite {
+    ClearHistory,
+    CheckpointLayout,
+}
+
 pub(in crate::app) struct Persistence {
     load_source: Option<session::RestoreSource>,
     restore: Option<session::PendingRestore>,
+    initial_scratch: Option<crate::editor::BufferId>,
+    initial_layout_revision: Option<u64>,
+    home_pin_revision: u64,
+    home_layout_rebased: bool,
+    ignored_read: Option<PersistenceId>,
+    history: HistoryEdits,
+    saving_history: HistoryEdits,
+    restored_layout: bool,
     recent_files: Vec<crate::persistence::RecentFile>,
     marks: Vec<crate::persistence::PersistedMark>,
     mark_sources: std::collections::HashMap<
@@ -46,8 +83,11 @@ pub(in crate::app) struct Persistence {
     path: PathBuf,
     pending: Option<(PersistenceId, bool)>,
     save_requested: bool,
-    save_notice: bool,
+    explicit_save_requested: bool,
+    saving_explicit_layout: bool,
     saved_notice: bool,
+    auxiliary: std::collections::HashMap<PersistenceId, AuxiliaryWrite>,
+    history_clear_notice: Option<bool>,
     failure: Option<String>,
     undo_saves: Vec<(PathBuf, std::sync::mpsc::Receiver<Result<(), String>>)>,
     undo_failures: std::collections::BTreeMap<PathBuf, String>,
@@ -66,6 +106,14 @@ impl Persistence {
         Self {
             load_source: None,
             restore: None,
+            initial_scratch: None,
+            initial_layout_revision: None,
+            home_pin_revision: 0,
+            home_layout_rebased: false,
+            ignored_read: None,
+            history: HistoryEdits::default(),
+            saving_history: HistoryEdits::default(),
+            restored_layout: false,
             recent_files: Vec::new(),
             marks: Vec::new(),
             mark_sources: Default::default(),
@@ -76,8 +124,11 @@ impl Persistence {
             path,
             pending: None,
             save_requested: false,
-            save_notice: false,
+            explicit_save_requested: false,
+            saving_explicit_layout: false,
             saved_notice: false,
+            auxiliary: Default::default(),
+            history_clear_notice: None,
             failure: None,
             undo_saves: Vec::new(),
             undo_failures: Default::default(),
@@ -86,6 +137,53 @@ impl Persistence {
             saved_on_exit: false,
             exit_request: None,
             navigation_reads: Default::default(),
+        }
+    }
+    pub(in crate::app) fn remember_initial_layout(&mut self, state: &crate::editor::EditorState) {
+        self.initial_scratch = state.active_buffer_id();
+        self.initial_layout_revision = state.layout_revision();
+    }
+    pub(in crate::app) fn rebase_home_layout(
+        &mut self,
+        state: &crate::editor::EditorState,
+        pin_revision: u64,
+    ) {
+        self.remember_initial_layout(state);
+        self.home_pin_revision = pin_revision;
+        self.restored_layout = false;
+        self.home_layout_rebased = true;
+    }
+    fn layout_revisions_changed(
+        &self,
+        state: &crate::editor::EditorState,
+        pin_revision: u64,
+    ) -> bool {
+        state.layout_revision().is_none()
+            || self.initial_layout_revision != state.layout_revision()
+            || self.home_pin_revision != pin_revision
+    }
+    fn layout_has_changed(&self, state: &crate::editor::EditorState, pin_revision: u64) -> bool {
+        // Track editor topology even when the last pane is closed. Native surfaces and
+        // dirty indicators don't count; user pin changes have their own revision.
+        self.layout_revisions_changed(state, pin_revision)
+            || !self.home_layout_rebased && !self.layout_is_initial(state)
+    }
+    /// Native startup surfaces and work on a pathless scratch are not layout changes.
+    fn layout_is_initial(&self, state: &crate::editor::EditorState) -> bool {
+        let mut windows = state.editor_windows();
+        match (windows.next(), self.initial_scratch) {
+            (None, None) => true,
+            (Some(window), Some(scratch)) if windows.next().is_none() => {
+                state
+                    .window_view(window.id)
+                    .and_then(|view| state.views.get(view))
+                    .is_some_and(|view| view.buffer == scratch)
+                    && state
+                        .buffers
+                        .get(scratch)
+                        .is_some_and(|buffer| buffer.path.is_none())
+            }
+            _ => false,
         }
     }
     pub(in crate::app) fn track_undo_save(
@@ -145,10 +243,39 @@ impl Persistence {
     pub(in crate::app) fn forget_document_request(&mut self, id: crate::files::RequestId) {
         self.navigation_reads.remove(&id);
     }
-    pub(in crate::app) fn request_save_notice(&mut self) {
-        self.save_notice = true;
+    pub(in crate::app) fn record_history(&mut self, kind: PromptKind, input: &str) {
+        let history = if kind == PromptKind::Command {
+            &mut self.history.commands
+        } else {
+            &mut self.history.searches
+        };
+        history.push(input.into());
+        HistoryEdits::trim(history);
     }
-    pub(in crate::app) fn take_saved_notice(&mut self) -> bool {
+    fn clear_history(&mut self, policy: PersistencePolicy) -> Result<(), PersistenceError> {
+        let id = self.worker.clear_history(self.path.clone(), policy)?;
+        self.auxiliary.insert(id, AuxiliaryWrite::ClearHistory);
+        // Earlier submissions are ordered before the clear, even if they have not replied.
+        self.history = HistoryEdits::default();
+        self.saving_history = HistoryEdits::default();
+        Ok(())
+    }
+
+    fn checkpoint_layout(
+        &mut self,
+        layout: Option<PersistedSession>,
+        policy: PersistencePolicy,
+    ) -> Result<(), PersistenceError> {
+        let id = self
+            .worker
+            .checkpoint_layout(self.path.clone(), policy, layout)?;
+        self.auxiliary.insert(id, AuxiliaryWrite::CheckpointLayout);
+        Ok(())
+    }
+    pub(in crate::app) fn request_explicit_save(&mut self) {
+        self.explicit_save_requested = true;
+    }
+    fn take_saved_notice(&mut self) -> bool {
         std::mem::take(&mut self.saved_notice)
     }
     pub(in crate::app) fn request_save(&mut self) {
@@ -160,7 +287,7 @@ impl Persistence {
         !self.pending() && !self.closing && std::mem::take(&mut self.save_requested)
     }
     pub(in crate::app) fn pending(&self) -> bool {
-        self.pending.is_some()
+        self.pending.is_some() || !self.auxiliary.is_empty()
     }
     pub(in crate::app) fn load(&mut self, policy: PersistencePolicy) -> Result<(), String> {
         if self.pending() || self.closing {
@@ -174,19 +301,32 @@ impl Persistence {
         self.failure = None;
         Ok(())
     }
-    pub(in crate::app) fn save(
+    fn save(
         &mut self,
-        state: PersistedState,
+        mut state: PersistedState,
         policy: PersistencePolicy,
+        session_write: SessionWrite,
+        explicit: bool,
     ) -> Result<(), String> {
         if self.pending() {
             return Err("persistence is already pending".into());
         }
         self.save_requested = false;
+        state.command_history.clone_from(&self.history.commands);
+        state.search_history.clone_from(&self.history.searches);
         let id = self
             .worker
-            .write(self.path.clone(), state, policy)
+            .write_with_session_policy(
+                self.path.clone(),
+                state,
+                policy,
+                session_write,
+                self.ignored_read,
+                HistoryWrite::Append,
+            )
             .map_err(|e| self.failed(e))?;
+        self.saving_history = std::mem::take(&mut self.history);
+        self.saving_explicit_layout = explicit && session_write == SessionWrite::Replace;
         self.pending = Some((id, true));
         if self.closing {
             self.exit_request = Some(id);
@@ -206,15 +346,40 @@ impl Persistence {
                 Ok(Some(event)) => event,
                 Ok(None) => return None,
                 Err(error) => {
-                    self.pending.take()?;
+                    if !self.pending() {
+                        return None;
+                    }
+                    self.pending = None;
+                    if self
+                        .auxiliary
+                        .values()
+                        .any(|operation| matches!(operation, AuxiliaryWrite::ClearHistory))
+                    {
+                        self.history_clear_notice = Some(false);
+                    }
+                    self.auxiliary.clear();
+                    self.history
+                        .prepend(std::mem::take(&mut self.saving_history));
                     return Some(Err(self.failed(error)));
                 }
             };
             let request_id = match &event {
                 PersistenceEvent::Loaded { request_id, .. }
                 | PersistenceEvent::Saved { request_id }
+                | PersistenceEvent::Edited { request_id }
                 | PersistenceEvent::Failed { request_id, .. } => *request_id,
             };
+            if let Some(operation) = self.auxiliary.remove(&request_id) {
+                let success = matches!(&event, PersistenceEvent::Edited { .. });
+                match operation {
+                    AuxiliaryWrite::ClearHistory => self.history_clear_notice = Some(success),
+                    AuxiliaryWrite::CheckpointLayout if !success => {
+                        return Some(Err(self.failed("Couldn't save the layout")));
+                    }
+                    AuxiliaryWrite::CheckpointLayout => {}
+                }
+                continue;
+            }
             let Some((expected, saving)) = self.pending else {
                 continue;
             };
@@ -226,10 +391,13 @@ impl Persistence {
                 PersistenceEvent::Loaded { state, .. } if !saving && !self.closing => {
                     return Some(Ok(state));
                 }
-                PersistenceEvent::Loaded { .. } if !saving => {}
+                PersistenceEvent::Loaded { .. } if !saving => {
+                    self.ignored_read = Some(request_id);
+                }
                 PersistenceEvent::Saved { .. } if saving => {
+                    self.saving_history = HistoryEdits::default();
                     self.saved_on_exit = self.exit_request == Some(request_id);
-                    if !self.save_requested && std::mem::take(&mut self.save_notice) {
+                    if self.saving_explicit_layout && !self.explicit_save_requested {
                         self.saved_notice = true;
                     }
                 }
@@ -237,8 +405,14 @@ impl Persistence {
                     error: PersistenceError::Io(error),
                     ..
                 } if !saving && error.kind() == std::io::ErrorKind::NotFound => {}
-                PersistenceEvent::Failed { error, .. } => return Some(Err(self.failed(error))),
-                _ => return Some(Err(self.failed("unexpected persistence terminal result"))),
+                event => {
+                    self.history
+                        .prepend(std::mem::take(&mut self.saving_history));
+                    return Some(Err(match event {
+                        PersistenceEvent::Failed { error, .. } => self.failed(error),
+                        _ => self.failed("unexpected persistence terminal result"),
+                    }));
+                }
             }
         }
     }
@@ -310,7 +484,7 @@ impl App {
                 windows: &self.window_session,
                 configuration: self.configuration.binding_revision(),
             },
-            true,
+            Some(session::RestoreKind::Requested),
         );
         match result {
             Ok(()) => {
@@ -327,7 +501,7 @@ impl App {
 impl App {
     pub(in crate::app) fn load_persistence(&mut self) {
         let configured = &self.configuration.settings().persistence;
-        if !configured.enabled || !configured.restore_on_startup {
+        if !configured.enabled || !configured.restore_on_startup || self.workspace.safe_mode() {
             return;
         }
         if let Err(error) = self.persistence.load_session(
@@ -339,7 +513,8 @@ impl App {
                 windows: &self.window_session,
                 configuration: self.configuration.binding_revision(),
             },
-            !self.documents.has_startup_work() && self.state.buffers.is_empty(),
+            (!self.documents.has_startup_work() && self.persistence.layout_is_initial(&self.state))
+                .then_some(session::RestoreKind::Startup),
         ) {
             self.ui.config_diagnostic = Some(error);
         } else {
@@ -444,22 +619,68 @@ impl App {
 }
 
 impl App {
-    pub(in crate::app) fn save_persistence(&mut self) {
-        self.write_persistence();
+    pub(in crate::app) fn rebase_home_layout(&mut self) {
+        self.persistence
+            .rebase_home_layout(&self.state, self.window_session.pin_revision());
     }
-}
 
-impl App {
-    pub(in crate::app) fn write_persistence(&mut self) {
-        self.persistence.reconcile_marks(&self.state);
-        let configured = &self.configuration.settings().persistence;
-        if !configured.enabled {
+    pub(in crate::app) fn layout_has_changed(&self) -> bool {
+        self.persistence
+            .layout_has_changed(&self.state, self.window_session.pin_revision())
+    }
+
+    pub(in crate::app) fn replaces_saved_layout_on_automatic_save(&self) -> bool {
+        if self.tutor.owns_layout(&self.state.workspace_root)
+            || self.tutor.returning_home()
+                && (self.persistence.restoring()
+                    || !self
+                        .persistence
+                        .layout_revisions_changed(&self.state, self.window_session.pin_revision()))
+        {
+            return false;
+        }
+        self.persistence.restored_layout || self.layout_has_changed()
+    }
+
+    pub(in crate::app) fn clear_persisted_history(&mut self) {
+        if !self.configuration.settings().persistence.enabled || self.workspace.safe_mode() {
+            self.input.clear_history();
+            self.persistence.history = HistoryEdits::default();
+            self.notify_message("History cleared for this run.".into(), false);
+        } else if self
+            .persistence
+            .clear_history(self.persistence_policy())
+            .is_ok()
+        {
+            self.input.clear_history();
+        } else {
+            self.show_error("Couldn't clear command and search histories");
+        }
+    }
+
+    pub(in crate::app) fn checkpoint_home_layout(&mut self, layout: Option<PersistedSession>) {
+        if !self.configuration.settings().persistence.enabled || self.workspace.safe_mode() {
             return;
         }
+        if self
+            .persistence
+            .checkpoint_layout(layout, self.persistence_policy())
+            .is_err()
+        {
+            self.show_error("Couldn't save the layout");
+        }
+    }
+
+    pub(in crate::app) fn save_persistence(&mut self) {
+        if !self.configuration.settings().persistence.enabled || self.workspace.safe_mode() {
+            return;
+        }
+        self.persistence.reconcile_marks(&self.state);
         if self.persistence.pending() {
             self.persistence.request_save();
             return;
         }
+        let explicit = std::mem::take(&mut self.persistence.explicit_save_requested);
         let mut metadata = self.tooling.metadata();
         match self.configuration.theme_state() {
             Ok(Some(theme)) => {
@@ -471,18 +692,18 @@ impl App {
                 return;
             }
         }
-        // During the tutor the layout to keep is the user's own, not the practice project's.
-        let captured = match self.tutor.saved_layout() {
-            Some(layout) => Ok(layout.clone()),
-            None => self.try_capture_session(),
-        };
-        let session = match captured {
-            Ok(session) => session,
-            Err(error) => {
+        let layout = (explicit || self.replaces_saved_layout_on_automatic_save())
+            .then(|| self.try_capture_session());
+        let (session, session_write) = match layout {
+            None => (None, SessionWrite::Keep),
+            Some(Ok(session)) => (session, SessionWrite::Replace),
+            Some(Err(error)) => {
                 self.ui.config_diagnostic = Some(error);
                 return;
             }
         };
+        self.debugger_session
+            .sync_breakpoint_locations(&mut self.state);
         let state = PersistedState {
             version: STATE_VERSION,
             session,
@@ -499,8 +720,8 @@ impl App {
             // deleted when the tutor ends, so they are kept only until then.
             jumps: outside_practice_projects(self.persistence.jumps()),
             changes: outside_practice_projects(self.persistence.changes()),
-            command_history: self.input.command_history().to_vec(),
-            search_history: self.input.search_history().to_vec(),
+            command_history: Vec::new(),
+            search_history: Vec::new(),
             breakpoints: self.debugger_session.persisted_breakpoints(&self.state),
             large_file_overrides: self
                 .documents
@@ -517,7 +738,10 @@ impl App {
             watches: self.debugger_session.persisted_watches(),
             metadata,
         };
-        if let Err(error) = self.persistence.save(state, self.persistence_policy()) {
+        if let Err(error) =
+            self.persistence
+                .save(state, self.persistence_policy(), session_write, explicit)
+        {
             self.ui.config_diagnostic = Some(error);
         }
     }
@@ -570,8 +794,12 @@ impl App {
                             .into_iter()
                             .map(|entry| (entry.path, entry.mode)),
                     );
-                    self.input
-                        .restore_history(state.command_history, state.search_history);
+                    self.input.restore_history(
+                        state.command_history,
+                        state.search_history,
+                        &self.persistence.history.commands,
+                        &self.persistence.history.searches,
+                    );
                     let requested = std::mem::take(&mut self.session_load_requested);
                     if let Some(session) = session {
                         self.session_restore_notice = requested;
@@ -591,6 +819,11 @@ impl App {
         }
         if self.persistence.take_saved_notice() {
             self.notify_message(self.message("session_saved", &[]), false);
+        }
+        match self.persistence.history_clear_notice.take() {
+            Some(true) => self.notify_message(self.message("history_cleared", &[]), false),
+            Some(false) => self.show_error("Couldn't clear command and search histories"),
+            None => {}
         }
     }
 }
@@ -614,6 +847,7 @@ impl App {
 
 impl App {
     pub(in crate::app) fn restore_session(&mut self, session: PersistedSession) {
+        let tutor_return = self.persistence.expecting_tutor_restore();
         let empty_rules = session.window_rules.clone();
         let paths = match self.persistence.begin_restore(
             session,
@@ -644,6 +878,10 @@ impl App {
                 ));
                 self.session_restore_notice = false;
             } else {
+                if tutor_return {
+                    self.tutor.finish_return();
+                    self.rebase_home_layout();
+                }
                 self.notify_session_restored();
             }
             return;
@@ -714,6 +952,7 @@ impl App {
 
 impl App {
     pub(in crate::app) fn finish_session_restore(&mut self, ready: RestoreReady) {
+        let tutor_return = ready.is_tutor_return();
         let result = ready
             .prepare(RestoreContext {
                 editor: &self.state,
@@ -764,6 +1003,10 @@ impl App {
         match result {
             Ok((state, paths, pinned)) => {
                 *self.state = state;
+                if !tutor_return {
+                    self.tutor.finish_return();
+                    self.persistence.restored_layout = true;
+                }
                 let cancelled_confirmation = self.extension.reset_runtime();
                 if cancelled_confirmation
                     && self
@@ -805,6 +1048,10 @@ impl App {
                     .collect();
                 self.window_session.restore_pins(pinned);
                 self.window_session.restore_content_order(order);
+                if tutor_return {
+                    self.tutor.finish_return();
+                    self.rebase_home_layout();
+                }
                 self.notify_session_restored();
             }
             Err(error) => {

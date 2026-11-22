@@ -18,6 +18,7 @@ use std::collections::BTreeSet;
 pub(super) struct ContentLine {
     order: Vec<BufferId>,
     pins: BTreeSet<BufferId>,
+    pin_revision: u64,
     order_revision: u64,
     diagnostic_revision: u64,
     pub(super) signature: Option<(u64, u64, u64, u64)>,
@@ -68,6 +69,14 @@ impl Windows {
         if !line.pins.remove(&buffer) {
             line.pins.insert(buffer);
         }
+        // Only direct toggles of file-backed pins change persisted layout intent.
+        if state
+            .buffers
+            .get(buffer)
+            .is_some_and(|buffer| buffer.path.is_some())
+        {
+            line.pin_revision = line.pin_revision.saturating_add(1);
+        }
         line.order_revision = line.order_revision.saturating_add(1);
         line.signature = None;
     }
@@ -116,6 +125,9 @@ impl Windows {
     #[cfg(test)]
     pub(in crate::app) fn content_builds(&self) -> usize {
         self.content_line.builds
+    }
+    pub(in crate::app) fn pin_revision(&self) -> u64 {
+        self.content_line.pin_revision
     }
     pub(in crate::app) fn pins(&self) -> &BTreeSet<BufferId> {
         &self.content_line.pins

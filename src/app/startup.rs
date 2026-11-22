@@ -455,6 +455,11 @@ impl App {
         let persistence_queue_capacity = PERSISTENCE_QUEUE_CAPACITY;
         let tasks = crate::app::tasks::Tasks::new(&configuration.settings);
         let persistence_path = state_directory.join(STATE_FILE);
+        let mut saved_state = crate::app::persistence::Persistence::new(
+            PersistenceWorker::start(persistence_queue_capacity),
+            persistence_path,
+        );
+        saved_state.remember_initial_layout(&state);
         let workspace = crate::app::workspace::Workspace::new(
             workspace,
             state_directory.join("trusted-workspaces.toml"),
@@ -573,10 +578,7 @@ impl App {
             macro_running: false,
             explorer: crate::app::explorer::Explorer::new(explorer_watch),
             syntax: Syntax::new(syntax_queue_capacity),
-            persistence: crate::app::persistence::Persistence::new(
-                PersistenceWorker::start(persistence_queue_capacity),
-                persistence_path,
-            ),
+            persistence: saved_state,
             tasks,
             notices: crate::app::notifications::Notifications::new(),
             health,

@@ -352,7 +352,9 @@ impl App {
 
 impl App {
     pub(in crate::app) fn record_prompt_history(&mut self, kind: PromptKind, input: &str) {
-        self.input.record_prompt_history(kind, input);
+        if self.input.record_prompt_history(kind, input) {
+            self.persistence.record_history(kind, input);
+        }
     }
 }
 
@@ -441,8 +443,19 @@ impl App {
                 &self.configuration.settings().input.command_aliases,
             ) {
                 Ok(invocation) => {
+                    // An untouched exit while restore is pending should not rewrite the
+                    // saved state solely to remember the command that exited.
+                    let early_quit = invocation.id.as_str() == "editor.quit"
+                        && self.persistence.restoring()
+                        && !self.replaces_saved_layout_on_automatic_save();
+                    if !early_quit {
+                        self.record_prompt_history(prompt.kind, &prompt.input);
+                    }
                     self.close_prompt();
                     self.invoke(invocation);
+                    if early_quit && !self.should_quit {
+                        self.record_prompt_history(prompt.kind, &prompt.input);
+                    }
                 }
                 Err(error) => {
                     self.prompt_error(error.to_string());

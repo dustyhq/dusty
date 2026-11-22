@@ -97,14 +97,13 @@ impl App {
         effect: AppEffect,
     ) -> Result<(), AppEffect> {
         match effect {
-            AppEffect::HistoryClear => {
-                self.input.clear_history();
-                self.notify_message(self.message("history_cleared", &[]), false);
-            }
+            AppEffect::HistoryClear => self.clear_persisted_history(),
             AppEffect::SessionSave => {
-                if self.configuration.settings().persistence.enabled {
-                    self.persistence.request_save_notice();
-                    self.write_persistence();
+                if self.workspace.safe_mode() {
+                    self.show_error("Safe mode doesn't save the layout");
+                } else if self.configuration.settings().persistence.enabled {
+                    self.persistence.request_explicit_save();
+                    self.save_persistence();
                 } else {
                     self.show_error(self.message("session_disabled", &[]));
                 }

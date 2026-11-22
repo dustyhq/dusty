@@ -10,6 +10,7 @@ use crate::editor::EditorState;
 use crate::editor::EditorVersion;
 use crate::editor::text::TextBuffer;
 use crate::files::RequestId;
+use crate::files::VfsError;
 use crate::files::VfsResult;
 use crate::persistence::PersistedContentDescriptor;
 use crate::persistence::PersistedLayout;
@@ -38,7 +39,15 @@ pub(in crate::app) struct RestoreContext<'a> {
     pub windows: &'a Windows,
     pub configuration: u64,
 }
+#[derive(Clone, Copy)]
+pub(super) enum RestoreKind {
+    Startup,
+    Requested,
+    Tutor,
+}
+
 pub(super) struct RestoreSource {
+    kind: RestoreKind,
     editor: EditorVersion,
     workspace: WorkspaceVersion,
     capture: Arc<()>,
@@ -46,8 +55,9 @@ pub(super) struct RestoreSource {
     configuration: u64,
 }
 impl RestoreSource {
-    pub(in crate::app) fn capture(context: &RestoreContext<'_>) -> Self {
+    fn capture(context: &RestoreContext<'_>, kind: RestoreKind) -> Self {
         Self {
+            kind,
             editor: context.editor.version(),
             workspace: context.workspace.version(),
             capture: context.input.capture_epoch(),
@@ -59,12 +69,20 @@ impl RestoreSource {
         }
     }
     pub(in crate::app) fn current(&self, context: &RestoreContext<'_>) -> bool {
+        let root_current = match self.kind {
+            RestoreKind::Startup => context
+                .workspace
+                .startup_restore_root_current(&self.workspace),
+            RestoreKind::Requested | RestoreKind::Tutor => {
+                self.workspace == context.workspace.version()
+            }
+        };
         self.editor == context.editor.version()
             && context
                 .windows
                 .check_editor_source(&context.editor.into())
                 .is_ok()
-            && self.workspace == context.workspace.version()
+            && root_current
             && self.configuration == context.configuration
             && !context.workspace.safe_mode()
             && context.input.capture_current(&self.capture)
@@ -110,13 +128,18 @@ pub(in crate::app) struct RestoreReady {
     loaded: HashMap<PathBuf, (PathBuf, TextBuffer)>,
 }
 impl RestoreReady {
+    pub(super) fn is_tutor_return(&self) -> bool {
+        matches!(self.source.kind, RestoreKind::Tutor)
+    }
+
     pub(in crate::app) fn prepare(
-        self,
+        mut self,
         context: RestoreContext<'_>,
     ) -> Result<RestorePrepared, String> {
         if !self.source.current(&context) {
             return Err("session restore source changed".into());
         }
+        prune_unreadable_panes(&mut self.session, &self.loaded);
         let mut draft = context.editor.draft();
         crate::app::persistence::restore::restore_layout(&mut draft, &self.session, &self.loaded)?;
         // Files come back in the order their windows had, which the buffer line follows.
@@ -155,20 +178,23 @@ impl Persistence {
             || self.load_source.is_some() && self.pending.is_some_and(|(_, saving)| !saving)
     }
 
-    pub(in crate::app) fn load_session(
+    pub(super) fn load_session(
         &mut self,
         policy: crate::persistence::PersistencePolicy,
         context: RestoreContext<'_>,
-        restore_allowed: bool,
+        kind: Option<RestoreKind>,
     ) -> Result<(), String> {
         self.load(policy)?;
-        self.load_source = restore_allowed.then(|| RestoreSource::capture(&context));
+        self.load_source = kind.map(|kind| RestoreSource::capture(&context, kind));
         Ok(())
     }
-    /// Let the next `begin_restore` replace what is open, for a session kept in memory, as
-    /// `load_session` does for the one read from disk.
-    pub(in crate::app) fn allow_restore(&mut self, context: RestoreContext<'_>) {
-        self.load_source = Some(RestoreSource::capture(&context));
+    pub(in crate::app) fn allow_tutor_restore(&mut self, context: RestoreContext<'_>) {
+        self.load_source = Some(RestoreSource::capture(&context, RestoreKind::Tutor));
+    }
+    pub(super) fn expecting_tutor_restore(&self) -> bool {
+        self.load_source
+            .as_ref()
+            .is_some_and(|source| matches!(source.kind, RestoreKind::Tutor))
     }
     pub(in crate::app) fn begin_restore(
         &mut self,
@@ -287,19 +313,29 @@ impl Persistence {
                 "session restore read left its workspace".into(),
             ));
         }
-        let text = match result
-            .map_err(|error| error.to_string())
-            .and_then(|bytes| TextBuffer::from_bytes(&bytes).map_err(|error| error.to_string()))
-        {
-            Ok(text) => text,
-            Err(error) => return Break(RestoreUpdate::Failed(error)),
+        let text = match result {
+            Ok(bytes) => TextBuffer::from_bytes(&bytes).ok(),
+            Err(
+                VfsError::Io { .. }
+                | VfsError::NotRegularFile(_)
+                | VfsError::DocumentTooLarge { .. },
+            ) => None,
+            Err(error) => return Break(RestoreUpdate::Failed(error.to_string())),
         };
         let restore = self.restore.as_mut().expect("checked restore source");
-        restore.loaded.insert(requested, (path, text));
+        if let Some(text) = text {
+            restore.loaded.insert(requested, (path, text));
+        }
         if !restore.remaining.is_empty() || !restore.requests.is_empty() {
             return Break(RestoreUpdate::Waiting);
         }
         let restore = self.restore.take().expect("completed restore");
+        // An entirely unreadable session must not clear the editor or the saved layout.
+        if restore.loaded.is_empty() {
+            return Break(RestoreUpdate::Failed(
+                "Couldn't reopen any files from the saved layout".into(),
+            ));
+        }
         Break(RestoreUpdate::Ready(Box::new(RestoreReady {
             source: restore.source,
             session: restore.session,
@@ -588,7 +624,7 @@ impl Persistence {
 #[cfg(test)]
 impl Persistence {
     pub(in crate::app) fn fixture_restore_source(&mut self, context: RestoreContext<'_>) {
-        self.load_source = Some(RestoreSource::capture(&context));
+        self.load_source = Some(RestoreSource::capture(&context, RestoreKind::Requested));
     }
 }
 fn collect_persistable_editor_panes(
@@ -618,6 +654,100 @@ fn collect_persistable_editor_panes(
         crate::windows::TiledLayoutNode::Split { first, second, .. } => {
             collect_persistable_editor_panes(state, first, roots, panes);
             collect_persistable_editor_panes(state, second, roots, panes);
+        }
+    }
+}
+
+/// Remove unavailable leaves before building a draft, keeping focus and window placements
+/// attached to the same surviving panes.
+fn prune_unreadable_panes(
+    session: &mut PersistedSession,
+    loaded: &HashMap<PathBuf, (PathBuf, TextBuffer)>,
+) {
+    let mut remapped = HashMap::new();
+    let mut active_tab = 0;
+    for (old_tab, tab) in std::mem::take(&mut session.tabs).into_iter().enumerate() {
+        let mut next_pane = 0;
+        let mut kept = Vec::new();
+        let Some(layout) = prune_layout(tab.layout, loaded, &mut next_pane, &mut kept) else {
+            continue;
+        };
+        let new_tab = session.tabs.len();
+        if old_tab < session.active_tab {
+            active_tab += 1;
+        }
+        for (new_pane, old_pane) in kept.iter().enumerate() {
+            remapped.insert(
+                format!("text:{old_tab}:{old_pane}"),
+                format!("text:{new_tab}:{new_pane}"),
+            );
+        }
+        session.tabs.push(PersistedTab {
+            layout,
+            focused_pane: tab
+                .focused_pane
+                .and_then(|index| kept.iter().position(|&old| old == index)),
+            focused_path: tab.focused_path.filter(|path| loaded.contains_key(path)),
+        });
+    }
+    session.active_tab = active_tab.min(session.tabs.len().saturating_sub(1));
+    session.content_descriptors.retain_mut(|descriptor| {
+        if descriptor.adapter != "text-buffer" {
+            return true;
+        }
+        let Some(id) = remapped.remove(&descriptor.semantic_id) else {
+            return false;
+        };
+        descriptor.semantic_id = id;
+        if let Some((canonical, _)) = descriptor.path.as_ref().and_then(|path| loaded.get(path)) {
+            descriptor.path = Some(canonical.clone());
+        }
+        true
+    });
+    session.pinned.retain_mut(|path| {
+        let Some((canonical, _)) = loaded.get(path) else {
+            return false;
+        };
+        path.clone_from(canonical);
+        true
+    });
+}
+
+fn prune_layout(
+    layout: PersistedLayout,
+    loaded: &HashMap<PathBuf, (PathBuf, TextBuffer)>,
+    next_pane: &mut usize,
+    kept: &mut Vec<usize>,
+) -> Option<PersistedLayout> {
+    match layout {
+        PersistedLayout::Pane { ref pane } => {
+            let index = *next_pane;
+            *next_pane += 1;
+            if loaded.contains_key(&pane.path) {
+                kept.push(index);
+                Some(layout)
+            } else {
+                None
+            }
+        }
+        PersistedLayout::Split {
+            axis,
+            ratio,
+            first,
+            second,
+        } => {
+            let first = prune_layout(*first, loaded, next_pane, kept);
+            let second = prune_layout(*second, loaded, next_pane, kept);
+            match (first, second) {
+                (Some(first), Some(second)) => Some(PersistedLayout::Split {
+                    axis,
+                    ratio,
+                    first: Box::new(first),
+                    second: Box::new(second),
+                }),
+                (Some(layout), None) | (None, Some(layout)) => Some(layout),
+                (None, None) => None,
+            }
         }
     }
 }

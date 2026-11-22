@@ -14,6 +14,498 @@ use std::thread;
 use std::time::Duration;
 use std::time::Instant;
 
+pub(in crate::app) fn seeded_split(
+    root: &std::path::Path,
+    state_dir: &std::path::Path,
+    paths: &[&str],
+    history: &[&str],
+) -> Vec<u8> {
+    use crate::persistence::{
+        PersistedContentDescriptor, PersistedLayout, PersistedPane, PersistedTab,
+        PersistedWindowPlacement,
+    };
+    let paths = paths.iter().map(|name| root.join(name)).collect::<Vec<_>>();
+    let mut layouts = paths.iter().map(|path| PersistedLayout::Pane {
+        pane: PersistedPane {
+            path: path.clone(),
+            cursor: 0,
+            anchor: 0,
+            scroll_line: 0,
+            scroll_column: 0,
+        },
+    });
+    let first = layouts.next().expect("first saved pane");
+    let layout = layouts.fold(first, |first, second| PersistedLayout::Split {
+        axis: "horizontal".into(),
+        ratio: 500,
+        first: Box::new(first),
+        second: Box::new(second),
+    });
+    let session = PersistedSession {
+        roots: vec![root.to_path_buf()],
+        tabs: vec![PersistedTab {
+            layout,
+            focused_path: paths.last().cloned(),
+            focused_pane: Some(paths.len() - 1),
+        }],
+        active_tab: 0,
+        window_rules: Vec::new(),
+        content_descriptors: paths
+            .iter()
+            .enumerate()
+            .map(|(index, path)| PersistedContentDescriptor {
+                semantic_id: format!("text:0:{index}"),
+                content_type: "builtin.text-buffer".into(),
+                adapter: "text-buffer".into(),
+                path: Some(path.clone()),
+                provider: None,
+                source: None,
+                key: None,
+                desired_placement: PersistedWindowPlacement::Tiled,
+            })
+            .collect(),
+        pinned: paths,
+    };
+    let bytes = serde_json::to_vec_pretty(&PersistedState {
+        session: Some(session),
+        command_history: history.iter().map(|entry| (*entry).into()).collect(),
+        ..PersistedState::default()
+    })
+    .unwrap();
+    fs::write(state_dir.join(super::STATE_FILE), &bytes).unwrap();
+    bytes
+}
+
+pub(in crate::app) fn startup_with_saved_layout(
+    root: &std::path::Path,
+    state_dir: &std::path::Path,
+    safe_mode: bool,
+    show_dashboard: bool,
+    restore_on_startup: bool,
+) -> crate::app::App {
+    let mut loaded = crate::config::load_bundled_config();
+    loaded.config.persistence.restore_on_startup = restore_on_startup;
+    loaded.config.startup.show_dashboard = show_dashboard;
+    let mut app = crate::app::App::new(
+        crate::app::startup::StartupTarget::Dashboard { root: root.into() },
+        loaded,
+        safe_mode,
+        state_dir.into(),
+        true,
+        false,
+        std::sync::Arc::new(crate::clock::SystemClock),
+    )
+    .unwrap();
+    app.window_session
+        .configure_initial(&app.configuration.settings().windows, &mut app.state)
+        .unwrap();
+    app.window_session.observe_size((80, 24));
+    app.reconcile_editor_windows();
+    app
+}
+
+pub(in crate::app) fn poll_until(
+    app: &mut crate::app::App,
+    mut step: impl FnMut(&mut crate::app::App) -> bool,
+) {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !step(app) {
+        assert!(Instant::now() < deadline, "startup did not finish");
+        thread::yield_now();
+    }
+}
+
+pub(in crate::app) fn submit_ex(app: &mut crate::app::App, input: &str) {
+    use crate::ui::{KeyInputKind, UiEvent};
+
+    for key in std::iter::once(":".into())
+        .chain(input.chars().map(|character| character.to_string()))
+        .chain(std::iter::once("enter".into()))
+    {
+        app.handle_event(UiEvent::Key {
+            key: key.parse().unwrap(),
+            kind: KeyInputKind::Press,
+        });
+    }
+}
+
+#[test]
+fn safe_mode_quit_keeps_saved_layout_bytes() {
+    let directory = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let root = crate::files::canonicalize(directory.path()).unwrap();
+    let before = seeded_split(&root, state.path(), &["a", "b"], &[]);
+    let mut app = startup_with_saved_layout(&root, state.path(), true, true, true);
+    app.process_effect(AppEffect::SessionSave);
+    assert_eq!(
+        app.ui.notification.as_deref(),
+        Some("Safe mode doesn't save the layout")
+    );
+    app.finish_shutdown().expect("safe-mode quit");
+    assert_eq!(
+        fs::read(state.path().join(super::STATE_FILE)).unwrap(),
+        before
+    );
+}
+
+#[test]
+fn safe_mode_historyclear_reports_a_local_clear_without_writing() {
+    let directory = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let root = crate::files::canonicalize(directory.path()).unwrap();
+    let before = seeded_split(&root, state.path(), &["a"], &["help"]);
+    let mut app = startup_with_saved_layout(&root, state.path(), true, true, true);
+    submit_ex(&mut app, "historyclear");
+    assert_eq!(
+        app.ui.notification.as_deref(),
+        Some("History cleared for this run.")
+    );
+    assert!(!app.persistence.pending());
+    assert_eq!(
+        fs::read(state.path().join(super::STATE_FILE)).unwrap(),
+        before
+    );
+}
+
+#[test]
+fn missing_leaf_restores_the_rest_of_the_split_and_saves_it_on_quit() {
+    use crate::persistence::PersistedLayout;
+    let directory = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let root = crate::files::canonicalize(directory.path()).unwrap();
+    for path in ["a", "c"] {
+        fs::write(root.join(path), path).unwrap();
+    }
+    seeded_split(&root, state.path(), &["a", "missing", "c"], &[]);
+    let mut app = startup_with_saved_layout(&root, state.path(), false, true, true);
+    app.load_session_on_request();
+    poll_until(&mut app, |app| {
+        app.process_persistence_events();
+        app.process_vfs_results();
+        !app.persistence.restoring()
+    });
+    assert_eq!(app.state.editor_windows().count(), 2);
+    assert_eq!(
+        app.state.buffers[app.state.active_buffer_id().unwrap()].path,
+        Some(root.join("c"))
+    );
+    app.finish_shutdown().expect("quit after partial restore");
+    let saved: PersistedState =
+        serde_json::from_slice(&fs::read(state.path().join(super::STATE_FILE)).unwrap()).unwrap();
+    let session = saved.session.expect("saved remainder of session");
+    assert!(matches!(
+        session.tabs[0].layout,
+        PersistedLayout::Split { .. }
+    ));
+    assert_eq!(session.pinned, [root.join("a"), root.join("c")]);
+    assert_eq!(session.content_descriptors[1].semantic_id, "text:0:1");
+    assert_eq!(
+        session.content_descriptors[1].path.as_deref(),
+        Some(root.join("c").as_path())
+    );
+}
+
+#[test]
+fn closing_the_only_open_file_replaces_an_unrestored_split() {
+    let directory = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let root = crate::files::canonicalize(directory.path()).unwrap();
+    for name in ["a", "b"] {
+        fs::write(root.join(name), name).unwrap();
+    }
+    seeded_split(&root, state.path(), &["a", "b"], &[]);
+    let mut app = startup_with_saved_layout(&root, state.path(), false, true, false);
+    app.load_persistence();
+    assert!(!app.persistence.pending());
+
+    let path = root.join("a");
+    app.open_dashboard_file(path.clone());
+    poll_until(&mut app, |app| {
+        app.process_vfs_results();
+        !app.documents.has_work()
+    });
+    let buffer = app.state.active_buffer_id().expect("opened dashboard file");
+    assert_eq!(app.state.buffers[buffer].path.as_ref(), Some(&path));
+
+    submit_ex(&mut app, "bd");
+    assert_eq!(app.state.editor_windows().count(), 0);
+    submit_ex(&mut app, "q");
+    assert!(app.should_quit);
+    app.finish_shutdown().expect("quit after clearing layout");
+    let saved: PersistedState =
+        serde_json::from_slice(&fs::read(state.path().join(super::STATE_FILE)).unwrap()).unwrap();
+    assert!(saved.session.is_none());
+}
+
+#[test]
+fn sessionload_reports_a_deleted_only_file_and_keeps_the_saved_layout() {
+    let directory = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let root = crate::files::canonicalize(directory.path()).unwrap();
+    let path = root.join("removed");
+    fs::write(&path, "saved").unwrap();
+    let before = seeded_split(&root, state.path(), &["removed"], &[]);
+    let original: PersistedState = serde_json::from_slice(&before).unwrap();
+    fs::remove_file(path).unwrap();
+    let mut app = startup_with_saved_layout(&root, state.path(), false, true, false);
+
+    submit_ex(&mut app, "sessionload");
+    assert!(app.persistence.restoring());
+    poll_until(&mut app, |app| {
+        app.process_persistence_events();
+        app.process_vfs_results();
+        !app.persistence.restoring()
+    });
+    assert_eq!(
+        app.ui.notification.as_deref(),
+        Some("Couldn't reopen any files from the saved layout")
+    );
+    assert_eq!(app.state.editor_windows().count(), 0);
+
+    app.finish_shutdown().expect("quit after failed restore");
+    let saved: PersistedState =
+        serde_json::from_slice(&fs::read(state.path().join(super::STATE_FILE)).unwrap()).unwrap();
+    assert_eq!(saved.session, original.session);
+}
+
+#[test]
+fn restore_skips_a_leaf_with_a_read_io_error() {
+    use crate::files::{RequestId, VfsError, VfsResult};
+    use std::ops::ControlFlow::Break;
+
+    let directory = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let root = crate::files::canonicalize(directory.path()).unwrap();
+    let saved: PersistedState =
+        serde_json::from_slice(&seeded_split(&root, state.path(), &["a", "b"], &[])).unwrap();
+    let mut app = startup_with_saved_layout(&root, state.path(), false, true, false);
+    macro_rules! context {
+        () => {
+            RestoreContext {
+                editor: &app.state,
+                workspace: &app.workspace,
+                input: &app.input,
+                windows: &app.window_session,
+                configuration: app.configuration.binding_revision(),
+            }
+        };
+    }
+    app.persistence.fixture_restore_source(context!());
+    let paths = app
+        .persistence
+        .begin_restore(saved.session.unwrap(), context!(), super::STATE_ENTRY_LIMIT)
+        .unwrap()
+        .unwrap();
+    for (path, id) in paths.iter().zip([RequestId(1), RequestId(2)]) {
+        app.persistence
+            .restore_read(path, context!())
+            .unwrap()
+            .register(id)
+            .unwrap();
+    }
+    // Inject an ordinary disk read failure without requiring a faulty filesystem.
+    let bad = paths[0].clone();
+    let result = app.persistence.accept_restore(
+        VfsResult::Read {
+            id: RequestId(1),
+            path: bad.clone(),
+            result: Err(VfsError::Io {
+                operation: "read",
+                path: bad,
+                source: std::io::Error::other("disk read failed"),
+            }),
+        },
+        context!(),
+    );
+    assert!(matches!(result, Break(RestoreUpdate::Waiting)));
+    let result = app.persistence.accept_restore(
+        VfsResult::Read {
+            id: RequestId(2),
+            path: paths[1].clone(),
+            result: Ok(b"still readable".to_vec()),
+        },
+        context!(),
+    );
+    let Break(RestoreUpdate::Ready(ready)) = result else {
+        panic!("the surviving pane must be ready to restore");
+    };
+    app.finish_session_restore(*ready);
+    assert_eq!(app.state.editor_windows().count(), 1);
+    let buffer = app.state.active_buffer_id().unwrap();
+    assert_eq!(app.state.buffers[buffer].text.to_string(), "still readable");
+}
+
+#[cfg(unix)]
+#[test]
+fn restore_skips_a_dangling_symlink_and_reopens_its_sibling() {
+    let directory = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let root = crate::files::canonicalize(directory.path()).unwrap();
+    let good = root.join("good");
+    let dangling = root.join("dangling");
+    fs::write(&good, "readable").unwrap();
+    fs::write(&dangling, "original").unwrap();
+    seeded_split(&root, state.path(), &["good", "dangling"], &[]);
+    fs::remove_file(&dangling).unwrap();
+    std::os::unix::fs::symlink("missing", &dangling).unwrap();
+
+    let mut app = startup_with_saved_layout(&root, state.path(), false, true, false);
+    submit_ex(&mut app, "sessionload");
+    assert!(app.persistence.restoring());
+    poll_until(&mut app, |app| {
+        app.process_persistence_events();
+        app.process_vfs_results();
+        !app.persistence.restoring()
+    });
+    assert_eq!(app.state.editor_windows().count(), 1);
+    let buffer = app.state.active_buffer_id().unwrap();
+    assert_eq!(app.state.buffers[buffer].path.as_ref(), Some(&good));
+}
+
+#[test]
+fn historyclear_commits_before_quit_and_keeps_another_instances_later_entries() {
+    let directory = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let root = crate::files::canonicalize(directory.path()).unwrap();
+    let before = seeded_split(&root, state.path(), &["a"], &["help", "set number", "help"]);
+    let mut original: PersistedState = serde_json::from_slice(&before).unwrap();
+    original.search_history.push("saved search".into());
+    let state_path = state.path().join(super::STATE_FILE);
+    fs::write(&state_path, serde_json::to_vec(&original).unwrap()).unwrap();
+    let mut app = startup_with_saved_layout(&root, state.path(), false, true, true);
+    app.load_persistence();
+    assert!(app.persistence.restoring());
+
+    let mut other = startup_with_saved_layout(&root, state.path(), false, true, false);
+    submit_ex(&mut app, "historyclear");
+    let notice = app.message("history_cleared", &[]);
+    assert_ne!(app.ui.notification.as_deref(), Some(notice.as_str()));
+    poll_until(&mut app, |app| {
+        app.process_persistence_events();
+        !app.persistence.pending()
+    });
+    assert_eq!(app.ui.notification.as_deref(), Some(notice.as_str()));
+    let cleared: PersistedState = serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+    assert_eq!(cleared.session, original.session);
+    assert!(cleared.command_history.is_empty());
+    assert!(cleared.search_history.is_empty());
+
+    other.record_prompt_history(crate::ui::PromptKind::Command, "new command");
+    other.record_prompt_history(crate::ui::PromptKind::SearchForward, "new search");
+    submit_ex(&mut other, "q");
+    assert!(other.should_quit);
+    other.finish_shutdown().unwrap();
+    submit_ex(&mut app, "q");
+    assert!(app.should_quit);
+    app.finish_shutdown().unwrap();
+
+    let saved: PersistedState = serde_json::from_slice(&fs::read(state_path).unwrap()).unwrap();
+    assert_eq!(saved.session, original.session);
+    assert_eq!(
+        saved.command_history.first().map(String::as_str),
+        Some("new command")
+    );
+    assert_eq!(saved.search_history, ["new search"]);
+}
+
+#[test]
+fn opened_split_survives_quit_and_restart() {
+    let directory = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let root = crate::files::canonicalize(directory.path()).unwrap();
+    fs::write(root.join("a"), "first pane").unwrap();
+    fs::write(root.join("b"), "second pane").unwrap();
+    let mut app = startup_with_saved_layout(&root, state.path(), false, true, false);
+    app.open_dashboard_file(root.join("a"));
+    poll_until(&mut app, |app| {
+        app.process_vfs_results();
+        !app.documents.has_work()
+    });
+    submit_ex(&mut app, "vsplit");
+    submit_ex(&mut app, "e b");
+    poll_until(&mut app, |app| {
+        app.process_vfs_results();
+        !app.documents.has_work()
+    });
+    let before = app.capture_session().expect("file-backed split");
+    assert!(matches!(
+        before.tabs[0].layout,
+        crate::persistence::PersistedLayout::Split { .. }
+    ));
+    assert_eq!(before.tabs[0].focused_path.as_ref(), Some(&root.join("b")));
+
+    submit_ex(&mut app, "q");
+    assert!(app.should_quit);
+    app.finish_shutdown().unwrap();
+
+    let mut restarted = startup_with_saved_layout(&root, state.path(), false, true, true);
+    restarted.load_persistence();
+    assert!(restarted.persistence.restoring());
+    poll_until(&mut restarted, |app| {
+        app.process_persistence_events();
+        app.process_vfs_results();
+        !app.persistence.restoring()
+    });
+    assert_eq!(restarted.state.editor_windows().count(), 2);
+    assert_eq!(restarted.capture_session().as_ref(), Some(&before));
+}
+
+#[test]
+fn startup_root_inspection_keeps_pending_restore_and_untouched_quit_keeps_file() {
+    let directory = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let root = crate::files::canonicalize(directory.path()).unwrap();
+    for path in ["a", "b"] {
+        fs::write(root.join(path), path).unwrap();
+    }
+    let before = seeded_split(
+        &root,
+        state.path(),
+        &["a", "b"],
+        &["help", "set number", "help"],
+    );
+    let inspect_first = |app: &mut crate::app::App| {
+        app.load_persistence();
+        poll_until(app, |app| {
+            app.process_trust_events();
+            app.maybe_prompt_for_unseen_workspace();
+            app.workspace.roots()[0]
+                .identity
+                .filesystem_identity
+                .is_some()
+        });
+    };
+
+    let mut quit_early = startup_with_saved_layout(&root, state.path(), false, false, true);
+    inspect_first(&mut quit_early);
+    assert!(quit_early.persistence.restoring());
+    assert!(!quit_early.layout_has_changed());
+    submit_ex(&mut quit_early, "q");
+    assert!(quit_early.should_quit);
+    assert!(!quit_early.layout_has_changed());
+    quit_early.finish_shutdown().expect("quit before restore");
+    assert_eq!(
+        fs::read(state.path().join(super::STATE_FILE)).unwrap(),
+        before
+    );
+
+    let mut resumed = startup_with_saved_layout(&root, state.path(), false, false, true);
+    inspect_first(&mut resumed);
+    poll_until(&mut resumed, |app| {
+        app.process_persistence_events();
+        app.process_vfs_results();
+        !app.persistence.restoring()
+    });
+    assert_eq!(resumed.state.editor_windows().count(), 2);
+    assert!(
+        resumed
+            .state
+            .buffers
+            .values()
+            .all(|buffer| buffer.path.is_some())
+    );
+}
+
 #[test]
 fn help_restores_the_visible_palette_and_keeps_file_search_alive() {
     let (_app_dirs, mut app) = app();
@@ -655,21 +1147,33 @@ fn successful_undo_retry_clears_only_that_files_failure() {
     }
 }
 #[test]
-fn save_notice_waits_for_the_latest_queued_snapshot() {
+fn queued_explicit_save_is_acknowledged_only_after_its_layout_write() {
     let root = tempfile::tempdir().unwrap();
     let (worker, release) = PersistenceWorker::gated_for_test(1);
     let mut owner = Persistence::new(worker, root.path().join("state.json"));
     owner
-        .save(PersistedState::default(), PersistencePolicy::default())
+        .save(
+            PersistedState::default(),
+            PersistencePolicy::default(),
+            crate::persistence::SessionWrite::Keep,
+            false,
+        )
         .unwrap();
-    owner.request_save_notice();
+    owner.request_explicit_save();
     owner.request_save();
     drop(release);
     drain(&mut owner);
     assert!(!owner.take_saved_notice());
     assert!(owner.take_save_request());
+    let explicit = std::mem::take(&mut owner.explicit_save_requested);
+    assert!(explicit);
     owner
-        .save(PersistedState::default(), PersistencePolicy::default())
+        .save(
+            PersistedState::default(),
+            PersistencePolicy::default(),
+            crate::persistence::SessionWrite::Replace,
+            explicit,
+        )
         .unwrap();
     drain(&mut owner);
     assert!(owner.take_saved_notice());
@@ -680,7 +1184,12 @@ fn state_save_requests_coalesce_without_consuming_a_pending_write() {
     let (worker, release) = PersistenceWorker::gated_for_test(1);
     let mut owner = Persistence::new(worker, root.path().join("state.json"));
     owner
-        .save(PersistedState::default(), PersistencePolicy::default())
+        .save(
+            PersistedState::default(),
+            PersistencePolicy::default(),
+            crate::persistence::SessionWrite::Replace,
+            false,
+        )
         .unwrap();
     owner.request_save();
     owner.request_save();
@@ -708,8 +1217,13 @@ fn full_and_stopped_exit_queues_are_not_successful_snapshots() {
     let mut full = Persistence::new(worker, path.clone());
     full.begin_shutdown(true);
     assert!(
-        full.save(PersistedState::default(), PersistencePolicy::default())
-            .is_err()
+        full.save(
+            PersistedState::default(),
+            PersistencePolicy::default(),
+            crate::persistence::SessionWrite::Replace,
+            false,
+        )
+        .is_err()
     );
     assert!(full.shutdown_result().is_err());
     drop(full);
@@ -718,7 +1232,12 @@ fn full_and_stopped_exit_queues_are_not_successful_snapshots() {
     stopped.begin_shutdown(true);
     assert!(
         stopped
-            .save(PersistedState::default(), PersistencePolicy::default())
+            .save(
+                PersistedState::default(),
+                PersistencePolicy::default(),
+                crate::persistence::SessionWrite::Replace,
+                false,
+            )
             .is_err()
     );
     assert!(stopped.shutdown_result().is_err());
@@ -729,7 +1248,12 @@ fn earlier_save_finishing_during_exit_does_not_acknowledge_the_exit_snapshot() {
     let (worker, release) = PersistenceWorker::gated_for_test(1);
     let mut owner = Persistence::new(worker, directory.path().join("state.json"));
     owner
-        .save(PersistedState::default(), PersistencePolicy::default())
+        .save(
+            PersistedState::default(),
+            PersistencePolicy::default(),
+            crate::persistence::SessionWrite::Replace,
+            false,
+        )
         .unwrap();
     owner.begin_shutdown(true);
     release.send(()).unwrap();
@@ -739,7 +1263,12 @@ fn earlier_save_finishing_during_exit_does_not_acknowledge_the_exit_snapshot() {
         "earlier save incorrectly acknowledged an exit snapshot that was never accepted"
     );
     owner
-        .save(PersistedState::default(), PersistencePolicy::default())
+        .save(
+            PersistedState::default(),
+            PersistencePolicy::default(),
+            crate::persistence::SessionWrite::Replace,
+            false,
+        )
         .unwrap();
     drain(&mut owner);
     owner.shutdown_result().unwrap();
@@ -757,7 +1286,12 @@ fn exit_requires_a_completed_snapshot_not_idle_or_failed_submission() {
         "a completed load is not an exit save"
     );
     owner
-        .save(PersistedState::default(), PersistencePolicy::default())
+        .save(
+            PersistedState::default(),
+            PersistencePolicy::default(),
+            crate::persistence::SessionWrite::Replace,
+            false,
+        )
         .unwrap();
     assert!(owner.shutdown_result().is_err());
     drain(&mut owner);
@@ -767,7 +1301,12 @@ fn exit_requires_a_completed_snapshot_not_idle_or_failed_submission() {
         Persistence::new(PersistenceWorker::start(1), directory.path().to_path_buf());
     rejected.begin_shutdown(true);
     rejected
-        .save(PersistedState::default(), PersistencePolicy::default())
+        .save(
+            PersistedState::default(),
+            PersistencePolicy::default(),
+            crate::persistence::SessionWrite::Replace,
+            false,
+        )
         .unwrap();
     drain(&mut rejected);
     assert!(

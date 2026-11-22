@@ -83,6 +83,7 @@ pub(super) struct Workspace {
     state_path: PathBuf,
     load_request_id: Option<u64>,
     identity_request_id: Option<(u64, RootId, WorkspaceVersion)>,
+    startup_identity_change: Option<(WorkspaceVersion, WorkspaceVersion)>,
     persist: Option<Persist>,
     database_ready: bool,
     identity_ready: bool,
@@ -135,6 +136,7 @@ impl Workspace {
             state_path,
             load_request_id,
             identity_request_id,
+            startup_identity_change: None,
             persist: None,
             database_ready: false,
             identity_ready: false,
@@ -151,6 +153,14 @@ impl Workspace {
     }
     pub(in crate::app) fn version(&self) -> WorkspaceVersion {
         self.version.clone()
+    }
+    /// Startup restore may span inspection of the same provisional root.
+    pub(in crate::app) fn startup_restore_root_current(&self, source: &WorkspaceVersion) -> bool {
+        *source == self.version
+            || self
+                .startup_identity_change
+                .as_ref()
+                .is_some_and(|(before, after)| before == source && *after == self.version)
     }
     pub(in crate::app) fn roots(&self) -> &[WorkspaceRoot] {
         self.state.roots()
@@ -559,12 +569,22 @@ impl Workspace {
                     .as_ref()
                     .is_some_and(|(g, _, _)| *g == request_id) =>
             {
-                let (_, root, _) = self.identity_request_id.take().expect("matched identity");
+                let (_, root, source) = self.identity_request_id.take().expect("matched identity");
+                let same_startup_root = source == self.version
+                    && result.as_ref().is_ok_and(|identity| {
+                        self.roots().iter().any(|candidate| {
+                            candidate.id == root
+                                && candidate.identity.canonical_path == identity.canonical_path
+                        })
+                    });
                 match result {
                     Ok(identity) => match self.state.replace_root_identity(root, identity) {
                         Ok(()) => {
                             self.identity_ready = true;
                             self.changed();
+                            if same_startup_root {
+                                self.startup_identity_change = Some((source, self.version()));
+                            }
                         }
                         Err(e) => updates.push(WorkspaceUpdate::Failure(WorkspaceFailure::Plain(
                             e.to_string(),
@@ -972,6 +992,10 @@ impl App {
             ));
             return;
         }
+        if let Err(error) = self.prepare_tutor_entry(&current_path, &target) {
+            self.show_error(error);
+            return;
+        }
         self.switch_ends_terminals = None;
         self.close_picker();
         match self.workspace.add_root_request(target, Some(id)) {
@@ -1085,6 +1109,7 @@ impl App {
             |name| name.to_string_lossy().into_owned(),
         );
         self.notify_message(format!("switched to {name}"), false);
+        self.checkpoint_tutor_entry(&path);
     }
 }
 
@@ -1431,6 +1456,7 @@ impl App {
             .is_some_and(|at| at.elapsed() < std::time::Duration::from_millis(800));
         if self.workspace.should_prompt(
             typing
+                || self.persistence.restoring()
                 || self.input.prompt().is_some()
                 || self.ui.picker.is_some()
                 || self.ui.tool_menu.is_some()

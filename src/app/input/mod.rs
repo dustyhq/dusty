@@ -1,10 +1,10 @@
 //! Keyboard, mouse and mapped command input.
 
 use crate::app::language::snippets;
+use crate::persistence::HISTORY_LIMIT;
 mod mouse;
 
 pub(in crate::app) const COMPLETION_LIMIT: usize = 1000;
-pub(in crate::app) const HISTORY_LIMIT: usize = 100;
 
 pub(in crate::app) use mouse::MouseDocument;
 
@@ -1072,21 +1072,22 @@ impl InputState {
         self.history_index = None;
         self.history_draft = None;
     }
-    pub(in crate::app) fn restore_history(&mut self, commands: Vec<String>, searches: Vec<String>) {
+    pub(in crate::app) fn restore_history(
+        &mut self,
+        mut commands: Vec<String>,
+        mut searches: Vec<String>,
+        pending_commands: &[String],
+        pending_searches: &[String],
+    ) {
         if self.history_cleared {
             return;
         }
-        let merge = |mut saved: Vec<String>, current: &mut Vec<String>| {
-            saved.retain(|entry| !current.contains(entry));
-            saved.append(current);
-            *current = saved;
-        };
-        merge(commands, &mut self.command_history);
-        merge(searches, &mut self.search_history);
+        commands.extend_from_slice(pending_commands);
+        searches.extend_from_slice(pending_searches);
+        self.command_history = commands;
+        self.search_history = searches;
         for history in [&mut self.command_history, &mut self.search_history] {
-            let excess = history
-                .len()
-                .saturating_sub(crate::app::input::HISTORY_LIMIT);
+            let excess = history.len().saturating_sub(HISTORY_LIMIT);
             history.drain(..excess);
         }
         self.history_index = None;
@@ -1496,22 +1497,21 @@ impl InputState {
         request
     }
 
-    pub(in crate::app) fn record_prompt_history(&mut self, kind: PromptKind, input: &str) {
-        if input.is_empty() {
-            return;
-        }
-        if matches!(
-            kind,
-            PromptKind::Text
-                | PromptKind::WorkspaceTrust
-                | PromptKind::ExplorerRename
-                | PromptKind::ReviewComment
-                | PromptKind::BreakpointCondition
-                | PromptKind::ReplaceFind
-                | PromptKind::ReplaceWith
-                | PromptKind::SubstituteConfirm
-        ) {
-            return;
+    pub(in crate::app) fn record_prompt_history(&mut self, kind: PromptKind, input: &str) -> bool {
+        if input.is_empty()
+            || matches!(
+                kind,
+                PromptKind::Text
+                    | PromptKind::WorkspaceTrust
+                    | PromptKind::ExplorerRename
+                    | PromptKind::ReviewComment
+                    | PromptKind::BreakpointCondition
+                    | PromptKind::ReplaceFind
+                    | PromptKind::ReplaceWith
+                    | PromptKind::SubstituteConfirm
+            )
+        {
+            return false;
         }
         let history = if kind == PromptKind::Command {
             &mut self.command_history
@@ -1519,15 +1519,14 @@ impl InputState {
             &mut self.search_history
         };
         if history.last().is_some_and(|entry| entry == input) {
-            return;
+            return false;
         }
         history.push(input.into());
-        let excess = history
-            .len()
-            .saturating_sub(crate::app::input::HISTORY_LIMIT);
+        let excess = history.len().saturating_sub(HISTORY_LIMIT);
         if excess > 0 {
             history.drain(..excess);
         }
+        true
     }
 }
 

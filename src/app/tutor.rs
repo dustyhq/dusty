@@ -429,6 +429,7 @@ struct Practice {
     /// The user's project and layout, put back when the tutor ends.
     home: PathBuf,
     layout: Option<PersistedSession>,
+    checkpoint_home: bool,
     dashboard: bool,
     stage: Stage,
     language: Language,
@@ -514,6 +515,7 @@ pub(super) struct Tutor {
     checked: Option<u64>,
     progress: PathBuf,
     practice: Option<Practice>,
+    return_layout: Option<PersistedSession>,
     /// The steps the user has done, for the chapters' progress.
     completed: std::collections::BTreeSet<usize>,
     /// Error notices so far; a command that raised one doesn't count as the step done.
@@ -539,6 +541,7 @@ impl Tutor {
             checked: None,
             progress: state_directory.join("tutor-step"),
             practice: None,
+            return_layout: None,
             completed: std::collections::BTreeSet::new(),
             errors: 0,
             state_checked: None,
@@ -608,9 +611,18 @@ impl Tutor {
         chapters
     }
 
-    /// The user's own layout while the tutor has the editor in its practice project.
-    pub(in crate::app) fn saved_layout(&self) -> Option<&Option<PersistedSession>> {
-        self.practice.as_ref().map(|practice| &practice.layout)
+    pub(in crate::app) fn owns_layout(&self, workspace_root: &Path) -> bool {
+        self.practice.as_ref().is_some_and(|practice| {
+            practice.stage != Stage::Entering || practice.root == workspace_root
+        })
+    }
+
+    pub(in crate::app) fn returning_home(&self) -> bool {
+        self.return_layout.is_some()
+    }
+
+    pub(in crate::app) fn finish_return(&mut self) {
+        self.return_layout = None;
     }
 }
 
@@ -748,10 +760,6 @@ impl App {
         if self.state.buffers.values().any(|buffer| buffer.dirty) {
             return self.show_error("save or close unsaved buffers before starting the tutor");
         }
-        let layout = match self.try_capture_session() {
-            Ok(layout) => layout,
-            Err(error) => return self.show_error(format!("could not keep your layout: {error}")),
-        };
         let folder = match create_practice_project(start.language) {
             Ok(folder) => folder,
             Err(error) => {
@@ -760,30 +768,29 @@ impl App {
         };
         let root = crate::files::canonicalize(folder.path())
             .unwrap_or_else(|_| folder.path().to_path_buf());
-        let home = crate::files::canonicalize(&self.state.workspace_root)
-            .unwrap_or_else(|_| self.state.workspace_root.clone());
-        self.switch_workspace_root(root.clone());
-        // Keep the same project while confirming that running terminals may stop.
-        if !self.workspace.root_operation_pending()
-            && self.switch_ends_terminals.as_ref() != Some(&root)
-        {
-            return;
-        }
         let mut step = start.step.min(self.tutor.steps.len().saturating_sub(1));
         while step > 0 && self.tutor.steps[step].resume_from_previous {
             step -= 1;
         }
         self.tutor.practice = Some(Practice {
             _folder: folder,
-            root,
-            home,
-            layout,
+            root: root.clone(),
+            home: self.state.workspace_root.clone(),
+            layout: None,
+            checkpoint_home: false,
             dashboard: self.ui.dashboard,
             stage: Stage::Entering,
             language: start.language,
             start: step,
             tasks: Vec::new(),
         });
+        self.switch_workspace_root(root.clone());
+        // Keep the same project while confirming that running terminals may stop.
+        if !self.workspace.root_operation_pending()
+            && self.switch_ends_terminals.as_ref() != Some(&root)
+        {
+            self.tutor.practice = None;
+        }
     }
 
     pub(in crate::app) fn tutor_next(&mut self) {
@@ -900,6 +907,49 @@ impl App {
                 .any(|pattern| invocation_matches(pattern, invocation))
         {
             self.tutor.observed = true;
+        }
+    }
+
+    /// Capture home just before submitting entry, after any terminal confirmation.
+    pub(in crate::app) fn prepare_tutor_entry(
+        &mut self,
+        home: &Path,
+        target: &Path,
+    ) -> Result<(), String> {
+        // A repeat command must not replace the snapshot for an already pending switch.
+        if self.workspace.root_operation_pending()
+            || !self.tutor.practice.as_ref().is_some_and(|practice| {
+                practice.stage == Stage::Entering && practice.root == target
+            })
+        {
+            return Ok(());
+        }
+        // Also check for dirty scratch buffers created while the warning was up.
+        if self.state.buffers.values().any(|buffer| buffer.dirty) {
+            return Err("save or close unsaved buffers before starting the tutor".into());
+        }
+        let layout = self
+            .try_capture_session()
+            .map_err(|error| format!("could not keep your layout: {error}"))?;
+        let checkpoint_home = self.layout_has_changed();
+        if let Some(practice) = &mut self.tutor.practice {
+            practice.home = home.to_path_buf();
+            practice.layout = layout;
+            practice.checkpoint_home = checkpoint_home;
+            practice.dashboard = self.ui.dashboard;
+        }
+        Ok(())
+    }
+
+    /// Save the home snapshot only after the switch into this practice project succeeds.
+    pub(in crate::app) fn checkpoint_tutor_entry(&mut self, root: &Path) {
+        if let Some(practice) = &mut self.tutor.practice
+            && practice.stage == Stage::Entering
+            && practice.root == root
+            && std::mem::take(&mut practice.checkpoint_home)
+        {
+            let layout = practice.layout.clone();
+            self.checkpoint_home_layout(layout);
         }
     }
 
@@ -1337,8 +1387,10 @@ impl App {
         if let Err(error) = self.workspace.forget_folder(&practice.root) {
             self.show_workspace_failure(error);
         }
+        self.rebase_home_layout();
         if let Some(layout) = practice.layout {
-            self.persistence.allow_restore(RestoreContext {
+            self.tutor.return_layout = Some(layout.clone());
+            self.persistence.allow_tutor_restore(RestoreContext {
                 editor: &self.state,
                 workspace: &self.workspace,
                 input: &self.input,
@@ -1346,6 +1398,8 @@ impl App {
                 configuration: self.configuration.binding_revision(),
             });
             self.restore_session(layout);
+        } else {
+            self.tutor.finish_return();
         }
         if practice.dashboard {
             self.set_dashboard_visibility(true);
@@ -1673,11 +1727,48 @@ mod tests {
         assert_eq!(app.tutor.practice.as_ref().unwrap().root, root);
     }
 
+    fn startup_for_tutor_persistence(
+        home: &Path,
+        state_dir: &Path,
+        restore_on_startup: bool,
+    ) -> App {
+        use crate::app::persistence::tests::{poll_until, startup_with_saved_layout};
+
+        let mut app = startup_with_saved_layout(home, state_dir, false, true, restore_on_startup);
+        // Startup inspection changes the workspace version. Finish it before requesting a switch.
+        poll_until(&mut app, |app| {
+            app.process_trust_events();
+            app.workspace.roots()[0]
+                .identity
+                .filesystem_identity
+                .is_some()
+                && !app.workspace.persist_pending()
+        });
+        app
+    }
+
     #[test]
-    fn tutor_quit_cancels_entry_and_terminal_confirmation() {
+    fn tutor_quit_cancels_entry_without_checkpointing_home_layout() {
+        use crate::app::persistence::tests::{poll_until, seeded_split, submit_ex};
+
         for terminal in [false, true] {
-            let mut app = app();
-            let home = app.state.workspace_root.clone();
+            let directory = tempfile::tempdir().unwrap();
+            let state = tempfile::tempdir().unwrap();
+            let home = crate::files::canonicalize(directory.path()).unwrap();
+            let state_path = state.path().join(crate::app::persistence::STATE_FILE);
+            let before = seeded_split(&home, state.path(), &["old"], &[]);
+            std::fs::write(home.join("old"), "old").unwrap();
+            let mut app = startup_for_tutor_persistence(&home, state.path(), false);
+            submit_ex(&mut app, "sessionload");
+            poll_until(&mut app, |app| {
+                app.process_persistence_events();
+                app.process_vfs_results();
+                !app.persistence.restoring()
+            });
+            assert_eq!(app.state.editor_windows().count(), 1);
+            submit_ex(&mut app, "vsplit");
+            assert_eq!(app.state.editor_windows().count(), 2);
+            assert!(app.layout_has_changed());
             if terminal {
                 running_terminal(&mut app);
             }
@@ -1687,7 +1778,10 @@ mod tests {
             });
             let root = app.tutor.practice.as_ref().unwrap().root.clone();
             assert_eq!(app.workspace.root_operation_pending(), !terminal);
+            assert!(!app.persistence.pending(), "entry has not succeeded yet");
             app.tutor_quit();
+            assert!(!app.persistence.pending());
+            assert_eq!(std::fs::read(state_path).unwrap(), before);
             assert!(app.tutor.practice.is_none());
             assert!(app.switch_ends_terminals.is_none());
             assert!(!app.workspace.root_operation_pending());
@@ -1697,6 +1791,320 @@ mod tests {
             assert!(app.ui.picker.is_some());
             assert!(app.tutor.practice.is_none());
         }
+    }
+
+    fn restore_one_home_pane(home: &Path, state_dir: &Path) -> App {
+        use crate::app::persistence::tests::{poll_until, seeded_split, submit_ex};
+
+        std::fs::write(home.join("a"), "a").unwrap();
+        seeded_split(home, state_dir, &["a"], &[]);
+        let mut app = startup_for_tutor_persistence(home, state_dir, false);
+        submit_ex(&mut app, "sessionload");
+        assert!(app.persistence.restoring());
+        poll_until(&mut app, |app| {
+            app.process_persistence_events();
+            app.process_vfs_results();
+            !app.persistence.restoring()
+        });
+        assert_eq!(app.state.editor_windows().count(), 1);
+        app
+    }
+
+    #[test]
+    fn quitting_at_tutor_terminal_warning_saves_the_home_split() {
+        use crate::app::persistence::tests::{poll_until, submit_ex};
+
+        let directory = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let home = crate::files::canonicalize(directory.path()).unwrap();
+        let mut app = restore_one_home_pane(&home, state.path());
+        submit_ex(&mut app, "vsplit");
+        assert_eq!(app.state.editor_windows().count(), 2);
+        running_terminal(&mut app);
+        // Include the running terminal's hidden placement in the home snapshot.
+        app.reconcile_editor_windows();
+        let expected = app.capture_session().unwrap();
+
+        app.start_tutor(TutorStart {
+            language: Language::Rust,
+            step: 0,
+        });
+        assert!(app.switch_ends_terminals.is_some());
+        assert!(!app.workspace.root_operation_pending());
+        assert!(!app.persistence.pending());
+        assert_eq!(app.state.workspace_root, home);
+
+        submit_ex(&mut app, "q");
+        assert!(app.should_quit);
+        app.finish_shutdown().unwrap();
+
+        let mut restarted = startup_for_tutor_persistence(&home, state.path(), true);
+        restarted.load_persistence();
+        assert!(restarted.persistence.restoring());
+        poll_until(&mut restarted, |app| {
+            app.process_persistence_events();
+            app.process_vfs_results();
+            !app.persistence.restoring()
+        });
+        assert_eq!(restarted.state.editor_windows().count(), 2);
+        assert_eq!(restarted.capture_session().as_ref(), Some(&expected));
+    }
+
+    #[test]
+    fn confirming_tutor_entry_keeps_the_layout_saved_at_the_terminal_warning() {
+        use crate::app::persistence::tests::{poll_until, submit_ex};
+        use crate::persistence::PersistedState;
+
+        let directory = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let home = crate::files::canonicalize(directory.path()).unwrap();
+        let mut app = restore_one_home_pane(&home, state.path());
+        submit_ex(&mut app, "vsplit");
+        assert_eq!(app.state.editor_windows().count(), 2);
+        assert!(app.layout_has_changed());
+        running_terminal(&mut app);
+        app.start_tutor(TutorStart {
+            language: Language::Rust,
+            step: 0,
+        });
+        let root = app.tutor.practice.as_ref().unwrap().root.clone();
+        assert_eq!(app.switch_ends_terminals.as_ref(), Some(&root));
+        assert!(!app.workspace.root_operation_pending());
+
+        submit_ex(&mut app, "split");
+        assert_eq!(app.state.editor_windows().count(), 3);
+        let expected = app.capture_session().unwrap();
+        submit_ex(&mut app, "sessionsave");
+        poll_until(&mut app, |app| {
+            app.process_persistence_events();
+            !app.persistence.pending()
+        });
+        assert_eq!(app.ui.notification.as_deref(), Some("session saved"));
+        let state_path = state.path().join(crate::app::persistence::STATE_FILE);
+        let saved: PersistedState =
+            serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
+        assert_eq!(saved.session.as_ref(), Some(&expected));
+
+        submit_ex(&mut app, "Tutor");
+        assert!(app.workspace.root_operation_pending());
+        enter(&mut app);
+        assert_eq!(app.state.workspace_root, root);
+
+        submit_ex(&mut app, "q");
+        assert!(app.should_quit);
+        app.finish_shutdown().unwrap();
+        let saved: PersistedState =
+            serde_json::from_slice(&std::fs::read(state_path).unwrap()).unwrap();
+        assert_eq!(saved.session, Some(expected));
+    }
+
+    #[test]
+    fn quitting_in_practice_saves_the_pre_tutor_split() {
+        use crate::app::persistence::tests::{poll_until, submit_ex};
+        use crate::persistence::PersistedState;
+
+        let directory = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let home = crate::files::canonicalize(directory.path()).unwrap();
+        for name in ["a", "b"] {
+            std::fs::write(home.join(name), name).unwrap();
+        }
+        let mut app = startup_for_tutor_persistence(&home, state.path(), false);
+        app.open_dashboard_file(home.join("a"));
+        poll_until(&mut app, |app| {
+            app.process_vfs_results();
+            !app.documents.has_work()
+        });
+        submit_ex(&mut app, "vsplit");
+        submit_ex(&mut app, "e b");
+        poll_until(&mut app, |app| {
+            app.process_vfs_results();
+            !app.documents.has_work()
+        });
+        assert_eq!(app.state.editor_windows().count(), 2);
+        let before = app.capture_session().unwrap();
+        let state_path = state.path().join(crate::app::persistence::STATE_FILE);
+        assert!(!state_path.exists());
+        app.start_tutor(TutorStart {
+            language: Language::Rust,
+            step: 0,
+        });
+        enter(&mut app);
+        assert_ne!(app.state.workspace_root, home);
+        submit_ex(&mut app, "q");
+        assert!(app.should_quit);
+        app.finish_shutdown().unwrap();
+
+        let saved: PersistedState =
+            serde_json::from_slice(&std::fs::read(state_path).unwrap()).unwrap();
+        assert_eq!(saved.session, Some(before));
+    }
+
+    #[test]
+    fn explicit_sessionsave_replaces_disk_layout_during_practice() {
+        use crate::app::persistence::tests::{poll_until, seeded_split, submit_ex};
+        use crate::persistence::PersistedState;
+
+        let directory = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let home = crate::files::canonicalize(directory.path()).unwrap();
+        seeded_split(&home, state.path(), &["old"], &[]);
+        let mut app = startup_for_tutor_persistence(&home, state.path(), false);
+        app.start_tutor(TutorStart {
+            language: Language::Rust,
+            step: 0,
+        });
+        enter(&mut app);
+        assert_ne!(app.state.workspace_root, home);
+        poll_until(&mut app, |app| {
+            app.process_vfs_results();
+            app.process_persistence_events();
+            !app.documents.has_work() && !app.persistence.pending()
+        });
+        let buffer = app.state.active_buffer_id().unwrap();
+        assert!(
+            app.state.buffers[buffer]
+                .path
+                .as_ref()
+                .is_some_and(|path| path.starts_with(&app.state.workspace_root))
+        );
+        let layout = app.capture_session().unwrap();
+
+        submit_ex(&mut app, "sessionsave");
+        poll_until(&mut app, |app| {
+            app.process_persistence_events();
+            !app.persistence.pending()
+        });
+        let state_path = state.path().join(crate::app::persistence::STATE_FILE);
+        let saved: PersistedState =
+            serde_json::from_slice(&std::fs::read(state_path).unwrap()).unwrap();
+        assert_eq!(saved.session, Some(layout));
+        assert_eq!(app.ui.notification.as_deref(), Some("session saved"));
+    }
+
+    #[derive(Clone, Copy)]
+    enum AfterTutorReturn {
+        QuitWhileLoading,
+        QuitAfterRestore,
+        TogglePinThenQuit,
+        SaveAfterRestore,
+    }
+
+    #[test]
+    fn tutor_return_keeps_the_latest_saved_split_before_and_after_publication() {
+        for action in [
+            AfterTutorReturn::QuitWhileLoading,
+            AfterTutorReturn::QuitAfterRestore,
+        ] {
+            check_layout_after_tutor_return(action);
+        }
+    }
+
+    #[test]
+    fn toggling_a_restored_pin_after_tutor_return_is_saved_on_quit() {
+        check_layout_after_tutor_return(AfterTutorReturn::TogglePinThenQuit);
+    }
+
+    #[test]
+    fn explicit_sessionsave_after_tutor_return_writes_even_without_edits() {
+        check_layout_after_tutor_return(AfterTutorReturn::SaveAfterRestore);
+    }
+
+    fn check_layout_after_tutor_return(action: AfterTutorReturn) {
+        use crate::app::persistence::tests::{poll_until, seeded_split, submit_ex};
+        use crate::persistence::PersistedState;
+
+        let directory = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let home = crate::files::canonicalize(directory.path()).unwrap();
+        for name in ["a", "b", "newer"] {
+            std::fs::write(home.join(name), name).unwrap();
+        }
+        seeded_split(&home, state.path(), &["a", "b"], &[]);
+        let mut app = startup_for_tutor_persistence(&home, state.path(), false);
+        submit_ex(&mut app, "sessionload");
+        assert!(app.persistence.restoring());
+        poll_until(&mut app, |app| {
+            app.process_persistence_events();
+            app.process_vfs_results();
+            !app.persistence.restoring()
+        });
+        assert_eq!(app.state.editor_windows().count(), 2);
+
+        app.start_tutor(TutorStart {
+            language: Language::Rust,
+            step: 0,
+        });
+        enter(&mut app);
+        assert_ne!(app.state.workspace_root, home);
+        // Wait for the entry checkpoint before another instance changes the saved layout.
+        poll_until(&mut app, |app| {
+            app.process_persistence_events();
+            !app.persistence.pending()
+        });
+        let latest = seeded_split(&home, state.path(), &["a", "newer"], &[]);
+        let latest: PersistedState = serde_json::from_slice(&latest).unwrap();
+        let state_path = state.path().join(crate::app::persistence::STATE_FILE);
+        app.save_persistence();
+        assert!(app.persistence.pending());
+        poll_until(&mut app, |app| {
+            app.process_persistence_events();
+            !app.persistence.pending()
+        });
+        let during: PersistedState =
+            serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
+        assert_eq!(during.session, latest.session);
+
+        submit_ex(&mut app, "TutorQuit");
+        enter(&mut app); // Process the root switch, but not the document replies.
+        assert_eq!(app.state.workspace_root, home);
+        assert!(app.persistence.restoring());
+        if !matches!(action, AfterTutorReturn::QuitWhileLoading) {
+            poll_until(&mut app, |app| {
+                app.process_vfs_results();
+                !app.persistence.restoring()
+            });
+            assert_eq!(app.state.editor_windows().count(), 2);
+            let active = app.state.active_buffer_id().unwrap();
+            assert_eq!(
+                app.state.buffers[active].path.as_ref(),
+                Some(&home.join("b"))
+            );
+            assert!(app.window_session.pins().contains(&active));
+            assert!(
+                !app.layout_has_changed(),
+                "restored pins are not a user change"
+            );
+        }
+        let expected = match action {
+            AfterTutorReturn::QuitWhileLoading | AfterTutorReturn::QuitAfterRestore => {
+                latest.session
+            }
+            AfterTutorReturn::TogglePinThenQuit => {
+                app.process_effect(AppEffect::ToggleBufferPin);
+                let layout = app.capture_session().unwrap();
+                assert_eq!(layout.pinned, [home.join("a")]);
+                Some(layout)
+            }
+            AfterTutorReturn::SaveAfterRestore => {
+                let layout = app.capture_session().unwrap();
+                submit_ex(&mut app, "sessionsave");
+                poll_until(&mut app, |app| {
+                    app.process_persistence_events();
+                    !app.persistence.pending()
+                });
+                assert_eq!(app.ui.notification.as_deref(), Some("session saved"));
+                Some(layout)
+            }
+        };
+        if !matches!(action, AfterTutorReturn::SaveAfterRestore) {
+            submit_ex(&mut app, "q");
+            assert!(app.should_quit);
+            app.finish_shutdown().unwrap();
+        }
+        let after: PersistedState =
+            serde_json::from_slice(&std::fs::read(state_path).unwrap()).unwrap();
+        assert_eq!(after.session, expected);
     }
 
     #[cfg(unix)]

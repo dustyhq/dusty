@@ -47,6 +47,7 @@ impl App {
         self.drain_linter_sources();
         self.documents.cancel_startup();
         self.queue_dirty_recovery_before_exit();
+        self.process_trust_events();
         while (self
             .recovery
             .unwritten(&self.state, &self.configuration.settings().recovery)
@@ -124,8 +125,9 @@ impl App {
         // results does not roll back filesystem operations.
         self.finish_workspace_resources("shared shutdown deadline");
         self.documents.stop_worker();
-        self.persistence
-            .begin_shutdown(self.configuration.settings().persistence.enabled);
+        self.persistence.begin_shutdown(
+            self.configuration.settings().persistence.enabled && !self.workspace.safe_mode(),
+        );
         // Drain an earlier load/save without applying a late restore at exit.
         while self.persistence.pending() && Instant::now() < deadline {
             self.process_persistence_events();
@@ -134,18 +136,24 @@ impl App {
         if !incomplete && Instant::now() < deadline {
             self.save_persistence();
         }
-        while (self.persistence.pending()
-            || self.persistence.undo_pending()
-            || !self.documents.worker_finished())
-            && Instant::now() < deadline
-        {
+        loop {
+            // A late startup inspection can enqueue a write recording that the root was seen.
+            // Poll before checking whether shutdown work is done, not after leaving the loop.
+            self.process_trust_events();
+            if Instant::now() >= deadline
+                || !(self.persistence.pending()
+                    || self.persistence.undo_pending()
+                    || !self.documents.worker_finished()
+                    || self.workspace.persist_pending())
+            {
+                break;
+            }
             self.process_persistence_events();
             std::thread::sleep(Duration::from_millis(2));
         }
         for error in self.persistence.poll_undo_saves() {
             self.show_error(error);
         }
-        self.process_trust_events();
         let result = (|| {
             self.workspace.trust_shutdown_result().map_err(|message| {
                 InteractiveError::Vfs(VfsError::Io {

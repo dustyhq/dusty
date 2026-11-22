@@ -50,7 +50,7 @@ pub struct PersistedLocation {
     pub scroll_line: usize,
     pub scroll_column: usize,
 }
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PersistedPane {
     #[serde(with = "crate::files::path_encoding")]
@@ -60,7 +60,7 @@ pub struct PersistedPane {
     pub scroll_line: usize,
     pub scroll_column: usize,
 }
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum PersistedLayout {
     Pane {
@@ -73,7 +73,7 @@ pub enum PersistedLayout {
         second: Box<PersistedLayout>,
     },
 }
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PersistedTab {
     pub layout: PersistedLayout,
@@ -123,7 +123,7 @@ pub struct PersistedContentDescriptor {
     pub desired_placement: PersistedWindowPlacement,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PersistedSession {
     #[serde(with = "crate::files::path_encoding::list")]
@@ -603,6 +603,31 @@ fn layout_has_oversized_scroll_column(layout: &PersistedLayout) -> bool {
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct PersistenceId(pub u64);
+/// Number of entries retained per prompt history, on disk and in recall.
+pub const HISTORY_LIMIT: usize = 100;
+
+/// Whether a state write preserves the layout or replaces it with the new snapshot.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SessionWrite {
+    Keep,
+    Replace,
+}
+
+/// How the history entries in a write relate to the histories already on disk.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HistoryWrite {
+    /// The entries are snapshots; merge changes relative to this worker's previous state.
+    Merge,
+    /// The entries are newly recorded, in oldest-to-newest order.
+    Append,
+}
+
+#[derive(Debug)]
+enum StateEdit {
+    ClearHistory,
+    CheckpointLayout(Option<Box<PersistedSession>>),
+}
+
 #[derive(Debug)]
 enum Request {
     Read {
@@ -615,6 +640,15 @@ enum Request {
         path: PathBuf,
         state: Box<PersistedState>,
         policy: PersistencePolicy,
+        session_write: SessionWrite,
+        ignored_read: Option<PersistenceId>,
+        history_write: HistoryWrite,
+    },
+    Edit {
+        request_id: PersistenceId,
+        path: PathBuf,
+        policy: PersistencePolicy,
+        edit: StateEdit,
     },
 }
 #[derive(Debug)]
@@ -624,6 +658,9 @@ pub enum PersistenceEvent {
         state: Box<PersistedState>,
     },
     Saved {
+        request_id: PersistenceId,
+    },
+    Edited {
         request_id: PersistenceId,
     },
     Failed {
@@ -681,6 +718,7 @@ impl PersistenceWorker {
                     let _ = gate.recv();
                 }
                 let mut previous = BTreeMap::new();
+                let mut observed_layouts = BTreeMap::new();
                 while let Ok(request) = rx.recv() {
                     let event = match request {
                         Request::Read {
@@ -689,7 +727,8 @@ impl PersistenceWorker {
                             policy,
                         } => match read_state(&path, &policy) {
                             Ok(state) => {
-                                previous.insert(path, state.clone());
+                                observed_layouts.insert(path.clone(), state.session.clone());
+                                previous.insert(path, (request_id, state.clone()));
                                 PersistenceEvent::Loaded {
                                     request_id,
                                     state: Box::new(state),
@@ -702,13 +741,55 @@ impl PersistenceWorker {
                             path,
                             state,
                             policy,
-                        } => match write_state(&path, &state, previous.get(&path), &policy) {
+                            session_write,
+                            ignored_read,
+                            history_write,
+                        } => match write_state(
+                            &path,
+                            &state,
+                            previous.get(&path).and_then(|(id, state)| {
+                                (Some(*id) != ignored_read).then_some(state)
+                            }),
+                            &policy,
+                            session_write,
+                            history_write,
+                        ) {
                             Ok(()) => {
-                                previous.insert(path, *state);
+                                if session_write == SessionWrite::Replace {
+                                    observed_layouts.insert(path.clone(), state.session.clone());
+                                }
+                                previous.insert(path, (request_id, *state));
                                 PersistenceEvent::Saved { request_id }
                             }
                             Err(error) => PersistenceEvent::Failed { request_id, error },
                         },
+                        Request::Edit {
+                            request_id,
+                            path,
+                            policy,
+                            edit,
+                        } => {
+                            let observed = observed_layouts.get(&path).and_then(Option::as_ref);
+                            match edit_state(&path, &policy, &edit, observed) {
+                                Ok(changed) => {
+                                    match edit {
+                                        StateEdit::CheckpointLayout(layout) if changed => {
+                                            observed_layouts
+                                                .insert(path, layout.map(|layout| *layout));
+                                        }
+                                        StateEdit::ClearHistory => {
+                                            if let Some((_, state)) = previous.get_mut(&path) {
+                                                state.command_history.clear();
+                                                state.search_history.clear();
+                                            }
+                                        }
+                                        StateEdit::CheckpointLayout(_) => {}
+                                    }
+                                    PersistenceEvent::Edited { request_id }
+                                }
+                                Err(error) => PersistenceEvent::Failed { request_id, error },
+                            }
+                        }
                     };
                     if etx.send(event).is_err() {
                         break;
@@ -754,6 +835,29 @@ impl PersistenceWorker {
         state: PersistedState,
         policy: PersistencePolicy,
     ) -> Result<PersistenceId, PersistenceError> {
+        self.write_with_session_policy(
+            path,
+            state,
+            policy,
+            SessionWrite::Replace,
+            None,
+            HistoryWrite::Merge,
+        )
+    }
+    /// Save shared state, choosing separately whether to write the layout. A read the caller
+    /// did not apply cannot serve as the baseline for detecting deletions.
+    pub fn write_with_session_policy(
+        &mut self,
+        path: PathBuf,
+        mut state: PersistedState,
+        policy: PersistencePolicy,
+        session_write: SessionWrite,
+        ignored_read: Option<PersistenceId>,
+        history_write: HistoryWrite,
+    ) -> Result<PersistenceId, PersistenceError> {
+        if session_write == SessionWrite::Keep {
+            state.session = None;
+        }
         state.validate(&policy)?;
         let request_id = self.id()?;
         self.sender
@@ -762,10 +866,55 @@ impl PersistenceWorker {
                 path,
                 state: Box::new(state),
                 policy,
+                session_write,
+                ignored_read,
+                history_write,
             })
             .map_err(queue_error)?;
         Ok(request_id)
     }
+    /// Clear both histories in worker order without writing the layout or other state.
+    pub fn clear_history(
+        &mut self,
+        path: PathBuf,
+        policy: PersistencePolicy,
+    ) -> Result<PersistenceId, PersistenceError> {
+        self.edit(path, policy, StateEdit::ClearHistory)
+    }
+
+    /// Save the captured home layout only if the disk layout is still the one we observed.
+    /// If no layout has been observed, this only fills an empty layout.
+    pub fn checkpoint_layout(
+        &mut self,
+        path: PathBuf,
+        policy: PersistencePolicy,
+        layout: Option<PersistedSession>,
+    ) -> Result<PersistenceId, PersistenceError> {
+        self.edit(
+            path,
+            policy,
+            StateEdit::CheckpointLayout(layout.map(Box::new)),
+        )
+    }
+
+    fn edit(
+        &mut self,
+        path: PathBuf,
+        policy: PersistencePolicy,
+        edit: StateEdit,
+    ) -> Result<PersistenceId, PersistenceError> {
+        let request_id = self.id()?;
+        self.sender
+            .try_send(Request::Edit {
+                request_id,
+                path,
+                policy,
+                edit,
+            })
+            .map_err(queue_error)?;
+        Ok(request_id)
+    }
+
     pub fn try_event(&self) -> Result<Option<PersistenceEvent>, PersistenceError> {
         match self.receiver.try_recv() {
             Ok(event) => Ok(Some(event)),
@@ -796,7 +945,8 @@ fn read_state(path: &Path, policy: &PersistencePolicy) -> Result<PersistedState,
     if bytes.len() > policy.maximum_file_bytes {
         return Err(PersistenceError::TooLarge);
     }
-    let state: PersistedState = serde_json::from_slice(&bytes).map_err(PersistenceError::Json)?;
+    let mut state: PersistedState =
+        serde_json::from_slice(&bytes).map_err(PersistenceError::Json)?;
     state.validate(policy)?;
     // Two instances reading the same legacy snapshot must derive the same IDs.
     // Include an occurrence number so even identical legacy rows have distinct identities.
@@ -818,7 +968,75 @@ fn write_state(
     state: &PersistedState,
     previous: Option<&PersistedState>,
     policy: &PersistencePolicy,
+    session_write: SessionWrite,
+    history_write: HistoryWrite,
 ) -> Result<(), PersistenceError> {
+    update_state(path, policy, |current| {
+        let mut merged = state.clone();
+        if let Some(current) = &current {
+            merge_shared_state(
+                &mut merged,
+                current,
+                previous,
+                policy.maximum_entries,
+                history_write,
+            );
+            if session_write == SessionWrite::Keep {
+                merged.session.clone_from(&current.session);
+            }
+        }
+        limit_history(&mut merged, policy);
+        if session_write == SessionWrite::Keep && current.as_ref() == Some(&merged) {
+            None
+        } else {
+            Some(merged)
+        }
+    })
+    .map(|_| ())
+}
+
+fn edit_state(
+    path: &Path,
+    policy: &PersistencePolicy,
+    edit: &StateEdit,
+    observed_layout: Option<&PersistedSession>,
+) -> Result<bool, PersistenceError> {
+    update_state(path, policy, |current| {
+        let mut state = current.unwrap_or_default();
+        match edit {
+            StateEdit::ClearHistory => {
+                if state.command_history.is_empty() && state.search_history.is_empty() {
+                    return None;
+                }
+                state.command_history.clear();
+                state.search_history.clear();
+            }
+            StateEdit::CheckpointLayout(layout) => {
+                if state.session.as_ref() != observed_layout
+                    || state.session.as_ref() == layout.as_deref()
+                {
+                    return None;
+                }
+                state.session = layout.as_deref().cloned();
+            }
+        }
+        limit_history(&mut state, policy);
+        Some(state)
+    })
+}
+
+fn limit_history(state: &mut PersistedState, policy: &PersistencePolicy) {
+    let maximum = HISTORY_LIMIT.min(policy.maximum_entries);
+    for history in [&mut state.command_history, &mut state.search_history] {
+        history.drain(..history.len().saturating_sub(maximum));
+    }
+}
+
+fn update_state(
+    path: &Path,
+    policy: &PersistencePolicy,
+    update: impl FnOnce(Option<PersistedState>) -> Option<PersistedState>,
+) -> Result<bool, PersistenceError> {
     let parent = path.parent().ok_or(PersistenceError::InvalidPath)?;
     fs::create_dir_all(parent).map_err(PersistenceError::Io)?;
     #[cfg(unix)]
@@ -829,17 +1047,16 @@ fn write_state(
     }
     let _lock =
         crate::files::lock_file(&path.with_extension("json.lock")).map_err(PersistenceError::Io)?;
-    let mut merged = state.clone();
-    match read_state(path, policy) {
-        Ok(current) => merge_shared_state(&mut merged, &current, previous, policy.maximum_entries),
-        Err(PersistenceError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {}
+    let current = match read_state(path, policy) {
+        Ok(state) => Some(state),
+        Err(PersistenceError::Io(error)) if error.kind() == io::ErrorKind::NotFound => None,
         Err(error) => return Err(error),
-    }
-    merged.validate(policy)?;
-    let bytes = serde_json::to_vec(&merged).map_err(PersistenceError::Json)?;
-    if bytes.len() > policy.maximum_file_bytes {
-        return Err(PersistenceError::TooLarge);
-    }
+    };
+    let Some(mut state) = update(current) else {
+        return Ok(false);
+    };
+    state.validate(policy)?;
+    let bytes = encode_state(&mut state, policy.maximum_file_bytes)?;
     if let Ok(metadata) = fs::symlink_metadata(path)
         && (!metadata.file_type().is_file() || metadata.file_type().is_symlink())
     {
@@ -850,13 +1067,40 @@ fn write_state(
     file.as_file().sync_all().map_err(PersistenceError::Io)?;
     file.persist(path)
         .map_err(|error| PersistenceError::Io(error.error))?;
-    crate::files::sync_directory(parent).map_err(PersistenceError::Io)
+    crate::files::sync_directory(parent).map_err(PersistenceError::Io)?;
+    Ok(true)
 }
+
+fn encode_state(state: &mut PersistedState, maximum: usize) -> Result<Vec<u8>, PersistenceError> {
+    let bytes = serde_json::to_vec(state).map_err(PersistenceError::Json)?;
+    if bytes.len() <= maximum {
+        return Ok(bytes);
+    }
+
+    // Give the layout priority over recall when unusually long entries fill the file.
+    let mut excess = bytes.len() - maximum;
+    for history in [&mut state.command_history, &mut state.search_history] {
+        let mut remove = 0;
+        while excess != 0 && remove < history.len() {
+            let bytes = serde_json::to_vec(&history[remove]).map_err(PersistenceError::Json)?;
+            remove += 1;
+            let comma = usize::from(remove < history.len());
+            excess = excess.saturating_sub(bytes.len() + comma);
+        }
+        history.drain(..remove);
+    }
+    if excess != 0 {
+        return Err(PersistenceError::TooLarge);
+    }
+    serde_json::to_vec(state).map_err(PersistenceError::Json)
+}
+
 fn merge_shared_state(
     state: &mut PersistedState,
     current: &PersistedState,
     previous: Option<&PersistedState>,
     maximum: usize,
+    history_write: HistoryWrite,
 ) {
     let empty = PersistedState::default();
     let previous = previous.unwrap_or(&empty);
@@ -902,19 +1146,17 @@ fn merge_shared_state(
         maximum,
         |location| (location.path.clone(), location.byte),
     );
-    merge_entries(
+    merge_history(
         &mut state.command_history,
         &current.command_history,
         &previous.command_history,
-        maximum,
-        Clone::clone,
+        history_write,
     );
-    merge_entries(
+    merge_history(
         &mut state.search_history,
         &current.search_history,
         &previous.search_history,
-        maximum,
-        Clone::clone,
+        history_write,
     );
     merge_entries(
         &mut state.breakpoints,
@@ -949,7 +1191,45 @@ fn merge_shared_state(
             state.metadata.remove(key);
         }
     }
-    // The saving instance owns its layout, pins and active tab; they are not merged.
+}
+
+fn merge_history(
+    local: &mut Vec<String>,
+    disk: &[String],
+    previous: &[String],
+    write: HistoryWrite,
+) {
+    let mut history = disk.to_vec();
+    let mut retained = 0;
+    if write == HistoryWrite::Merge {
+        // A snapshot can delete entries anywhere, then append new entries.
+        // Find the longest prefix still present, preferring its newest occurrences.
+        for entry in previous {
+            if local.get(retained) == Some(entry) {
+                retained += 1;
+            }
+        }
+        let mut keep = local[..retained].iter().rev().peekable();
+        let mut occurrences = BTreeMap::<&str, Vec<bool>>::new();
+        for entry in previous.iter().rev() {
+            let retained = keep.peek().is_some_and(|next| *next == entry);
+            if retained {
+                keep.next();
+            }
+            occurrences
+                .entry(entry.as_str())
+                .or_default()
+                .push(retained);
+        }
+        history.retain(|entry| {
+            occurrences
+                .get_mut(entry.as_str())
+                .and_then(Vec::pop)
+                .unwrap_or(true)
+        });
+    }
+    history.extend(local.drain(retained..));
+    *local = history;
 }
 
 fn merge_entries<T: Clone + PartialEq, K: Eq>(
@@ -1025,7 +1305,9 @@ mod tests {
 
     use tempfile::tempdir;
 
+    use crate::persistence::HistoryWrite;
     use crate::persistence::MAXIMUM_DESCRIPTOR_ID_BYTES;
+    use crate::persistence::SessionWrite;
 
     use crate::persistence::MAXIMUM_VIRTUAL_KEY_BYTES;
 
@@ -1125,7 +1407,15 @@ mod tests {
         }];
         let policy = PersistencePolicy::default();
         let saved = directory.path().join("state.json");
-        write_state(&saved, &state, None, &policy).unwrap();
+        write_state(
+            &saved,
+            &state,
+            None,
+            &policy,
+            SessionWrite::Replace,
+            HistoryWrite::Merge,
+        )
+        .unwrap();
         let loaded = read_state(&saved, &policy).unwrap();
         assert_eq!(
             serde_json::to_value(&state).unwrap(),
@@ -1162,11 +1452,26 @@ mod tests {
         let path = directory.path().join("state.json");
         let policy = PersistencePolicy::default();
         let mut state = PersistedState::default();
-        write_state(&path, &state, None, &policy).unwrap();
+        write_state(
+            &path,
+            &state,
+            None,
+            &policy,
+            SessionWrite::Replace,
+            HistoryWrite::Merge,
+        )
+        .unwrap();
         let original = fs::read(&path).unwrap();
         state.command_history.push("x".repeat(8192));
         assert!(matches!(
-            write_state(&path, &state, None, &policy),
+            write_state(
+                &path,
+                &state,
+                None,
+                &policy,
+                SessionWrite::Replace,
+                HistoryWrite::Merge
+            ),
             Err(PersistenceError::Io(_))
         ));
         assert_eq!(fs::read(&path).unwrap(), original);
@@ -1225,12 +1530,24 @@ mod tests {
             ..previous.clone()
         };
         let mut state = previous.clone();
-        crate::persistence::merge_shared_state(&mut state, &current, Some(&previous), 3);
+        crate::persistence::merge_shared_state(
+            &mut state,
+            &current,
+            Some(&previous),
+            3,
+            HistoryWrite::Merge,
+        );
         assert_eq!(state.recent_files, paths(&["/c", "/d", "/a"]));
 
         // Local opens stay ahead of external opens, while local deletions stay deleted.
         state.recent_files = paths(&["/e", "/a"]);
-        crate::persistence::merge_shared_state(&mut state, &current, Some(&previous), 3);
+        crate::persistence::merge_shared_state(
+            &mut state,
+            &current,
+            Some(&previous),
+            3,
+            HistoryWrite::Merge,
+        );
         assert_eq!(state.recent_files, paths(&["/e", "/c", "/d"]));
 
         let reordered = PersistedState {
@@ -1238,10 +1555,22 @@ mod tests {
             ..previous.clone()
         };
         state = previous.clone();
-        crate::persistence::merge_shared_state(&mut state, &reordered, Some(&previous), 3);
+        crate::persistence::merge_shared_state(
+            &mut state,
+            &reordered,
+            Some(&previous),
+            3,
+            HistoryWrite::Merge,
+        );
         assert_eq!(state.recent_files, reordered.recent_files);
         state = reordered.clone();
-        crate::persistence::merge_shared_state(&mut state, &current, Some(&previous), 3);
+        crate::persistence::merge_shared_state(
+            &mut state,
+            &current,
+            Some(&previous),
+            3,
+            HistoryWrite::Merge,
+        );
         assert_eq!(state.recent_files, paths(&["/b", "/c", "/d"]));
     }
 
@@ -1253,7 +1582,15 @@ mod tests {
         let mut original = PersistedState::default();
         original.command_history.push("old".into());
         original.metadata.insert("old".into(), "old".into());
-        write_state(&path, &original, None, &policy).unwrap();
+        write_state(
+            &path,
+            &original,
+            None,
+            &policy,
+            SessionWrite::Replace,
+            HistoryWrite::Merge,
+        )
+        .unwrap();
         let mut first = original.clone();
         first.recent_files.push(RecentFile {
             path: crate::files::absolute_test_path("/first"),
@@ -1299,7 +1636,15 @@ mod tests {
                 let policy = &policy;
                 scope.spawn(move || {
                     barrier.wait();
-                    write_state(path, state, Some(original), policy).unwrap();
+                    write_state(
+                        path,
+                        state,
+                        Some(original),
+                        policy,
+                        SessionWrite::Replace,
+                        HistoryWrite::Merge,
+                    )
+                    .unwrap();
                 });
             }
         });
@@ -1323,7 +1668,15 @@ mod tests {
         assert!(saved.metadata.contains_key("first"));
         assert!(saved.metadata.contains_key("second"));
         assert!(!saved.metadata.contains_key("old"));
-        write_state(&path, &second, Some(&second), &policy).unwrap();
+        write_state(
+            &path,
+            &second,
+            Some(&second),
+            &policy,
+            SessionWrite::Replace,
+            HistoryWrite::Merge,
+        )
+        .unwrap();
         assert_eq!(read_state(&path, &policy).unwrap().marks.len(), 2);
     }
 
@@ -1598,7 +1951,15 @@ mod tests {
         let root = tempdir().expect("temporary persistence directory");
         let path = root.path().join("state.json");
         let policy = PersistencePolicy::default();
-        write_state(&path, &state_with_horizontal_offsets(), None, &policy).expect("write state");
+        write_state(
+            &path,
+            &state_with_horizontal_offsets(),
+            None,
+            &policy,
+            SessionWrite::Replace,
+            HistoryWrite::Merge,
+        )
+        .expect("write state");
         let restored = read_state(&path, &policy).expect("read state");
         let pane = match &restored.session.as_ref().expect("session").tabs[0].layout {
             PersistedLayout::Pane { pane } => pane,

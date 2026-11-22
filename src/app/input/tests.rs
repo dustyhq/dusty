@@ -1019,11 +1019,20 @@ fn prompt_mode_restore_rejects_a_new_editor_with_reused_view_ids() {
 fn delayed_history_restore_preserves_new_entries_and_explicit_clear() {
     let mut input = InputState::new(100);
     input.record_prompt_history(PromptKind::Command, "new");
-    input.restore_history(vec!["old".into()], vec!["saved search".into()]);
-    assert_eq!(input.command_history(), ["old", "new"]);
+    input.restore_history(
+        vec!["new".into(), "old".into()],
+        vec!["saved search".into()],
+        &["new".into()],
+        &[],
+    );
+    input.open_prompt(PromptKind::Command, String::new(), None);
+    for expected in ["new", "old", "new"] {
+        input.prompt_history(-1);
+        assert_eq!(input.prompt().unwrap().input, expected);
+    }
     input.clear_history();
     input.record_prompt_history(PromptKind::Command, "after clear");
-    input.restore_history(vec!["old".into()], vec!["saved search".into()]);
+    input.restore_history(vec!["old".into()], vec!["saved search".into()], &[], &[]);
     assert_eq!(input.command_history(), ["after clear"]);
     assert!(input.search_history().is_empty());
 }

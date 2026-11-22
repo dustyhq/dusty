@@ -196,7 +196,7 @@ impl EditorState {
             if unused && !self.views.values().any(|other| other.buffer == old_buffer) {
                 self.remove_buffer(old_buffer);
             }
-            self.select_editor_window(window)?;
+            self.select_editor_window_after_layout_change(window)?;
         } else {
             let tab = self
                 .graph
@@ -206,15 +206,35 @@ impl EditorState {
                 .graph
                 .open_window(tab, graph_view, WindowPlacement::Tiled, true, OWNER, 1)
                 .map_err(layout_error)?;
-            self.select_editor_window(window)?;
+            self.select_editor_window_after_layout_change(window)?;
         }
         Ok(())
     }
 
     fn select_editor_window(&mut self, window: WindowId) -> Result<(), &'static str> {
+        self.select_editor_window_inner(window, self.focused_window() != Some(window))
+    }
+
+    fn select_editor_window_after_layout_change(
+        &mut self,
+        window: WindowId,
+    ) -> Result<(), &'static str> {
+        self.select_editor_window_inner(window, true)
+    }
+
+    fn select_editor_window_inner(
+        &mut self,
+        window: WindowId,
+        layout_changed: bool,
+    ) -> Result<(), &'static str> {
         self.window_view(window).ok_or("target pane is stale")?;
         self.graph.select_window(window).map_err(layout_error)?;
-        self.mark_window_changed();
+        if layout_changed {
+            self.mark_layout_changed();
+        } else {
+            // Returning focus from a prompt to the same pane does not change the saved layout.
+            self.mark_window_changed();
+        }
         Ok(())
     }
 
@@ -248,7 +268,7 @@ impl EditorState {
             )
             .map_err(layout_error)?;
         self.remove_view(old)?;
-        self.select_editor_window(window)
+        self.select_editor_window_after_layout_change(window)
     }
 
     fn leave_kept_pane(&mut self, view: ViewId) -> Result<(), &'static str> {
@@ -298,7 +318,7 @@ impl EditorState {
             .tile(right, Some(window), TileAxis::Horizontal, true, 500)
             .map_err(layout_error)?;
         self.graph = graph;
-        self.select_editor_window(window)
+        self.select_editor_window_after_layout_change(window)
     }
 
     pub fn split_active(&mut self, axis: TileAxis, ratio: u16) -> Result<ViewId, &'static str> {
@@ -330,7 +350,7 @@ impl EditorState {
             self.graph
                 .tile(window, Some(source), axis, true, ratio)
                 .map_err(layout_error)?;
-            self.select_editor_window(window)?;
+            self.select_editor_window_after_layout_change(window)?;
             Ok(view)
         })();
         if result.is_err() {
@@ -361,7 +381,7 @@ impl EditorState {
                 .graph
                 .open_window(tab, graph_view, WindowPlacement::Tiled, true, OWNER, 1)
                 .map_err(layout_error)?;
-            self.select_editor_window(window)?;
+            self.select_editor_window_after_layout_change(window)?;
             Ok(tab)
         })();
         if result.is_err() {
@@ -479,7 +499,7 @@ impl EditorState {
         self.graph
             .resize_window_split(self.focused_window().ok_or("no active tab")?, None, delta)
             .map_err(layout_error)?;
-        self.mark_window_changed();
+        self.mark_layout_changed();
         Ok(())
     }
     pub fn resize_active_pane_on_axis(
@@ -494,7 +514,7 @@ impl EditorState {
                 delta,
             )
             .map_err(|_| "active pane has no resizable split on that axis")?;
-        self.mark_window_changed();
+        self.mark_layout_changed();
         Ok(())
     }
     pub fn panes_of_split_between(
@@ -513,14 +533,14 @@ impl EditorState {
         self.graph
             .set_split_ratio(first, second, ratio)
             .map_err(|_| "no split between those panes")?;
-        self.mark_window_changed();
+        self.mark_layout_changed();
         Ok(())
     }
     pub fn swap_panes(&mut self, first: WindowId, second: WindowId) -> Result<(), &'static str> {
         self.graph
             .swap_tiled_windows(self.active_tab().ok_or("no active tab")?, first, second)
             .map_err(|_| "both panes must belong to the active tab")?;
-        self.mark_window_changed();
+        self.mark_layout_changed();
         Ok(())
     }
     pub fn close_view(&mut self, view: ViewId) -> Result<(), &'static str> {
@@ -575,7 +595,7 @@ impl EditorState {
         } else {
             let tab = self.active_tab().ok_or("no active tab")?;
             self.close_editor_tab(tab, None)?;
-            self.mark_window_changed();
+            self.mark_layout_changed();
         }
         Ok(view)
     }
@@ -586,7 +606,7 @@ impl EditorState {
             return self.close_active_tab();
         }
         self.close_window(focused)?;
-        self.select_editor_window(self.tab_windows(tab)[0])
+        self.select_editor_window_after_layout_change(self.tab_windows(tab)[0])
     }
     pub fn close_active_tab(&mut self) -> Result<(), &'static str> {
         let tab = self.active_tab().ok_or("no active tab")?;
@@ -601,7 +621,9 @@ impl EditorState {
                 .is_some_and(|window| window.owner.starts_with("plugin."))
         });
         self.close_editor_tab(tab, Some(next))?;
-        self.activate_tab(next)?;
+        self.select_editor_window_after_layout_change(
+            self.tab_focused_window(next).ok_or("target tab is stale")?,
+        )?;
         if let Some(plugin) = plugin.filter(|id| self.graph.can_focus(*id)) {
             self.graph.focus(plugin).map_err(layout_error)?;
         }
