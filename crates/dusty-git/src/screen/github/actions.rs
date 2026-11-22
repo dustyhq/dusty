@@ -80,6 +80,12 @@ pub(in crate::screen) enum Action {
     Approve(u64),
     /// Ctrl+s in a job log: write it to a local file.
     SaveLog(u64),
+    /// Replace the destination chosen in the Save job log sheet.
+    ReplaceLog {
+        job: u64,
+        destination: Box<runs::LogDestination>,
+        path_top: std::cell::Cell<usize>,
+    },
     Download(u64, String),
     /// A comment on lines `start..=line` (`V`, then `c` in Files): held for the review.
     InlineRange {
@@ -153,6 +159,7 @@ impl Action {
                 | Self::Check(..)
                 | Self::Attempt(_)
                 | Self::SaveLog(_)
+                | Self::ReplaceLog { .. }
                 | Self::Draft(..)
                 | Self::CreatePullRequestWeb
                 | Self::MergeMethod(_)
@@ -303,7 +310,9 @@ impl Workspace {
         }
         if action != Action::CreatePullRequest {
             self.pending_pr = false;
-            self.ready_form = None;
+            if !matches!(action, Action::SaveLog(_)) {
+                self.ready_form = None;
+            }
         }
         let title_owned: String;
         let mut fields;
@@ -475,6 +484,7 @@ impl Workspace {
                 form.title = title_owned;
                 return Ok(Some(form));
             }
+            Action::ReplaceLog { .. } => return Ok(None),
             Action::Download(_, name) => {
                 let caps = self.capabilities();
                 if let Some(reason) = caps.artifacts_download.reason() {
@@ -941,34 +951,75 @@ impl Workspace {
         }
         Ok(Some(self.form(title, action, fields)))
     }
-    pub fn submit(&mut self, action: Action, values: Vec<String>) -> Result<(), String> {
-        if let Action::SaveLog(job) = &action {
-            return self.save_log(*job, &values);
+    /// Return the log's follow-up directly, without taking a sheet waiting for its forge reply.
+    pub(in crate::screen) fn submit_log(
+        &mut self,
+        action: &Action,
+        values: &[String],
+    ) -> Result<Option<Form>, String> {
+        match action {
+            Action::SaveLog(job) => self.save_log(*job, values),
+            Action::ReplaceLog {
+                job, destination, ..
+            } => self.replace_log(*job, destination),
+            _ => Err("This action does not save a log".into()),
         }
+    }
+
+    pub fn submit(&mut self, action: Action, values: Vec<String>) -> Result<(), String> {
         if self.writing() {
             return Err("Wait for the current action to finish".into());
         }
         self.save_draft(&action, values.clone());
-        if let Action::Scoped {
-            host,
-            repo,
-            page,
-            number,
-            action,
-        } = action
-        {
-            if host != self.host
-                || repo != self.repo
-                || page != self.page
-                || number != self.number()
-            {
-                return Err(
-                    "The action source changed; reopen the original item (draft preserved)".into(),
-                );
+        let draft_key = self.draft_key(&action);
+        let (action, target) = match action {
+            Action::Scoped {
+                host,
+                repo,
+                page,
+                number,
+                action,
+            } => {
+                let still_selected = if action.item_scoped() {
+                    self.selected_item_target().is_some_and(|selected| {
+                        selected.host == host
+                            && selected.repo.eq_ignore_ascii_case(&repo)
+                            && selected.page == page
+                            && selected.number == number
+                    })
+                } else {
+                    host == self.host
+                        && repo.eq_ignore_ascii_case(&self.repo)
+                        && page == self.page
+                        && number == self.number()
+                };
+                if !still_selected {
+                    return Err(
+                        "The action source changed; reopen the original item (draft preserved)"
+                            .into(),
+                    );
+                }
+                (*action, ForgeTarget::repository(&host, &repo))
             }
-            return self.submit(*action, values);
-        }
+            action => {
+                let target = if action.item_scoped() {
+                    self.selected_item_target().map(|item| item.repository())
+                } else {
+                    None
+                };
+                (action, target.unwrap_or_else(|| self.target()))
+            }
+        };
         self.check_inbox_action(&action)?;
+        if matches!(
+            action,
+            Action::Review(_)
+                | Action::Inline { .. }
+                | Action::InlineRange { .. }
+                | Action::Draft(..)
+        ) {
+            self.sync_drafts();
+        }
         if let Some(result) = self.submit_feature(&action, &values) {
             return result;
         }

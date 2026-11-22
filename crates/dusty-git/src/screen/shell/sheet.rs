@@ -830,13 +830,15 @@ fn generic(app: &GitScreen, frame: &mut Frame, form: &Form, lay: &Layout) {
     use super::super::github::Action;
     let run_sheet = matches!(
         &form.action,
-        FormAction::Github(
+        FormAction::Github(action) if matches!(
+            action.unscoped(),
             Action::Cancel(_)
                 | Action::Rerun(_)
                 | Action::Approve(_)
                 | Action::Dispatch(_)
                 | Action::Download(..)
                 | Action::SaveLog(_)
+                | Action::ReplaceLog { .. }
         )
     );
     // The frame's corner, a space either side of the title, and the position label.

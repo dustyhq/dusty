@@ -11,14 +11,224 @@ use super::super::{FormAction, GitScreen};
 use super::keymap::{Named, Step};
 use super::*;
 use crate::config::ExplorerIconMode;
+use crate::files::{VfsError, WriteExpectation, checked_atomic_write};
 use crate::forge::host_state;
 use crate::forge::records;
 use crate::forge::transport::HostKey;
 use crate::ui::{CellGrid, Frame, GitRole, GitSurface, Style};
 use crossterm::cursor::SetCursorStyle;
+use std::fs::{self, File};
+use std::io::{self, Write as _};
 use std::ops::Range;
+use std::path::Path;
+use std::time::SystemTime;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
+
+fn log_save_error(error: io::Error) -> String {
+    log_file_error("Couldn't save the log", &error)
+}
+
+fn log_replace_error(error: io::Error) -> String {
+    // ERROR_SHARING_VIOLATION or ERROR_LOCK_VIOLATION.
+    if cfg!(windows) && matches!(error.raw_os_error(), Some(32 | 33)) {
+        return "Couldn't replace the log: close the file in the other program and try again."
+            .into();
+    }
+    log_file_error("Couldn't replace the log", &error)
+}
+
+fn log_replace_write_error(error: VfsError) -> String {
+    match error {
+        VfsError::Io { source, .. } | VfsError::RootIo { source, .. } => log_replace_error(source),
+        VfsError::ReadOnlyDestination(_) => {
+            log_replace_error(io::ErrorKind::PermissionDenied.into())
+        }
+        _ => "Couldn't replace the log".into(),
+    }
+}
+
+fn log_file_error(message: &str, error: &io::Error) -> String {
+    if error.kind() == io::ErrorKind::IsADirectory {
+        return format!("{message}: the path is a folder");
+    }
+    let reason = crate::screen::words::io_reason(error);
+    match reason.strip_prefix(" · ") {
+        Some(reason) => format!("{message}: {reason}"),
+        None => message.to_owned(),
+    }
+}
+
+/// The selected path, its resolved file, and the revision shown in the question.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(in crate::screen) struct LogDestination {
+    entered: String,
+    resolved: PathBuf,
+    revision: LogRevision,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct LogRevision {
+    identity: (u64, u64),
+    len: u64,
+    modified: SystemTime,
+}
+
+impl LogDestination {
+    fn find(root: &Path, entered: &str) -> io::Result<Option<Self>> {
+        match Self::read(root, entered) {
+            Ok(destination) => Ok(Some(destination)),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn read(root: &Path, entered: &str) -> io::Result<Self> {
+        let resolved = resolve_log_path(&root.join(entered))?;
+        let (metadata, identity) = log_file_identity(&resolved)?;
+        if metadata.is_dir() {
+            return Err(io::ErrorKind::IsADirectory.into());
+        }
+        if !metadata.is_file() {
+            return Err(io::ErrorKind::InvalidInput.into());
+        }
+        let revision = LogRevision {
+            identity,
+            len: metadata.len(),
+            modified: metadata.modified()?,
+        };
+        Ok(Self {
+            entered: entered.to_owned(),
+            resolved,
+            revision,
+        })
+    }
+
+    pub(in crate::screen) fn path(&self) -> &Path {
+        &self.resolved
+    }
+}
+
+#[cfg(unix)]
+fn log_file_identity(path: &Path) -> io::Result<(fs::Metadata, (u64, u64))> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = fs::symlink_metadata(path)?;
+    let identity = (metadata.dev(), metadata.ino());
+    Ok((metadata, identity))
+}
+
+#[cfg(windows)]
+fn log_file_identity(path: &Path) -> io::Result<(fs::Metadata, (u64, u64))> {
+    use std::os::windows::fs::OpenOptionsExt;
+    // Inspect the file without asking for data access or following a substituted leaf link.
+    const OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    const BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    let file = File::options()
+        .access_mode(0)
+        .custom_flags(OPEN_REPARSE_POINT | BACKUP_SEMANTICS)
+        .open(path)?;
+    Ok((file.metadata()?, crate::files::file_identity(&file)?))
+}
+
+/// Check authorization on the file itself, not just permission to rename in its parent.
+fn authorize_log_replace(path: &Path) -> io::Result<(u64, u64)> {
+    let mut options = File::options();
+    options.write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options.custom_flags(OPEN_REPARSE_POINT);
+    }
+    // Never truncate or create here. Even a privileged process respects a read-only file.
+    let file = options.open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.permissions().readonly() {
+        return Err(io::ErrorKind::PermissionDenied.into());
+    }
+    #[cfg(windows)]
+    check_log_delete_sharing(path)?;
+    crate::files::file_identity(&file)
+}
+
+#[cfg(windows)]
+fn check_log_delete_sharing(path: &Path) -> io::Result<()> {
+    use std::os::windows::fs::OpenOptionsExt;
+    const DELETE_ACCESS: u32 = 0x0001_0000;
+    // An opener can share writes without sharing deletes. Check delete access explicitly
+    // so a sharing denial at replacement gets the actionable Windows message.
+    File::options()
+        .access_mode(DELETE_ACCESS)
+        .open(path)
+        .map(drop)
+}
+
+fn resolve_log_path(path: &Path) -> io::Result<PathBuf> {
+    let mut path = path.to_path_buf();
+    // Canonicalize existing files, but follow leaf links ourselves so an absent referent
+    // can still be created. A relative link is relative to the directory containing it.
+    for _ in 0..40 {
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.is_symlink() => {
+                let link = fs::read_link(&path)?;
+                let parent = path.parent().ok_or(io::ErrorKind::InvalidInput)?;
+                path = crate::files::canonicalize(parent)?.join(link);
+            }
+            Ok(_) => return crate::files::canonicalize(path),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(path),
+            Err(error) => return Err(error),
+        }
+    }
+    Err(io::ErrorKind::InvalidInput.into())
+}
+
+#[derive(Clone, Copy)]
+enum LogQuestion {
+    First,
+    Changed,
+}
+
+fn replace_log_form(
+    job: u64,
+    destination: LogDestination,
+    question: LogQuestion,
+) -> Result<Form, String> {
+    let title = match question {
+        LogQuestion::First => {
+            let name = Path::new(&destination.entered)
+                .file_name()
+                .ok_or("A file name is required")?;
+            format!("Replace {}?", name.to_string_lossy())
+        }
+        LogQuestion::Changed => "The file changed. Replace it anyway?".into(),
+    };
+    Ok(Form {
+        title,
+        action: FormAction::Github(Action::ReplaceLog {
+            job,
+            destination: Box::new(destination),
+            path_top: std::cell::Cell::default(),
+        }),
+        fields: vec![],
+        // A held Enter or Ctrl+Enter can arrive as fresh presses. Replace needs focus.
+        selected: 1,
+        focus_moved: false,
+    })
+}
+
+fn log_for_export(raw: &str) -> (String, usize) {
+    let lines = raw
+        .lines()
+        .filter_map(|line| LogLine::new(logs::unpack(line).1))
+        .map(|line| line.text)
+        .collect::<Vec<_>>();
+    (lines.join("\n") + "\n", lines.len())
+}
 
 /// A pull request's check, read as this tree reads a job (the Checks tab, `checks.rs`).
 pub(super) mod check_job;
@@ -3166,37 +3376,89 @@ impl Workspace {
         }
     }
 
-    /// Ctrl+s: writes the full job log to a file under the repository.
-    pub(super) fn save_log(&mut self, job: u64, values: &[String]) -> Result<(), String> {
+    /// Save the full job log, or ask before replacing an existing destination.
+    pub(super) fn save_log(&mut self, job: u64, values: &[String]) -> Result<Option<Form>, String> {
         let path = values
             .first()
             .map(|path| path.trim())
             .filter(|path| !path.is_empty())
             .ok_or("A file name is required")?;
+        self.save_log_to(job, path, LogQuestion::First)
+    }
+
+    fn save_log_to(
+        &mut self,
+        job: u64,
+        path: &str,
+        question: LogQuestion,
+    ) -> Result<Option<Form>, String> {
         let raw = self.raw(&Key::Log(job)).ok_or("The log is not loaded")?;
-        let text = raw
-            .lines()
-            .filter_map(|line| LogLine::new(logs::unpack(line).1))
-            .map(|line| line.text)
-            .collect::<Vec<_>>();
-        let target = self.root.join(path);
-        if let Some(parent) = target.parent() {
-            std::fs::create_dir_all(parent).map_err(|error| {
+        let chosen = self.root.join(path);
+        if let Some(parent) = chosen.parent() {
+            fs::create_dir_all(parent).map_err(|error| {
                 format!(
                     "Couldn't create the folder{}",
                     crate::screen::words::io_reason(&error)
                 )
             })?;
         }
-        std::fs::write(&target, text.join("\n") + "\n").map_err(|error| {
-            format!(
-                "Couldn't save the log{}",
-                crate::screen::words::io_reason(&error)
-            )
-        })?;
-        self.notice = format!("Saved {} lines to {path}", text.len());
+        let target = resolve_log_path(&chosen).map_err(log_save_error)?;
+        // The open itself must refuse to clobber a file, even one that just appeared.
+        match File::options().write(true).create_new(true).open(&target) {
+            Ok(mut file) => {
+                let (text, lines) = log_for_export(raw);
+                file.write_all(text.as_bytes()).map_err(log_save_error)?;
+                self.log_saved(path, lines);
+                Ok(None)
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                let destination = LogDestination::read(&self.root, path).map_err(log_save_error)?;
+                replace_log_form(job, destination, question).map(Some)
+            }
+            Err(error) => Err(log_save_error(error)),
+        }
+    }
+
+    /// Publish the complete new log only if the destination still matches the question.
+    pub(super) fn replace_log(
+        &mut self,
+        job: u64,
+        destination: &LogDestination,
+    ) -> Result<Option<Form>, String> {
+        let path = &destination.entered;
+        let Some(current) = LogDestination::find(&self.root, path).map_err(log_replace_error)?
+        else {
+            return self.save_log_to(job, path, LogQuestion::Changed);
+        };
+        if &current != destination {
+            return replace_log_form(job, current, LogQuestion::Changed).map(Some);
+        }
+
+        let raw = self.raw(&Key::Log(job)).ok_or("The log is not loaded")?;
+        let (text, lines) = log_for_export(raw);
+        let authorized = authorize_log_replace(current.path());
+        // The path may have changed during export or authorization. Validate the
+        // entered path again before writing to its resolved referent.
+        let Some(current) = LogDestination::find(&self.root, path).map_err(log_replace_error)?
+        else {
+            return self.save_log_to(job, path, LogQuestion::Changed);
+        };
+        if &current != destination {
+            return replace_log_form(job, current, LogQuestion::Changed).map(Some);
+        }
+        if authorized.map_err(log_replace_error)? != current.revision.identity {
+            return Err(log_replace_error(io::ErrorKind::PermissionDenied.into()));
+        }
+
+        checked_atomic_write(current.path(), text.as_bytes(), &WriteExpectation::Any)
+            .map_err(log_replace_write_error)?;
+        self.log_saved(path, lines);
+        Ok(None)
+    }
+
+    fn log_saved(&mut self, path: &str, lines: usize) {
+        self.notice = format!("Saved {lines} lines to {path}");
         self.notice_error = false;
-        Ok(())
     }
 
     /// The default file for Ctrl+s: `<job>.log`.
@@ -6040,6 +6302,7 @@ mod tests {
 
         // One job's reply names only the job: it pins the run it was sent for, not another.
         let mut workspace = start(true);
+        let target = workspace.target();
         workspace.actions.rerun_job_run = Some(502);
         workspace.written(&Write::RerunJob(7.into()), Ok(Default::default()), &target);
         assert!(!workspace.actions.pinned);
@@ -6246,19 +6509,398 @@ mod tests {
         );
     }
 
+    fn open_log_save(app: &mut GitScreen) {
+        app.github.focus_panel(2);
+        let mut save = KeyEvent::character('s');
+        save.modifiers.control = true;
+        app.github_key(&save);
+        let form = app.form.as_ref().expect("Ctrl+S opens the save sheet");
+        assert_eq!(form.fields[0].input.input, "test.log");
+    }
+
+    fn ctrl_enter() -> KeyEvent {
+        let mut key = KeyEvent::plain(KeyCode::Enter);
+        key.modifiers.control = true;
+        key
+    }
+
+    fn log_key(app: &mut GitScreen, key: KeyEvent, kind: crate::ui::KeyInputKind) {
+        app.event(crate::ui::UiEvent::Key { key, kind });
+    }
+
+    #[test]
+    fn key_repeat_does_not_confirm_log_replacement() {
+        use crate::ui::KeyInputKind::{Press, Release, Repeat};
+
+        for submit in [KeyEvent::plain(KeyCode::Enter), ctrl_enter()] {
+            let (root, mut app) = actions_screen();
+            app.frame(100, 30);
+            let target = root.path().join("test.log");
+            fs::write(&target, "keep this").unwrap();
+            open_log_save(&mut app);
+            if !submit.modifiers.control {
+                log_key(&mut app, KeyEvent::plain(KeyCode::Tab), Press);
+            }
+            log_key(&mut app, submit.clone(), Press);
+            assert_eq!(app.form.as_ref().unwrap().title, "Replace test.log?");
+            log_key(&mut app, submit.clone(), Repeat);
+            assert_eq!(app.form.as_ref().unwrap().title, "Replace test.log?");
+            assert_eq!(fs::read_to_string(&target).unwrap(), "keep this");
+            log_key(&mut app, submit.clone(), Release);
+
+            log_key(&mut app, KeyEvent::plain(KeyCode::Tab), Press);
+            log_key(&mut app, submit.clone(), Repeat);
+            assert!(!app.form.as_ref().unwrap().cancel_focused());
+            assert_eq!(fs::read_to_string(&target).unwrap(), "keep this");
+
+            log_key(&mut app, submit.clone(), Release);
+            log_key(&mut app, submit, Press);
+            assert!(app.form.is_none());
+            assert!(
+                fs::read_to_string(&target)
+                    .unwrap()
+                    .contains("running 3 tests")
+            );
+        }
+    }
+
+    #[test]
+    fn second_ctrl_enter_press_does_not_replace_an_existing_log() {
+        use crate::ui::KeyInputKind::Press;
+
+        let (root, mut app) = actions_screen();
+        app.frame(100, 30);
+        let target = root.path().join("test.log");
+        fs::write(&target, "keep this").unwrap();
+        open_log_save(&mut app);
+
+        log_key(&mut app, ctrl_enter(), Press);
+        let form = app.form.as_ref().expect("saving opens a Replace sheet");
+        assert_eq!(form.title, "Replace test.log?");
+        assert!(form.cancel_focused());
+
+        log_key(&mut app, ctrl_enter(), Press);
+        assert!(app.form.is_none(), "the fresh press honors Cancel");
+        assert_eq!(fs::read_to_string(&target).unwrap(), "keep this");
+    }
+
+    #[test]
+    fn saving_a_log_keeps_existing_contents_until_replace_is_chosen() {
+        let (root, mut app) = actions_screen();
+        let target = root.path().join("test.log");
+        fs::write(&target, "keep this").unwrap();
+        let submit = ctrl_enter();
+
+        for dismiss in [Some(KeyCode::Escape), Some(KeyCode::Enter), None] {
+            open_log_save(&mut app);
+            app.form_key(&submit).unwrap();
+            assert_eq!(fs::read_to_string(&target).unwrap(), "keep this");
+            let form = app
+                .form
+                .as_ref()
+                .expect("an existing file needs confirmation");
+            assert_eq!(form.title, "Replace test.log?");
+            assert!(form.cancel_focused(), "Cancel has default focus");
+
+            if let Some(key) = dismiss {
+                app.form_key(&KeyEvent::plain(key)).unwrap();
+                assert!(app.form.is_none());
+                assert_eq!(fs::read_to_string(&target).unwrap(), "keep this");
+            } else {
+                app.form_key(&KeyEvent::plain(KeyCode::Tab)).unwrap();
+                app.form_key(&submit).unwrap();
+            }
+        }
+        assert!(app.form.is_none());
+        assert_eq!(app.github.notice, "Saved 3 lines to test.log");
+        let written = fs::read_to_string(&target).unwrap();
+        assert!(written.contains("running 3 tests"));
+        assert!(!written.contains("keep this"));
+    }
+
+    #[test]
+    fn saving_a_fresh_log_keeps_a_dispatch_sheet_that_loaded_while_saving() {
+        let (root, mut app) = actions_screen();
+        app.github.begin_dispatch(31);
+        open_log_save(&mut app);
+        app.github.cache.insert(
+            Key::Workflow(31, String::new()),
+            Ok(Reply {
+                text: "on: workflow_dispatch".into(),
+                value: Value::Null,
+            }),
+        );
+        app.github.poll_actions();
+        assert!(matches!(
+            app.github.ready_form.as_ref().map(|form| &form.action),
+            Some(FormAction::Github(action)) if matches!(action.unscoped(), Action::Dispatch(31))
+        ));
+
+        app.form_key(&ctrl_enter()).unwrap();
+
+        assert!(app.form.is_none(), "a new path needs only one submission");
+        assert!(root.path().join("test.log").is_file());
+        let deferred = app.github.take_form().expect("Dispatch is still waiting");
+        assert!(matches!(
+            deferred.action,
+            FormAction::Github(action) if matches!(action.unscoped(), Action::Dispatch(31))
+        ));
+    }
+
+    #[test]
+    fn replacing_a_log_asks_again_when_a_different_file_took_its_place() {
+        use crate::ui::KeyInputKind::{Press, Release, Repeat};
+
+        let (root, mut app) = actions_screen();
+        app.frame(100, 30);
+        let target = root.path().join("test.log");
+        fs::write(&target, "first").unwrap();
+        open_log_save(&mut app);
+        let submit = ctrl_enter();
+        app.form_key(&submit).unwrap();
+        assert_eq!(app.form.as_ref().unwrap().title, "Replace test.log?");
+
+        let other = root.path().join("other.log");
+        fs::write(&other, "later").unwrap();
+        let modified = fs::metadata(&target).unwrap().modified().unwrap();
+        File::options()
+            .write(true)
+            .open(&other)
+            .unwrap()
+            .set_modified(modified)
+            .unwrap();
+        fs::rename(other, &target).unwrap();
+        assert_eq!(fs::metadata(&target).unwrap().modified().unwrap(), modified);
+
+        log_key(&mut app, KeyEvent::plain(KeyCode::Tab), Press);
+        log_key(&mut app, submit.clone(), Press);
+        assert_eq!(fs::read_to_string(&target).unwrap(), "later");
+        let renewed = "The file changed. Replace it anyway?";
+        assert_eq!(app.form.as_ref().unwrap().title, renewed);
+
+        log_key(&mut app, submit.clone(), Repeat);
+        assert_eq!(app.form.as_ref().unwrap().title, renewed);
+        assert!(app.form.as_ref().unwrap().cancel_focused());
+        assert_eq!(fs::read_to_string(&target).unwrap(), "later");
+        log_key(&mut app, submit.clone(), Release);
+        log_key(&mut app, KeyEvent::plain(KeyCode::Tab), Press);
+        log_key(&mut app, submit, Press);
+        assert!(app.form.is_none());
+        assert!(
+            fs::read_to_string(target)
+                .unwrap()
+                .contains("running 3 tests")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replacing_a_read_only_log_preserves_it() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (root, mut app) = actions_screen();
+        let target = root.path().join("test.log");
+        fs::write(&target, "keep this").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o444)).unwrap();
+        open_log_save(&mut app);
+        app.form_key(&ctrl_enter()).unwrap();
+        app.form_key(&KeyEvent::plain(KeyCode::Tab)).unwrap();
+
+        let error = app.form_key(&ctrl_enter()).unwrap_err();
+        assert_eq!(error, "Couldn't replace the log: permission denied");
+        assert!(app.form.is_some());
+        assert_eq!(fs::read_to_string(&target).unwrap(), "keep this");
+        assert_eq!(
+            fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o444
+        );
+    }
+
+    #[test]
+    fn replacing_a_removed_log_saves_fresh_to_the_typed_path() {
+        let (root, mut app) = actions_screen();
+        let path = "logs/custom.log";
+        let target = root.path().join(path);
+        fs::create_dir(root.path().join("logs")).unwrap();
+        fs::write(&target, "old log").unwrap();
+        open_log_save(&mut app);
+        app.form.as_mut().unwrap().fields[0].input.input = path.into();
+        app.form_key(&ctrl_enter()).unwrap();
+        assert_eq!(app.form.as_ref().unwrap().title, "Replace custom.log?");
+        fs::remove_file(&target).unwrap();
+
+        app.form_key(&KeyEvent::plain(KeyCode::Tab)).unwrap();
+        app.form_key(&ctrl_enter()).unwrap();
+
+        assert!(app.form.is_none());
+        assert_eq!(app.github.notice, "Saved 3 lines to logs/custom.log");
+        assert!(
+            fs::read_to_string(target)
+                .unwrap()
+                .contains("running 3 tests")
+        );
+        assert!(!root.path().join("test.log").exists());
+    }
+
+    #[test]
+    fn the_replace_question_wraps_the_destination_at_100_columns() {
+        let (root, mut app) = actions_screen();
+        let name = format!("{}-end.log", "longname".repeat(18));
+        let directory = root.path().join("ci");
+        fs::create_dir(&directory).unwrap();
+        let target = directory.join(&name);
+        fs::write(&target, "previous log").unwrap();
+        app.form = app.github.save_log(602, &[format!("ci/{name}")]).unwrap();
+
+        let shown = frame(&mut app, 100, 30);
+        let body = (0..30)
+            .filter_map(|row| {
+                let row = shown.grid.row_text(row);
+                let (_, inside) = row.split_once('│')?;
+                let (inside, _) = inside.split_once('│')?;
+                Some(inside.trim().to_owned())
+            })
+            .collect::<String>();
+        let resolved = crate::files::canonicalize(&target).unwrap();
+        assert!(body.contains(resolved.to_str().unwrap()), "{body}");
+    }
+
+    #[test]
+    fn the_replace_question_wraps_the_sharing_remedy_at_100_columns() {
+        let (root, mut app) = actions_screen();
+        fs::write(root.path().join("test.log"), "previous log").unwrap();
+        open_log_save(&mut app);
+        app.form_key(&ctrl_enter()).unwrap();
+        let notice = "Couldn't replace the log: close the file in the other program and try again.";
+        app.report(Err(notice.into()));
+
+        let shown = frame(&mut app, 100, 30);
+        let rows: Vec<Vec<char>> = (0..30)
+            .map(|row| shown.grid.row_text(row).chars().collect())
+            .collect();
+        // The sheet's own columns: from its top-left corner to its top-right corner.
+        let (top, left, right) = rows
+            .iter()
+            .enumerate()
+            .find_map(|(y, row)| {
+                let text: String = row.iter().collect();
+                if !text.contains("Replace test.log?") {
+                    return None;
+                }
+                let left = row.iter().position(|c| *c == '╭')?;
+                let right = left + row[left..].iter().position(|c| *c == '╮')?;
+                Some((y, left, right))
+            })
+            .unwrap_or_else(|| panic!("no replace sheet"));
+        let body = rows[top + 1..]
+            .iter()
+            .take_while(|row| row.get(left) == Some(&'│'))
+            .map(|row| {
+                row[left + 1..right.min(row.len())]
+                    .iter()
+                    .collect::<String>()
+                    .trim()
+                    .to_owned()
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(body.contains(notice), "{body}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn saving_through_a_dangling_symlink_creates_then_replaces_its_referent() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let alias = root.path().join("latest.log");
+        let referent = root.path().join("build.log");
+        symlink("build.log", &alias).unwrap();
+        let mut workspace = workspace();
+        workspace.root = root.path().into();
+
+        let values = ["latest.log".to_owned()];
+        assert!(workspace.save_log(602, &values).unwrap().is_none());
+        assert!(
+            fs::read_to_string(&referent)
+                .unwrap()
+                .contains("running 3 tests")
+        );
+
+        fs::write(&referent, "replace me").unwrap();
+        let form = workspace.save_log(602, &values).unwrap().unwrap();
+        assert_eq!(fs::read_to_string(&referent).unwrap(), "replace me");
+        let FormAction::Github(action) = form.action else {
+            panic!("expected a replacement question for latest.log");
+        };
+        assert!(workspace.submit_log(&action, &[]).unwrap().is_none());
+        assert_eq!(fs::read_link(alias).unwrap(), Path::new("build.log"));
+        assert!(
+            fs::read_to_string(referent)
+                .unwrap()
+                .contains("running 3 tests")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_file_open_without_delete_sharing_is_not_replaced() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("build.log");
+        fs::write(&target, "keep this").unwrap();
+        let mut workspace = workspace();
+        workspace.root = root.path().into();
+        let form = workspace
+            .save_log(602, &["build.log".into()])
+            .unwrap()
+            .unwrap();
+        let FormAction::Github(action) = form.action else {
+            panic!("expected a replacement question for build.log");
+        };
+
+        let held = File::options()
+            .read(true)
+            .share_mode(3)
+            .open(&target)
+            .unwrap();
+        let error = workspace.submit_log(&action, &[]).err();
+        assert_eq!(
+            error.as_deref(),
+            Some("Couldn't replace the log: close the file in the other program and try again.")
+        );
+        assert_eq!(fs::read_to_string(&target).unwrap(), "keep this");
+        assert_eq!(fs::read_dir(root.path()).unwrap().count(), 1);
+        drop(held);
+
+        assert!(workspace.submit_log(&action, &[]).unwrap().is_none());
+        assert!(
+            fs::read_to_string(&target)
+                .unwrap()
+                .contains("running 3 tests")
+        );
+    }
+
     #[test]
     fn saving_a_log_hides_unknown_folder_errors() {
         let mut workspace = workspace();
         let directory = tempfile::tempdir().unwrap();
         workspace.root = directory.path().to_owned();
         assert_eq!(
-            workspace.save_log(602, &["private\0/log.txt".into()]),
-            Err("Couldn't create the folder".into())
+            workspace
+                .save_log(602, &["private\0/log.txt".into()])
+                .err()
+                .as_deref(),
+            Some("Couldn't create the folder")
         );
         std::fs::write(directory.path().join("occupied"), "").unwrap();
         assert_eq!(
-            workspace.save_log(602, &["occupied/log.txt".into()]),
-            Err("Couldn't create the folder · already exists".into())
+            workspace
+                .save_log(602, &["occupied/log.txt".into()])
+                .err()
+                .as_deref(),
+            Some("Couldn't create the folder · already exists")
         );
     }
 
@@ -6267,19 +6909,27 @@ mod tests {
         let mut workspace = workspace();
         let directory = tempfile::tempdir().unwrap();
         workspace.root = directory.path().to_owned();
-        // Writing over a folder: Linux and macOS give an error the notice doesn't name,
-        // Windows "access denied".
-        let error = workspace.save_log(602, &[".".into()]).err();
+        // A directory isn't a file we can offer to replace.
+        std::fs::create_dir(directory.path().join("folder")).unwrap();
+        let error = workspace.save_log(602, &["folder".into()]).err();
         assert!(
             matches!(
                 error.as_deref(),
-                Some("Couldn't save the log" | "Couldn't save the log · permission denied")
+                Some(
+                    "Couldn't save the log: the path is a folder"
+                        | "Couldn't save the log: permission denied"
+                )
             ),
             "{error:?}"
         );
         workspace.notice = "Couldn't save the log".into();
         workspace.notice_error = true;
-        workspace.save_log(602, &["test.log".into()]).unwrap();
+        assert!(
+            workspace
+                .save_log(602, &["test.log".into()])
+                .unwrap()
+                .is_none()
+        );
         assert_eq!(workspace.notice, "Saved 3 lines to test.log");
         assert!(!workspace.notice_error);
         assert!(
