@@ -118,13 +118,15 @@ fn language_mapping_preserves_case_sensitive_cpp_extensions() {
 
 #[test]
 fn file_uris_validate_authorities() {
-    for uri in [
+    // Named so the loop stays a loop on Windows, where only the first entry remains.
+    let accepted = [
         "file:///home/user/a%20b.rs",
         #[cfg(unix)]
         "file://localhost/home/user/a%20b.rs",
         #[cfg(unix)]
         "file://LOCALHOST/home/user/a%20b.rs",
-    ] {
+    ];
+    for uri in accepted {
         assert_eq!(
             path_from_file_uri(uri).as_deref(),
             Some(Path::new("/home/user/a b.rs"))
