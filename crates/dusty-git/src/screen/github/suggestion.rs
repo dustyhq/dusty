@@ -4,8 +4,8 @@
 use super::lines::Line;
 use super::prose::{Rich, role, strong};
 use super::*;
-use crate::forge::request::Write;
-use crate::ui::{GitRole, GitSurface};
+use crate::forge::{provider::ProviderKind, request::Write};
+use crate::ui::{GitRole, GitSurface, parse_unified_patch};
 use unicode_width::UnicodeWidthStr;
 
 /// A comment body cut at its suggestion blocks.
@@ -84,22 +84,113 @@ pub(super) fn first(body: &str) -> Option<Vec<String>> {
     })
 }
 
-/// The `count` lines a comment on the end of `hunk` covers: the last lines of its new side.
-pub(super) fn original(hunk: &str, count: usize) -> Vec<String> {
-    let new_side = hunk
-        .lines()
-        .filter(|line| !line.starts_with("@@") && !line.starts_with('-') && !line.starts_with('\\'))
-        .map(|line| line.get(1..).unwrap_or_default().to_owned())
-        .collect::<Vec<_>>();
-    new_side[new_side.len().saturating_sub(count)..].to_vec()
+/// Read exactly the requested right-side lines from a GitHub hunk excerpt.
+fn original(hunk: &str, start: u64, end: u64) -> Option<Vec<String>> {
+    let header = hunk.lines().next()?;
+    let (left, _) = header.strip_prefix("@@ -")?.split_once(" @@")?;
+    let (_, right) = left.split_once(" +")?;
+    let (first, count) = match right.split_once(',') {
+        Some((first, count)) => (first.parse::<u64>().ok()?, count.parse::<u64>().ok()?),
+        None => (right.parse::<u64>().ok()?, 1),
+    };
+    if first == 0 || start < first || start > end || end - first >= count {
+        return None;
+    }
+    // Use the Files parser's line numbers, including counted blank context lines.
+    let excerpt = hunk.split_once("\n@@ ").map_or(hunk, |(first, _)| first);
+    let parsed = parse_unified_patch(excerpt, "").hunks.into_iter().next()?;
+    if parsed.header != header {
+        return None;
+    }
+    let mut next = start;
+    let mut lines = Vec::new();
+    for entry in parsed.lines {
+        let Some(number) = entry.new_number.map(u64::from) else {
+            continue;
+        };
+        if number < start {
+            continue;
+        }
+        if number != next {
+            return None;
+        }
+        lines.push(entry.text);
+        if number == end {
+            return Some(lines);
+        }
+        next += 1;
+    }
+    None
 }
 
-/// How many lines a comment on `start..=line` covers.
-pub(super) fn span(start: Option<u64>, line: Option<u64>) -> usize {
-    match (start, line) {
-        (Some(start), Some(line)) if start <= line => (line - start + 1) as usize,
-        _ => 1,
+fn right_range(thread: &Value) -> Option<(u64, u64)> {
+    if thread["diffSide"] != "RIGHT" || thread["startDiffSide"] == "LEFT" {
+        return None;
     }
+    let end = thread["line"].as_u64()?;
+    let start = thread["startLine"].as_u64().unwrap_or(end);
+    (0 < start && start <= end).then_some((start, end))
+}
+
+fn original_lines(thread: &Value) -> Option<Vec<String>> {
+    if thread["diffSide"] != "RIGHT" || thread["startDiffSide"] == "LEFT" {
+        return None;
+    }
+    let anchor = thread["comments"]["nodes"].as_array()?.first()?;
+    let end = thread["originalLine"]
+        .as_u64()
+        .or_else(|| anchor["originalLine"].as_u64())?;
+    let start = match thread["originalStartLine"].as_u64() {
+        Some(start) => start,
+        // Without the original start, the current start of a range is not a safe fallback.
+        None if thread["startLine"].is_number() => return None,
+        None => end,
+    };
+    original(anchor["diffHunk"].as_str()?, start, end)
+}
+
+/// Gitea/Forgejo only provide the current coordinates. The hunk excerpt's right-side
+/// tail is useful for display, but isn't proof of the original coordinates for a write.
+fn preview_hunk_tail(thread: &Value) -> Option<Vec<String>> {
+    let (start, end) = right_range(thread)?;
+    let anchor = thread["comments"]["nodes"].as_array()?.first()?;
+    if thread["originalLine"].is_number() || anchor["originalLine"].is_number() {
+        return None;
+    }
+    let count = usize::try_from(end - start + 1).ok()?;
+    let mut lines: Vec<_> = parse_unified_patch(anchor["diffHunk"].as_str()?, "")
+        .hunks
+        .into_iter()
+        .flat_map(|hunk| hunk.lines)
+        .filter(|entry| entry.new_number.is_some())
+        .map(|entry| entry.text)
+        .collect();
+    Some(lines.split_off(lines.len().saturating_sub(count)))
+}
+
+/// Compare the historical text with the current right side, without borrowing coordinates
+/// from a different file or from an earlier revision of the patch.
+fn current_lines_match(patch: &str, path: &str, start: u64, end: u64, expected: &[String]) -> bool {
+    use super::super::preview::header_path;
+    use std::path::Path;
+
+    patch.split("\ndiff --git ").any(|file| {
+        let current = file
+            .lines()
+            .take_while(|line| !line.starts_with("@@"))
+            .find_map(|line| header_path(line.strip_prefix("+++ ")?));
+        current.as_deref() == Some(Path::new(path))
+            && file.match_indices("\n@@ ").any(|(at, _)| {
+                original(&file[at + 1..], start, end)
+                    .is_some_and(|lines| lines.as_slice() == expected)
+            })
+    })
+}
+
+fn replacement(thread: &Value) -> Option<(&str, Vec<String>)> {
+    array(&thread["comments"], "nodes")
+        .iter()
+        .find_map(|comment| Some((comment["id"].as_str()?, first(comment["body"].as_str()?)?)))
 }
 
 /// `Suggested change`, then the replaced lines and the suggested ones, as a diff.
@@ -157,48 +248,20 @@ pub(super) fn rows(
     }
 }
 
-/// A thread's suggestion, ready to commit: lines `start..=end` of `path`.
-pub(super) struct Found {
-    pub(super) path: String,
-    pub(super) start: u64,
-    pub(super) end: u64,
-    /// The lines it replaces, from the thread's hunk; empty when the hunk does not reach them.
-    pub(super) original: Vec<String>,
-    pub(super) replacement: Vec<String>,
-}
-
-/// The first suggestion in a review thread (the forge's thread JSON); `None` when it has none
-/// or the thread is outdated (its line is gone from the diff).
-pub(super) fn found(thread: &Value) -> Option<Found> {
-    let comments = thread["comments"]["nodes"].as_array()?;
-    let (comment, replacement) = comments
-        .iter()
-        .find_map(|comment| Some((comment, first(comment["body"].as_str()?)?)))?;
-    let end = thread["line"]
-        .as_u64()
-        .or_else(|| comment["line"].as_u64())?;
-    let start = thread["startLine"]
-        .as_u64()
-        .filter(|start| *start <= end)
-        .unwrap_or(end);
-    let path = thread["path"]
-        .as_str()
-        .filter(|path| !path.is_empty())
-        .or_else(|| comment["path"].as_str())?
-        .to_owned();
-    let count = span(Some(start), Some(end));
-    let original = original(comment["diffHunk"].as_str().unwrap_or_default(), count);
-    Some(Found {
-        path,
-        start,
-        end,
-        original: if original.len() == count {
-            original
-        } else {
-            Vec::new()
-        },
-        replacement,
-    })
+/// The reviewed lines and their revision, kept with the form until it submits.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(in crate::screen) struct Snapshot {
+    target: ForgeTarget,
+    pub(super) number: u64,
+    thread: String,
+    comment: String,
+    path: String,
+    start: u64,
+    end: u64,
+    original: Vec<String>,
+    replacement: Vec<String>,
+    branch: String,
+    head: String,
 }
 
 fn lines_text(start: u64, end: u64) -> String {
@@ -213,37 +276,98 @@ fn lines_text(start: u64, end: u64) -> String {
 const MESSAGE: &str = "Apply suggestion from code review";
 
 impl Workspace {
-    fn suggestion(&self, number: u64, thread: &str) -> Result<Found, String> {
+    fn suggestion_thread(&self, number: u64, id: &str) -> Option<&Value> {
         self.review_threads(number)
             .into_iter()
-            .find(|candidate| candidate["id"].as_str() == Some(thread))
-            .and_then(found)
-            .ok_or_else(|| "That suggestion is no longer on the pull request · R refreshes".into())
+            .find(|thread| thread["id"] == id)
     }
 
-    /// Whether a thread offers `Commit suggestion`: an open thread with a suggestion on a line
-    /// still in the diff, on GitHub, signed in.
+    pub(super) fn suggestion_original(&self, number: u64, id: &str) -> Vec<String> {
+        self.suggestion_thread(number, id)
+            .map(|thread| self.suggestion_preview(thread))
+            .unwrap_or_default()
+    }
+
+    pub(super) fn suggestion_preview(&self, thread: &Value) -> Vec<String> {
+        original_lines(thread)
+            .or_else(|| match self.forge_kind() {
+                Some(ProviderKind::Gitea | ProviderKind::Forgejo) => preview_hunk_tail(thread),
+                _ => None,
+            })
+            .unwrap_or_default()
+    }
+
+    fn can_commit_suggestion(&self) -> bool {
+        !self.read_only()
+            && !matches!(
+                self.forge_kind(),
+                Some(ProviderKind::GitLab | ProviderKind::Gitea | ProviderKind::Forgejo)
+            )
+    }
+
+    /// Conversation and Activity only need the Files patch when they can offer a suggestion.
+    pub(super) fn wants_suggestion_patch(&self, number: u64) -> bool {
+        matches!(self.pr_tab, pr::CONVERSATION | 4 | 5)
+            && self.can_commit_suggestion()
+            && self.review_threads(number).into_iter().any(|thread| {
+                thread["isResolved"] == false
+                    && right_range(thread).is_some()
+                    && replacement(thread).is_some()
+                    && original_lines(thread).is_some()
+            })
+    }
+
+    fn suggestion(&self, number: u64, id: &str) -> Option<Snapshot> {
+        if !self.can_commit_suggestion() {
+            return None;
+        }
+        let thread = self.suggestion_thread(number, id)?;
+        if thread["isResolved"] != false {
+            return None;
+        }
+        let head = self.review_head(number);
+        self.check_inline_head(number, head).ok()?;
+        let branch = string(self.value(&Key::Item(2, number))?, "headRefName");
+        let path = string(thread, "path");
+        if branch.is_empty() || path.is_empty() {
+            return None;
+        }
+        let (start, end) = right_range(thread)?;
+        let original = original_lines(thread)?;
+        let (comment, replacement) = replacement(thread)?;
+        let patch = self.raw(&Key::Diff(number))?;
+        if !current_lines_match(patch, path, start, end, &original) {
+            return None;
+        }
+        Some(Snapshot {
+            target: self.target(),
+            number,
+            thread: id.to_owned(),
+            comment: comment.to_owned(),
+            path: path.to_owned(),
+            start,
+            end,
+            original,
+            replacement,
+            branch: branch.to_owned(),
+            head: head.to_owned(),
+        })
+    }
+
+    /// Offer the action only on a signed-in, open thread with a current right-side hunk.
     pub(super) fn offers_commit(&self, number: u64, thread: &str) -> bool {
-        use crate::forge::provider::ProviderKind;
-        !matches!(
-            self.forge_kind(),
-            Some(ProviderKind::GitLab | ProviderKind::Gitea | ProviderKind::Forgejo)
-        ) && !self.read_only()
-            && self
-                .review_threads(number)
-                .into_iter()
-                .find(|candidate| candidate["id"].as_str() == Some(thread))
-                .is_some_and(|thread| {
-                    thread["isResolved"].as_bool() == Some(false) && found(thread).is_some()
-                })
+        self.suggestion(number, thread).is_some()
     }
 
     /// The sheet for `Commit suggestion`: the commit message, GitHub's default filled in.
-    pub(super) fn suggestion_form(&mut self, action: &Action) -> Result<Option<Form>, String> {
+    pub(super) fn suggestion_form(&self, action: &Action) -> Result<Option<Form>, String> {
         let Action::CommitSuggestion(number, thread) = action else {
             return Ok(None);
         };
-        let found = self.suggestion(*number, thread)?;
+        self.check_inbox_action(action)?;
+        let snapshot = self
+            .suggestion(*number, thread)
+            .ok_or("That suggestion is no longer on the pull request · R refreshes")?;
         let fields = vec![super::actions::field(
             "Commit message",
             MESSAGE,
@@ -252,54 +376,39 @@ impl Workspace {
         )];
         let title = format!(
             "Commit suggestion to {}:{}",
-            found.path,
-            lines_text(found.start, found.end)
+            snapshot.path,
+            lines_text(snapshot.start, snapshot.end)
         );
-        Ok(Some(self.form(&title, action.clone(), fields)))
+        Ok(Some(self.form(
+            &title,
+            Action::ConfirmSuggestion(Box::new(snapshot)),
+            fields,
+        )))
     }
 
     /// The line under the sheet's title: where the commit goes and what it changes.
-    pub(super) fn suggestion_note(&self, action: &Action) -> Option<String> {
-        let Action::CommitSuggestion(number, thread) = action else {
-            return None;
-        };
-        let found = self.suggestion(*number, thread).ok()?;
-        let branch = self
-            .item()
-            .map(|item| string(item, "headRefName").to_owned())
-            .unwrap_or_default();
-        let replaced = (found.end - found.start + 1) as usize;
+    pub(super) fn suggestion_note(&self, snapshot: &Snapshot) -> String {
         let words = |count: usize| format!("{count} line{}", if count == 1 { "" } else { "s" });
-        let change = if found.replacement.is_empty() {
-            format!("deletes {}", words(replaced))
+        let replaced = words(snapshot.original.len());
+        let change = if snapshot.replacement.is_empty() {
+            format!("deletes {replaced}")
         } else {
             format!(
-                "replaces {} with {}",
-                words(replaced),
-                words(found.replacement.len())
+                "replaces {replaced} with {}",
+                words(snapshot.replacement.len())
             )
         };
-        Some(if branch.is_empty() {
-            format!("Commits to the head branch · {change}")
-        } else {
-            format!("Commits to {branch} · {change}")
-        })
+        format!("Commits to {} · {change}", snapshot.branch)
     }
 
-    /// The write for a confirmed `Commit suggestion`, pinned to the head it was read at.
+    /// The write uses exactly the destination and suggestion confirmed in the sheet.
     pub(super) fn suggestion_write(
         &self,
-        number: u64,
-        thread: &str,
+        snapshot: &Snapshot,
         values: &[String],
     ) -> Result<Write, String> {
-        let found = self.suggestion(number, thread)?;
-        let head = self
-            .value(&Key::Item(2, number))
-            .map(|item| string(item, "headRefOid").to_owned())
-            .unwrap_or_default();
-        if head.is_empty() {
-            return Err("Refresh the pull request before committing a suggestion".into());
+        if self.suggestion(snapshot.number, &snapshot.thread).as_ref() != Some(snapshot) {
+            return Err("The suggestion changed. Refresh and open it again.".into());
         }
         let message = values
             .first()
@@ -307,13 +416,13 @@ impl Workspace {
             .filter(|message| !message.is_empty())
             .unwrap_or(MESSAGE);
         Ok(Write::CommitSuggestion {
-            number,
-            path: found.path,
-            start: found.start,
-            end: found.end,
-            original: found.original,
-            replacement: found.replacement,
-            head,
+            number: snapshot.number,
+            path: snapshot.path.clone(),
+            start: snapshot.start,
+            end: snapshot.end,
+            original: snapshot.original.clone(),
+            replacement: snapshot.replacement.clone(),
+            head: snapshot.head.clone(),
             message: message.to_owned(),
         })
     }
@@ -339,9 +448,9 @@ mod tests {
     }
 
     #[test]
-    fn the_replaced_lines_are_the_end_of_the_hunks_new_side() {
-        let hunk = "@@ -1,3 +1,4 @@\n keep\n-old\n+one\n+two\n\\ No newline at end of file";
-        assert_eq!(original(hunk, 2), vec!["one".to_owned(), "two".to_owned()]);
+    fn a_hunk_must_cover_the_exact_right_side_range() {
+        let hunk = "@@ -1,3 +5,4 @@\n keep\n-old\n+one\n+two\n\\ No newline at end of file";
+        assert_eq!(original(hunk, 6, 7), Some(vec!["one".into(), "two".into()]));
         assert_eq!(
             original(hunk, 5, 6),
             Some(vec!["keep".into(), "one".into()])
@@ -479,8 +588,6 @@ mod tests {
             original_lines(&thread).is_none(),
             "writes require original coordinates"
         );
-        assert_eq!(span(Some(2), Some(4)), 3);
-        assert_eq!(span(None, Some(4)), 1);
     }
 
     #[test]

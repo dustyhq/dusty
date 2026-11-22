@@ -710,7 +710,10 @@ fn thread(number: u64, discussion: &Value) -> Option<ReviewThread> {
         total_comments: None,
         // Discussions carry a position, not the diff lines around it.
         diff_hunk: None,
+        diff_head: None,
         start_line: None,
+        original_start_line: None,
+        start_side: None,
     })
 }
 
@@ -2072,6 +2075,7 @@ impl GitLab {
                     .collect(),
             ),
             Read::Diff(number) => {
+                let before = Self::diff_refs(ctx, *number, cancel)?;
                 let files = match Self::rest_pages(ctx, requests.remove(0), cancel) {
                     Ok((files, _)) => files,
                     // `/diffs` is GitLab ≥ 15.7; `/changes` carries the same entries.
@@ -2088,7 +2092,17 @@ impl GitLab {
                     }
                     Err(error) => return Err(error),
                 };
-                Payload::Text(assemble_diff(&files))
+                let after = Self::diff_refs(ctx, *number, cancel)?;
+                let refs = &before["diff_refs"];
+                let head = if refs == &after["diff_refs"] {
+                    text(refs, "head_sha")
+                } else {
+                    String::new()
+                };
+                Payload::Diff {
+                    head,
+                    text: assemble_diff(&files),
+                }
             }
             Read::CommitDiff(_) => Payload::Text(assemble_diff(
                 &Self::rest_pages(ctx, requests.remove(0), cancel)?.0,

@@ -50,11 +50,35 @@ fn hunk_stats(diff: &str) -> std::collections::BTreeMap<String, (u64, u64)> {
     stats
 }
 
+pub(super) const OUTDATED_DIFF: &str = "The diff is outdated. Refresh before commenting.";
+
+impl Workspace {
+    pub(super) fn patch_head(&self, number: u64) -> &str {
+        self.value(&Key::Diff(number))
+            .map_or("", |patch| string(patch, "headRefOid"))
+    }
+
+    pub(super) fn review_head(&self, number: u64) -> &str {
+        self.value(&Key::Item(2, number))
+            .map_or("", |item| string(item, "headRefOid"))
+    }
+
+    pub(super) fn check_inline_head(&self, number: u64, head: &str) -> Result<(), String> {
+        if head.is_empty() || head != self.patch_head(number) || head != self.review_head(number) {
+            return Err(OUTDATED_DIFF.into());
+        }
+        Ok(())
+    }
+}
+
 /// The diff's counts once it is here, so the tree, the file heading, `Changes` and the
 /// merge box's `Brings` all count the hunks on screen (R16 prs-02); the forge's own numbers
 /// until then, or for a file the diff does not carry.
 pub(super) fn diff_counted(workspace: &Workspace, id: u64, record: &DetailRecord) -> DetailRecord {
     let mut record = record.clone();
+    if workspace.patch_head(id) != record.head_sha {
+        return record;
+    }
     let Some(diff) = workspace.raw(&Key::Diff(id)) else {
         return record;
     };
@@ -181,7 +205,10 @@ pub(super) fn rows(
         return;
     }
     let preview = Preview::git(workspace.raw(&Key::Diff(id)).unwrap_or_default(), None);
-    let head = record.head_sha.clone();
+    let head = workspace.patch_head(id);
+    if workspace.check_inline_head(id, head).is_err() {
+        rows.push(muted(OUTDATED_DIFF));
+    }
     let path = Path::new(&selected);
     let diff_start = rows.len();
     let wrap = (!workspace.diff_nowrap).then(|| diff_width(workspace, width));
@@ -191,7 +218,7 @@ pub(super) fn rows(
     } else {
         ""
     };
-    unified(&preview, path, id, &head, rows, wrap, finding);
+    unified(&preview, path, id, head, rows, wrap, finding);
     let conversation = if wide {
         width.saturating_sub(((width + 5) / 3).clamp(24, 42))
     } else {

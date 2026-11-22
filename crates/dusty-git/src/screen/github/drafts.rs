@@ -74,16 +74,52 @@ pub(super) struct Anchor {
     pub(super) path: String,
     pub(super) line: u32,
     pub(super) side: &'static str,
+    pub(super) head: String,
+}
+
+type Scope = (String, String, Option<super::AccountNamespace>);
+
+pub(super) struct SentReview {
+    pub(super) ids: BTreeSet<String>,
+    pub(super) account: Option<super::AccountNamespace>,
+    /// Spelling of the draft directory at submit, independent of the wire target.
+    pub(super) repo: String,
 }
 
 #[derive(Default)]
 pub(super) struct Review {
-    /// The (host, repository) whose drafts `inline_drafts` holds.
-    scope: Option<(String, String)>,
+    /// The host, repository and namespace whose drafts `inline_drafts` holds.
+    scope: Option<Scope>,
     /// What the state directory holds for that scope: only changes are written.
-    saved: Drafts,
+    saved: SavedDrafts,
+    parked: BTreeMap<Scope, ParkedDrafts>,
+    save_issue: Option<SaveIssue>,
+    retry_at: Option<std::time::Instant>,
     pub(super) anchor: Option<Anchor>,
 }
+
+struct ParkedDrafts {
+    drafts: Drafts,
+    saved: SavedDrafts,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SaveIssue {
+    Failed,
+    NoDirectory,
+}
+
+impl SaveIssue {
+    fn notice(self) -> &'static str {
+        match self {
+            Self::Failed => "Couldn't save review drafts",
+            Self::NoDirectory => "Review drafts aren't saved between sessions.",
+        }
+    }
+}
+
+/// A failed write is retried on a later poll, not on every paint loop.
+const SAVE_RETRY: std::time::Duration = std::time::Duration::from_secs(1);
 
 fn segment(text: &str) -> String {
     let mut escaped = String::new();
@@ -191,7 +227,7 @@ fn encode(drafts: &[PendingDraft]) -> Value {
     })
 }
 
-pub(super) fn decode(value: &Value) -> Vec<(InlineDraft, String)> {
+fn decode(value: &Value, source: &str) -> Vec<PendingDraft> {
     if value["schema"].as_u64() != Some(SCHEMA) {
         return Vec::new();
     }
@@ -199,15 +235,21 @@ pub(super) fn decode(value: &Value) -> Vec<(InlineDraft, String)> {
         .as_array()
         .into_iter()
         .flatten()
-        .filter_map(|draft| {
+        .enumerate()
+        .filter_map(|(index, draft)| {
             let path = draft["path"].as_str()?.to_owned();
             let body = draft["body"].as_str()?.to_owned();
             let line = draft["line"].as_u64()?;
             if path.is_empty() || body.trim().is_empty() || line == 0 {
                 return None;
             }
-            Some((
-                InlineDraft {
+            Some(PendingDraft {
+                // Old files did not store IDs. The stored spelling and row position keep
+                // identical rows in two different files distinct.
+                id: draft["id"]
+                    .as_str()
+                    .map_or_else(|| format!("legacy-{source}-{index}"), str::to_owned),
+                comment: InlineDraft {
                     path,
                     line,
                     start_line: draft["start_line"].as_u64(),
@@ -218,16 +260,10 @@ pub(super) fn decode(value: &Value) -> Vec<(InlineDraft, String)> {
                     },
                     body,
                 },
-                draft["head"].as_str().unwrap_or_default().to_owned(),
-            ))
+                head: draft["head"].as_str().unwrap_or_default().to_owned(),
+            })
         })
         .collect()
-}
-
-pub(super) fn load(host: &str, repo: &str) -> Drafts {
-    directory(host, repo)
-        .map(|directory| load_from(&directory))
-        .unwrap_or_default()
 }
 
 fn load_from(directory: &std::path::Path) -> Drafts {
@@ -344,78 +380,243 @@ fn wrap(text: &str, width: usize) -> Vec<String> {
 
 impl Workspace {
     /// The drafts waiting for the review of `number`.
-    pub(super) fn review_drafts(&self, number: u64) -> &[(InlineDraft, String)] {
+    pub(super) fn review_drafts(&self, number: u64) -> &[PendingDraft] {
         self.inline_drafts
             .get(&number)
             .map(Vec::as_slice)
             .unwrap_or_default()
     }
 
-    /// From `poll`: loads the drafts of the repository on screen and writes what changed.
-    pub(super) fn sync_drafts(&mut self) -> bool {
-        if self.host.is_empty() || self.repo.is_empty() {
+    fn outdated_drafts(&self, number: u64) -> impl Iterator<Item = (usize, &PendingDraft)> {
+        let current = self.review_head(number);
+        self.review_drafts(number)
+            .iter()
+            .enumerate()
+            .filter(move |(_, draft)| !current.is_empty() && draft.head != current)
+    }
+
+    pub(super) fn outdated_notice(&self, number: u64) -> Option<String> {
+        match self.outdated_drafts(number).count() {
+            0 => None,
+            1 => Some("1 draft doesn't match this version of the pull request. See Outdated drafts to copy or delete it.".into()),
+            count => Some(format!("{count} drafts don't match this version of the pull request. See Outdated drafts to copy or delete them.")),
+        }
+    }
+
+    /// Take the user from the refused review sheet to the drafts that block it.
+    pub(in crate::screen) fn open_outdated_drafts(&mut self, action: &Action, error: &str) -> bool {
+        let Action::Review(number) = action.unscoped() else {
+            return false;
+        };
+        if self.page != 2
+            || self.number() != *number
+            || self.outdated_notice(*number).as_deref() != Some(error)
+        {
             return false;
         }
-        let scope = (self.host.clone(), self.repo.clone());
-        if self.review.scope.as_ref() == Some(&scope) {
-            self.flush_drafts();
+        if self.activate(Action::PrTab(pr::CONVERSATION)).is_err() {
             return false;
         }
-        let first = self.review.scope.is_none();
-        self.flush_drafts();
-        let loaded = load(&scope.0, &scope.1);
-        let mut drafts = loaded.clone();
-        if first {
-            // Drafts made before the repository first resolved stay with it.
-            for (number, held) in std::mem::take(&mut self.inline_drafts) {
-                drafts.insert(number, held);
-            }
-        }
-        self.inline_drafts = drafts;
-        self.review.saved = loaded;
-        self.review.scope = Some(scope);
-        self.review.anchor = None;
-        self.flush_drafts();
+        self.reading = false;
+        self.reading_position.context = None;
         true
     }
 
-    fn flush_drafts(&mut self) {
-        let Some((host, repo)) = self.review.scope.clone() else {
-            return;
+    /// The one revision shared by all drafts, if they still describe the current head.
+    pub(super) fn pending_review_head(&self, number: u64) -> Result<Option<&str>, String> {
+        let drafts = self.review_drafts(number);
+        let Some(first) = drafts.first() else {
+            return Ok(None);
         };
-        if self.inline_drafts == self.review.saved {
-            return;
+        let current = self.review_head(number);
+        if current.is_empty() {
+            return Err("Refresh the pull request before submitting drafts.".into());
         }
-        let numbers = self
-            .inline_drafts
-            .keys()
-            .chain(self.review.saved.keys())
-            .copied()
-            .collect::<BTreeSet<_>>();
-        for number in numbers {
-            let now = self
-                .inline_drafts
-                .get(&number)
-                .map(Vec::as_slice)
-                .unwrap_or_default();
-            if self
+        if let Some(notice) = self.outdated_notice(number) {
+            return Err(notice);
+        }
+        Ok(Some(&first.head))
+    }
+
+    /// Retire only the drafts sent by this write, even if another repository is on screen.
+    pub(super) fn clear_sent_review_drafts(
+        &mut self,
+        target: &ForgeTarget,
+        number: u64,
+        sent: &SentReview,
+    ) -> Result<(), String> {
+        self.clear_sent_review_drafts_with(target, number, sent, &directories)
+    }
+
+    fn clear_sent_review_drafts_with(
+        &mut self,
+        target: &ForgeTarget,
+        number: u64,
+        sent: &SentReview,
+        directory: &impl Fn(Option<&AccountNamespace>, &str, &str) -> Vec<PathBuf>,
+    ) -> Result<(), String> {
+        if sent.ids.is_empty() {
+            return Ok(());
+        }
+        let (Some(host), Some(repo)) = (&target.host, &target.repo) else {
+            return Ok(());
+        };
+        if !sent.repo.eq_ignore_ascii_case(repo) {
+            return Ok(());
+        }
+        let in_scope = |(h, r, account): &Scope| {
+            h == host && r.eq_ignore_ascii_case(repo) && account == &sent.account
+        };
+        let maps = if self.account != sent.account {
+            None
+        } else if self.review.scope.as_ref().is_some_and(in_scope) {
+            Some((&mut self.inline_drafts, &mut self.review.saved))
+        } else {
+            self.review
+                .parked
+                .iter_mut()
+                .find(|(scope, _)| in_scope(scope))
+                .map(|(_, parked)| (&mut parked.drafts, &mut parked.saved))
+        };
+        let mut saved = None;
+        if let Some((drafts, baseline)) = maps {
+            retire_ids(drafts, number, &sent.ids);
+            saved = Some(baseline);
+        }
+        let mut failure = None;
+        for path in directory(sent.account.as_ref(), host, &sent.repo) {
+            match retire_in(&path, number, &sent.ids) {
+                Ok(()) => {
+                    if let Some(snapshot) = saved
+                        .as_deref_mut()
+                        .and_then(|saved| saved.0.get_mut(&path))
+                    {
+                        retire_ids(snapshot, number, &sent.ids);
+                    }
+                }
+                Err(error) => {
+                    failure.get_or_insert(error);
+                }
+            }
+        }
+        failure.map_or(Ok(()), Err)
+    }
+
+    /// From `poll`: loads the drafts of the repository on screen and writes what changed.
+    pub(super) fn sync_drafts(&mut self) -> bool {
+        self.sync_drafts_with(&directories)
+    }
+
+    fn sync_drafts_with(
+        &mut self,
+        directory: &impl Fn(Option<&AccountNamespace>, &str, &str) -> Vec<PathBuf>,
+    ) -> bool {
+        if self.host.is_empty() || self.repo.is_empty() {
+            return false;
+        }
+        let scope = (self.host.clone(), self.repo.clone(), self.account.clone());
+        if self.review.scope.as_ref() == Some(&scope) {
+            return self
                 .review
-                .saved
-                .get(&number)
-                .map(Vec::as_slice)
-                .unwrap_or_default()
-                == now
-            {
-                continue;
+                .retry_at
+                .is_none_or(|at| std::time::Instant::now() >= at)
+                && self.flush_drafts_with(directory);
+        }
+
+        let previous = self.review.scope.replace(scope.clone());
+        let held = std::mem::take(&mut self.inline_drafts);
+        let saved = std::mem::take(&mut self.review.saved);
+        let first = previous.is_none();
+        if let Some(previous) = previous
+            && !saved.matches(&held)
+        {
+            self.review.parked.insert(
+                previous,
+                ParkedDrafts {
+                    drafts: held,
+                    saved,
+                },
+            );
+        } else if first {
+            // Drafts made before the repository first resolved stay with it.
+            self.inline_drafts = held;
+        }
+        if let Some(parked) = self.review.parked.remove(&scope) {
+            self.inline_drafts = parked.drafts;
+            self.review.saved = parked.saved;
+        } else {
+            let mut loaded = Drafts::new();
+            for path in directory(scope.2.as_ref(), &scope.0, &scope.1) {
+                let drafts = load_from(&path);
+                for (&number, comments) in &drafts {
+                    loaded
+                        .entry(number)
+                        .or_default()
+                        .extend_from_slice(comments);
+                }
+                if !drafts.is_empty() {
+                    self.review.saved.0.insert(path, drafts);
+                }
             }
-            if save(&host, &repo, number, now).is_err() {
-                self.notice = "Couldn't save review drafts".into();
-                self.notice_error = true;
+            for (number, drafts) in loaded {
+                self.inline_drafts.entry(number).or_insert(drafts);
             }
         }
-        self.review.saved = self.inline_drafts.clone();
-        self.inline_drafts.retain(|_, drafts| !drafts.is_empty());
-        self.review.saved.retain(|_, drafts| !drafts.is_empty());
+        self.review.anchor = None;
+        self.flush_drafts_with(directory);
+        true
+    }
+
+    pub(super) fn flush_drafts(&mut self) {
+        self.flush_drafts_with(&directories);
+    }
+
+    pub(super) fn retire_review_drafts(&mut self) {
+        self.flush_drafts();
+        self.review = Review::default();
+        self.inline_drafts.clear();
+    }
+
+    fn flush_drafts_with(
+        &mut self,
+        directory: &impl Fn(Option<&AccountNamespace>, &str, &str) -> Vec<PathBuf>,
+    ) -> bool {
+        let Some((host, repo, account)) = &self.review.scope else {
+            return false;
+        };
+        let mut issue = flush_scope(
+            || directory(account.as_ref(), host, repo),
+            &mut self.inline_drafts,
+            &mut self.review.saved,
+        );
+        self.review.parked.retain(|(host, repo, account), parked| {
+            if let Some(parked_issue) = flush_scope(
+                || directory(account.as_ref(), host, repo),
+                &mut parked.drafts,
+                &mut parked.saved,
+            ) {
+                issue.get_or_insert(parked_issue);
+                true
+            } else {
+                false
+            }
+        });
+        self.review.retry_at = issue.map(|_| std::time::Instant::now() + SAVE_RETRY);
+        let previous = std::mem::replace(&mut self.review.save_issue, issue);
+        match issue {
+            Some(issue) if Some(issue) != previous => {
+                self.notice = issue.notice().into();
+                self.notice_error = issue == SaveIssue::Failed;
+                self.notice_transient = false;
+                true
+            }
+            None if previous.is_some_and(|issue| self.notice == issue.notice()) => {
+                self.notice.clear();
+                self.notice_error = false;
+                true
+            }
+            _ => false,
+        }
     }
 
     fn files_reader(&self) -> bool {
@@ -461,16 +662,20 @@ impl Workspace {
                     path,
                     line,
                     side,
-                    ..
+                    head,
                 }) = row
                 else {
                     return Some(Err("Move to a line of the diff to start a range".into()));
                 };
+                if let Err(error) = self.check_inline_head(number, &head) {
+                    return Some(Err(error));
+                }
                 let anchor = Anchor {
                     number,
                     path,
                     line,
                     side,
+                    head,
                 };
                 if self.review.anchor.as_ref() == Some(&anchor) {
                     self.review.anchor = None;
@@ -495,6 +700,11 @@ impl Workspace {
                     if anchor.number != number || anchor.path != path || anchor.side != side {
                         return Some(Err(
                             "A range stays in one file and on one side · Esc cancels it".into(),
+                        ));
+                    }
+                    if anchor.head != head {
+                        return Some(Err(
+                            "The range is on an older commit. Press Esc and start it again.".into(),
                         ));
                     }
                     if anchor.line == line {
@@ -531,8 +741,14 @@ impl Workspace {
     pub(super) fn draft_form(&mut self, action: &Action) -> Result<Option<Form>, String> {
         match action {
             Action::InlineRange {
-                path, start, line, ..
+                number,
+                path,
+                start,
+                line,
+                head,
+                ..
             } => {
+                self.check_inline_head(*number, head)?;
                 if let Some(reason) = self
                     .capabilities()
                     .inline_comment
@@ -589,6 +805,9 @@ impl Workspace {
                 side,
                 head,
             } => {
+                if let Err(error) = self.check_inline_head(*number, head) {
+                    return Some(Err(error));
+                }
                 let body = values.first().map(|body| body.trim()).unwrap_or_default();
                 if body.is_empty() {
                     return Some(Err("Comment is required".into()));
@@ -667,8 +886,14 @@ impl Workspace {
             }
             Action::Review(number) => {
                 let drafts = self.review_drafts(*number);
-                (!drafts.is_empty())
-                    .then(|| format!("Submits {} as one review", pending(drafts.len())))
+                match self.pending_review_head(*number) {
+                    Err(_) if self.outdated_drafts(*number).next().is_some() => {
+                        Some("Ctrl+Enter opens Outdated drafts".into())
+                    }
+                    Err(notice) => Some(notice),
+                    Ok(Some(_)) => Some(format!("Submits {} as one review", pending(drafts.len()))),
+                    Ok(None) => None,
+                }
             }
             _ => None,
         }
@@ -700,12 +925,11 @@ pub(super) fn mark_range(
     rows: &mut [Line],
     diff_start: usize,
 ) {
-    let Some(anchor) = workspace
-        .review
-        .anchor
-        .as_ref()
-        .filter(|anchor| anchor.number == id && anchor.path == path)
-    else {
+    let Some(anchor) = workspace.review.anchor.as_ref().filter(|anchor| {
+        anchor.number == id
+            && anchor.path == path
+            && workspace.check_inline_head(id, &anchor.head).is_ok()
+    }) else {
         return;
     };
     let cursor = match workspace
@@ -717,8 +941,9 @@ pub(super) fn mark_range(
             line,
             side,
             path: at,
+            head,
             ..
-        }) if *side == anchor.side && at == path => *line,
+        }) if *side == anchor.side && at == path && *head == anchor.head => *line,
         _ => anchor.line,
     };
     let (low, high) = (anchor.line.min(cursor), anchor.line.max(cursor));
@@ -743,6 +968,37 @@ pub(super) fn mark_range(
     }
 }
 
+/// Outdated drafts live here even if their file is absent from Files.
+pub(super) fn outdated_rows(workspace: &Workspace, id: u64, rows: &mut Vec<Line>, width: usize) {
+    let mut drafts = workspace.outdated_drafts(id).peekable();
+    if drafts.peek().is_none() {
+        return;
+    }
+    rows.push(super::prose::heading(
+        "Outdated drafts",
+        "y copy · c or Enter to edit or delete",
+    ));
+    for (index, pending) in drafts {
+        let draft = &pending.comment;
+        let action = Action::Draft(id, index);
+        let mut header = Line::button(
+            format!("{}:{}", draft.path, draft_lines(draft)),
+            action.clone(),
+        );
+        header.card = true;
+        rows.push(header);
+        for text in wrap(
+            &draft.body,
+            width.saturating_sub(4).min(super::prose::MEASURE),
+        ) {
+            let mut row = Rich::new().plain("  ").plain(&text).line();
+            row.action = Some(action.clone());
+            rows.push(row);
+        }
+    }
+    rows.push(super::prose::blank());
+}
+
 /// Draft cards under the lines they are about (after any review thread there); drafts whose
 /// line is not in this diff follow it.
 pub(super) fn place(
@@ -761,7 +1017,9 @@ pub(super) fn place(
     };
     let mut placed: Vec<(usize, usize, Vec<Line>)> = Vec::new();
     let mut trailing = Vec::new();
-    for (index, (draft, _)) in workspace.review_drafts(id).iter().enumerate() {
+    for (index, pending) in workspace.review_drafts(id).iter().enumerate() {
+        let draft = &pending.comment;
+        let head = &pending.head;
         if draft.path != path {
             continue;
         }
@@ -770,6 +1028,8 @@ pub(super) fn place(
         } else {
             "RIGHT"
         };
+        let outdated = head.is_empty() || head != workspace.review_head(id);
+        let matches_patch = !head.is_empty() && head == workspace.patch_head(id);
         let mut card = Vec::new();
         let header = Rich::new()
             .push(
@@ -804,9 +1064,13 @@ pub(super) fn place(
                     surface: GitSurface::Code,
                     emphasis: Emphasis::None,
                 },
-            )
-            .line();
-        card.push(header);
+            );
+        let header = if outdated {
+            header.sep().push("Outdated", role(GitRole::Muted))
+        } else {
+            header
+        };
+        card.push(header.line());
         let measure = width.saturating_sub(6).min(super::prose::MEASURE);
         let prose = |card: &mut Vec<Line>, text: &str| {
             for text in wrap(text, measure) {
@@ -829,6 +1093,7 @@ pub(super) fn place(
             Some(parts) => {
                 let start = draft.start_line.unwrap_or(draft.line);
                 let original = (start..=draft.line)
+                    .take_while(|_| matches_patch)
                     .filter_map(|line| {
                         rows[diff_start..]
                             .iter()
@@ -874,7 +1139,7 @@ pub(super) fn place(
         let line = draft.line as u32;
         let target = rows[diff_start..]
             .iter()
-            .rposition(|row| matches!(&row.action, Some(Action::Inline { line: at, side: s, .. }) if *at == line && *s == side))
+            .rposition(|row| matches_patch && matches!(&row.action, Some(Action::Inline { line: at, side: s, .. }) if *at == line && *s == side))
             .map(|at| {
                 // After the review threads already under that line.
                 let mut at = diff_start + at + 1;
@@ -918,8 +1183,8 @@ pub(super) fn review_row(workspace: &Workspace, id: u64) -> Line {
 mod tests {
     use super::*;
 
-    fn draft(line: u64, start: Option<u64>, body: &str) -> (InlineDraft, String) {
-        (
+    fn draft(line: u64, start: Option<u64>, body: &str) -> PendingDraft {
+        PendingDraft::new(
             InlineDraft {
                 path: "src/lib.rs".into(),
                 line,

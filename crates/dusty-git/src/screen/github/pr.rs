@@ -202,6 +202,9 @@ pub(super) fn rows(workspace: &Workspace, width: usize, mode: ExplorerIconMode) 
     let item = loaded.expect("loaded");
     // Every `+N −M` on the page counts the diff's hunks once it is here (R16 prs-02).
     let record = super::files::diff_counted(workspace, id, &record);
+    if workspace.pr_tab == CONVERSATION {
+        super::drafts::outdated_rows(workspace, id, &mut rows, width);
+    }
     match workspace.pr_tab {
         COMMITS => commits(workspace, &record, &mut rows, width, now, mode),
         CHECKS => checks(

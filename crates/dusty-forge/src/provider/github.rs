@@ -120,9 +120,9 @@ files(first: 100, after: $after) { pageInfo { hasNextPage endCursor } nodes { pa
 const THREADS_DOCUMENT: &str = "query ReviewThreads($owner: String!, $name: String!, $number: Int!, $after: String) { \
 repository(owner: $owner, name: $name) { pullRequest(number: $number) { \
 reviewThreads(first: 100, after: $after) { pageInfo { hasNextPage endCursor } nodes { \
-id isResolved path line originalLine startLine diffSide \
+id isResolved path line originalLine startLine originalStartLine diffSide startDiffSide \
 comments(first: 100) { totalCount nodes { id author { login __typename } authorAssociation body path line originalLine \
-createdAt lastEditedAt diffHunk commit { oid } reactionGroups { content users { totalCount } } } } } } } } }";
+createdAt lastEditedAt diffHunk commit { oid } originalCommit { oid } reactionGroups { content users { totalCount } } } } } } } } }";
 
 const FINGERPRINT_DOCUMENT: &str = "query PullRequestFingerprint($owner: String!, $name: String!, $number: Int!) { \
 repository(owner: $owner, name: $name) { pullRequest(number: $number) { \
@@ -595,11 +595,21 @@ fn thread(node: &Value) -> ReviewThread {
         commit: comments
             .first()
             .and_then(|comment| comment.position.as_ref()?.commit.clone()),
+        // The original hunk is not remapped when later commits move the thread's line.
+        diff_head: nodes(&node["comments"])
+            .first()
+            .and_then(|first| optional(&first["originalCommit"], "oid")),
         total_comments: total.filter(|total| *total > comments.len() as u64),
         diff_hunk: nodes(&node["comments"])
             .first()
             .and_then(|first| optional(first, "diffHunk")),
         start_line: node["startLine"].as_u64(),
+        original_start_line: node["originalStartLine"].as_u64(),
+        start_side: match node["startDiffSide"].as_str() {
+            Some("LEFT") => Some(Side::Left),
+            Some("RIGHT") => Some(Side::Right),
+            _ => None,
+        },
         comments,
     }
 }
@@ -1221,6 +1231,38 @@ impl GitHub {
         Ok(ctx.ok(&request, cancel)?.text())
     }
 
+    /// The PR diff media type only needs Pull requests: read. Anchor it only when
+    /// the head agrees on both sides of fetching the patch.
+    fn pull_diff(
+        ctx: &ForgeContext,
+        patch: &ApiRequest,
+        cancel: &AtomicBool,
+    ) -> Result<Payload, ForgeError> {
+        let metadata = patch.clone().accept(Accept::Json);
+        let head = || {
+            let pull = ctx.json(&metadata, cancel)?;
+            optional(&pull["head"], "sha").ok_or_else(|| {
+                ForgeError::BadResponse("Couldn't check which commit this diff is from.".into())
+            })
+        };
+        let read_once = || {
+            let before = head()?;
+            let text = Self::text_read(ctx, patch.clone(), cancel)?;
+            let after = head()?;
+            let head = if before == after {
+                before
+            } else {
+                String::new()
+            };
+            Ok::<_, ForgeError>((head, text))
+        };
+        let (mut head, mut text) = read_once()?;
+        if head.is_empty() {
+            (head, text) = read_once()?;
+        }
+        Ok(Payload::Diff { head, text })
+    }
+
     fn requests(ctx: &ForgeContext, read: &Read) -> Result<Vec<ApiRequest>, ForgeError> {
         let rest = |tail: &str| repos_path(ctx, tail).map(ApiRequest::get);
         let graphql = |document: &str, number: u64| {
@@ -1523,7 +1565,8 @@ impl GitHub {
             request.query.push(("since".into(), since.as_str().into()));
         }
         // Single REST reads revalidate with ETags; a 304 costs no rate limit.
-        if let ([request], Some(etag)) = (requests.as_mut_slice(), &cond.etag)
+        if !matches!(read, Read::Diff(_))
+            && let ([request], Some(etag)) = (requests.as_mut_slice(), &cond.etag)
             && matches!(request.target, Target::Rest(_))
             && request.method == Method::Get
         {
@@ -1679,9 +1722,8 @@ impl GitHub {
                     .map(|file| (text(file, "path"), file["viewerViewedState"] == "VIEWED"))
                     .collect(),
             ),
-            Read::Diff(_) | Read::CommitDiff(_) => {
-                Payload::Text(Self::text_read(ctx, requests.remove(0), cancel)?)
-            }
+            Read::Diff(_) => Self::pull_diff(ctx, &requests[0], cancel)?,
+            Read::CommitDiff(_) => Payload::Text(Self::text_read(ctx, requests.remove(0), cancel)?),
             Read::PullRequestForBranch(_) => Payload::MaybePullRequest(
                 ctx.json(&requests[0], cancel)?
                     .as_array()
@@ -1845,9 +1887,28 @@ impl GitHub {
         ctx.json(&request, cancel)
     }
 
-    /// A suggested change committed the way GitHub's "Commit suggestion" does, through the contents API: the head branch's file is read, the suggested lines
-    /// replace the ones the suggestion was made on (checked first), and the file is written back
-    /// on that branch, pinned to the blob that was read.
+    fn pull_at_head(
+        ctx: &ForgeContext,
+        number: u64,
+        head: &str,
+        stale: &str,
+        cancel: &AtomicBool,
+    ) -> Result<Value, ForgeError> {
+        if head.is_empty() {
+            return Err(ForgeError::Conflict(stale.into()));
+        }
+        let pull = ctx.json(
+            &ApiRequest::get(repos_path(ctx, &format!("pulls/{number}"))?),
+            cancel,
+        )?;
+        if text(&pull["head"], "sha") != head {
+            return Err(ForgeError::Conflict(stale.into()));
+        }
+        Ok(pull)
+    }
+
+    /// Read the file at the reviewed commit. GitHub only writes it if the branch still has
+    /// that exact head, even when an intervening commit has not changed this file.
     fn commit_suggestion(
         ctx: &ForgeContext,
         number: u64,
@@ -1856,25 +1917,22 @@ impl GitHub {
         message: &str,
         cancel: &AtomicBool,
     ) -> Result<(), ForgeError> {
-        let pull = ctx.json(
-            &ApiRequest::get(repos_path(ctx, &format!("pulls/{number}"))?),
-            cancel,
-        )?;
-        let sha = text(&pull["head"], "sha");
-        if !head.is_empty() && sha != head {
+        if !suggestion.has_complete_original() {
             return Err(ForgeError::Conflict(
-                "The pull request has new commits · refresh before committing this suggestion"
-                    .into(),
+                "Couldn't verify the lines this suggestion would replace.".into(),
             ));
         }
+        let pull = Self::pull_at_head(
+            ctx,
+            number,
+            head,
+            "The pull request has new commits · refresh before committing this suggestion",
+            cancel,
+        )?;
         let branch = text(&pull["head"], "ref");
-        let repo = match pull["head"]["repo"]["full_name"].as_str() {
-            Some(name) => name.to_owned(),
-            None => {
-                let repo = ctx.repo()?;
-                format!("{}/{}", repo.owner, repo.name)
-            }
-        };
+        let repo = optional(&pull["head"]["repo"], "full_name").ok_or_else(|| {
+            ForgeError::NotFound("The repository for this branch is no longer available.".into())
+        })?;
         let contents = format!(
             "repos/{repo}/contents/{}",
             suggestion
@@ -1884,10 +1942,7 @@ impl GitHub {
                 .collect::<Vec<_>>()
                 .join("/")
         );
-        let file = ctx.json(
-            &ApiRequest::get(contents.clone()).query("ref", &branch),
-            cancel,
-        )?;
+        let file = ctx.json(&ApiRequest::get(contents).query("ref", head), cancel)?;
         let decoded = base64_decode(&text(&file, "content"))
             .and_then(|bytes| String::from_utf8(bytes).ok())
             .ok_or_else(|| ForgeError::Failed(format!("{} is not a text file", suggestion.path)))?;
@@ -1897,13 +1952,20 @@ impl GitHub {
                 suggestion.lines.0, suggestion.lines.1, suggestion.path
             ))
         })?;
-        let request = ApiRequest::new(Method::Put, contents).json(json!({
-            "message": message,
-            "content": base64_encode(changed.as_bytes()),
-            "sha": text(&file, "sha"),
-            "branch": branch,
-        }));
-        Self::send_write(ctx, request, cancel)?;
+        Self::mutation(
+            ctx,
+            "mutation CommitReviewSuggestion($input: CreateCommitOnBranchInput!) { \
+             createCommitOnBranch(input: $input) { commit { oid } } }",
+            json!({ "input": {
+                "branch": { "repositoryNameWithOwner": repo, "branchName": branch },
+                "expectedHeadOid": head,
+                "message": { "headline": message },
+                "fileChanges": { "additions": [{
+                    "path": suggestion.path, "contents": base64_encode(changed.as_bytes())
+                }] },
+            }}),
+            cancel,
+        )?;
         Ok(())
     }
 
@@ -2313,6 +2375,29 @@ impl Provider for GitHub {
             invalidates: invalidates.clone(),
         };
         match write {
+            Write::InlineComment { number, head, .. } => {
+                Self::pull_at_head(
+                    ctx,
+                    *number,
+                    head,
+                    "The diff is outdated. Refresh before commenting.",
+                    cancel,
+                )?;
+            }
+            Write::SubmitReview {
+                number,
+                drafts,
+                head,
+                ..
+            } if !drafts.is_empty() => {
+                Self::pull_at_head(
+                    ctx,
+                    *number,
+                    head.as_deref().unwrap_or_default(),
+                    "The pull request changed. Refresh, then open Outdated drafts.",
+                    cancel,
+                )?;
+            }
             Write::Reply { thread, body, .. } => {
                 Self::mutation(
                     ctx,
@@ -2435,7 +2520,7 @@ impl Provider for GitHub {
     }
 }
 
-/// A suggested change: lines `lines.0..=lines.1` of `path`, which read `original` (when known),
+/// A suggested change: lines `lines.0..=lines.1` of `path`, which read `original`,
 /// become `replacement`.
 struct Suggestion<'a> {
     path: &'a str,
@@ -2445,25 +2530,30 @@ struct Suggestion<'a> {
 }
 
 impl Suggestion<'_> {
+    fn has_complete_original(&self) -> bool {
+        let (start, end) = self.lines;
+        start > 0 && end >= start && usize::try_from(end - start + 1) == Ok(self.original.len())
+    }
+
     /// `file` with the lines swapped, each new line ending as the last replaced one did;
     /// `None` when the lines are out of range or no longer read as the suggestion saw them.
     fn apply(&self, file: &str) -> Option<String> {
-        let (start, end) = self.lines;
-        let lines = file.split_inclusive('\n').collect::<Vec<_>>();
-        if start == 0 || start > end || end as usize > lines.len() {
+        if !self.has_complete_original() {
             return None;
         }
-        let (start, end) = (start as usize - 1, end as usize);
+        let (start, end) = self.lines;
+        let lines = file.split_inclusive('\n').collect::<Vec<_>>();
+        let (start, end) = (usize::try_from(start - 1).ok()?, usize::try_from(end).ok()?);
+        let range = lines.get(start..end)?;
         let bare = |line: &str| {
             line.trim_end_matches('\n')
                 .trim_end_matches('\r')
                 .to_owned()
         };
-        if !self.original.is_empty()
-            && lines[start..end]
-                .iter()
-                .map(|line| bare(line))
-                .ne(self.original.iter().cloned())
+        if range
+            .iter()
+            .map(|line| bare(line))
+            .ne(self.original.iter().cloned())
         {
             return None;
         }
@@ -2567,6 +2657,42 @@ mod tests {
             ..suggestion
         };
         assert_eq!(delete.apply("a\nb\nc\nd\n").as_deref(), Some("a\nd\n"));
+    }
+
+    #[test]
+    fn commit_suggestion_refuses_missing_or_partial_original_before_reading() {
+        let ctx = ctx();
+        for original in [vec![], vec!["old".into()]] {
+            assert_eq!(
+                GitHub.write(
+                    &ctx,
+                    &Write::CommitSuggestion {
+                        number: 9,
+                        path: "x.py".into(),
+                        start: 1,
+                        end: 2,
+                        original: original.clone(),
+                        replacement: vec!["new".into()],
+                        head: "a".repeat(40),
+                        message: "Replace two lines".into(),
+                    },
+                    &AtomicBool::new(false),
+                ),
+                Err(ForgeError::Conflict(
+                    "Couldn't verify the lines this suggestion would replace.".into()
+                )),
+            );
+            assert!(
+                Suggestion {
+                    path: "x.py",
+                    lines: (1, 2),
+                    original: &original,
+                    replacement: &[],
+                }
+                .apply("old\nkeep\n")
+                .is_none()
+            );
+        }
     }
 
     #[test]

@@ -346,7 +346,7 @@ impl Workspace {
             Action::CreatePullRequest | Action::CreatePullRequestWeb => {
                 self.create_note(action, fields)
             }
-            Action::CommitSuggestion(..) => self.suggestion_note(action),
+            Action::ConfirmSuggestion(snapshot) => Some(self.suggestion_note(snapshot)),
             _ => self.draft_note(action),
         }
     }

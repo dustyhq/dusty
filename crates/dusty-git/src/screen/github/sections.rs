@@ -541,7 +541,7 @@ impl Workspace {
             Action::Inline { .. } => reason(caps.inline_comment),
             Action::Reply { .. } | Action::Comment(..) => reason(caps.reply_in_thread),
             Action::Resolve(..) => reason(caps.resolve_thread),
-            Action::CommitSuggestion(..) => reason(caps.writes),
+            Action::CommitSuggestion(..) | Action::ConfirmSuggestion(_) => reason(caps.writes),
             Action::Merge(..) => reason(caps.merge_pinned_head),
             Action::Viewed(..) => reason(caps.viewed_files),
             Action::Edit(..) | Action::State(..) | Action::Metadata(..) => Some("Sign in to edit"),

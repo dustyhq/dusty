@@ -828,7 +828,7 @@ pub fn diff_has_git_headers(harness: &Harness) {
     let diff = some(
         harness.read(Read::Diff(13)).unwrap(),
         |payload| match payload {
-            Payload::Text(text) => Some(text),
+            Payload::Diff { head, text } if !head.is_empty() => Some(text),
             _ => None,
         },
     );

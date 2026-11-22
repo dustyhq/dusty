@@ -161,6 +161,9 @@ pub enum Shape {
 /// The legacy JSON value and the raw text view.rs keeps beside it.
 pub fn encode(shape: Shape, payload: &Payload) -> (Value, String) {
     let value = match (shape, payload) {
+        (_, Payload::Diff { head, text }) => {
+            return (json!({ "headRefOid": head }), text.clone());
+        }
         (_, Payload::Text(text)) => return (Value::Null, text.clone()),
         (_, Payload::Log(log)) => return (Value::Null, log_text(log)),
         (Shape::Repository, Payload::Repo(repo)) => json!({
@@ -794,7 +797,10 @@ fn thread(thread: &ReviewThread) -> Value {
         "path": thread.path,
         "line": thread.line,
         "originalLine": thread.original_line,
+        "originalStartLine": thread.original_start_line,
         "diffSide": thread.side.as_github(),
+        "diffHeadOid": thread.diff_head,
+        "startDiffSide": thread.start_side.map(Side::as_github),
         "comments": {
             "totalCount": thread.total_comments.unwrap_or(thread.comments.len() as u64),
             "nodes": thread.comments.iter().map(|comment| {

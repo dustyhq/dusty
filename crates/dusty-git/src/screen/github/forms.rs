@@ -258,6 +258,12 @@ pub(super) fn paint(
         ));
         facts.push((" · ".into(), st(GitRole::Muted, PANE)));
         facts.push(("Not submitted".into(), st(GitRole::Muted, PANE)));
+        if workspace.outdated_notice(workspace.number()).is_some() {
+            facts.push((
+                " · Ctrl+Enter opens Outdated drafts".into(),
+                st(GitRole::Modified, PANE),
+            ));
+        }
     }
     chrome::put_spans(&mut frame.grid, x, y, &facts, right);
     y += 2;
@@ -421,7 +427,8 @@ pub(super) fn paint(
                 "included when you submit",
             );
             y += 1;
-            for (draft, _) in drafts {
+            for pending in drafts {
+                let draft = &pending.comment;
                 if y + 1 >= content_bottom {
                     break;
                 }

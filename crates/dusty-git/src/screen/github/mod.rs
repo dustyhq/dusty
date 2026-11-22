@@ -1460,8 +1460,10 @@ impl Workspace {
                         let read = self.read(Read::CommitDiff(sha.clone()));
                         self.enqueue(Key::Commit(sha), read, refresh);
                     }
-                    if self.pr_tab == 3 {
+                    if self.pr_tab == pr::FILES || self.wants_suggestion_patch(id) {
                         self.enqueue(Key::Diff(id), self.read(Read::Diff(id)), refresh);
+                    }
+                    if self.pr_tab == pr::FILES {
                         self.enqueue(Key::Viewed(id), self.read(Read::Viewed(id)), refresh);
                     }
                     if self.pr_tab == pr::CHECKS {

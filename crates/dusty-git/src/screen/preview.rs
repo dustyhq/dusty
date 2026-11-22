@@ -489,7 +489,7 @@ impl super::GitScreen {
     }
 }
 
-fn header_path(header: &str) -> Option<PathBuf> {
+pub(super) fn header_path(header: &str) -> Option<PathBuf> {
     let decoded = if header.starts_with('"') {
         serde_json::from_str::<String>(header).ok()?
     } else {

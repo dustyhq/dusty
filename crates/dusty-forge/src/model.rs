@@ -447,9 +447,18 @@ pub struct ReviewThread {
     /// forge sends them (GitHub, Gitea, Forgejo).
     #[serde(default)]
     pub diff_hunk: Option<String>,
+    /// The commit whose coordinates and text the hunk records, when supplied by the forge.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diff_head: Option<String>,
     /// The first line of a multi-line thread (GitHub's `startLine`); `None` for one line.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub start_line: Option<u64>,
+    /// The first line in the historical hunk, before GitHub remaps the thread.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original_start_line: Option<u64>,
+    /// The side of the first line, when supplied separately by the forge.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_side: Option<Side>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

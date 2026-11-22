@@ -457,16 +457,20 @@ fn body(rows: &mut Vec<Line>, text: &str, width: usize) {
 }
 /// A review comment's body; a ```` ```suggestion ```` block in it reads as the change it
 /// suggests, against the lines the thread covers at the end of its diff hunk.
-fn suggested_body(rows: &mut Vec<Line>, thread: &Value, comment: &Value, width: usize) {
+fn suggested_body(
+    workspace: &Workspace,
+    rows: &mut Vec<Line>,
+    thread: &Value,
+    comment: &Value,
+    width: usize,
+) {
     use super::suggestion::{self, Part};
     let text = string(comment, "body");
     let Some(parts) = suggestion::split(text) else {
         body(rows, text, width);
         return;
     };
-    let line = thread["line"].as_u64().or_else(|| comment["line"].as_u64());
-    let count = suggestion::span(thread["startLine"].as_u64(), line);
-    let original = suggestion::original(string(comment, "diffHunk"), count);
+    let original = workspace.suggestion_preview(thread);
     for part in parts {
         match part {
             Part::Text(text) => body(rows, &text, width),
@@ -603,7 +607,7 @@ pub(super) fn threads(
                 rows.push(Line::text("Outdated · original line", Style::Muted));
             }
             let body_start = rows.len();
-            suggested_body(rows, thread, comment, width);
+            suggested_body(workspace, rows, thread, comment, width);
             let mut logical = 0;
             for row in &mut rows[body_start..] {
                 if row.source.as_ref().is_some_and(|source| source.offset == 0) {
@@ -696,6 +700,7 @@ mod tests {
             "number": 7, "title": "Read the actual content before editing metadata",
             "state": "OPEN", "body": "The description comes first.",
             "author": {"login": "alice"}, "headRefName": "feature", "baseRefName": "main",
+            "headRefOid": "a".repeat(40),
             "closedByPullRequestsReferences": [{"number": 9, "title": "Linked work"}],
             "closingIssuesReferences": [{"number": 9, "title": "Linked work"}],
             "mergeStateStatus": "BLOCKED", "files": [], "commits": []
@@ -1752,7 +1757,7 @@ mod tests {
             {"path":"example.rs","additions":1,"deletions":1},
             {"path":"src/nested/other.rs","additions":1,"deletions":0}
         ]);
-        workspace.cache.insert(Key::Diff(7), Ok(Reply { value: Value::Null, text: "diff --git a/example.rs b/example.rs\n--- a/example.rs\n+++ b/example.rs\n@@ -1 +1 @@\n-fn before() {}\n+fn after() {}\n".into() }));
+        workspace.cache.insert(Key::Diff(7), Ok(Reply { value: json!({ "headRefOid": "a".repeat(40) }), text: "diff --git a/example.rs b/example.rs\n--- a/example.rs\n+++ b/example.rs\n@@ -1 +1 @@\n-fn before() {}\n+fn after() {}\n".into() }));
         workspace
     }
 
@@ -2001,7 +2006,7 @@ mod tests {
         workspace.cache.insert(
             Key::Diff(7),
             Ok(Reply {
-                value: Value::Null,
+                value: json!({ "headRefOid": "a".repeat(40) }),
                 text: "diff --git a/example.rs b/example.rs\n--- a/example.rs\n+++ b/example.rs\n@@ -1,4 +1,5 @@\n fn head() {}\n\n-fn before() {}\n+fn after() {}\n+fn extra() {}\n fn tail() {}\n".into(),
             }),
         );

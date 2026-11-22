@@ -614,8 +614,7 @@ fn thread_card(
         match super::suggestion::split(&comment.body) {
             // A suggested change reads as a diff against the lines the thread covers.
             Some(parts) => {
-                let count = super::suggestion::span(thread.start_line, thread.line);
-                let original = super::suggestion::original(&thread.hunk, count);
+                let original = workspace.suggestion_original(number, &thread.id);
                 for (part_index, part) in parts.into_iter().enumerate() {
                     match part {
                         super::suggestion::Part::Text(text) => {

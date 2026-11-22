@@ -62,6 +62,8 @@ pub(in crate::screen) enum Action {
     /// A review thread's suggested change (pull request, thread id), committed to the head
     /// branch after its sheet.
     CommitSuggestion(u64, String),
+    /// The revision, destination and text shown in the commit sheet.
+    ConfirmSuggestion(Box<super::suggestion::Snapshot>),
     Files(u64),
     Viewed(u64, String),
     Collapse(u64, String),
@@ -124,6 +126,7 @@ impl Action {
                 | Self::Reply { .. }
                 | Self::Resolve(..)
                 | Self::CommitSuggestion(..)
+                | Self::ConfirmSuggestion(_)
                 | Self::Files(_)
                 | Self::Viewed(..)
         )
@@ -688,8 +691,13 @@ impl Workspace {
                 fields = vec![];
             }
             Action::Inline {
-                number, path, line, ..
+                number,
+                path,
+                line,
+                head,
+                ..
             } => {
+                self.check_inline_head(*number, head)?;
                 // Where the forge batches reviews, a comment can start a review
                 // (held as pending) instead of notifying at once, in GitHub's words; once a
                 // review is pending, the next comment joins it unless changed.
@@ -928,6 +936,7 @@ impl Workspace {
             Action::InlineRange { .. }
             | Action::Draft(..)
             | Action::CommitSuggestion(..)
+            | Action::ConfirmSuggestion(_)
             | Action::CreatePullRequestWeb
             | Action::Check(..)
             | Action::MergeMethod(_) => {
@@ -1151,6 +1160,7 @@ impl Workspace {
                 }
             }
             Action::Review(id) => {
+                let head = self.pending_review_head(*id)?.map(str::to_owned);
                 // Drafts make a review on their own; otherwise a comment needs a summary.
                 if values[0] != "Approve"
                     && values[1].trim().is_empty()
@@ -1233,6 +1243,7 @@ impl Workspace {
                 side,
                 head,
             } => {
+                self.check_inline_head(*number, head)?;
                 let side = if *side == "LEFT" {
                     Side::Left
                 } else {
@@ -1244,7 +1255,7 @@ impl Workspace {
                         return Err("Comment is required".into());
                     }
                     let drafts = self.inline_drafts.entry(*number).or_default();
-                    drafts.push((
+                    drafts.push(drafts::PendingDraft::new(
                         crate::forge::request::InlineDraft {
                             path: path.clone(),
                             line: u64::from(*line),
@@ -1260,6 +1271,7 @@ impl Workspace {
                     self.notice =
                         format!("Added to your review · {}", super::drafts::pending(count));
                     self.notice_transient = true;
+                    self.flush_drafts();
                     return Ok(());
                 }
                 Write::InlineComment {
@@ -1314,9 +1326,7 @@ impl Workspace {
                 thread: id.as_str().into(),
                 resolved: *resolved,
             },
-            Action::CommitSuggestion(number, thread) => {
-                self.suggestion_write(*number, thread, &values)?
-            }
+            Action::ConfirmSuggestion(snapshot) => self.suggestion_write(snapshot, &values)?,
             Action::Dispatch(id) => {
                 let inputs = match self.raw(&Key::Workflow(*id, String::new())) {
                     Some(yaml) => workflow::Definition::parse(yaml)?.inputs,
