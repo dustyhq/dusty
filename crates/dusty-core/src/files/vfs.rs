@@ -2769,7 +2769,9 @@ fn write_linked_document(
                 use std::os::unix::fs::PermissionsExt;
                 writable.set_mode(writable.mode() | 0o200);
             }
+            // Windows only: this clears the read-only attribute, nothing like Unix's world-writable.
             #[cfg(windows)]
+            #[allow(clippy::permissions_set_readonly_false)]
             writable.set_readonly(false);
             let set_permissions = |permissions| {
                 #[cfg(target_os = "linux")]
@@ -2822,7 +2824,10 @@ fn check_document_write_access(path: &Path) -> Result<(), VfsError> {
     Ok(())
 }
 
+// Windows only: set_readonly(false) clears the read-only attribute, nothing like Unix's
+// world-writable.
 #[cfg(windows)]
+#[allow(clippy::permissions_set_readonly_false)]
 fn replace_read_only_document(path: &Path, bytes: &[u8]) -> Result<(), VfsError> {
     use std::os::windows::fs::OpenOptionsExt;
 
