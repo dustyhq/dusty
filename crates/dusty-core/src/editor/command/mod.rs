@@ -598,6 +598,18 @@ fn validate_context(
     }
 }
 
+fn formatted_count_limit() -> String {
+    let digits = crate::editor::input::ABSOLUTE_MAX_COUNT.to_string();
+    let mut grouped = String::new();
+    for (i, digit) in digits.bytes().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            grouped.push(',');
+        }
+        grouped.push(char::from(digit));
+    }
+    grouped
+}
+
 #[derive(Debug, Error)]
 pub enum CommandError {
     #[error("invalid command ID `{0}`")]
@@ -610,6 +622,8 @@ pub enum CommandError {
     Unknown(CommandId),
     #[error("invalid command arguments: {0}")]
     InvalidArguments(String),
+    #[error("Count is too large. Use {limit} or less.", limit = formatted_count_limit())]
+    CountTooLarge,
     #[error("command is unavailable: {0}")]
     Unavailable(String),
     #[error("command failed: {0}")]

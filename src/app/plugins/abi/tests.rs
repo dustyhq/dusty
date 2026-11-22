@@ -168,6 +168,35 @@ fn invocation_keeps_targets_counts_registers_and_named_arguments() {
 }
 
 #[test]
+fn plugin_api_rejects_a_count_above_the_keyboard_limit() {
+    use crate::editor::{CommandError, CommandRegistry, EditorState, register_builtin_commands};
+
+    let mut state = EditorState::new(Default::default());
+    state
+        .open_text(TextBuffer::from_text("one\n\ntwo\n"), None)
+        .unwrap();
+    let mut registry = CommandRegistry::<()>::default();
+    register_builtin_commands(&mut registry).unwrap();
+    let movement = CommandInvocation::new("view.cursor.move", InvocationSource::Test)
+        .unwrap()
+        .with_argument("motion", CommandValue::String("paragraph_forward".into()));
+    let mut call = command_call(&movement, None);
+    call.count = Some(u64::MAX);
+    let invocation = super::invocation(&call).unwrap();
+    assert!(matches!(
+        registry.execute_with_authority(
+            &state,
+            &invocation,
+            CommandAuthority::Plugin {
+                initiator: "example".into(),
+                grants: [CommandAccess::Edit].into(),
+            },
+        ),
+        Err(CommandError::CountTooLarge)
+    ));
+}
+
+#[test]
 fn real_guest_registers_a_typed_command_and_returns_nested_values() {
     let (_roots, mut app) = real_app(&["demo"]);
     action(&mut app, "demo", "register");

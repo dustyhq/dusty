@@ -149,8 +149,7 @@ pub(super) fn execute_builtin<E>(
         .get(buffer_id)
         .ok_or_else(|| CommandError::Unavailable("target buffer is stale".into()))?;
     let count = invocation.count.map_or(1, |value| value.get());
-    let count = usize::try_from(count)
-        .map_err(|_| CommandError::InvalidArguments("count is too large".into()))?;
+    let count = usize::try_from(count).map_err(|_| CommandError::CountTooLarge)?;
     let mut transaction = transaction_for(view_id, buffer_id, buffer.text.revision());
 
     match invocation.id.as_str() {
@@ -1113,7 +1112,8 @@ pub(super) fn execute_builtin<E>(
                     (RegisterShape::Character, RegisterShape::Line) => format!("\n{text}"),
                     _ => text,
                 };
-                let replaced = buffer.text.slice(whole_range).map_err(failed)?;
+                let replaced =
+                    register_text(buffer.text.slice(whole_range).map_err(failed)?, shape);
                 transaction.operations.push(EditorOperation::ApplyEdits {
                     buffer: buffer_id,
                     edits: TextEditSet::new(
@@ -1400,9 +1400,11 @@ pub(super) fn execute_builtin<E>(
                     text.push('\n');
                 }
                 text = text.repeat(count);
-                if !before
+                // Keep the logical empty line after a linewise P, or before a p.
+                if before && buffer.text.is_empty() {
+                    text.push('\n');
+                } else if !before
                     && at.get() == buffer.text.len_bytes()
-                    && at.get() > 0
                     && !buffer.text.to_string().ends_with('\n')
                 {
                     text.insert(0, '\n');

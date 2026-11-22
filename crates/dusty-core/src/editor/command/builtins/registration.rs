@@ -18,6 +18,7 @@ pub fn register_builtin_commands<E: 'static>(
         ContextRequirement::View,
         ArgumentSchema::default()
             .field("motion", ArgumentType::String, true)
+            .field("linewise", ArgumentType::Bool, false)
             .field("character", ArgumentType::String, false),
     )?;
     register(

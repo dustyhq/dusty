@@ -276,6 +276,7 @@ pub enum HarnessError {
 
 #[cfg(test)]
 mod tests {
+    use crate::editor::EditorMode;
     use crate::editor::input::KeyEvent;
 
     use crate::testing::HeadlessEditor;
@@ -648,9 +649,33 @@ mod tests {
         assert_eq!(edited("abc,def", "dt,"), ",def");
         assert_eq!(edited("abc,def", "df,"), "def");
         assert_eq!(edited("abc,def", "$F,x"), "abcdef");
-        assert_eq!(edited("abc,def", "$dT,"), "abc,");
+        assert_eq!(edited("abc,def", "$dT,"), "abc,f");
+        assert_eq!(edited("abc def ghi", "$dFa"), "i");
+        assert_eq!(edited("abc def ghi", "$dTa"), "ai");
+        assert_eq!(edited("a abc def ghi", "$Tad;"), "abc def ghi");
+        assert_eq!(edited("xyabc def ghi", "ta$d,"), "xyai");
         // `;` after `t` steps past the character the cursor already stands before.
         assert_eq!(edited("a,b,c", "t,;x"), "a,,c");
+    }
+
+    #[test]
+    fn adjacent_backward_till_preserves_yank_on_delete_and_change() {
+        use crate::editor::RegisterShape;
+
+        for (keys, expected, yanked, shape) in [
+            ("lyydTap", "ab\nab\nnext\n", "ab\n", RegisterShape::Line),
+            ("lyycTaX", "aXb\nnext\n", "ab\n", RegisterShape::Line),
+            ("lyyyTa", "ab\nnext\n", "", RegisterShape::Character),
+        ] {
+            let mut editor = HeadlessEditor::with_text("ab\nnext\n");
+            for key in keys.chars() {
+                editor.feed(KeyEvent::character(key)).unwrap();
+            }
+            let register = editor.state.registers.get('"').unwrap();
+            assert_eq!(editor.text(), expected, "{keys}");
+            assert_eq!(register.text, yanked, "{keys}");
+            assert_eq!(register.shape, shape, "{keys}");
+        }
     }
 
     #[test]
@@ -666,6 +691,303 @@ mod tests {
         );
         assert_eq!(edited("one\ntwo\nthree\nfour", "d50%"), "three\nfour");
         assert_eq!(edited("  one\ntwo", "jggx"), "  ne\ntwo");
+    }
+
+    fn assert_word_operator_put(
+        source: &str,
+        keys: &str,
+        shape: crate::editor::RegisterShape,
+        yanked: &str,
+        expected: &str,
+    ) {
+        let mut editor = HeadlessEditor::with_text(source);
+        for key in keys.chars() {
+            editor.feed(KeyEvent::character(key)).unwrap();
+        }
+        let register = editor.state.registers.get('"').unwrap();
+        assert_eq!(register.shape, shape, "{source:?} {keys}");
+        assert_eq!(register.text, yanked, "{source:?} {keys}");
+        editor.feed(KeyEvent::character('p')).unwrap();
+        assert_eq!(editor.text(), expected, "{source:?} {keys}p");
+    }
+
+    #[test]
+    fn cross_line_word_operators_store_the_shape_used_by_put() {
+        use crate::editor::RegisterShape;
+        for (source, keys, shape, yanked, expected) in [
+            (
+                "aa\nbb\ncc\ndd\n",
+                "d2w",
+                RegisterShape::Line,
+                "aa\nbb\n",
+                "cc\naa\nbb\ndd\n",
+            ),
+            (
+                "aaa\nbbb\nccc\nddd\n",
+                "y2w",
+                RegisterShape::Character,
+                "aaa\nbbb",
+                "aaaa\nbbbaa\nbbb\nccc\nddd\n",
+            ),
+            (
+                "aa\n\ncc\ndd\n",
+                "y2w",
+                RegisterShape::Line,
+                "aa\n\n",
+                "aa\naa\n\n\ncc\ndd\n",
+            ),
+        ] {
+            assert_word_operator_put(source, keys, shape, yanked, expected);
+        }
+    }
+
+    #[test]
+    fn counted_word_operator_grid_matches_vim() {
+        use crate::editor::RegisterShape::{self, Character as C, Line as L};
+        use crate::editor::input::KeyCode;
+
+        let check = |source: &str, keys: &str, text: &str, shape: RegisterShape, expected: &str| {
+            let mut editor = HeadlessEditor::with_text(source);
+            for key in keys.chars() {
+                let event = if key == '\u{1b}' {
+                    KeyEvent::plain(KeyCode::Escape)
+                } else {
+                    KeyEvent::character(key)
+                };
+                editor.feed(event).unwrap();
+            }
+            let register = editor.state.registers.get('"').unwrap();
+            assert_eq!(register.text, text, "{source:?} {keys:?}");
+            assert_eq!(register.shape, shape, "{source:?} {keys:?}");
+            let actual = editor.text();
+            // Vim reports logical lines separately from the final file newline.
+            if keys.starts_with('y') {
+                assert_eq!(actual, source, "{source:?} {keys:?}");
+            }
+            assert_eq!(
+                actual.strip_suffix('\n').unwrap_or(&actual),
+                expected,
+                "{source:?} {keys:?}",
+            );
+        };
+
+        // Vim 9.2: getreg(), getregtype(), and join(getline(1, '$'), "\\n").
+        // w and W agree on this grid, which has no punctuation.
+        for (source, deletes, yanks) in [
+            ("aa\n", [("aa", C, ""); 4], [("aa", C); 4]),
+            (
+                "aa\n\n",
+                [
+                    ("aa", C, "\n"),
+                    ("aa\n", L, ""),
+                    ("aa\n", L, ""),
+                    ("aa\n", L, ""),
+                ],
+                [("aa", C), ("aa\n", L), ("aa\n", L), ("aa\n", L)],
+            ),
+            (
+                "aa\n  \n",
+                [
+                    ("aa", C, "\n  "),
+                    ("aa\n  \n", L, ""),
+                    ("aa\n  \n", L, ""),
+                    ("aa\n  \n", L, ""),
+                ],
+                [("aa", C), ("aa\n  ", C), ("aa\n  ", C), ("aa\n  ", C)],
+            ),
+            (
+                "aa\n\n  \n",
+                [
+                    ("aa", C, "\n\n  "),
+                    ("aa\n\n", L, "  "),
+                    ("aa\n\n  \n", L, ""),
+                    ("aa\n\n  \n", L, ""),
+                ],
+                [("aa", C), ("aa\n\n", L), ("aa\n\n  ", C), ("aa\n\n  ", C)],
+            ),
+            (
+                "aa\nbb",
+                [
+                    ("aa", C, "\nbb"),
+                    ("aa\nbb\n", L, ""),
+                    ("aa\nbb\n", L, ""),
+                    ("aa\nbb\n", L, ""),
+                ],
+                [("aa", C), ("aa\nbb", C), ("aa\nbb", C), ("aa\nbb", C)],
+            ),
+            (
+                "aa\nbb\n",
+                [
+                    ("aa", C, "\nbb"),
+                    ("aa\nbb\n", L, ""),
+                    ("aa\nbb\n", L, ""),
+                    ("aa\nbb\n", L, ""),
+                ],
+                [("aa", C), ("aa\nbb", C), ("aa\nbb", C), ("aa\nbb", C)],
+            ),
+            (
+                "aa bb\n\n",
+                [
+                    ("aa ", C, "bb\n"),
+                    ("aa bb", C, "\n"),
+                    ("aa bb\n", L, ""),
+                    ("aa bb\n", L, ""),
+                ],
+                [("aa ", C), ("aa bb", C), ("aa bb\n", L), ("aa bb\n", L)],
+            ),
+        ] {
+            for (index, ((deleted, delete_shape, after), (yanked, yank_shape))) in
+                deletes.into_iter().zip(yanks).enumerate()
+            {
+                let count = index + 1;
+                for motion in ['w', 'W'] {
+                    for (operator, text, shape, expected) in [
+                        ('d', deleted, delete_shape, after),
+                        (
+                            'y',
+                            yanked,
+                            yank_shape,
+                            source.strip_suffix('\n').unwrap_or(source),
+                        ),
+                    ] {
+                        let keys = format!("{operator}{count}{motion}");
+                        check(source, &keys, text, shape, expected);
+                    }
+                }
+            }
+        }
+
+        for (source, count, suffix, text, expected) in [
+            ("word\n", 2, "XY\u{1b}0p", "word", "XwordY"),
+            ("word\n", 2, "\u{1b}", "word", ""),
+            ("word\n", 3, "\u{1b}", "word", ""),
+            ("word\nnext\n", 2, "\u{1b}", "word\nnext", ""),
+        ] {
+            for motion in ['w', 'W'] {
+                check(
+                    source,
+                    &format!("gg0c{count}{motion}{suffix}"),
+                    text,
+                    C,
+                    expected,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn counted_word_yank_keeps_a_blank_line_before_final_spaces() {
+        use crate::editor::RegisterShape;
+
+        for motion in ['w', 'W'] {
+            for (count, shape, yanked, expected) in [
+                (2, RegisterShape::Line, "aa\n\n", "aa\naa\n\n\n  \n"),
+                (
+                    3,
+                    RegisterShape::Character,
+                    "aa\n\n  ",
+                    "aaa\n\n  a\n\n  \n",
+                ),
+            ] {
+                assert_word_operator_put(
+                    "aa\n\n  \n",
+                    &format!("y{count}{motion}"),
+                    shape,
+                    yanked,
+                    expected,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn counted_word_operators_stay_linewise_past_eof() {
+        use crate::editor::RegisterShape;
+
+        for count in [2, 3, 9] {
+            assert_word_operator_put(
+                "aa\n\n",
+                &format!("d{count}w"),
+                RegisterShape::Line,
+                "aa\n",
+                "\naa\n",
+            );
+            assert_word_operator_put(
+                "aa\n\n",
+                &format!("y{count}w"),
+                RegisterShape::Line,
+                "aa\n",
+                "aa\naa\n\n",
+            );
+            for source in ["aa\nbb", "aa\nbb\n"] {
+                assert_word_operator_put(
+                    source,
+                    &format!("d{count}w"),
+                    RegisterShape::Line,
+                    "aa\nbb\n",
+                    "\naa\nbb\n",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn visual_put_records_the_replaced_unterminated_line_with_a_newline() {
+        use crate::editor::RegisterShape;
+
+        let mut editor = HeadlessEditor::with_text("aa\n\nbb");
+        for key in "yyGvipp".chars() {
+            editor.feed(KeyEvent::character(key)).unwrap();
+        }
+        let register = editor.state.registers.get('"').unwrap();
+        assert_eq!(register.shape, RegisterShape::Line);
+        assert_eq!(register.text, "bb\n");
+        assert_eq!(editor.text(), "aa\n\naa\n");
+    }
+
+    #[test]
+    fn visual_inner_paragraph_saves_linewise_selection_on_an_empty_buffer() {
+        use crate::editor::SelectionKind;
+        use crate::editor::input::KeyCode;
+
+        let mut editor = HeadlessEditor::with_text("");
+        for key in "vip".chars() {
+            editor.feed(KeyEvent::character(key)).unwrap();
+        }
+        assert_eq!(
+            editor.state.views[editor.active_view()].mode,
+            EditorMode::VisualLine
+        );
+        editor.feed(KeyEvent::plain(KeyCode::Escape)).unwrap();
+        let buffer = editor.state.active_buffer_id().unwrap();
+        let selection = editor.state.buffers[buffer].last_visual.unwrap();
+        assert_eq!(selection.kind, SelectionKind::Line);
+    }
+
+    #[test]
+    fn linewise_yank_and_put_on_an_empty_buffer() {
+        use crate::editor::RegisterShape;
+
+        for (put, cursor) in [('p', 1), ('P', 0)] {
+            for count in [1, 3] {
+                let mut editor = HeadlessEditor::with_text("");
+                for key in "vipy".chars() {
+                    editor.feed(KeyEvent::character(key)).unwrap();
+                }
+                let register = editor.state.registers.get('"').unwrap();
+                assert_eq!(register.shape, RegisterShape::Line);
+                assert_eq!(register.text, "\n");
+                for key in format!("{count}{put}").chars() {
+                    editor.feed(KeyEvent::character(key)).unwrap();
+                }
+                assert_eq!(editor.text(), "\n".repeat(count + 1), "{count}{put}");
+                assert_eq!(
+                    editor.state.views[editor.active_view()].cursor.get(),
+                    cursor,
+                    "{count}{put}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -691,6 +1013,22 @@ mod tests {
         assert_eq!(edited("a\nb\nc\n", "jdk"), "c\n");
         assert_eq!(edited("a\nb\nc\n", "jdG"), "a\n");
         assert_eq!(edited("a\nb\nc\n", "Gdgg"), "");
+    }
+
+    #[test]
+    fn vertical_operator_at_an_edge_leaves_text_and_register_unchanged() {
+        let source = "alpha\nbravo\ncharlie\n";
+        let mut editor = HeadlessEditor::with_text(source);
+        for key in "yydkckykGdj".chars() {
+            editor.feed(KeyEvent::character(key)).unwrap();
+        }
+        assert_eq!(editor.text(), source);
+        assert_eq!(
+            editor.state.views[editor.active_view()].mode,
+            EditorMode::Normal
+        );
+        assert_eq!(editor.state.registers.get('"').unwrap().text, "alpha\n");
+        assert_eq!(edited(source, "9dj"), "");
     }
 
     #[test]

@@ -95,12 +95,7 @@ pub(super) fn motion_target(
                 Some(column) => column,
                 None => cursor_display_column(text, cursor, policy)?,
             };
-            let destination = if motion == "up" {
-                folds.backward(line, count)
-            } else {
-                let last = text.visible_lines().saturating_sub(1).max(line);
-                folds.forward(line, count, last)
-            };
+            let destination = vertical_destination(text, line, motion, count, folds);
             let destination_start = text.line_to_byte(destination).map_err(failed)?;
             let destination_line = text.line(destination).map_err(failed)?;
             let destination_content = destination_line
@@ -188,6 +183,9 @@ pub(super) fn motion_target(
             let mut line = text.byte_to_line(cursor).map_err(failed)?;
             for _ in 0..count {
                 if motion == "paragraph_forward" {
+                    if line >= last {
+                        break;
+                    }
                     while line < last && blank(line) {
                         line += 1;
                     }
@@ -195,6 +193,9 @@ pub(super) fn motion_target(
                         line += 1;
                     }
                 } else {
+                    if line == 0 {
+                        break;
+                    }
                     while line > 0 && blank(line) {
                         line -= 1;
                     }
@@ -497,7 +498,7 @@ pub(super) fn operator_range(
         } else {
             ByteOffset(text.len_bytes())
         };
-        return ByteRange::new(start, end).map_err(failed);
+        return ranged(start, end);
     }
     if motion == "right" {
         // `l` is exclusive, but `dl` on the last character still takes it, as in Vim.
@@ -514,77 +515,26 @@ pub(super) fn operator_range(
             }
             end = next;
         }
-        return ByteRange::new(cursor, end).map_err(failed);
+        return ranged(cursor, end);
     }
-    let target = if change_word {
-        let first = if motion == "big_word_end" {
-            big_word_end(&text.to_string(), cursor)
-        } else {
-            word_end(&text.to_string(), cursor)
-        };
-        motion_target(
-            buffer,
-            first,
-            motion,
-            count.saturating_sub(1),
-            character,
-            policy,
-            None,
-            folds,
-        )?
-    } else {
-        motion_target(
-            buffer, cursor, motion, count, character, policy, None, folds,
-        )?
+    let forward_step: Option<fn(&str, ByteOffset) -> ByteOffset> = match motion {
+        "word_forward" => Some(word_forward),
+        "big_word_forward" => Some(big_word_forward),
+        _ => None,
     };
-    // `dw`/`dW` stop at the end of the last word's line, even when whitespace-only
-    // lines follow it. Counted motions spanning whole lines keep those lines whole.
-    let target = if matches!(motion, "word_forward" | "big_word_forward") && target > cursor {
-        let target_line = text.byte_to_line(target).map_err(failed)?;
-        let cursor_line = text.byte_to_line(cursor).map_err(failed)?;
-        let line_start = text.line_to_byte(target_line).map_err(failed)?;
-        let prefix = text
-            .slice(ByteRange::new(line_start, target).map_err(failed)?)
-            .map_err(failed)?;
-        if target_line > cursor_line && prefix.trim().is_empty() {
-            let last_step = motion_target(
-                buffer,
-                cursor,
-                motion,
-                count.saturating_sub(1),
-                character,
-                policy,
-                None,
-                folds,
-            )?;
-            let last_line = text.byte_to_line(last_step).map_err(failed)?;
-            let end = line_content_end(text, last_line)?;
-            if last_step < target
-                && last_line > cursor_line
-                && cursor <= first_nonblank(text, cursor_line)?
-            {
-                return ByteRange::new(
-                    text.line_to_byte(cursor_line).map_err(failed)?,
-                    text.line_to_byte(last_line + 1).map_err(failed)?,
-                )
-                .map_err(failed);
-            }
-            if last_step < target && (last_line > cursor_line || last_step < end) {
-                end
-            } else {
-                target
-            }
-        } else {
-            target
-        }
-    } else {
-        target
-    };
+    if let Some(step) = forward_step {
+        return word_operator_range(text, cursor, count, motion, step, operator).map(Some);
+    }
+    let target = motion_target(
+        buffer, cursor, motion, count, character, policy, None, folds,
+    )?;
     let (start, mut end) = if target < cursor {
         (target, cursor)
     } else {
         (cursor, target)
     };
+    // Backward find/till (including repeats) exclude the cursor. Matching pairs
+    // include both endpoints regardless of direction.
     if matches!(
         motion,
         "word_end"
@@ -592,17 +542,142 @@ pub(super) fn operator_range(
             | "line_end"
             | "matching_pair"
             | "find_forward"
-            | "find_backward"
             | "till_forward"
             | "till_forward_again"
-            | "till_backward"
-            | "till_backward_again"
     ) && !(motion == "line_end"
         && end == line_content_end(text, text.byte_to_line(end).map_err(failed)?)?)
     {
         end = next_grapheme_boundary(text, end);
     }
-    ByteRange::new(start, end).map_err(failed)
+    ranged(start, end)
+}
+
+fn word_operator_range(
+    text: &TextBuffer,
+    cursor: ByteOffset,
+    count: usize,
+    motion: &str,
+    step: fn(&str, ByteOffset) -> ByteOffset,
+    operator: &str,
+) -> Result<(ByteRange, RegisterShape), CommandError> {
+    let source = text.to_string();
+    // Vim stops at the end of the last real line, not at the rope's trailing
+    // empty line. If the last real line is empty, EOF is also its column one.
+    let eof = line_content_end(text, text.visible_lines().saturating_sub(1))?;
+    if matches!(
+        change_word_motion(operator, motion, text, cursor),
+        "word_end" | "big_word_end"
+    ) {
+        // :help cw. On a word, count through word ends starting with the
+        // current word, and return the inclusive motion as a half-open range.
+        // This skips the exclusive-to-linewise adjustment entirely.
+        let big = motion == "big_word_forward";
+        let mut previous = 0;
+        let mut remaining = count;
+        let end = source[cursor.get()..eof.get()]
+            .grapheme_indices(true)
+            .find_map(|(relative, grapheme)| {
+                let class = word_class(grapheme.chars().next().unwrap_or(' '));
+                let class = if big { u8::from(class != 0) } else { class };
+                if previous != 0 && previous != class {
+                    remaining = remaining.saturating_sub(1);
+                }
+                previous = class;
+                (remaining == 0).then_some(ByteOffset(cursor.get() + relative))
+            })
+            .unwrap_or(eof);
+        return Ok((
+            ByteRange::new(cursor, end).map_err(failed)?,
+            RegisterShape::Character,
+        ));
+    }
+
+    let mut end = cursor;
+    for remaining in (1..=count).rev() {
+        if end >= eof {
+            break;
+        }
+        let limit = if remaining == 1 {
+            // :help word. For operators the last step stops at the line break,
+            // or at the next line's first column if it started on a line break.
+            if source.as_bytes()[end.get()] == b'\n' {
+                end = ByteOffset(end.get() + 1);
+                break;
+            }
+            line_content_end(text, text.byte_to_line(end).map_err(failed)?)?
+        } else {
+            eof
+        };
+        end = step(&source[..limit.get()], end);
+    }
+
+    let first = text.byte_to_line(cursor).map_err(failed)?;
+    let last = text.byte_to_line(end).map_err(failed)?;
+    if last > first {
+        let first_start = text.line_to_byte(first).map_err(failed)?;
+        let is_indent = |byte| matches!(byte, b' ' | b'\t');
+        let starts_in_indent = source[first_start.get()..cursor.get()]
+            .bytes()
+            .all(is_indent);
+        let last_start = text.line_to_byte(last).map_err(failed)?;
+        let last_end = line_content_end(text, last)?;
+        // :help exclusive-linewise. A nonempty line's end is already inclusive
+        // in Vim; its half-open byte range ends just before the newline.
+        let linewise_end = if end == last_start {
+            if starts_in_indent {
+                Some(end)
+            } else {
+                end = line_content_end(text, last - 1)?;
+                None
+            }
+        } else if operator == "delete"
+            && starts_in_indent
+            && source[end.get()..last_end.get()].bytes().all(is_indent)
+        {
+            // A multiline delete that would leave only indentation on the joined
+            // line deletes whole lines. A yank of the same span does not.
+            Some(if last + 1 < text.len_lines() {
+                text.line_to_byte(last + 1).map_err(failed)?
+            } else {
+                ByteOffset(text.len_bytes())
+            })
+        } else {
+            None
+        };
+        if let Some(end) = linewise_end {
+            return Ok((
+                ByteRange::new(first_start, end).map_err(failed)?,
+                RegisterShape::Line,
+            ));
+        }
+    }
+    Ok((
+        ByteRange::new(cursor, end).map_err(failed)?,
+        RegisterShape::Character,
+    ))
+}
+
+/// `cw` on a word changes to the word's end and keeps the space after it, as in Vim.
+fn change_word_motion<'a>(
+    operator: &str,
+    motion: &'a str,
+    text: &TextBuffer,
+    cursor: ByteOffset,
+) -> &'a str {
+    if operator != "change" || !matches!(motion, "word_forward" | "big_word_forward") {
+        return motion;
+    }
+    let next = next_grapheme_boundary(text, cursor);
+    let on_word = ByteRange::new(cursor, next)
+        .ok()
+        .and_then(|range| text.slice(range).ok())
+        .and_then(|character| character.chars().next())
+        .is_some_and(|character| !character.is_whitespace());
+    match (motion, on_word) {
+        ("word_forward", true) => "word_end",
+        ("big_word_forward", true) => "big_word_end",
+        _ => motion,
+    }
 }
 
 /// `f`/`t` search the cursor line only, like Vim. `till_*_again` is the `;` repeat of a

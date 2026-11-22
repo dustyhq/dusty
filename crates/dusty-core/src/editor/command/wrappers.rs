@@ -259,6 +259,14 @@ impl<E> CommandRegistry<E> {
                 call.invocation = frame.invocation;
                 (frame.index, true, Some(result))
             } else {
+                // A wrapper's CallNext can supply a new count, so check on every dispatch.
+                if call
+                    .invocation
+                    .count
+                    .is_some_and(|count| count.get() > crate::editor::input::ABSOLUTE_MAX_COUNT)
+                {
+                    return Err(CommandError::CountTooLarge);
+                }
                 command
                     .spec
                     .arguments

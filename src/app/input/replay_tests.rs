@@ -480,6 +480,47 @@ fn recording_and_repeat_retain_semantics_and_strip_original_targets() {
 }
 
 #[test]
+fn visual_paragraphs_keep_linewise_shape_for_put_reselect_and_dot() {
+    use crate::editor::{EditorMode, RegisterShape};
+
+    let session_with_text = |source: &str| {
+        let mut config = crate::config::load_bundled_config();
+        config.config.editor.registers.clipboard = crate::config::ClipboardSync::Off;
+        let mut session = crate::app::tests::driver::TestSession::new(config);
+        session.new_buffer();
+        let app = &mut session.application;
+        keys(app, &["i"]);
+        app.invoke_insert_text(source.into());
+        keys(app, &["escape", "g", "g", "0"]);
+        session
+    };
+
+    let mut session = session_with_text("first\nsecond\n\nlast\n");
+    let app = &mut session.application;
+    let view = app.state.active_view().unwrap();
+    let buffer = app.state.views[view].buffer;
+    keys(app, &["v", "i", "p", "y", "p"]);
+    let register = app.state.registers.get('"').unwrap();
+    assert_eq!(register.shape, RegisterShape::Line);
+    assert_eq!(register.text, "first\nsecond\n");
+    assert_eq!(
+        app.state.buffers[buffer].text.to_string(),
+        "first\nfirst\nsecond\nsecond\n\nlast\n"
+    );
+    keys(app, &["g", "v"]);
+    assert_eq!(app.state.views[view].mode, EditorMode::VisualLine);
+
+    let mut session = session_with_text("first\nsecond\n\nlonger-line\nanother-long-line\n\nend\n");
+    let app = &mut session.application;
+    let view = app.state.active_view().unwrap();
+    let buffer = app.state.views[view].buffer;
+    keys(app, &["v", "a", "p"]);
+    assert_eq!(app.state.views[view].mode, EditorMode::VisualLine);
+    keys(app, &["escape", "g", "g", "v", "i", "p", "d", "j", "."]);
+    assert_eq!(app.state.buffers[buffer].text.to_string(), "\n\nend\n");
+}
+
+#[test]
 fn visual_repeat_keeps_surround_delimiters_and_comment_tokens() {
     use crate::editor::CommandRegistry;
     use crate::editor::CommandValue;

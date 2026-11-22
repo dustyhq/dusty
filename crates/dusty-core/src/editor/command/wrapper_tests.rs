@@ -86,6 +86,32 @@ fn typed_arguments_and_results_round_trip_with_target_count_and_register() {
 }
 
 #[test]
+fn wrapper_cannot_dispatch_a_count_above_the_keyboard_limit() {
+    let (state, mut registry, invocation) = editing();
+    registry
+        .register_wrapper(
+            &invocation.id,
+            "example".into(),
+            0,
+            CommandAuthority::Host,
+            |_, invocation, _, _| {
+                let mut next = invocation.clone();
+                next.count = NonZeroU64::new(crate::editor::input::ABSOLUTE_MAX_COUNT + 1);
+                Ok(CommandWrapperAction::CallNext(next))
+            },
+        )
+        .unwrap();
+    let error = match registry.execute(&state, &invocation) {
+        Err(error @ CommandError::CountTooLarge) => error,
+        _ => panic!("expected an over-limit count error"),
+    };
+    assert_eq!(
+        error.to_string(),
+        "Count is too large. Use 1,000,000 or less."
+    );
+}
+
+#[test]
 fn typed_results_reject_wrong_handler_and_wrapper_values() {
     let state = EditorState::new(PathBuf::from("/tmp"));
     let invocation = CommandInvocation::new("editor.answer", InvocationSource::Test).unwrap();

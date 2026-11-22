@@ -371,9 +371,10 @@ fn counted_history_commands_stop_at_history_boundaries() {
     apply(&mut state, "history.undo", &[], 2);
     apply(&mut state, "edit.replace", &[("text", "Q")], 1);
     let branched = state.buffers[buffer].text.to_string();
-    apply(&mut state, "history.undo", &[], u64::MAX);
+    let count = crate::editor::input::ABSOLUTE_MAX_COUNT;
+    apply(&mut state, "history.undo", &[], count);
     assert_eq!(state.buffers[buffer].text.to_string(), "abc");
-    apply(&mut state, "history.redo", &[], u64::MAX);
+    apply(&mut state, "history.redo", &[], count);
     assert_eq!(state.buffers[buffer].text.to_string(), branched);
 }
 
@@ -385,7 +386,7 @@ fn counted_history_commands_preserve_empty_history_errors() {
     register_builtin_commands(&mut registry).unwrap();
     for id in ["history.undo", "history.redo"] {
         let mut invocation = CommandInvocation::new(id, InvocationSource::Test).unwrap();
-        invocation.count = std::num::NonZeroU64::new(u64::MAX);
+        invocation.count = std::num::NonZeroU64::new(crate::editor::input::ABSOLUTE_MAX_COUNT);
         let outcome = registry.execute(&state, &invocation).unwrap();
         let error = state
             .apply_transaction(&outcome.transaction.unwrap())
@@ -555,7 +556,7 @@ fn visual_put_repeats_the_register_before_replacing_the_selection() {
 }
 
 #[test]
-fn visual_linewise_put_terminates_an_unterminated_yanked_line() {
+fn visual_linewise_put_after_yanking_an_unterminated_line() {
     let (mut state, buffer, view) = editing("one\ntwo", 4);
     apply(
         &mut state,
@@ -567,7 +568,7 @@ fn visual_linewise_put_terminates_an_unterminated_yanked_line() {
         ],
         1,
     );
-    assert_eq!(state.registers.get('"').unwrap().text, "two");
+    assert_eq!(state.registers.get('"').unwrap().text, "two\n");
     state.views[view].cursor = crate::editor::text::ByteOffset(0);
     apply(&mut state, "mode.visual_line", &[], 1);
     apply(
@@ -597,7 +598,8 @@ fn normal_linewise_yank_keeps_the_cursor_column() {
         1,
     );
     assert_eq!(state.views[view].cursor.get(), 2);
-    assert_eq!(state.registers.get('"').unwrap().text, "abcdef");
+    // A linewise register always ends in a newline, as in Vim, even at EOF.
+    assert_eq!(state.registers.get('"').unwrap().text, "abcdef\n");
 }
 
 #[test]
@@ -629,7 +631,7 @@ fn visual_yank_returns_to_the_start_of_the_selection() {
             2,
             8,
             0,
-            "abcdef\nghijkl",
+            "abcdef\nghijkl\n",
         ),
         (
             EditorMode::VisualBlock,
@@ -1045,12 +1047,27 @@ fn replace_backspace_does_not_restore_across_cursor_movement() {
 }
 
 #[test]
-fn backward_inclusive_operators_include_the_cursor_character() {
+fn backward_matching_pair_operator_remains_inclusive() {
+    let (mut state, buffer, _) = editing("(abc)", 4);
+    apply(
+        &mut state,
+        "edit.operator",
+        &[
+            ("operator", "delete"),
+            ("motion", "matching_pair"),
+            ("linewise", "false"),
+        ],
+        0,
+    );
+    assert_eq!(state.buffers[buffer].text.to_string(), "");
+}
+
+#[test]
+fn backward_find_operators_exclude_the_cursor_character() {
     for (text, cursor, motion, character, expected) in [
-        ("(abc)", 4, "matching_pair", "(", ""),
-        ("abc", 2, "find_backward", "a", ""),
-        ("abc", 2, "till_backward", "a", "a"),
-        ("abcb", 3, "till_backward_again", "a", "a"),
+        ("abc def ghi", 10, "find_backward", "a", "i"),
+        ("abc def ghi", 10, "till_backward", "a", "ai"),
+        ("abcb", 3, "till_backward_again", "a", "ab"),
     ] {
         let (mut state, buffer, _) = editing(text, cursor);
         apply(

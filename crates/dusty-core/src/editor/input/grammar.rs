@@ -403,6 +403,9 @@ impl ModalResolver {
         }
         let mut invocation = command("view.cursor.move")?
             .with_argument("motion", CommandValue::String(motion.into()));
+        if linewise {
+            invocation = invocation.with_argument("linewise", CommandValue::Bool(true));
+        }
         if let Some(character) = character {
             invocation =
                 invocation.with_argument("character", CommandValue::String(character.to_string()));
