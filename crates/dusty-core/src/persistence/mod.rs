@@ -163,9 +163,25 @@ pub struct PersistedMark {
     pub name: String,
     pub location: PersistedLocation,
 }
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+/// Identity shared by editor instances even when the breakpoint's settings or anchor change.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+pub struct PersistedBreakpointId([u64; 2]);
+
+impl PersistedBreakpointId {
+    #[must_use]
+    pub fn fresh() -> Self {
+        use std::hash::{BuildHasher, RandomState};
+
+        let random = RandomState::new();
+        Self([random.hash_one(0_u8), random.hash_one(1_u8)])
+    }
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PersistedBreakpoint {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<PersistedBreakpointId>,
     #[serde(with = "crate::files::path_encoding")]
     pub path: PathBuf,
     pub line: u64,
@@ -233,7 +249,7 @@ impl From<RecentFile> for SavedRecentFile {
         }
     }
 }
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PersistedState {
     pub version: u32,
@@ -782,6 +798,19 @@ fn read_state(path: &Path, policy: &PersistencePolicy) -> Result<PersistedState,
     }
     let state: PersistedState = serde_json::from_slice(&bytes).map_err(PersistenceError::Json)?;
     state.validate(policy)?;
+    // Two instances reading the same legacy snapshot must derive the same IDs.
+    // Include an occurrence number so even identical legacy rows have distinct identities.
+    let mut occurrences = BTreeMap::<u64, u64>::new();
+    for row in state.breakpoints.iter_mut().filter(|row| row.id.is_none()) {
+        use std::hash::{DefaultHasher, Hash, Hasher};
+
+        let mut hash = DefaultHasher::new();
+        row.hash(&mut hash);
+        let fingerprint = hash.finish();
+        let occurrence = occurrences.entry(fingerprint).or_default();
+        row.id = Some(PersistedBreakpointId([fingerprint, *occurrence]));
+        *occurrence += 1;
+    }
     Ok(state)
 }
 fn write_state(
@@ -892,7 +921,7 @@ fn merge_shared_state(
         &current.breakpoints,
         &previous.breakpoints,
         maximum,
-        |breakpoint| (breakpoint.path.clone(), breakpoint.line, breakpoint.column),
+        |breakpoint| breakpoint.id,
     );
     merge_entries(
         &mut state.watches,
@@ -1081,6 +1110,7 @@ mod tests {
         state.jumps = vec![location.clone()];
         state.changes = vec![location];
         state.breakpoints = vec![crate::persistence::PersistedBreakpoint {
+            id: Some(super::PersistedBreakpointId::fresh()),
             path: path.clone(),
             line: 1,
             disabled: false,
@@ -1295,6 +1325,231 @@ mod tests {
         assert!(!saved.metadata.contains_key("old"));
         write_state(&path, &second, Some(&second), &policy).unwrap();
         assert_eq!(read_state(&path, &policy).unwrap().marks.len(), 2);
+    }
+
+    #[test]
+    fn snapshot_history_removes_middle_entries_without_reordering_the_disk() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("state.json");
+        let policy = PersistencePolicy::default();
+        let previous = PersistedState {
+            command_history: ["a", "b", "c"].map(String::from).to_vec(),
+            ..PersistedState::default()
+        };
+        let mut disk = previous.clone();
+        disk.command_history.push("d".into());
+        write_state(
+            &path,
+            &disk,
+            None,
+            &policy,
+            SessionWrite::Replace,
+            HistoryWrite::Merge,
+        )
+        .unwrap();
+        let mut edited = previous.clone();
+        edited.command_history.remove(1);
+        write_state(
+            &path,
+            &edited,
+            Some(&previous),
+            &policy,
+            SessionWrite::Keep,
+            HistoryWrite::Merge,
+        )
+        .unwrap();
+        assert_eq!(
+            read_state(&path, &policy).unwrap().command_history,
+            ["a", "c", "d"]
+        );
+    }
+
+    #[test]
+    fn history_retention_bounds_count_and_makes_room_for_the_layout() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("state.json");
+        let mut state = state_with_horizontal_offsets();
+        state.command_history = (0..super::HISTORY_LIMIT + 5)
+            .map(|n| format!("{n}:{}", "x".repeat(200)))
+            .collect();
+        let policy = PersistencePolicy::default();
+        write_state(
+            &path,
+            &state,
+            None,
+            &policy,
+            SessionWrite::Replace,
+            HistoryWrite::Append,
+        )
+        .unwrap();
+        let saved = read_state(&path, &policy).unwrap();
+        assert_eq!(saved.command_history, state.command_history[5..]);
+
+        let smaller_path = directory.path().join("smaller.json");
+        let small = PersistencePolicy {
+            maximum_file_bytes: 4096,
+            ..policy
+        };
+        write_state(
+            &smaller_path,
+            &state,
+            None,
+            &small,
+            SessionWrite::Replace,
+            HistoryWrite::Append,
+        )
+        .unwrap();
+        let saved = read_state(&smaller_path, &small).unwrap();
+        assert_eq!(saved.session, state.session);
+        assert!(!saved.command_history.is_empty());
+        assert!(saved.command_history.len() < super::HISTORY_LIMIT);
+        assert!(state.command_history.ends_with(&saved.command_history));
+    }
+
+    #[test]
+    fn co_located_breakpoint_deletions_survive_a_stale_save_and_restart() {
+        use super::{
+            PersistedBreakpoint, PersistedBreakpointId, PersistenceEvent, PersistenceWorker,
+        };
+        use std::time::{Duration, Instant};
+
+        for legacy in [false, true] {
+            let directory = tempdir().unwrap();
+            let path = directory.path().join("state.json");
+            let policy = PersistencePolicy::default();
+            let plain = PersistedBreakpoint {
+                id: (!legacy).then(PersistedBreakpointId::fresh),
+                path: directory.path().join("source.rs"),
+                line: 2,
+                disabled: false,
+                column: None,
+                condition: None,
+                hit_condition: None,
+                log_message: None,
+            };
+            let logpoint = PersistedBreakpoint {
+                id: (!legacy).then(PersistedBreakpointId::fresh),
+                log_message: Some("trace".into()),
+                ..plain.clone()
+            };
+            let initial = PersistedState {
+                breakpoints: vec![plain, logpoint],
+                ..PersistedState::default()
+            };
+            fs::write(&path, serde_json::to_vec(&initial).unwrap()).unwrap();
+
+            let wait = |worker: &PersistenceWorker| {
+                let deadline = Instant::now() + Duration::from_secs(10);
+                loop {
+                    if let Some(event) = worker.try_event().unwrap() {
+                        return event;
+                    }
+                    assert!(Instant::now() < deadline);
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+            };
+            let load = |worker: &mut PersistenceWorker| {
+                let id = worker.read(path.clone(), policy.clone()).unwrap();
+                let PersistenceEvent::Loaded { request_id, state } = wait(worker) else {
+                    panic!("expected persistence load");
+                };
+                assert_eq!(request_id, id);
+                *state
+            };
+            let save = |worker: &mut PersistenceWorker, state: PersistedState| {
+                let id = worker.write(path.clone(), state, policy.clone()).unwrap();
+                assert!(
+                    matches!(wait(worker), PersistenceEvent::Saved { request_id } if request_id == id)
+                );
+            };
+
+            let mut current = PersistenceWorker::start(1);
+            let mut stale = PersistenceWorker::start(1);
+            let mut edited = load(&mut current);
+            let untouched = load(&mut stale);
+            assert_eq!(edited.breakpoints, untouched.breakpoints);
+            assert_ne!(edited.breakpoints[0].id, edited.breakpoints[1].id);
+
+            // Removing the plain row must not affect the independently moved logpoint.
+            edited.breakpoints.remove(0);
+            edited.breakpoints[0].line = 3;
+            save(&mut current, edited.clone());
+            save(&mut stale, untouched.clone());
+            assert_eq!(
+                load(&mut PersistenceWorker::start(1)).breakpoints,
+                edited.breakpoints
+            );
+
+            edited.breakpoints.clear();
+            save(&mut current, edited);
+            save(&mut stale, untouched);
+            assert!(
+                load(&mut PersistenceWorker::start(1))
+                    .breakpoints
+                    .is_empty()
+            );
+        }
+    }
+
+    #[test]
+    fn two_workers_keep_repeated_history_when_the_reader_has_no_edits() {
+        use super::{PersistenceEvent, PersistenceWorker};
+
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("state.json");
+        let policy = PersistencePolicy::default();
+        let mut writer = PersistenceWorker::start(1);
+        let mut reader = PersistenceWorker::start(1);
+        let wait = |worker: &PersistenceWorker| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                if let Some(event) = worker.try_event().unwrap() {
+                    break event;
+                }
+                assert!(std::time::Instant::now() < deadline);
+                std::thread::yield_now();
+            }
+        };
+
+        let save = |worker: &mut PersistenceWorker, commands: &[&str], ignored_read| {
+            let id = worker
+                .write_with_session_policy(
+                    path.clone(),
+                    PersistedState {
+                        command_history: commands.iter().map(|command| (*command).into()).collect(),
+                        ..PersistedState::default()
+                    },
+                    policy.clone(),
+                    SessionWrite::Keep,
+                    ignored_read,
+                    HistoryWrite::Append,
+                )
+                .unwrap();
+            assert!(matches!(
+                wait(worker),
+                PersistenceEvent::Saved { request_id } if request_id == id
+            ));
+        };
+        save(&mut writer, &["help", "set number"], None);
+        let ignored = reader.read(path.clone(), policy.clone()).unwrap();
+        assert!(matches!(
+            wait(&reader),
+            PersistenceEvent::Loaded { request_id, .. } if request_id == ignored
+        ));
+        save(&mut writer, &["help"], None);
+        let before = fs::read(&path).unwrap();
+        assert_eq!(
+            read_state(&path, &policy).unwrap().command_history,
+            ["help", "set number", "help"]
+        );
+
+        save(&mut reader, &[], Some(ignored));
+        assert_eq!(fs::read(&path).unwrap(), before);
+        save(&mut reader, &["set number"], None);
+        assert_eq!(
+            read_state(&path, &policy).unwrap().command_history,
+            ["help", "set number", "help", "set number"]
+        );
     }
 
     fn state_with_horizontal_offsets() -> PersistedState {

@@ -22,8 +22,8 @@ use crate::debugger::DapTerminalReply;
 use crate::editor::decorations::{Gravity, MarkId};
 use crate::editor::text::ByteRange;
 use crate::editor::{BufferId, EditorState};
-use crate::persistence::PersistedBreakpoint;
 use crate::persistence::PersistedWatch;
+use crate::persistence::{PersistedBreakpoint, PersistedBreakpointId};
 use crate::process::PtyId;
 pub(in crate::app) use presets::PresetLaunch;
 
@@ -33,9 +33,7 @@ pub(in crate::app) const MAXIMUM_DEBUG_ARGUMENTS: usize = 4096;
 pub(in crate::app) const MAXIMUM_DEBUG_ENVIRONMENT: usize = 4096;
 
 pub(in crate::app) use launch::DebugIntent;
-use std::collections::HashMap;
-use std::collections::VecDeque;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -151,12 +149,16 @@ pub(super) struct Debugger {
     build_jobs: Option<crate::process::JobSupervisor>,
     console: VecDeque<crate::debugger::DapConsoleEntry>,
     breakpoints: BTreeMap<PathBuf, Vec<SourceBreakpoint>>,
+    last_breakpoint_id: u64,
+    discarded_breakpoint_marks: Vec<BreakpointLocation>,
     execution_mark: Option<(PathBuf, u64, BreakpointLocation)>,
     /// Settings changed while persistence is loading must win over the saved values.
     changed_breakpoints: Option<BTreeSet<(PathBuf, u64)>>,
     changed_watches: Option<BTreeSet<String>>,
-    latest_breakpoints: BTreeMap<PathBuf, u64>,
+    latest_breakpoints: BTreeMap<PathBuf, BreakpointRequest>,
+    /// Changed sources that still need to be sent to the adapter.
     breakpoint_refresh: BTreeSet<PathBuf>,
+    breakpoint_picker_dirty: bool,
     /// The visible console row that an unterminated output chunk continues.
     output_line: Option<usize>,
     stop_follow: StopFollow,
@@ -223,6 +225,35 @@ pub(super) struct Debugger {
     event_source: Option<DapContext>,
     source: Option<Source>,
 }
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BreakpointRequest {
+    Pending(u64, u64),
+    Acknowledged(u64, u64),
+    Rejected(u64, u64),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub(in crate::app) struct BreakpointId(u64);
+
+pub(in crate::app) enum BreakpointConditionTarget {
+    Existing {
+        path: PathBuf,
+        identity: BreakpointId,
+    },
+    New {
+        path: PathBuf,
+        location: BreakpointLocation,
+    },
+}
+
+impl BreakpointConditionTarget {
+    pub(in crate::app) fn cancel(self, editor: &mut EditorState) {
+        if let Self::New { location, .. } = self {
+            location.remove_mark(editor);
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 pub(in crate::app) enum BreakpointLocation {
     Closed(u64),
@@ -305,7 +336,14 @@ impl BreakpointLocation {
     }
 }
 
+fn valid_breakpoint_text(text: &str) -> bool {
+    text.len() <= 64 * 1024 && !text.contains('\0')
+}
+
 struct SourceBreakpoint {
+    // The condition prompt keeps this identity even if the source mark is reattached.
+    identity: BreakpointId,
+    persisted_id: PersistedBreakpointId,
     location: BreakpointLocation,
     column: Option<u64>,
     condition: Option<String>,
@@ -313,6 +351,8 @@ struct SourceBreakpoint {
     log_message: Option<String>,
     disabled: bool,
     verdict: Option<DapBreakpointState>,
+    // Last confirmed line while a replacement request is pending.
+    pending_display_line: Option<u64>,
 }
 
 impl SourceBreakpoint {
@@ -325,6 +365,29 @@ impl SourceBreakpoint {
             hit_condition: self.hit_condition.clone(),
             log_message: self.log_message.clone(),
         }
+    }
+
+    /// Where the breakpoint is shown, which may differ from its requested mark.
+    fn display_line(&self, path: &Path, editor: &EditorState) -> u64 {
+        match self.state() {
+            Some(DapBreakpointState::Verified { line }) => line,
+            Some(DapBreakpointState::Requested { accepted: true }) => self
+                .pending_display_line
+                .unwrap_or_else(|| self.location.line(path, editor)),
+            _ => self.location.line(path, editor),
+        }
+    }
+
+    fn mark_pending(&mut self) {
+        if let Some(DapBreakpointState::Verified { line }) = self.verdict {
+            self.pending_display_line = Some(line);
+        }
+        self.verdict = Some(DapBreakpointState::Requested { accepted: true });
+    }
+
+    fn set_verdict(&mut self, verdict: Option<DapBreakpointState>) -> bool {
+        let had_pending_line = self.pending_display_line.take().is_some();
+        std::mem::replace(&mut self.verdict, verdict) != verdict || had_pending_line
     }
 
     fn state(&self) -> Option<DapBreakpointState> {
@@ -347,11 +410,14 @@ impl Debugger {
             build_jobs: None,
             console: VecDeque::new(),
             breakpoints: BTreeMap::new(),
+            last_breakpoint_id: 0,
+            discarded_breakpoint_marks: Vec::new(),
             execution_mark: None,
             changed_breakpoints: Default::default(),
             changed_watches: Default::default(),
             latest_breakpoints: BTreeMap::new(),
             breakpoint_refresh: std::collections::BTreeSet::new(),
+            breakpoint_picker_dirty: false,
             output_line: None,
             end_state: None,
             stop_epoch: 0,
@@ -405,6 +471,10 @@ impl Debugger {
         self.cancel_preset_launch();
         self.latest_breakpoints.clear();
         self.breakpoint_refresh.clear();
+        for row in self.breakpoints.values_mut().flatten() {
+            row.set_verdict(None);
+        }
+        self.breakpoint_picker_dirty = true;
         self.output_line = None;
         self.clear_paused_state();
         self.stop_reason = None;
@@ -425,6 +495,7 @@ impl Debugger {
         self.console.clear();
         self.configuration = None;
         self.last_preset = None;
+        self.remove_discarded_breakpoint_marks(editor);
         for rows in std::mem::take(&mut self.breakpoints).into_values() {
             for row in rows {
                 row.location.remove_mark(editor);
@@ -594,11 +665,16 @@ impl Debugger {
             .service
             .context()
             .ok_or(DapError::NotRunning)
-            .and_then(|context| self.service.control_tracked(&context, control));
+            .and_then(|context| {
+                self.service
+                    .control_tracked(&context, control)
+                    .map(|id| (id, context.connection()))
+            });
         match result {
-            Ok(id) => {
+            Ok((id, connection)) => {
                 if let Some(path) = breakpoint_path {
-                    self.latest_breakpoints.insert(path, id);
+                    self.latest_breakpoints
+                        .insert(path, BreakpointRequest::Pending(id, connection));
                 }
                 let submission = repl
                     .then(|| self.pending_submissions.back().map(|p| p.0))
@@ -710,6 +786,21 @@ impl Debugger {
         self.refresh_watches();
         let (context, event) = loop {
             let (context, event) = self.service.try_owned_event()?;
+            if !context.on_current_connection()
+                && matches!(
+                    &event,
+                    DapEvent::Response {
+                        response: DapResponse::Breakpoints(_)
+                            | DapResponse::BreakpointChanged { .. },
+                        ..
+                    } | DapEvent::RequestFailed {
+                        request: Some(DapControl::SetBreakpoints { .. }),
+                        ..
+                    }
+                )
+            {
+                continue;
+            }
             let answer = match &event {
                 DapEvent::Response {
                     request_id,
@@ -783,18 +874,22 @@ impl Debugger {
                 request_id,
                 response,
                 ..
-            } if !self.breakpoint_refresh.contains(path)
-                && self.latest_breakpoints.get(path).copied().unwrap_or(0) == *request_id =>
-            {
+            } if self.awaiting_breakpoints(path, *request_id, &context) => {
+                self.latest_breakpoints.insert(
+                    path.clone(),
+                    BreakpointRequest::Acknowledged(*request_id, context.connection()),
+                );
                 self.apply_breakpoints(path, breakpoints, response, editor);
             }
             DapEvent::RequestFailed {
                 request: Some(DapControl::SetBreakpoints { path, breakpoints }),
                 request_id,
                 ..
-            } if !self.breakpoint_refresh.contains(path)
-                && self.latest_breakpoints.get(path).copied().unwrap_or(0) == *request_id =>
-            {
+            } if self.awaiting_breakpoints(path, *request_id, &context) => {
+                self.latest_breakpoints.insert(
+                    path.clone(),
+                    BreakpointRequest::Rejected(*request_id, context.connection()),
+                );
                 self.apply_breakpoints(
                     path,
                     breakpoints,
@@ -818,26 +913,36 @@ impl Debugger {
                     DapResponse::BreakpointChanged {
                         path,
                         requested,
+                        request_index,
                         verified,
                         line,
                         removed,
                     },
+                request_id,
                 ..
             } => {
-                if !self.breakpoint_refresh.contains(path)
-                    && let Some(rows) = self.breakpoints.get_mut(path)
+                if context.on_current_connection()
+                    && self.latest_breakpoints.get(path)
+                        == Some(&BreakpointRequest::Acknowledged(
+                            *request_id,
+                            context.connection(),
+                        ))
+                    && let Some(row) = self.breakpoints.get_mut(path).and_then(|rows| {
+                        rows.iter_mut()
+                            .filter(|row| !row.disabled)
+                            .nth(*request_index)
+                    })
+                    && row.location.line(path, editor) == *requested
                 {
-                    for row in rows.iter_mut().filter(|row| {
-                        !row.disabled && row.location.line(path, editor) == *requested
-                    }) {
-                        row.verdict = (!removed).then_some(if *verified {
-                            DapBreakpointState::Verified {
-                                line: line.unwrap_or(*requested),
-                            }
-                        } else {
-                            DapBreakpointState::Requested { accepted: false }
-                        });
-                    }
+                    let verdict = (!removed).then_some(if *verified {
+                        DapBreakpointState::Verified {
+                            line: line.unwrap_or(*requested),
+                        }
+                    } else {
+                        DapBreakpointState::Requested { accepted: false }
+                    });
+                    self.breakpoint_picker_dirty |= row.set_verdict(verdict);
+                    self.coalesce_verified_breakpoints(path, editor);
                 }
             }
             _ => {}
@@ -1045,27 +1150,118 @@ impl Debugger {
         self.watch_refresh.retain(|watch| watch != expression);
         self.watch_values.remove(expression);
     }
-    pub(in crate::app) fn breakpoint_at(
+    pub(in crate::app) fn breakpoint_condition_target(
         &self,
-        path: &Path,
+        path: PathBuf,
         line: u64,
-        editor: &EditorState,
-    ) -> Option<DapSourceBreakpoint> {
-        self.breakpoints
-            .get(path)?
-            .iter()
-            .find(|row| row.location.line(path, editor) == line)
-            .map(|row| row.request_row(path, editor))
+        editor: &mut EditorState,
+    ) -> (String, BreakpointConditionTarget) {
+        if let Some(row) = self.displayed_breakpoint(&path, line, editor) {
+            (
+                row.condition.clone().unwrap_or_default(),
+                BreakpointConditionTarget::Existing {
+                    path,
+                    identity: row.identity,
+                },
+            )
+        } else {
+            let location = BreakpointLocation::attach(&path, line, editor);
+            (
+                String::new(),
+                BreakpointConditionTarget::New { path, location },
+            )
+        }
     }
 
+    pub(in crate::app) fn set_breakpoint_condition(
+        &mut self,
+        target: BreakpointConditionTarget,
+        condition: &str,
+        editor: &mut EditorState,
+    ) -> Result<(), String> {
+        let condition = condition.trim();
+        if !valid_breakpoint_text(condition) {
+            target.cancel(editor);
+            return Err("invalid debugger breakpoint".into());
+        }
+        let condition = (!condition.is_empty()).then(|| condition.to_owned());
+        let (path, identity) = match target {
+            BreakpointConditionTarget::Existing { path, identity } => (path, identity),
+            BreakpointConditionTarget::New { path, location } => {
+                let line = location.line(&path, editor);
+                location.remove_mark(editor);
+                // An edit while the prompt was open can move this mark onto an existing anchor.
+                let Some(row) = self.breakpoint_at_anchor(&path, line, editor) else {
+                    self.change_breakpoint(
+                        DapSourceBreakpoint {
+                            path,
+                            line,
+                            column: None,
+                            condition,
+                            hit_condition: None,
+                            log_message: None,
+                        },
+                        None,
+                        false,
+                        editor,
+                    )?;
+                    return Ok(());
+                };
+                (path, row.identity)
+            }
+        };
+        let Some(rows) = self.breakpoints.get_mut(&path) else {
+            return Ok(());
+        };
+        let Some(row) = rows.iter_mut().find(|row| row.identity == identity) else {
+            return Ok(());
+        };
+        if let Some(changed) = &mut self.changed_breakpoints {
+            changed.insert((path.clone(), row.location.line(&path, editor)));
+        }
+        row.condition = condition;
+        for row in rows {
+            row.mark_pending();
+        }
+        self.queue_breakpoints(&path);
+        self.refresh_breakpoints(editor);
+        Ok(())
+    }
+
+    #[cfg(test)]
     pub(in crate::app) fn breakpoint(
         &mut self,
         row: DapSourceBreakpoint,
         toggle: bool,
         editor: &mut EditorState,
     ) -> Result<bool, String> {
+        let existing = self
+            .breakpoint_at_anchor(&row.path, row.line, editor)
+            .map(|row| row.identity);
+        self.change_breakpoint(row, existing, toggle, editor)
+    }
+
+    fn breakpoint_on_display_line(
+        &mut self,
+        row: DapSourceBreakpoint,
+        toggle: bool,
+        editor: &mut EditorState,
+    ) -> Result<bool, String> {
+        let existing = self
+            .displayed_breakpoint(&row.path, row.line, editor)
+            .map(|row| row.identity);
+        self.change_breakpoint(row, existing, toggle, editor)
+    }
+
+    fn change_breakpoint(
+        &mut self,
+        row: DapSourceBreakpoint,
+        existing: Option<BreakpointId>,
+        toggle: bool,
+        editor: &mut EditorState,
+    ) -> Result<bool, String> {
         let path = row.path.clone();
-        let removed = self.update_breakpoint(row, toggle, None, editor)?;
+        let removed = self.update_breakpoint(row, existing, toggle, None, editor)?;
         self.queue_breakpoints(&path);
         self.refresh_breakpoints(editor);
         Ok(removed)
@@ -1074,71 +1270,95 @@ impl Debugger {
     fn update_breakpoint(
         &mut self,
         row: DapSourceBreakpoint,
+        identity: Option<BreakpointId>,
         toggle: bool,
-        disabled: Option<bool>,
+        saved: Option<(bool, Option<PersistedBreakpointId>)>,
         editor: &mut EditorState,
     ) -> Result<bool, String> {
         if row.line == 0
             || !row.path.is_absolute()
             || [
-                row.condition.as_ref(),
-                row.hit_condition.as_ref(),
-                row.log_message.as_ref(),
+                row.condition.as_deref(),
+                row.hit_condition.as_deref(),
+                row.log_message.as_deref(),
             ]
             .into_iter()
             .flatten()
-            .any(|s| s.len() > 64 * 1024 || s.contains('\0'))
+            .any(|text| !valid_breakpoint_text(text))
         {
             return Err("invalid debugger breakpoint".into());
         }
-        let count = self.breakpoints.values().map(Vec::len).sum::<usize>();
-        let existing = self.breakpoints.get(&row.path).and_then(|rows| {
-            rows.iter()
-                .position(|old| old.location.line(&row.path, editor) == row.line)
-        });
-        if existing.is_none() && count >= MAXIMUM_BREAKPOINTS {
-            return Err("debugger breakpoint limit reached".into());
-        }
-        if let Some(changed) = &mut self.changed_breakpoints {
-            changed.insert((row.path.clone(), row.line));
-        }
-        let rows = self.breakpoints.entry(row.path.clone()).or_default();
-        let removed = toggle && existing.is_some();
-        if let Some(index) = existing.filter(|_| toggle) {
-            rows.remove(index).location.remove_mark(editor);
+        let new_identity = if identity.is_none() {
+            if self.breakpoints.values().map(Vec::len).sum::<usize>() >= MAXIMUM_BREAKPOINTS {
+                return Err("debugger breakpoint limit reached".into());
+            }
+            self.last_breakpoint_id = self
+                .last_breakpoint_id
+                .checked_add(1)
+                .ok_or("debugger breakpoint limit reached")?;
+            Some(BreakpointId(self.last_breakpoint_id))
         } else {
-            let (location, was_disabled) = existing.map_or_else(
-                || {
-                    (
-                        BreakpointLocation::attach(&row.path, row.line, editor),
-                        false,
-                    )
-                },
-                |index| (rows[index].location, rows[index].disabled),
-            );
-            let breakpoint = SourceBreakpoint {
-                location,
+            None
+        };
+        let rows = self.breakpoints.entry(row.path.clone()).or_default();
+        let (removed, anchor) = if let Some(identity) = new_identity {
+            let (disabled, persisted_id) = saved.unwrap_or_default();
+            rows.push(SourceBreakpoint {
+                identity,
+                persisted_id: persisted_id.unwrap_or_else(PersistedBreakpointId::fresh),
+                location: BreakpointLocation::attach(&row.path, row.line, editor),
                 column: row.column,
                 condition: row.condition,
                 hit_condition: row.hit_condition,
                 log_message: row.log_message,
-                disabled: disabled.unwrap_or(was_disabled),
+                disabled,
                 verdict: None,
-            };
-            if let Some(index) = existing {
-                rows[index] = breakpoint;
+                pending_display_line: None,
+            });
+            (false, row.line)
+        } else if let Some(index) = rows.iter().position(|old| Some(old.identity) == identity) {
+            let old = &mut rows[index];
+            let anchor = old.location.line(&row.path, editor);
+            if toggle {
+                rows.remove(index).location.remove_mark(editor);
             } else {
-                rows.push(breakpoint);
+                old.column = row.column;
+                old.condition = row.condition;
+                old.hit_condition = row.hit_condition;
+                old.log_message = row.log_message;
             }
+            (toggle, anchor)
+        } else {
+            return Ok(false);
+        };
+        if let Some(changed) = &mut self.changed_breakpoints {
+            changed.insert((row.path.clone(), anchor));
         }
         if rows.is_empty() {
             self.breakpoints.remove(&row.path);
         } else {
             for row in rows {
-                row.verdict = Some(DapBreakpointState::Requested { accepted: true });
+                row.mark_pending();
             }
         }
         Ok(removed)
+    }
+
+    fn awaiting_breakpoints(&self, path: &Path, request_id: u64, context: &DapContext) -> bool {
+        if !context.on_current_connection() || self.breakpoint_refresh.contains(path) {
+            return false;
+        }
+        // A child connection replays the same request IDs, including startup ID zero.
+        match self.latest_breakpoints.get(path).copied() {
+            Some(BreakpointRequest::Pending(id, connection)) => {
+                id == request_id && connection <= context.connection()
+            }
+            Some(
+                BreakpointRequest::Acknowledged(id, connection)
+                | BreakpointRequest::Rejected(id, connection),
+            ) => id == request_id && connection < context.connection(),
+            None => request_id == 0,
+        }
     }
 
     fn apply_breakpoints(
@@ -1152,25 +1372,95 @@ impl Debugger {
             return;
         };
         let states = crate::debugger::breakpoint_states(rows, &[], answer);
+        // A new placement can share a requested line with a relocated breakpoint.
+        // Match each answer only once, in the order those rows were sent.
+        let mut matched = BTreeSet::new();
         for (row, state) in rows.iter().zip(states) {
-            for breakpoint in current
-                .iter_mut()
-                .filter(|r| !r.disabled && r.request_row(path, editor) == *row)
-            {
-                breakpoint.verdict = Some(state);
+            if row.path != path {
+                continue;
             }
+            if let Some(breakpoint) = current.iter_mut().find(|r| {
+                !r.disabled
+                    && !matched.contains(&r.identity)
+                    && r.location.line(path, editor) == row.line
+                    && r.column == row.column
+                    && r.condition == row.condition
+                    && r.hit_condition == row.hit_condition
+                    && r.log_message == row.log_message
+            }) {
+                matched.insert(breakpoint.identity);
+                self.breakpoint_picker_dirty |= breakpoint.set_verdict(Some(state));
+            }
+        }
+        self.coalesce_verified_breakpoints(path, editor);
+    }
+
+    /// The adapter may place two otherwise identical requests on the same executable line.
+    fn coalesce_verified_breakpoints(&mut self, path: &Path, editor: &EditorState) {
+        let Some(rows) = self.breakpoints.get_mut(path) else {
+            return;
+        };
+        let duplicates: BTreeSet<_> = {
+            let mut seen = HashSet::new();
+            rows.iter()
+                .filter_map(|row| {
+                    let Some(DapBreakpointState::Verified { line }) = row.state() else {
+                        return None;
+                    };
+                    let key = (
+                        line,
+                        row.column,
+                        row.condition.as_deref(),
+                        row.hit_condition.as_deref(),
+                        row.log_message.as_deref(),
+                    );
+                    (!seen.insert(key)).then_some(row.identity)
+                })
+                .collect()
+        };
+        if duplicates.is_empty() {
+            return;
+        }
+        rows.retain(|row| {
+            if duplicates.contains(&row.identity) {
+                if let Some(changed) = &mut self.changed_breakpoints {
+                    changed.insert((path.into(), row.location.line(path, editor)));
+                }
+                self.discarded_breakpoint_marks.push(row.location);
+                false
+            } else {
+                true
+            }
+        });
+        // Replace the adapter list too, so subsequent events index the surviving rows.
+        self.queue_breakpoints(path);
+    }
+
+    fn remove_discarded_breakpoint_marks(&mut self, editor: &mut EditorState) {
+        for location in self.discarded_breakpoint_marks.drain(..) {
+            location.remove_mark(editor);
         }
     }
 
-    fn breakpoint_disabled(&self, path: &Path, line: u64, editor: &EditorState) -> Option<bool> {
+    fn breakpoint_at_anchor(
+        &self,
+        path: &Path,
+        line: u64,
+        editor: &EditorState,
+    ) -> Option<&SourceBreakpoint> {
         self.breakpoints
             .get(path)?
             .iter()
             .find(|row| row.location.line(path, editor) == line)
+    }
+
+    #[cfg(test)]
+    fn breakpoint_disabled(&self, path: &Path, line: u64, editor: &EditorState) -> Option<bool> {
+        self.breakpoint_at_anchor(path, line, editor)
             .map(|row| row.disabled)
     }
 
-    /// Disable or enable a breakpoint without changing its position or configuration.
+    #[cfg(test)]
     fn set_breakpoint_disabled(
         &mut self,
         path: &Path,
@@ -1178,27 +1468,43 @@ impl Debugger {
         disabled: bool,
         editor: &EditorState,
     ) {
-        let Some(row) = self.breakpoints.get_mut(path).and_then(|rows| {
-            rows.iter_mut()
-                .find(|row| row.location.line(path, editor) == line)
-        }) else {
-            return;
-        };
-        if let Some(changed) = &mut self.changed_breakpoints {
-            changed.insert((path.to_path_buf(), line));
+        if let Some(row) = self.breakpoint_at_anchor(path, line, editor) {
+            let _ = self.set_breakpoint_disabled_by_id(path, row.identity, disabled, editor);
         }
-        row.disabled = disabled;
-        row.verdict = Some(DapBreakpointState::Requested { accepted: true });
-        self.queue_breakpoints(path);
-        self.refresh_breakpoints(editor);
     }
 
-    /// Keep a last known position for closed files. Only moved enabled rows need a new request.
+    /// Change only the enabled state and return the line where the sign is now shown.
+    fn set_breakpoint_disabled_by_id(
+        &mut self,
+        path: &Path,
+        identity: BreakpointId,
+        disabled: bool,
+        editor: &EditorState,
+    ) -> Option<u64> {
+        let rows = self.breakpoints.get_mut(path)?;
+        let row = rows.iter_mut().find(|row| row.identity == identity)?;
+        if let Some(changed) = &mut self.changed_breakpoints {
+            changed.insert((path.to_path_buf(), row.location.line(path, editor)));
+        }
+        row.disabled = disabled;
+        row.set_verdict(Some(DapBreakpointState::Requested { accepted: true }));
+        let line = row.display_line(path, editor);
+        for row in rows {
+            row.mark_pending();
+        }
+        self.queue_breakpoints(path);
+        self.refresh_breakpoints(editor);
+        Some(line)
+    }
+
+    /// Keep a last known position for closed files and merge marks that land on the same line.
     pub(in crate::app) fn sync_breakpoint_locations(&mut self, editor: &mut EditorState) {
-        let mut moved = Vec::new();
+        self.remove_discarded_breakpoint_marks(editor);
+        let mut refresh = Vec::new();
         for (path, rows) in &mut self.breakpoints {
-            let mut enabled_moved = false;
-            for row in rows {
+            let mut old_lines = BTreeMap::new();
+            let mut needs_refresh = false;
+            for row in rows.iter_mut() {
                 let before = row.location.last_line();
                 row.location.sync(path, editor);
                 let after = row.location.last_line();
@@ -1207,20 +1513,64 @@ impl Debugger {
                         changed.insert((path.clone(), before));
                         changed.insert((path.clone(), after));
                     }
-                    row.verdict = Some(DapBreakpointState::Requested { accepted: true });
-                    enabled_moved |= !row.disabled;
+                    row.set_verdict(Some(DapBreakpointState::Requested { accepted: true }));
+                    old_lines.insert(row.identity, before);
+                    needs_refresh |= !row.disabled;
                 }
             }
-            if enabled_moved {
-                moved.push(path.clone());
+            if !old_lines.is_empty() {
+                self.breakpoint_picker_dirty = true;
+                if rows.len() > 1 {
+                    needs_refresh |= Self::merge_breakpoints(rows, &old_lines, editor);
+                }
+            }
+            if needs_refresh {
+                refresh.push(path.clone());
             }
         }
-        for path in moved {
+        for path in refresh {
             self.queue_breakpoints(&path);
         }
     }
 
+    /// Keep the enabled row (the earlier one on ties) without taking settings from the loser.
+    fn merge_breakpoints(
+        rows: &mut Vec<SourceBreakpoint>,
+        old_lines: &BTreeMap<BreakpointId, u64>,
+        editor: &mut EditorState,
+    ) -> bool {
+        let mut by_line = HashMap::<u64, (BreakpointId, bool, u64, bool)>::new();
+        for row in rows.iter() {
+            let line = row.location.last_line();
+            let prior = old_lines.get(&row.identity).copied().unwrap_or(line);
+            let (winner, disabled, first_prior, converged) =
+                by_line
+                    .entry(line)
+                    .or_insert((row.identity, row.disabled, prior, false));
+            *converged |= *first_prior != prior;
+            if *disabled && !row.disabled {
+                *winner = row.identity;
+                *disabled = false;
+            }
+        }
+        // Co-located marks created by a cursor placement aren't an edit collision.
+        let mut removed_enabled = false;
+        rows.retain(|row| {
+            let (winner, _, _, converged) = by_line[&row.location.last_line()];
+            if converged && winner != row.identity {
+                // Undo remaps surviving marks; it does not restore the discarded breakpoint.
+                row.location.remove_mark(editor);
+                removed_enabled |= !row.disabled;
+                false
+            } else {
+                true
+            }
+        });
+        removed_enabled
+    }
+
     fn queue_breakpoints(&mut self, path: &Path) {
+        self.breakpoint_picker_dirty = true;
         if self.service.is_running() {
             self.latest_breakpoints.remove(path);
             self.breakpoint_refresh.insert(path.into());
@@ -1295,7 +1645,26 @@ impl Debugger {
     pub(in crate::app) fn end_state(&self) -> Option<crate::debugger::DapSessionEnd> {
         self.end_state
     }
-    /// What is true about a breakpoint, as a surface must render it.
+    /// Resolve only a displayed sign, using the same row order as the gutter.
+    fn displayed_breakpoint(
+        &self,
+        path: &Path,
+        line: u64,
+        editor: &EditorState,
+    ) -> Option<&SourceBreakpoint> {
+        self.breakpoints
+            .get(path)?
+            .iter()
+            .find(|row| row.display_line(path, editor) == line)
+    }
+
+    fn breakpoint_rows(&self) -> impl Iterator<Item = (&Path, &SourceBreakpoint)> {
+        self.breakpoints
+            .iter()
+            .flat_map(|(path, rows)| rows.iter().map(move |row| (path.as_path(), row)))
+    }
+
+    #[cfg(test)]
     fn breakpoint_state(
         &self,
         path: &Path,
@@ -1314,8 +1683,9 @@ impl Debugger {
         &mut self,
         editor: &EditorState,
     ) -> Vec<(PathBuf, Vec<DapSourceBreakpoint>)> {
+        self.breakpoint_picker_dirty = true;
         for row in self.breakpoints.values_mut().flatten() {
-            row.verdict = Some(DapBreakpointState::Requested { accepted: true });
+            row.set_verdict(Some(DapBreakpointState::Requested { accepted: true }));
         }
         self.breakpoints
             .keys()
@@ -1362,6 +1732,7 @@ impl Debugger {
             .iter()
             .flat_map(|(path, rows)| {
                 rows.iter().map(|row| PersistedBreakpoint {
+                    id: Some(row.persisted_id),
                     path: path.clone(),
                     line: row.location.line(path, editor),
                     column: row.column,
@@ -1428,8 +1799,9 @@ impl Debugger {
                         hit_condition: r.hit_condition,
                         log_message: r.log_message,
                     },
+                    None,
                     false,
-                    Some(r.disabled),
+                    Some((r.disabled, r.id)),
                     editor,
                 )
                 .is_ok()
@@ -1976,7 +2348,7 @@ pub(in crate::app) mod commands;
 
 use crate::app::App;
 use crate::app::TrustedAction;
-use crate::app::picker::PickerPayload;
+use crate::app::picker::{PickerOrigin, PickerPayload};
 use crate::editor::text::PositionCodec;
 use crate::editor::text::PositionEncoding;
 use crate::editor::text::TextBuffer;
@@ -2470,13 +2842,11 @@ impl App {
 }
 
 impl App {
-    /// Show what is TRUE about each breakpoint. The rows carry the adapter's verdict, so a
-    /// request is never presented as a fact.
-    pub(in crate::app) fn cursor_breakpoint_place(&self) -> Option<(PathBuf, u64)> {
+    fn cursor_breakpoint_place(&self) -> Option<(PathBuf, u64)> {
         let view = &self.state.views[self.state.active_view()?];
         let buffer = &self.state.buffers[view.buffer];
-        let line = buffer.text.byte_to_line(view.cursor).ok()?;
-        Some((buffer.path.clone()?, line as u64 + 1))
+        let line = buffer.text.byte_to_line(view.cursor).ok()? as u64 + 1;
+        Some((buffer.path.clone()?, line))
     }
 }
 
@@ -2490,7 +2860,7 @@ impl App {
         let Some((path, line)) = self.cursor_breakpoint_place() else {
             return;
         };
-        if let Err(error) = self.debugger_session.breakpoint(
+        if let Err(error) = self.debugger_session.breakpoint_on_display_line(
             DapSourceBreakpoint {
                 path,
                 line,
@@ -2508,39 +2878,80 @@ impl App {
 }
 
 impl App {
+    pub(in crate::app) fn remove_picked_breakpoint(&mut self, path: &Path, identity: BreakpointId) {
+        let Some(row) = self
+            .debugger_session
+            .breakpoints
+            .get(path)
+            .and_then(|rows| rows.iter().find(|row| row.identity == identity))
+        else {
+            return;
+        };
+        let requested = row.request_row(path, &self.state);
+        match self.debugger_session.change_breakpoint(
+            requested,
+            Some(identity),
+            true,
+            &mut self.state,
+        ) {
+            Ok(_) => self.project_debug_panes(),
+            Err(error) => self.show_error(error),
+        }
+    }
+
     pub(in crate::app) fn open_breakpoint_states(&mut self) {
-        let rows = self.debugger_session.persisted_breakpoints(&self.state);
-        let items = rows
-            .into_iter()
-            .enumerate()
-            .map(|(index, row)| {
-                let state = self
-                    .debugger_session
-                    .breakpoint_state(&row.path, row.line, &self.state)
-                    .map(|state| state.label())
-                    .unwrap_or("not requested");
+        let running = self.debugger_session.is_running();
+        let items = self
+            .debugger_session
+            .breakpoint_rows()
+            .map(|(path, row)| {
+                let line = row.display_line(path, &self.state);
+                let state = row
+                    .state()
+                    .filter(|state| running || *state == DapBreakpointState::Disabled)
+                    .map(DapBreakpointState::label);
+                let mut detail = state.unwrap_or_default().to_owned();
+                if let Some(condition) = &row.condition {
+                    if !detail.is_empty() {
+                        detail.push_str(", ");
+                    }
+                    detail.push_str("if ");
+                    detail.push_str(condition);
+                }
+                if let Some(message) = &row.log_message {
+                    if !detail.is_empty() {
+                        detail.push_str(", ");
+                    }
+                    // Keep the full message searchable, but let it clip after the condition.
+                    detail.push_str("logs: ");
+                    detail.push_str(message);
+                }
                 (
                     PickerItem {
                         badge: String::new(),
                         kind: crate::workspace::PickerItemKind::Entry,
-                        id: PickerItemId(format!("breakpoint:{index}")),
-                        label: format!("{}:{}", self.workspace_relative_label(&row.path), row.line),
-                        detail: match &row.condition {
-                            Some(condition) => format!("{state}, if {condition}"),
-                            None => state.to_owned(),
-                        },
+                        id: PickerItemId(format!("breakpoint:{}", row.identity.0)),
+                        label: format!("{}:{line}", self.workspace_relative_label(path)),
+                        detail,
                         source: "debugger".into(),
                         action: PickerAction::None,
                     },
-                    PickerPayload::Command("dap.breakpoints.states".into()),
+                    PickerPayload::Breakpoint {
+                        path: path.into(),
+                        identity: row.identity,
+                    },
                 )
             })
             .collect::<Vec<_>>();
-        let title = format!(
-            "Breakpoints · {} (what is true, not what was asked)",
-            items.len()
+        let title = format!("Breakpoints · {}", items.len());
+        self.install_surface_picker_state(
+            PickerSurfaceKind::Generic,
+            title,
+            items,
+            String::new(),
+            true,
+            PickerOrigin::Breakpoints,
         );
-        self.install_picker(title, items);
     }
 }
 
@@ -2571,21 +2982,28 @@ impl App {
             return;
         };
         let line = buffer.text.byte_to_line(cursor).unwrap_or(0) as u64 + 1;
-        let Some(disabled) = self
+        let Some(row) = self
             .debugger_session
-            .breakpoint_disabled(&path, line, &self.state)
+            .displayed_breakpoint(&path, line, &self.state)
         else {
             self.show_error("no breakpoint on this line");
             return;
         };
-        self.debugger_session
-            .set_breakpoint_disabled(&path, line, !disabled, &self.state);
+        let disabled = !row.disabled;
+        let Some(line) = self.debugger_session.set_breakpoint_disabled_by_id(
+            &path,
+            row.identity,
+            disabled,
+            &self.state,
+        ) else {
+            return;
+        };
         self.notify_message(
             format!(
                 "breakpoint {}:{} is now {}",
                 path.display(),
                 line,
-                if disabled { "enabled" } else { "disabled" }
+                if disabled { "disabled" } else { "enabled" }
             ),
             false,
         );
@@ -2625,7 +3043,19 @@ impl App {
     /// the breakpoints it holds, its watches and its console. Absent when there is no session, so
     /// the whole arrangement appears and disappears as ONE decision.
     pub(in crate::app) fn project_debug_panes(&mut self) {
+        self.debugger_session
+            .remove_discarded_breakpoint_marks(&mut self.state);
         self.project_debug_signs();
+        if std::mem::take(&mut self.debugger_session.breakpoint_picker_dirty)
+            && self.search.breakpoint_picker_open(
+                self.workspace.version(),
+                self.configuration.binding_revision(),
+            )
+        {
+            self.open_breakpoint_states();
+            // A reply can change only the picker's status, without moving a gutter sign.
+            self.ui.revision = self.ui.revision.wrapping_add(1);
+        }
         let was_open = self.ui.debug_panes.is_some();
         let target = self
             .debugger_session
@@ -2660,11 +3090,11 @@ impl App {
         let adapter = target.adapter.clone();
         let breakpoints = self
             .debugger_session
-            .persisted_breakpoints(&self.state)
-            .iter()
-            .map(|b| {
-                let place = format!("{}:{}", self.workspace_relative_label(&b.path), b.line);
-                match &b.condition {
+            .breakpoint_rows()
+            .map(|(path, row)| {
+                let line = row.display_line(path, &self.state);
+                let place = format!("{}:{line}", self.workspace_relative_label(path));
+                match &row.condition {
                     Some(condition) => format!("{place} if {condition}"),
                     None => place,
                 }
@@ -2742,24 +3172,20 @@ impl App {
         }
         signs.extend(
             self.debugger_session
-                .breakpoints
-                .iter()
-                .flat_map(|(path, rows)| {
-                    let editor = &self.state;
-                    rows.iter().map(move |row| DebugSign {
-                        path: path.clone(),
-                        line: row.location.line(path, editor).saturating_sub(1) as usize,
-                        kind: if row.disabled {
-                            DebugSignKind::DisabledBreakpoint
-                        } else if row.condition.is_some()
-                            || row.hit_condition.is_some()
-                            || row.log_message.is_some()
-                        {
-                            DebugSignKind::ConditionalBreakpoint
-                        } else {
-                            DebugSignKind::Breakpoint
-                        },
-                    })
+                .breakpoint_rows()
+                .map(|(path, row)| DebugSign {
+                    path: path.into(),
+                    line: row.display_line(path, &self.state).saturating_sub(1) as usize,
+                    kind: if row.disabled {
+                        DebugSignKind::DisabledBreakpoint
+                    } else if row.condition.is_some()
+                        || row.hit_condition.is_some()
+                        || row.log_message.is_some()
+                    {
+                        DebugSignKind::ConditionalBreakpoint
+                    } else {
+                        DebugSignKind::Breakpoint
+                    },
                 }),
         );
         self.ui.set(signs, |ui| &mut ui.debug_signs);

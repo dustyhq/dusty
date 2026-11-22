@@ -1454,18 +1454,22 @@ while True:
         ]
     );
     let path = root.path().join("main.rs");
-    service
-        .control(DapControl::SetBreakpoints {
-            path: path.clone(),
-            breakpoints: vec![DapSourceBreakpoint {
+    let context = service.context().unwrap();
+    let breakpoint_request = service
+        .control_tracked(
+            &context,
+            DapControl::SetBreakpoints {
                 path: path.clone(),
-                line: 20,
-                column: None,
-                condition: None,
-                hit_condition: None,
-                log_message: None,
-            }],
-        })
+                breakpoints: vec![DapSourceBreakpoint {
+                    path: path.clone(),
+                    line: 20,
+                    column: None,
+                    condition: None,
+                    hit_condition: None,
+                    log_message: None,
+                }],
+            },
+        )
         .unwrap();
     let mut acknowledged = false;
     let mut changed = false;
@@ -1474,13 +1478,17 @@ while True:
             match event {
                 DapEvent::Response {
                     response: DapResponse::Breakpoints(_),
+                    request_id,
                     request: Some(DapControl::SetBreakpoints { breakpoints, .. }),
                     ..
                 } => {
+                    assert_eq!(request_id, breakpoint_request);
                     assert_eq!(breakpoints[0].line, 20);
                     acknowledged = true;
                 }
                 DapEvent::Response {
+                    request_id,
+                    request: None,
                     response:
                         DapResponse::BreakpointChanged {
                             path: actual,
@@ -1491,6 +1499,7 @@ while True:
                         },
                     ..
                 } => {
+                    assert_eq!(request_id, breakpoint_request);
                     assert_eq!(actual, path);
                     changed = true;
                 }
@@ -1603,7 +1612,8 @@ fn abnormal_adapter_exit_kills_term_ignoring_descendants_and_releases_pipes() {
 }
 
 const SERVER_ADAPTER: &str = r#"
-import socket,threading,json,sys,pathlib
+import socket,threading,json,sys,pathlib,time
+gated='--gated' in sys.argv
 server=socket.socket()
 server.bind(('127.0.0.1',int(sys.argv[1])))
 server.listen(4)
@@ -1630,14 +1640,16 @@ def serve(sock,child):
   if m.get('type')!='request': continue
   c=m['command'];body={}
   if c=='initialize': body={'supportsConfigurationDoneRequest':True,'supportTerminateDebuggee':True}
-  if c=='setBreakpoints': body={'breakpoints':[{'verified':True,'line':b['line']} for b in m['arguments']['breakpoints']]}
+  if c=='setBreakpoints': body={'breakpoints':[{'verified':True,'line':b['line']+(2 if child else 1)} for b in m['arguments']['breakpoints']]}
   if c=='threads': body={'threads':[{'id':7,'name':'node-child'}]}
   if c=='evaluate': body={'result':'42','variablesReference':0}
   send({'type':'response','request_seq':m['seq'],'command':c,'success':True,'body':body})
   if c=='initialize': send({'type':'event','event':'initialized'})
   if c=='configurationDone':
    if child: send({'type':'event','event':'stopped','body':{'reason':'breakpoint','threadId':7}})
-   else: send({'type':'request','command':'startDebugging','arguments':{'request':'attach','configuration':{'type':'pwa-node','__pendingTargetId':'fixture-target'}}})
+   else:
+    while gated and not pathlib.Path('allow-child').exists(): time.sleep(.005)
+    send({'type':'request','command':'startDebugging','arguments':{'request':'attach','configuration':{'type':'pwa-node','__pendingTargetId':'fixture-target'}}})
   if c=='disconnect':
    # Close after Dusty does: Windows drops unread data when a peer resets the connection.
    try:
@@ -1650,13 +1662,21 @@ child,_=server.accept()
 serve(child,True)
 "#;
 
+pub(crate) fn server_launch(root: &Path, gated: bool) -> DapLaunch {
+    let script = root.join("server.py");
+    std::fs::write(&script, SERVER_ADAPTER).unwrap();
+    let mut configuration = launch(root, &script);
+    configuration.arguments.push("{listen_port}".into());
+    if gated {
+        configuration.arguments.push("--gated".into());
+    }
+    configuration
+}
+
 #[test]
 fn server_child_session_keeps_breakpoints_and_routes_controls_to_the_child() {
     let root = tempfile::tempdir().unwrap();
-    let script = root.path().join("server.py");
-    std::fs::write(&script, SERVER_ADAPTER).unwrap();
-    let mut configuration = launch(root.path(), &script);
-    configuration.arguments.push("{listen_port}".into());
+    let mut configuration = server_launch(root.path(), false);
     let source = root.path().join("demo.js");
     configuration.breakpoints = vec![(
         source.clone(),
@@ -1673,25 +1693,30 @@ fn server_child_session_keeps_breakpoints_and_routes_controls_to_the_child() {
     service.start_absolute(configuration).unwrap();
     let deadline = Instant::now() + Duration::from_secs(20);
     let mut stopped = false;
-    let mut verified = 0;
-    while !stopped || verified < 2 {
-        match service.try_event() {
-            Some(DapEvent::Stopped {
-                thread_id: Some(7), ..
-            }) => stopped = true,
-            Some(DapEvent::Response {
-                response: DapResponse::Breakpoints(rows),
-                ..
-            }) => {
-                assert!(rows[0].0);
-                verified += 1;
+    let mut verified = Vec::new();
+    while !stopped || verified.len() < 2 {
+        if let Some((context, event)) = service.try_owned_event() {
+            match event {
+                DapEvent::Stopped {
+                    thread_id: Some(7), ..
+                } => stopped = true,
+                DapEvent::Response {
+                    request_id,
+                    response: DapResponse::Breakpoints(rows),
+                    ..
+                } => {
+                    assert_eq!(request_id, 0);
+                    assert!(rows[0].0);
+                    verified.push((context.connection(), rows[0].1));
+                }
+                DapEvent::Failed { message, .. } => panic!("server adapter failed: {message}"),
+                _ => {}
             }
-            Some(DapEvent::Failed { message, .. }) => panic!("server adapter failed: {message}"),
-            _ => {}
         }
         assert!(Instant::now() < deadline, "child did not stop");
         thread::sleep(Duration::from_millis(2));
     }
+    assert_eq!(verified, [(0, Some(4)), (1, Some(5))]);
     service
         .control(DapControl::Evaluate {
             expression: "6*7".into(),

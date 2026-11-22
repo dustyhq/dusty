@@ -57,21 +57,20 @@ pub(super) struct InputState {
         usize,
         usize,
     )>,
-    pending_breakpoint: Option<(
-        crate::debugger::DapSourceBreakpoint,
-        crate::app::debugger::BreakpointLocation,
-    )>,
+    pending_breakpoint: Option<crate::app::debugger::BreakpointConditionTarget>,
     modal: ModalResolver,
     named_mode: Option<(
         crate::editor::EditorWindowVersion,
         crate::editor::ViewId,
         NamedMode,
     )>,
-    key_layers: Vec<(Option<(String, String)>, Keymap)>,
+    key_layers: Vec<EditorKeymapLayer>,
     pending_commands: BTreeMap<crate::editor::PendingCommandId, PendingCommand>,
     pending_input: Option<crate::editor::PendingCommandId>,
     held_input: VecDeque<crate::app::editing::clipboard::DeferredInput>,
     sequence: KeymapSequence,
+    release_keymap: ReleaseKeymap,
+    handoff_key: Option<HandoffKey>,
     pending: Option<PendingKeymap>,
     hints: Option<KeyHintUiState>,
     prompt: Option<crate::ui::PromptState>,
@@ -1070,17 +1069,13 @@ impl InputState {
     }
     pub(in crate::app) fn set_pending_breakpoint(
         &mut self,
-        row: crate::debugger::DapSourceBreakpoint,
-        location: crate::app::debugger::BreakpointLocation,
+        target: crate::app::debugger::BreakpointConditionTarget,
     ) {
-        self.pending_breakpoint = Some((row, location));
+        self.pending_breakpoint = Some(target);
     }
     pub(in crate::app) fn take_pending_breakpoint(
         &mut self,
-    ) -> Option<(
-        crate::debugger::DapSourceBreakpoint,
-        crate::app::debugger::BreakpointLocation,
-    )> {
+    ) -> Option<crate::app::debugger::BreakpointConditionTarget> {
         self.pending_breakpoint.take()
     }
     pub(in crate::app) fn prompt_insert(&mut self, text: &str) {

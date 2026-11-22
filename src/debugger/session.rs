@@ -32,6 +32,7 @@ pub(super) struct Actor {
     closed: AtomicBool,
     done: AtomicBool,
     pub(super) stop_id: AtomicU64,
+    connection: AtomicU64,
     pub(super) live: Arc<AtomicBool>,
     failure: Mutex<Option<String>>,
     pub(super) stderr: Mutex<Vec<u8>>,
@@ -48,6 +49,17 @@ pub(super) struct Actor {
 pub(crate) struct DapContext {
     actor: Arc<Actor>,
     stop_id: u64,
+    connection: u64,
+}
+
+impl DapContext {
+    pub(crate) fn connection(&self) -> u64 {
+        self.connection
+    }
+
+    pub(crate) fn on_current_connection(&self) -> bool {
+        self.connection == self.actor.connection.load(Ordering::Acquire)
+    }
 }
 pub(super) struct Control {
     pub(super) value: DapControl,
@@ -61,6 +73,10 @@ pub(super) struct Events {
     _resident: Arc<()>,
 }
 impl Events {
+    pub(super) fn next_connection(&self) {
+        self.actor.connection.fetch_add(1, Ordering::AcqRel);
+    }
+
     // Report worker failures after cleanup, when stderr has finished draining.
     pub(super) fn fail(&self, message: String) {
         if let Ok(mut failure) = self.actor.failure.lock() {
@@ -71,6 +87,7 @@ impl Events {
         let context = DapContext {
             actor: self.actor.clone(),
             stop_id: self.actor.stop_id.load(Ordering::Acquire),
+            connection: self.actor.connection.load(Ordering::Acquire),
         };
         deliver(&self.sender, (context, event), &self.actor.cancel)
             .then_some(())
@@ -132,16 +149,20 @@ impl DapClient {
         Some(DapContext {
             actor: session.actor.clone(),
             stop_id: session.actor.stop_id.load(Ordering::Acquire),
+            connection: session.actor.connection.load(Ordering::Acquire),
         })
     }
     pub(crate) fn current(&self, source: &DapContext) -> bool {
+        self.current_session(source)
+            && source.stop_id == source.actor.stop_id.load(Ordering::Acquire)
+    }
+    fn current_session(&self, source: &DapContext) -> bool {
         self.session.as_ref().is_some_and(|s| {
             Arc::ptr_eq(&s.actor, &source.actor)
                 && !s.actor.closed.load(Ordering::Acquire)
                 && !s.actor.cancel.load(Ordering::Acquire)
                 && !s.actor.done.load(Ordering::Acquire)
                 && s.actor.live.load(Ordering::Acquire)
-                && source.stop_id == s.actor.stop_id.load(Ordering::Acquire)
         })
     }
     #[cfg(test)]
@@ -239,6 +260,7 @@ impl DapClient {
             closed: AtomicBool::new(false),
             done: AtomicBool::new(false),
             stop_id: AtomicU64::new(0),
+            connection: AtomicU64::new(0),
             live: Arc::new(AtomicBool::new(true)),
             failure: Mutex::new(None),
             stderr: Mutex::new(Vec::new()),
@@ -305,7 +327,13 @@ impl DapClient {
         source: &DapContext,
         control: DapControl,
     ) -> Result<u64, DapError> {
-        if !self.current(source) {
+        // The breakpoint list belongs to the adapter, not to a particular pause.
+        let current = if matches!(control, DapControl::SetBreakpoints { .. }) {
+            self.current_session(source)
+        } else {
+            self.current(source)
+        };
+        if !current {
             return Err(DapError::StaleContext);
         }
         let session = self.session.as_ref().ok_or(DapError::NotRunning)?;
@@ -425,6 +453,7 @@ impl DapClient {
                         DapContext {
                             actor: session.actor.clone(),
                             stop_id: session.actor.stop_id.load(Ordering::Acquire),
+                            connection: session.actor.connection.load(Ordering::Acquire),
                         },
                         DapEvent::Failed {
                             adapter: session.name.clone(),
@@ -642,6 +671,10 @@ impl TestAdapter {
         self.events.actor.stop_id.store(stop_id, Ordering::Release);
         self.events.send(event).unwrap();
     }
+    pub(crate) fn next_connection(&self) {
+        self.events.next_connection();
+    }
+
     pub(crate) fn advance(&self, stop_id: u64) {
         self.events.actor.stop_id.store(stop_id, Ordering::Release);
     }
@@ -664,6 +697,7 @@ pub(crate) fn fixture() -> (DapClient, TestAdapter) {
         closed: AtomicBool::new(false),
         done: AtomicBool::new(false),
         stop_id: AtomicU64::new(0),
+        connection: AtomicU64::new(0),
         live: Arc::new(AtomicBool::new(true)),
         failure: Mutex::new(None),
         stderr: Mutex::new(Vec::new()),
@@ -836,6 +870,48 @@ mod request_tests {
             })
         ));
     }
+    #[test]
+    fn breakpoint_move_reaches_the_adapter_when_a_stop_advances_before_enqueue() {
+        let (service, adapter) = fixture();
+        let source = service.context().unwrap();
+        adapter.event(
+            1,
+            DapEvent::Stopped {
+                adapter: "same-name".into(),
+                reason: "step".into(),
+                thread_id: Some(1),
+            },
+        );
+        assert!(matches!(
+            service.control_tracked(&source, DapControl::Threads),
+            Err(DapError::StaleContext)
+        ));
+
+        let path = crate::files::absolute_test_path("/source.rs");
+        let moved = DapSourceBreakpoint {
+            path: path.clone(),
+            line: 3,
+            column: None,
+            condition: Some("ready".into()),
+            hit_condition: None,
+            log_message: None,
+        };
+        service
+            .control_tracked(
+                &source,
+                DapControl::SetBreakpoints {
+                    path: path.clone(),
+                    breakpoints: vec![moved.clone()],
+                },
+            )
+            .unwrap();
+        assert!(matches!(
+            adapter.control(),
+            Some(DapControl::SetBreakpoints { path: sent, breakpoints })
+                if sent == path && breakpoints == [moved]
+        ));
+    }
+
     #[test]
     fn queued_session_controls_survive_new_stops() {
         use crate::debugger::transport_tests::ADAPTER;

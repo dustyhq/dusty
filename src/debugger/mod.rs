@@ -56,6 +56,7 @@ pub enum DapEvent {
     Response {
         adapter: String,
         stop_id: u64,
+        /// For breakpoint events, the request that registered the adapter's breakpoint ID.
         request_id: u64,
         request: Option<DapControl>,
         response: DapResponse,
@@ -118,6 +119,7 @@ pub enum DapResponse {
     BreakpointChanged {
         path: PathBuf,
         requested: u64,
+        request_index: usize,
         verified: bool,
         line: Option<u64>,
         removed: bool,
@@ -716,14 +718,11 @@ fn run_adapter(
     let mut launch_accepted = false;
     let mut initialized = false;
     let mut configuration_sent = false;
-    let mut saved_breakpoints = initial_breakpoints
-        .iter()
-        .cloned()
-        .collect::<BTreeMap<_, _>>();
     let mut initial_breakpoints = initial_breakpoints
         .into_iter()
         .map(|(path, rows)| (path, (0, rows)))
         .collect::<BTreeMap<_, _>>();
+    let mut saved_breakpoints = initial_breakpoints.clone();
     let mut paused = false;
     let mut supports_configuration_done = false;
     let mut thread_id = None;
@@ -732,7 +731,7 @@ fn run_adapter(
     let mut adapter_exited_at = None;
     let mut stop_id = 0_u64;
     let mut pending: HashMap<i64, (String, u64, u64, Option<DapControl>)> = HashMap::new();
-    let mut breakpoint_ids = HashMap::<i64, (PathBuf, u64)>::new();
+    let mut breakpoint_ids = HashMap::<i64, (PathBuf, u64, usize, u64)>::new();
     let mut applied_breakpoints = HashMap::<PathBuf, i64>::new();
     let mut reverse = Vec::<reverse::ReverseRequest>::new();
     let mut last_reverse_sequence = 0;
@@ -763,7 +762,7 @@ fn run_adapter(
                 continue;
             }
             if let DapControl::SetBreakpoints { path, breakpoints } = &control.value {
-                saved_breakpoints.insert(path.clone(), breakpoints.clone());
+                saved_breakpoints.insert(path.clone(), (control.request_id, breakpoints.clone()));
             }
             let request_id = control.request_id;
             let original = control.value.clone();
@@ -1012,14 +1011,19 @@ fn run_adapter(
                                 .is_none_or(|applied| request_seq > *applied)
                         {
                             applied_breakpoints.insert(path.clone(), request_seq);
-                            breakpoint_ids.retain(|_, (old, _)| old != path);
+                            breakpoint_ids.retain(|_, (old, ..)| old != path);
                             if let Some(rows) = message
                                 .pointer("/body/breakpoints")
                                 .and_then(Value::as_array)
                             {
-                                for (asked, row) in breakpoints.iter().zip(rows) {
+                                for (index, (asked, row)) in
+                                    breakpoints.iter().zip(rows).enumerate()
+                                {
                                     if let Some(id) = row.get("id").and_then(Value::as_i64) {
-                                        breakpoint_ids.insert(id, (path.clone(), asked.line));
+                                        breakpoint_ids.insert(
+                                            id,
+                                            (path.clone(), asked.line, index, request_id),
+                                        );
                                     }
                                 }
                             }
@@ -1128,7 +1132,7 @@ fn run_adapter(
                     match event {
                         "breakpoint" => {
                             let row = &message["body"]["breakpoint"];
-                            if let Some((path, requested)) = row
+                            if let Some((path, requested, request_index, request_id)) = row
                                 .get("id")
                                 .and_then(Value::as_i64)
                                 .and_then(|id| breakpoint_ids.get(&id))
@@ -1138,11 +1142,12 @@ fn run_adapter(
                                     .send(DapEvent::Response {
                                         adapter: adapter.clone(),
                                         stop_id,
-                                        request_id: 0,
+                                        request_id,
                                         request: None,
                                         response: DapResponse::BreakpointChanged {
                                             path,
                                             requested,
+                                            request_index,
                                             verified: row.get("verified").and_then(Value::as_bool)
                                                 == Some(true),
                                             line: row.get("line").and_then(Value::as_u64),
@@ -1295,10 +1300,8 @@ fn run_adapter(
                         pending.clear();
                         breakpoint_ids.clear();
                         applied_breakpoints.clear();
-                        initial_breakpoints = saved_breakpoints
-                            .iter()
-                            .map(|(path, rows)| (path.clone(), (0, rows.clone())))
-                            .collect();
+                        events.next_connection();
+                        initial_breakpoints.clone_from(&saved_breakpoints);
                         initialize_sequence = sequence;
                         send_request(
                             &mut stdin,
@@ -1842,12 +1845,13 @@ pub(crate) use session::fixture as test_session;
 #[cfg(test)]
 mod transport_tests;
 #[cfg(test)]
-#[cfg(test)]
 pub(crate) use transport_tests::ADAPTER as TEST_ADAPTER;
 #[cfg(test)]
 pub(crate) use transport_tests::LOGGING_ADAPTER as TEST_LOGGING_ADAPTER;
 #[cfg(test)]
 pub(crate) use transport_tests::python as test_python;
+#[cfg(test)]
+pub(crate) use transport_tests::server_launch as test_server_launch;
 
 /// What is TRUE about a breakpoint, as opposed to what was asked for.
 ///
@@ -1878,9 +1882,9 @@ impl DapBreakpointState {
     #[must_use]
     pub fn label(self) -> &'static str {
         match self {
-            Self::Requested { accepted: false } => "requested (adapter did not verify it)",
-            Self::Requested { accepted: true } => "requested (awaiting acknowledgement)",
-            Self::Verified { .. } => "verified",
+            Self::Requested { accepted: false } => "not confirmed",
+            Self::Requested { accepted: true } => "waiting for debugger",
+            Self::Verified { .. } => "Verified",
             Self::Disabled => "disabled",
         }
     }
@@ -2033,7 +2037,7 @@ mod breakpoint_state_tests {
                 .all(|state| matches!(state, DapBreakpointState::Requested { .. })),
             "and every one is reported as requested: {pending:?}"
         );
-        assert_eq!(pending[0].label(), "requested (awaiting acknowledgement)");
+        assert_eq!(pending[0].label(), "waiting for debugger");
 
         // The adapter ANSWERS but declines to verify one of them: an answered request is still
         // not a fact, so it stays unverified and says so.
@@ -2055,11 +2059,7 @@ mod breakpoint_state_tests {
             !partial[1].is_verified(),
             "an adapter that did NOT verify a breakpoint must not be shown as verifying it"
         );
-        assert_eq!(
-            partial[1].label(),
-            "requested (adapter did not verify it)",
-            "and the state says which of the two it is"
-        );
+        assert_eq!(partial[1].label(), "not confirmed");
         assert_eq!(
             partial[2],
             DapBreakpointState::Verified { line: 31 },

@@ -101,8 +101,192 @@ fn breakpoint_condition_prompt_preserves_its_original_target_and_other_settings(
     );
     assert_eq!(
         app.debugger_session
-            .breakpoint_at(&expected.path, expected.line, &app.state),
-        Some(expected)
+            .enabled_breakpoints(&expected.path, &app.state),
+        [expected]
+    );
+}
+
+#[test]
+fn breakpoint_condition_prompt_follows_its_breakpoint_when_formatting_splits_the_line() {
+    use crate::app::language::tests::fixture_owned_lsp;
+    use crate::editor::text::{ByteRange, TextEdit, TextEditSet};
+    use crate::editor::{EditorOperation, EditorTransaction, TransactionId};
+    use crate::language::lsp::{
+        LspDocumentEdit, LspFeatureResult, LspPosition, LspRange, LspTextEdit, LspWorkspaceEdit,
+        file_uri,
+    };
+
+    let (_app_dirs, mut app) = app();
+    let path = app.state.workspace_root.join("source.rs");
+    let (buffer, view) = app
+        .state
+        .open_text(TextBuffer::from_text("first\nsecond\n"), Some(path.clone()))
+        .unwrap();
+    app.set_dashboard_visibility(false);
+    let mut expected = DapSourceBreakpoint {
+        path: path.clone(),
+        line: 2,
+        column: None,
+        condition: Some("old".into()),
+        hit_condition: Some("3".into()),
+        log_message: None,
+    };
+    app.debugger_session
+        .breakpoint(expected.clone(), false, &mut app.state)
+        .unwrap();
+
+    let line_start = ByteOffset("first\n".len());
+    let revision = app.state.buffers[buffer].text.revision();
+    app.state
+        .apply_transaction(&EditorTransaction::new(TransactionId(1)).with_operation(
+            EditorOperation::ApplyEdits {
+                buffer,
+                edits: TextEditSet::new(
+                    revision,
+                    vec![TextEdit::new(ByteRange::empty(line_start), "prefix ")],
+                ),
+            },
+        ))
+        .unwrap();
+    let formatter = fixture_owned_lsp(&mut app, "formatter", buffer);
+    app.state.views[view].cursor = line_start;
+    app.process_effect(AppEffect::DapBreakpointConfigure {
+        condition: None,
+        hit_condition: None,
+        log_message: None,
+    });
+    assert_eq!(app.input.prompt().unwrap().input, "old");
+
+    let uri = file_uri(&path);
+    let split = LspPosition {
+        line: 1,
+        character: 7,
+    };
+    app.present_lsp_result_owned(
+        "formatter",
+        1,
+        "textDocument/formatting",
+        &uri,
+        LspFeatureResult::WorkspaceEdit(LspWorkspaceEdit {
+            resources: Vec::new(),
+            documents: vec![LspDocumentEdit {
+                uri: uri.clone(),
+                version: None,
+                edits: vec![LspTextEdit {
+                    range: LspRange {
+                        start: split.clone(),
+                        end: split,
+                    },
+                    new_text: "\n".into(),
+                }],
+            }],
+        }),
+        Some(formatter.context()),
+    );
+    assert_eq!(
+        app.state.buffers[buffer].text.to_string(),
+        "first\nprefix \nsecond\n"
+    );
+    app.input.prompt_insert(" && ready");
+    app.submit_prompt();
+
+    expected.line = 3;
+    expected.condition = Some("old && ready".into());
+    assert_eq!(
+        app.debugger_session.enabled_breakpoints(&path, &app.state),
+        [expected]
+    );
+}
+
+#[test]
+fn breakpoint_condition_prompt_updates_the_disabled_breakpoint_on_the_remapped_line() {
+    use crate::app::language::tests::fixture_owned_lsp;
+    use crate::language::lsp::{
+        LspDocumentEdit, LspFeatureResult, LspPosition, LspRange, LspTextEdit, LspWorkspaceEdit,
+        file_uri,
+    };
+
+    let (_app_dirs, mut app) = app();
+    let path = app.state.workspace_root.join("source.rs");
+    let (buffer, view) = app
+        .state
+        .open_text(
+            TextBuffer::from_text("first\n\nsecond\n"),
+            Some(path.clone()),
+        )
+        .unwrap();
+    app.set_dashboard_visibility(false);
+    app.debugger_session
+        .breakpoint(
+            DapSourceBreakpoint {
+                path: path.clone(),
+                line: 3,
+                column: Some(2),
+                condition: Some("old".into()),
+                hit_condition: Some("3".into()),
+                log_message: Some("value={value}".into()),
+            },
+            false,
+            &mut app.state,
+        )
+        .unwrap();
+    app.debugger_session
+        .set_breakpoint_disabled(&path, 3, true, &app.state);
+    let mut expected = app
+        .debugger_session
+        .persisted_breakpoints(&app.state)
+        .remove(0);
+    assert!(expected.disabled);
+
+    let formatter = fixture_owned_lsp(&mut app, "formatter", buffer);
+    app.state.views[view].cursor = ByteOffset("first\n".len());
+    app.process_effect(AppEffect::DapBreakpointConfigure {
+        condition: None,
+        hit_condition: None,
+        log_message: None,
+    });
+    assert!(app.input.prompt().unwrap().input.is_empty());
+
+    let uri = file_uri(&path);
+    app.present_lsp_result_owned(
+        "formatter",
+        1,
+        "textDocument/formatting",
+        &uri,
+        LspFeatureResult::WorkspaceEdit(LspWorkspaceEdit {
+            resources: Vec::new(),
+            documents: vec![LspDocumentEdit {
+                uri: uri.clone(),
+                version: None,
+                edits: vec![LspTextEdit {
+                    range: LspRange {
+                        start: LspPosition {
+                            line: 1,
+                            character: 0,
+                        },
+                        end: LspPosition {
+                            line: 2,
+                            character: 0,
+                        },
+                    },
+                    new_text: String::new(),
+                }],
+            }],
+        }),
+        Some(formatter.context()),
+    );
+    assert_eq!(
+        app.state.buffers[buffer].text.to_string(),
+        "first\nsecond\n"
+    );
+    app.input.prompt_insert("ready");
+    app.submit_prompt();
+
+    expected.line = 2;
+    expected.condition = Some("ready".into());
+    assert_eq!(
+        app.debugger_session.persisted_breakpoints(&app.state),
+        [expected]
     );
 }
 
@@ -376,6 +560,837 @@ fn conditional_breakpoint_request_follows_an_inserted_line() {
         Some(DapControl::SetBreakpoints { path: source, breakpoints })
             if source == path && breakpoints == [row]
     ));
+}
+
+#[test]
+fn adapter_relocated_breakpoint_is_shown_separately_from_its_anchor() {
+    use crate::editor::text::{TextEdit, TextEditSet};
+    use crate::editor::{EditorOperation, EditorTransaction, TransactionId};
+
+    let (_app_dirs, mut app) = app();
+    let path = app.state.workspace_root.join("source.rs");
+    let (buffer, _) = app
+        .state
+        .open_text(
+            TextBuffer::from_text("first\nsecond\nthird\n"),
+            Some(path.clone()),
+        )
+        .unwrap();
+    app.set_dashboard_visibility(false);
+    let (service, adapter) = crate::debugger::test_session();
+    app.debugger_session.service = service;
+    app.debugger_session.target = Some(DapTargetIdentity {
+        configuration: None,
+        adapter: "fixture".into(),
+        request: crate::config::DebugRequestKind::Launch,
+        program: None,
+        automatic_program: false,
+        document: None,
+        target: None,
+    });
+    let mut row = DapSourceBreakpoint {
+        path: path.clone(),
+        line: 2,
+        column: None,
+        condition: None,
+        hit_condition: None,
+        log_message: None,
+    };
+    app.debugger_session
+        .breakpoint(row.clone(), false, &mut app.state)
+        .unwrap();
+
+    for (anchor, verified) in [(2, 3), (3, 4)] {
+        row.line = anchor;
+        let request = adapter.control().unwrap();
+        assert!(matches!(
+            &request,
+            DapControl::SetBreakpoints { path: source, breakpoints }
+                if source == &path && breakpoints.as_slice() == std::slice::from_ref(&row)
+        ));
+        let BreakpointRequest::Pending(request_id, ..) =
+            app.debugger_session.latest_breakpoints[&path]
+        else {
+            panic!("expected a pending update for the new anchor");
+        };
+        adapter.event(
+            0,
+            DapEvent::Response {
+                adapter: "fixture".into(),
+                stop_id: 0,
+                request_id,
+                request: Some(request),
+                response: DapResponse::Breakpoints(vec![(true, Some(verified), None)]),
+            },
+        );
+        app.process_dap_events();
+        assert_eq!(app.ui.debug_signs[0].line as u64, verified - 1);
+        let label = format!("{}:{verified}", app.workspace_relative_label(&path));
+        assert_eq!(
+            app.ui.debug_panes.as_ref().unwrap().breakpoints,
+            [label.as_str()]
+        );
+        app.open_breakpoint_states();
+        let picker = app.ui.picker.as_ref().unwrap();
+        assert_eq!(picker.rows[0].label, label);
+        assert_eq!(picker.rows[0].detail, "Verified");
+        app.close_picker();
+        assert_eq!(
+            app.debugger_session.persisted_breakpoints(&app.state)[0].line,
+            anchor
+        );
+
+        if anchor == 2 {
+            let revision = app.state.buffers[buffer].text.revision();
+            app.apply_authoritative_editor_transaction(
+                &EditorTransaction::new(TransactionId(1)).with_operation(
+                    EditorOperation::ApplyEdits {
+                        buffer,
+                        edits: TextEditSet::new(
+                            revision,
+                            vec![TextEdit::new(ByteRange::empty(ByteOffset(0)), "new\n")],
+                        ),
+                    },
+                ),
+            )
+            .unwrap();
+            app.process_dap_events();
+        }
+    }
+}
+
+fn breakpoint_request(path: &Path, line: u64) -> DapSourceBreakpoint {
+    DapSourceBreakpoint {
+        path: path.into(),
+        line,
+        column: None,
+        condition: None,
+        hit_condition: None,
+        log_message: None,
+    }
+}
+
+fn acknowledge_breakpoints(
+    app: &mut App,
+    adapter: &crate::debugger::TestAdapter,
+    path: &Path,
+    expected: &[DapSourceBreakpoint],
+    lines: &[u64],
+) {
+    let request = adapter.control().unwrap();
+    assert!(matches!(
+        &request,
+        DapControl::SetBreakpoints { path: source, breakpoints }
+            if source == path && breakpoints.as_slice() == expected
+    ));
+    let BreakpointRequest::Pending(request_id, ..) = app.debugger_session.latest_breakpoints[path]
+    else {
+        panic!("expected a pending breakpoint update");
+    };
+    adapter.event(
+        0,
+        DapEvent::Response {
+            adapter: "same-name".into(),
+            stop_id: 0,
+            request_id,
+            request: Some(request),
+            response: DapResponse::Breakpoints(
+                lines.iter().map(|line| (true, Some(*line), None)).collect(),
+            ),
+        },
+    );
+    app.process_dap_events();
+}
+
+#[test]
+fn cursor_breakpoint_commands_target_the_visible_sign_before_the_anchor() {
+    let (_app_dirs, mut app) = app();
+    let path = app.state.workspace_root.join("source.rs");
+    let (_, view) = app
+        .state
+        .open_text(TextBuffer::from_text("a\nb\nc\n"), Some(path.clone()))
+        .unwrap();
+    app.set_dashboard_visibility(false);
+    let (service, adapter) = crate::debugger::test_session();
+    app.debugger_session.service = service;
+    let mut row = breakpoint_request(&path, 2);
+    app.debugger_session
+        .breakpoint(row.clone(), false, &mut app.state)
+        .unwrap();
+    acknowledge_breakpoints(&mut app, &adapter, &path, std::slice::from_ref(&row), &[3]);
+    app.state.views[view].cursor = ByteOffset(4);
+
+    row.condition = Some("ready".into());
+    row.hit_condition = Some("3".into());
+    row.log_message = Some("value={value}".into());
+    app.process_effect(AppEffect::DapBreakpointConfigure {
+        condition: row.condition.clone(),
+        hit_condition: row.hit_condition.clone(),
+        log_message: row.log_message.clone(),
+    });
+    acknowledge_breakpoints(&mut app, &adapter, &path, std::slice::from_ref(&row), &[3]);
+
+    app.process_effect(AppEffect::DapBreakpointConfigure {
+        condition: None,
+        hit_condition: None,
+        log_message: None,
+    });
+    assert_eq!(app.input.prompt().unwrap().input, "ready");
+    app.input.prompt_insert(" && enabled");
+    app.submit_prompt();
+    row.condition = Some("ready && enabled".into());
+    acknowledge_breakpoints(&mut app, &adapter, &path, std::slice::from_ref(&row), &[3]);
+
+    app.toggle_breakpoint_disabled();
+    assert!(
+        app.ui
+            .notification
+            .as_deref()
+            .unwrap()
+            .ends_with(":2 is now disabled")
+    );
+    assert_eq!(
+        app.debugger_session
+            .breakpoint_disabled(&path, 2, &app.state),
+        Some(true)
+    );
+    assert!(
+        matches!(adapter.control(), Some(DapControl::SetBreakpoints { breakpoints, .. }) if breakpoints.is_empty())
+    );
+    app.state.views[view].cursor = ByteOffset(2);
+    app.toggle_breakpoint_disabled();
+    acknowledge_breakpoints(&mut app, &adapter, &path, std::slice::from_ref(&row), &[3]);
+
+    // If another breakpoint also shows on line 3, F9 still acts on the first gutter sign.
+    let other = breakpoint_request(&path, 3);
+    app.debugger_session
+        .breakpoint(other.clone(), false, &mut app.state)
+        .unwrap();
+    acknowledge_breakpoints(&mut app, &adapter, &path, &[row, other.clone()], &[3, 3]);
+    app.state.views[view].cursor = ByteOffset(4);
+    app.process_effect(AppEffect::DapBreakpointToggle);
+    assert!(matches!(
+        adapter.control(),
+        Some(DapControl::SetBreakpoints { breakpoints, .. }) if breakpoints == [other]
+    ));
+    let saved = app.debugger_session.persisted_breakpoints(&app.state);
+    assert_eq!(saved.len(), 1);
+    assert_eq!(saved[0].line, 3);
+}
+
+#[test]
+fn f9_on_a_blank_anchor_adds_a_breakpoint_without_removing_the_relocated_one() {
+    let (_app_dirs, mut app) = app();
+    let path = app.state.workspace_root.join("source.rs");
+    let (_, view) = app
+        .state
+        .open_text(TextBuffer::from_text("a\nb\nc\nd\n"), Some(path.clone()))
+        .unwrap();
+    app.set_dashboard_visibility(false);
+    let (service, adapter) = crate::debugger::test_session();
+    app.debugger_session.service = service;
+    let row = breakpoint_request(&path, 2);
+    app.debugger_session
+        .breakpoint(row.clone(), false, &mut app.state)
+        .unwrap();
+    acknowledge_breakpoints(&mut app, &adapter, &path, std::slice::from_ref(&row), &[4]);
+    assert_eq!(app.ui.debug_signs.len(), 1);
+    assert_eq!(app.ui.debug_signs[0].line, 3);
+
+    app.state.views[view].cursor = ByteOffset(2);
+    app.process_effect(AppEffect::DapBreakpointToggle);
+    assert_eq!(
+        app.ui
+            .debug_signs
+            .iter()
+            .map(|sign| sign.line)
+            .collect::<Vec<_>>(),
+        [3, 1]
+    );
+    acknowledge_breakpoints(
+        &mut app,
+        &adapter,
+        &path,
+        &[row.clone(), row.clone()],
+        &[4, 2],
+    );
+    assert_eq!(
+        app.ui
+            .debug_signs
+            .iter()
+            .map(|sign| sign.line)
+            .collect::<Vec<_>>(),
+        [3, 1]
+    );
+    app.open_breakpoint_states();
+    assert_eq!(app.ui.picker.as_ref().unwrap().rows.len(), 2);
+    app.close_picker();
+
+    app.state.views[view].cursor = ByteOffset(2);
+    app.process_effect(AppEffect::DapBreakpointToggle);
+    assert_eq!(app.ui.debug_signs.len(), 1);
+    assert_eq!(app.ui.debug_signs[0].line, 3);
+    assert!(matches!(
+        adapter.control(),
+        Some(DapControl::SetBreakpoints { breakpoints, .. }) if breakpoints == [row]
+    ));
+}
+
+#[test]
+fn repeated_f9_at_a_blank_anchor_coalesces_same_location_replies() {
+    let (_app_dirs, mut app) = app();
+    let path = app.state.workspace_root.join("source.rs");
+    let (_, view) = app
+        .state
+        .open_text(TextBuffer::from_text("a\nb\nc\nd\n"), Some(path.clone()))
+        .unwrap();
+    app.set_dashboard_visibility(false);
+    let (service, adapter) = crate::debugger::test_session();
+    app.debugger_session.service = service;
+    let row = breakpoint_request(&path, 2);
+    let single = std::slice::from_ref(&row);
+
+    app.state.views[view].cursor = ByteOffset(2);
+    app.process_effect(AppEffect::DapBreakpointToggle);
+    acknowledge_breakpoints(&mut app, &adapter, &path, single, &[4]);
+    let original = app.debugger_session.persisted_breakpoints(&app.state);
+    assert_eq!(original.len(), 1);
+
+    for _ in 0..3 {
+        app.process_effect(AppEffect::DapBreakpointToggle);
+        acknowledge_breakpoints(
+            &mut app,
+            &adapter,
+            &path,
+            &[row.clone(), row.clone()],
+            &[4, 4],
+        );
+        assert_eq!(app.ui.debug_signs.len(), 1);
+        assert_eq!(app.ui.debug_signs[0].line, 3);
+        assert_eq!(
+            app.debugger_session.persisted_breakpoints(&app.state),
+            original
+        );
+        acknowledge_breakpoints(&mut app, &adapter, &path, single, &[4]);
+    }
+
+    adapter.event(
+        0,
+        DapEvent::Terminated {
+            adapter: "same-name".into(),
+        },
+    );
+    app.process_dap_events();
+    assert_eq!(app.ui.debug_signs[0].line, 1);
+    app.process_effect(AppEffect::DapBreakpointToggle);
+    assert!(app.ui.debug_signs.is_empty());
+}
+
+#[test]
+fn offline_f9_adds_and_removes_at_the_cursor() {
+    let (_app_dirs, mut app) = app();
+    let path = app.state.workspace_root.join("source.rs");
+    let (_, view) = app
+        .state
+        .open_text(TextBuffer::from_text("a\nb\n"), Some(path.clone()))
+        .unwrap();
+    app.set_dashboard_visibility(false);
+    app.state.views[view].cursor = ByteOffset(2);
+
+    app.process_effect(AppEffect::DapBreakpointToggle);
+    assert_eq!(app.ui.debug_signs.len(), 1);
+    assert_eq!(app.ui.debug_signs[0].line, 1);
+    app.open_breakpoint_states();
+    let picker = app.ui.picker.as_ref().unwrap();
+    assert_eq!(picker.title, "Breakpoints · 1");
+    assert!(picker.rows[0].detail.is_empty());
+    app.close_picker();
+
+    app.process_effect(AppEffect::DapBreakpointToggle);
+    assert!(app.ui.debug_signs.is_empty());
+    assert!(!app.debugger_session.is_running());
+    assert!(app.debugger_session.breakpoint_refresh.is_empty());
+    assert!(
+        app.debugger_session
+            .persisted_breakpoints(&app.state)
+            .is_empty()
+    );
+}
+
+#[test]
+fn breakpoint_picker_shows_and_removes_the_selected_co_located_logpoint() {
+    let (_app_dirs, mut app) = app();
+    app.handle_event(crate::ui::UiEvent::Resize(100, 30));
+    let path = app.state.workspace_root.join("source.rs");
+    let (_, view) = app
+        .state
+        .open_text(TextBuffer::from_text("a\nb\nc\n"), Some(path.clone()))
+        .unwrap();
+    app.set_dashboard_visibility(false);
+    let (service, adapter) = crate::debugger::test_session();
+    app.debugger_session.service = service;
+    let shared_message = "request processed ".repeat(12);
+    let second_message = format!("{shared_message}hidden tail");
+    let first = DapSourceBreakpoint {
+        condition: Some("status == 200".into()),
+        log_message: Some(format!("{shared_message}bytes sent")),
+        ..breakpoint_request(&path, 1)
+    };
+    let second = DapSourceBreakpoint {
+        line: 2,
+        condition: Some("status == 500".into()),
+        log_message: Some(second_message.clone()),
+        ..first.clone()
+    };
+    for row in [&first, &second] {
+        app.debugger_session
+            .breakpoint(row.clone(), false, &mut app.state)
+            .unwrap();
+    }
+    adapter.control().unwrap();
+    acknowledge_breakpoints(&mut app, &adapter, &path, &[first.clone(), second], &[3, 3]);
+
+    app.open_breakpoint_states();
+    app.reconcile_editor_windows();
+    let frame = crate::ui::render(
+        &app.state,
+        &app.ui,
+        app.configuration.settings(),
+        app.configuration.dashboard(),
+        100,
+        30,
+    );
+    let painted = (0..30)
+        .map(|y| {
+            (0..100)
+                .filter_map(|x| frame.grid.get(x, y))
+                .map(|cell| cell.symbol.as_str())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>();
+    for status in [200, 500] {
+        let row_prefix = format!("source.rs:3  Verified, if status == {status}, logs: request");
+        let row = painted
+            .iter()
+            .find(|row| row.contains(&row_prefix))
+            .unwrap_or_else(|| {
+                panic!("the condition must precede the clipped log message: {painted:#?}")
+            });
+        assert!(row.contains('…'));
+        assert!(!row.contains("hidden tail"));
+    }
+
+    app.picker_insert("hidden tail");
+    let picker = app.ui.picker.as_ref().unwrap();
+    assert_eq!(picker.rows.len(), 1);
+    assert_eq!(
+        picker.rows[0].detail,
+        format!("Verified, if status == 500, logs: {second_message}")
+    );
+    app.accept_picker();
+
+    let picker = app.ui.picker.as_ref().unwrap();
+    assert_eq!(picker.query, "hidden tail");
+    assert!(picker.rows.is_empty());
+    let saved = app.debugger_session.persisted_breakpoints(&app.state);
+    assert_eq!(saved.len(), 1);
+    assert_eq!(saved[0].line, first.line);
+    assert_eq!(saved[0].log_message, first.log_message);
+    acknowledge_breakpoints(&mut app, &adapter, &path, &[first], &[3]);
+    app.close_picker();
+
+    app.state.views[view].cursor = ByteOffset(4);
+    app.process_effect(AppEffect::DapBreakpointToggle);
+    assert!(app.ui.debug_signs.is_empty());
+}
+
+#[test]
+fn node_child_replay_moves_the_displayed_breakpoint_and_f9_target() {
+    use std::time::{Duration, Instant};
+
+    let (_app_dirs, mut app) = app();
+    let root = app.state.workspace_root.clone();
+    let path = root.join("source.js");
+    let (_, view) = app
+        .state
+        .open_text(TextBuffer::from_text("a\nb\nc\nd\n"), Some(path.clone()))
+        .unwrap();
+    app.set_dashboard_visibility(false);
+    let row = breakpoint_request(&path, 2);
+    app.debugger_session
+        .breakpoint(row.clone(), false, &mut app.state)
+        .unwrap();
+    let mut launch = crate::debugger::test_server_launch(&root, true);
+    launch.breakpoints = vec![(path.clone(), vec![row])];
+    app.debugger_session.service.start_absolute(launch).unwrap();
+    app.open_breakpoint_states();
+
+    let wait_for_line = |app: &mut App, line: u64, connection| {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            app.process_dap_events();
+            if app.debugger_session.latest_breakpoints.get(&path)
+                == Some(&BreakpointRequest::Acknowledged(0, connection))
+            {
+                assert_eq!(app.ui.debug_signs[0].line as u64 + 1, line);
+                let picker = app.ui.picker.as_ref().unwrap();
+                assert!(picker.rows[0].label.ends_with(&format!(":{line}")));
+                assert_eq!(picker.rows[0].detail, "Verified");
+                break;
+            }
+            assert!(
+                app.debugger_session.is_running(),
+                "adapter exited before verifying line {line}"
+            );
+            assert!(Instant::now() < deadline, "no verification for line {line}");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    };
+    wait_for_line(&mut app, 3, 0);
+    fs::write(root.join("allow-child"), "").unwrap();
+    wait_for_line(&mut app, 4, 1);
+
+    app.close_picker();
+    app.state.views[view].cursor = ByteOffset(6);
+    app.process_effect(AppEffect::DapBreakpointToggle);
+    assert!(app.ui.debug_signs.is_empty());
+    assert!(
+        app.debugger_session
+            .persisted_breakpoints(&app.state)
+            .is_empty()
+    );
+    app.debugger_session.stop().unwrap();
+}
+
+#[test]
+fn child_replay_accepts_a_tracked_request_and_ignores_queued_parent_events() {
+    let (_app_dirs, mut app) = app();
+    let path = app.state.workspace_root.join("source.rs");
+    let (service, adapter) = crate::debugger::test_session();
+    app.debugger_session.service = service;
+    let row = breakpoint_request(&path, 2);
+    app.debugger_session
+        .breakpoint(row.clone(), false, &mut app.state)
+        .unwrap();
+    acknowledge_breakpoints(&mut app, &adapter, &path, std::slice::from_ref(&row), &[3]);
+    let BreakpointRequest::Acknowledged(request_id, 0) =
+        app.debugger_session.latest_breakpoints[&path]
+    else {
+        panic!("expected the parent's tracked acknowledgement");
+    };
+    assert_eq!(
+        app.debugger_session.breakpoint_state(&path, 2, &app.state),
+        Some(DapBreakpointState::Verified { line: 3 })
+    );
+    let changed = |line| DapEvent::Response {
+        adapter: "same-name".into(),
+        stop_id: 0,
+        request_id,
+        request: None,
+        response: DapResponse::BreakpointChanged {
+            path: path.clone(),
+            requested: 2,
+            request_index: 0,
+            verified: true,
+            line: Some(line),
+            removed: false,
+        },
+    };
+    adapter.event(0, changed(9));
+    adapter.next_connection();
+    app.process_dap_events();
+    assert_eq!(app.ui.debug_signs[0].line, 2);
+    adapter.event(
+        0,
+        DapEvent::Response {
+            adapter: "same-name".into(),
+            stop_id: 0,
+            request_id,
+            request: Some(DapControl::SetBreakpoints {
+                path: path.clone(),
+                breakpoints: vec![row],
+            }),
+            response: DapResponse::Breakpoints(vec![(true, Some(4), None)]),
+        },
+    );
+    app.process_dap_events();
+    assert_eq!(
+        app.debugger_session.breakpoint_state(&path, 2, &app.state),
+        Some(DapBreakpointState::Verified { line: 4 })
+    );
+    assert_eq!(app.ui.debug_signs[0].line, 3);
+    adapter.event(0, changed(5));
+    app.process_dap_events();
+    assert_eq!(app.ui.debug_signs[0].line, 4);
+}
+
+#[test]
+fn f9_twice_removes_both_relocated_breakpoints_without_waiting_for_a_reply() {
+    let (_app_dirs, mut app) = app();
+    let path = app.state.workspace_root.join("source.rs");
+    let (_, view) = app
+        .state
+        .open_text(TextBuffer::from_text("a\nb\nc\nd\n"), Some(path.clone()))
+        .unwrap();
+    app.set_dashboard_visibility(false);
+    let (service, adapter) = crate::debugger::test_session();
+    app.debugger_session.service = service;
+    let rows = [
+        breakpoint_request(&path, 2),
+        DapSourceBreakpoint {
+            log_message: Some("trace".into()),
+            ..breakpoint_request(&path, 3)
+        },
+    ];
+    for row in &rows {
+        app.debugger_session
+            .breakpoint(row.clone(), false, &mut app.state)
+            .unwrap();
+    }
+    adapter.control().unwrap();
+    acknowledge_breakpoints(&mut app, &adapter, &path, &rows, &[4, 4]);
+
+    app.state.views[view].cursor = ByteOffset(6);
+    app.process_effect(AppEffect::DapBreakpointToggle);
+    assert_eq!(app.ui.debug_signs.len(), 1);
+    assert_eq!(app.ui.debug_signs[0].line, 3);
+    assert!(matches!(
+        adapter.control(),
+        Some(DapControl::SetBreakpoints { breakpoints, .. }) if breakpoints.as_slice() == &rows[1..]
+    ));
+    app.open_breakpoint_states();
+    let picker = app.ui.picker.as_ref().unwrap();
+    assert_eq!(picker.rows.len(), 1);
+    assert!(picker.rows[0].label.ends_with(":4"));
+    assert_eq!(picker.rows[0].detail, "waiting for debugger, logs: trace");
+    app.close_picker();
+
+    app.state.views[view].cursor = ByteOffset(6);
+    app.process_effect(AppEffect::DapBreakpointToggle);
+    assert!(app.ui.debug_signs.is_empty());
+    assert!(
+        app.debugger_session
+            .persisted_breakpoints(&app.state)
+            .is_empty()
+    );
+    assert!(matches!(
+        adapter.control(),
+        Some(DapControl::SetBreakpoints { breakpoints, .. }) if breakpoints.is_empty()
+    ));
+}
+
+#[test]
+fn debugger_exit_clears_breakpoint_verification_and_restores_the_anchor_sign() {
+    let (_app_dirs, mut app) = app();
+    let path = app.state.workspace_root.join("source.rs");
+    let (service, adapter) = crate::debugger::test_session();
+    app.debugger_session.service = service;
+    let row = breakpoint_request(&path, 2);
+    app.debugger_session
+        .breakpoint(row.clone(), false, &mut app.state)
+        .unwrap();
+    acknowledge_breakpoints(&mut app, &adapter, &path, &[row], &[3]);
+    assert_eq!(app.ui.debug_signs[0].line, 2);
+
+    app.open_breakpoint_states();
+    adapter.event(
+        0,
+        DapEvent::Terminated {
+            adapter: "same-name".into(),
+        },
+    );
+    app.process_dap_events();
+
+    assert_eq!(app.ui.debug_signs[0].line, 1);
+    let picker = app.ui.picker.as_ref().unwrap();
+    assert!(picker.rows[0].label.ends_with(":2"));
+    assert!(picker.rows[0].detail.is_empty());
+
+    app.debugger_session
+        .breakpoint(breakpoint_request(&path, 3), false, &mut app.state)
+        .unwrap();
+    app.process_dap_events();
+    assert!(
+        app.ui
+            .picker
+            .as_ref()
+            .unwrap()
+            .rows
+            .iter()
+            .any(|row| row.label.ends_with(":3") && row.detail.is_empty())
+    );
+}
+
+#[test]
+fn open_breakpoint_picker_refreshes_verification_without_losing_search_or_selection() {
+    use crate::editor::text::{TextEdit, TextEditSet};
+    use crate::editor::{EditorOperation, EditorTransaction, TransactionId};
+
+    let (_app_dirs, mut app) = app();
+    let path = app.state.workspace_root.join("source.rs");
+    let (buffer, _) = app
+        .state
+        .open_text(TextBuffer::from_text("a\nb\nc\n"), Some(path.clone()))
+        .unwrap();
+    app.set_dashboard_visibility(false);
+    let (service, adapter) = crate::debugger::test_session();
+    app.debugger_session.service = service;
+    let rows = [breakpoint_request(&path, 1), breakpoint_request(&path, 2)];
+    for row in &rows {
+        app.debugger_session
+            .breakpoint(row.clone(), false, &mut app.state)
+            .unwrap();
+    }
+    adapter.control().unwrap(); // The request that contained only the first row.
+    app.open_breakpoint_states();
+    app.picker_insert("source");
+    app.picker_move(1);
+    let selected = app.search.picker().unwrap().selected_item().unwrap();
+    assert!(selected.label.ends_with(":2"));
+    assert_eq!(selected.detail, "waiting for debugger");
+    let id = selected.id.clone();
+    let epoch = app.search.picker_epoch().unwrap().clone();
+
+    acknowledge_breakpoints(&mut app, &adapter, &path, &rows, &[1, 3]);
+
+    assert!(app.search.owns_picker_epoch(&epoch));
+    let picker = app.search.picker().unwrap();
+    assert_eq!(picker.query(), "source");
+    let selected = picker.selected_item().unwrap();
+    assert_eq!(selected.id, id);
+    assert!(selected.label.ends_with(":3"));
+    assert_eq!(selected.detail, "Verified");
+    assert!(
+        app.ui
+            .picker
+            .as_ref()
+            .unwrap()
+            .rows
+            .iter()
+            .any(|row| row.label.ends_with(":3") && row.detail == "Verified")
+    );
+
+    // The first row now has the second row's old anchor. Selection must follow the second row.
+    let revision = app.state.buffers[buffer].text.revision();
+    app.apply_authoritative_editor_transaction(
+        &EditorTransaction::new(TransactionId(1)).with_operation(EditorOperation::ApplyEdits {
+            buffer,
+            edits: TextEditSet::new(
+                revision,
+                vec![TextEdit::new(ByteRange::empty(ByteOffset(0)), "new\n")],
+            ),
+        }),
+    )
+    .unwrap();
+    app.process_dap_events();
+
+    assert!(app.search.owns_picker_epoch(&epoch));
+    let picker = app.search.picker().unwrap();
+    assert_eq!(picker.query(), "source");
+    let selected = picker.selected_item().unwrap();
+    assert_eq!(selected.id, id);
+    assert!(selected.label.ends_with(":3"));
+}
+
+#[test]
+fn converging_breakpoints_keep_only_the_enabled_row_and_its_settings_after_undo() {
+    use crate::editor::text::{TextEdit, TextEditSet};
+    use crate::editor::{EditorOperation, EditorTransaction, TransactionId};
+
+    for preferred in [Some("enabled condition"), None] {
+        let (_app_dirs, mut app) = app();
+        let path = app.state.workspace_root.join("source.rs");
+        let (buffer, view) = app
+            .state
+            .open_text(TextBuffer::from_text("a\nb\nc\n"), Some(path.clone()))
+            .unwrap();
+        app.set_dashboard_visibility(false);
+        let (service, adapter) = crate::debugger::test_session();
+        app.debugger_session.service = service;
+        let enabled = DapSourceBreakpoint {
+            path: path.clone(),
+            line: 2,
+            column: Some(1),
+            condition: preferred.map(str::to_owned),
+            hit_condition: None,
+            log_message: None,
+        };
+        app.debugger_session
+            .breakpoint(
+                DapSourceBreakpoint {
+                    line: 3,
+                    column: None,
+                    condition: Some("disabled condition".into()),
+                    hit_condition: Some("5".into()),
+                    log_message: Some("disabled log".into()),
+                    ..enabled.clone()
+                },
+                false,
+                &mut app.state,
+            )
+            .unwrap();
+        app.debugger_session
+            .set_breakpoint_disabled(&path, 3, true, &app.state);
+        app.debugger_session
+            .breakpoint(enabled.clone(), false, &mut app.state)
+            .unwrap();
+        while adapter.control().is_some() {}
+
+        let revision = app.state.buffers[buffer].text.revision();
+        app.apply_authoritative_editor_transaction(
+            &EditorTransaction::new(TransactionId(1)).with_operation(EditorOperation::ApplyEdits {
+                buffer,
+                edits: TextEditSet::new(
+                    revision,
+                    vec![TextEdit::new(
+                        ByteRange::new(ByteOffset(2), ByteOffset(4)).unwrap(),
+                        "",
+                    )],
+                ),
+            }),
+        )
+        .unwrap();
+
+        // The edit itself merges the rows, before the next debugger poll.
+        let saved = app.debugger_session.persisted_breakpoints(&app.state);
+        assert_eq!(saved.len(), 1);
+        assert_eq!(saved[0].line, 2);
+        assert!(!saved[0].disabled);
+        assert_eq!(saved[0].condition.as_deref(), preferred);
+        assert_eq!(saved[0].column, enabled.column);
+        app.open_breakpoint_states();
+        assert_eq!(app.ui.picker.as_ref().unwrap().rows.len(), 1);
+        app.close_picker();
+
+        app.apply_authoritative_editor_transaction(
+            &EditorTransaction::new(TransactionId(2))
+                .with_operation(EditorOperation::Undo { buffer }),
+        )
+        .unwrap();
+        assert_eq!(app.state.buffers[buffer].text.to_string(), "a\nb\nc\n");
+        let saved = app.debugger_session.persisted_breakpoints(&app.state);
+        assert_eq!(saved.len(), 1);
+        assert_eq!(saved[0].line, 2);
+        assert!(!saved[0].disabled);
+        assert_eq!(
+            app.debugger_session.enabled_breakpoints(&path, &app.state),
+            [enabled]
+        );
+        app.process_dap_events();
+        assert!(adapter.control().is_none());
+        app.state.views[view].cursor = ByteOffset(2);
+        app.process_effect(AppEffect::DapBreakpointToggle);
+        assert!(
+            app.debugger_session
+                .persisted_breakpoints(&app.state)
+                .is_empty()
+        );
+        assert!(matches!(
+            adapter.control(),
+            Some(DapControl::SetBreakpoints { path: source, breakpoints })
+                if source == path && breakpoints.is_empty()
+        ));
+    }
 }
 
 #[test]
@@ -892,6 +1907,199 @@ fn debugger_owner_keeps_original_actor_stop_context_and_private_selection() {
             })
             .is_err()
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn focused_shell_gets_input_after_either_debug_terminal_open() {
+    use crate::app::command;
+    use crate::app::terminal::TerminalInput;
+    use crate::app::tests::driver::TestSession;
+    use crate::editor::CommandValue;
+
+    for from_profile in [true, false] {
+        let mut loaded = crate::config::load_bundled_config();
+        loaded
+            .config
+            .input
+            .paste_commands
+            .insert("editor.insert".into(), "terminal.send".into());
+        let mut shell = loaded.config.terminals.profiles["shell"].clone();
+        shell.program = crate::debugger::test_python();
+        shell.close_on_exit = false;
+        shell.arguments = vec![
+            "-c".into(),
+            r#"import os, pathlib, sys, tty
+tty.setraw(0)
+os.write(1, b"\x1b[?1h\x1b[?2004hREADY\r\n")
+path = pathlib.Path(sys.argv[1])
+temporary = path.with_suffix(".tmp")
+temporary.write_bytes(sys.stdin.buffer.readline())
+temporary.rename(path)"#
+                .into(),
+            "shell-input".into(),
+        ];
+        let mut debug = shell.clone();
+        *debug.arguments.last_mut().unwrap() = "debug-input".into();
+        loaded
+            .config
+            .terminals
+            .profiles
+            .insert("shell".into(), shell);
+        loaded
+            .config
+            .terminals
+            .profiles
+            .insert("debug-input".into(), debug.clone());
+        let mut driver = TestSession::new(loaded);
+        driver.new_buffer();
+        driver.trust_owned_terminal_fixture();
+        driver.terminal_open("shell");
+
+        let app = driver.application_mut();
+        let shell = app.keyboard_terminal().expect("shell has keyboard focus");
+        let root = app.workspace.roots()[0].identity.canonical_path.clone();
+        app.debugger_session
+            .refresh(&app.configuration.settings().debug, app.workspace.version());
+        let (service, adapter) = crate::debugger::test_session();
+        app.debugger_session.service = service;
+        app.debugger_session.adapter_runs_terminal = !from_profile;
+        if from_profile {
+            app.debugger_session.terminal_profile = Some(TerminalPolicy {
+                name: "debug-input".into(),
+                profile: debug.clone(),
+                cwd: root.clone(),
+            });
+        }
+        let (_request, reply) = adapter.terminal_reply();
+        adapter.event(
+            0,
+            DapEvent::RunInTerminal {
+                adapter: "same-name".into(),
+                request_seq: 1,
+                reply,
+                cwd: root.clone(),
+                arguments: std::iter::once(debug.program.to_str().unwrap().into())
+                    .chain(debug.arguments)
+                    .collect(),
+                environment: debug.environment.into_iter().collect(),
+            },
+        );
+        app.process_dap_events();
+        let debug = app
+            .terminal_session
+            .selected()
+            .expect("debug terminal opened");
+        assert_ne!(
+            debug, shell,
+            "from_profile={from_profile}: {:?}",
+            app.ui.notification
+        );
+        assert_eq!(app.keyboard_terminal(), Some(shell));
+
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            driver.pump_terminal();
+            let app = driver.application();
+            if [shell, debug].iter().all(|id| {
+                app.terminal_session
+                    .fixture_lines(*id)
+                    .iter()
+                    .any(|line| line.contains("READY"))
+            }) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "terminals did not start: {:?}",
+                app.ui.notification,
+            );
+            std::thread::yield_now();
+        }
+        driver.key("a");
+        driver.key("up");
+        driver.key("ctrl-c");
+        // Escape is also a mapping prefix, so the next key is replayed.
+        driver.key("escape");
+        driver.key("b");
+        driver.paste("pasted");
+
+        driver.terminal_unfocus();
+        driver.select_terminal_without_focus(shell.0);
+        assert_eq!(driver.context(), "editor.normal");
+        driver.key(":");
+        driver.paste("terminalsend echo hello");
+        driver.key("enter");
+
+        driver.key("i");
+        assert_eq!(driver.context(), "editor.insert");
+        assert_eq!(driver.selected_terminal(), Some(shell.0));
+        assert_eq!(driver.keyboard_terminal(), None);
+        driver.paste("mapped paste");
+        driver.key("escape");
+
+        let app = driver.application_mut();
+        app.reveal_terminal(shell);
+        assert_eq!(app.keyboard_terminal(), Some(shell));
+        assert!(
+            app.invoke_checked(
+                command("macro.record.start")
+                    .unwrap()
+                    .with_argument("register", CommandValue::String("a".into())),
+            )
+        );
+        driver.key("up");
+
+        let app = driver.application_mut();
+        assert!(app.invoke_checked(command("macro.record.stop").unwrap()));
+        app.reveal_terminal(debug);
+        assert!(app.terminal_session.select(shell));
+        assert_eq!(app.keyboard_terminal(), Some(debug));
+        assert_eq!(app.terminal_session.selected(), Some(shell));
+        assert!(app.replay_macro('a', 1));
+
+        driver.terminal_unfocus();
+        driver.select_terminal_without_focus(debug.0);
+        assert_eq!(driver.selected_terminal(), Some(debug.0));
+        assert!(driver.application_mut().replay_macro('a', 1));
+
+        let app = driver.application_mut();
+        app.reveal_terminal(debug);
+        assert_eq!(app.keyboard_terminal(), Some(debug));
+        assert!(
+            app.invoke_checked(
+                command("terminal.send")
+                    .unwrap()
+                    .with_argument("id", CommandValue::Integer(shell.0.try_into().unwrap()))
+                    .with_argument("text", CommandValue::String("explicit".into())),
+            )
+        );
+
+        // End each capture explicitly so even input sent to the wrong PTY is reported.
+        let app = driver.application();
+        for id in [shell, debug] {
+            app.terminal_session
+                .send(id, TerminalInput::Text("\n"), &app.workspace)
+                .expect("finish terminal input capture");
+        }
+        let shell_input = root.join("shell-input");
+        let debug_input = root.join("debug-input");
+        while !shell_input.exists() || !debug_input.exists() {
+            driver.pump_terminal();
+            assert!(Instant::now() < deadline, "terminals did not report input");
+            std::thread::yield_now();
+        }
+        assert_eq!(
+            fs::read(shell_input).unwrap(),
+            b"a\x1bOA\x03\x1bb\x1b[200~pasted\x1b[201~echo hellomapped paste\x1bOAexplicit\n",
+            "from_profile={from_profile}",
+        );
+        assert_eq!(
+            fs::read(debug_input).unwrap(),
+            b"\x1bOA\x1bOA\n",
+            "from_profile={from_profile}"
+        );
+    }
 }
 
 #[test]
@@ -2091,7 +3299,9 @@ fn breakpoint_rejections_update_only_the_latest_requested_rows() {
     owner
         .breakpoint(at(10), false, &mut empty_editor())
         .unwrap();
-    let first_id = owner.latest_breakpoints[&path];
+    let BreakpointRequest::Pending(first_id, ..) = owner.latest_breakpoints[&path] else {
+        panic!("first breakpoint update must be pending");
+    };
     let first = adapter.control().unwrap();
     assert!(
         matches!(&first, DapControl::SetBreakpoints { breakpoints, .. } if breakpoints == &[at(10)])
@@ -2099,7 +3309,9 @@ fn breakpoint_rejections_update_only_the_latest_requested_rows() {
     owner
         .breakpoint(at(20), false, &mut empty_editor())
         .unwrap();
-    let latest_id = owner.latest_breakpoints[&path];
+    let BreakpointRequest::Pending(latest_id, ..) = owner.latest_breakpoints[&path] else {
+        panic!("replacement breakpoint update must be pending");
+    };
     let latest = adapter.control().unwrap();
     let failure = |request_id, request| DapEvent::RequestFailed {
         adapter: "same-name".into(),
@@ -2125,7 +3337,9 @@ fn breakpoint_rejections_update_only_the_latest_requested_rows() {
         );
     }
     owner.set_breakpoint_disabled(&path, 20, true, &empty_editor());
-    let request_id = owner.latest_breakpoints[&path];
+    let BreakpointRequest::Pending(request_id, ..) = owner.latest_breakpoints[&path] else {
+        panic!("disabling a breakpoint must update the adapter");
+    };
     let request = adapter.control().unwrap();
     adapter.event(
         0,
@@ -2191,7 +3405,21 @@ fn breakpoint_changes_send_only_enabled_rows_and_acknowledge_the_captured_list()
         .unwrap();
     adapter.control();
     owner.breakpoint(at(10), true, &mut empty_editor()).unwrap();
-    adapter.control();
+    let BreakpointRequest::Pending(previous_id, ..) = owner.latest_breakpoints[&path] else {
+        panic!("removing a breakpoint must update the adapter");
+    };
+    let previous = adapter.control();
+    adapter.event(
+        0,
+        DapEvent::Response {
+            adapter: "same-name".into(),
+            stop_id: 0,
+            request_id: previous_id,
+            request: previous,
+            response: DapResponse::Breakpoints(vec![(false, None, None)]),
+        },
+    );
+    owner.try_event(&empty_editor()).unwrap();
     owner.apply_breakpoints(
         &path,
         &first,
@@ -2209,25 +3437,52 @@ fn breakpoint_changes_send_only_enabled_rows_and_acknowledge_the_captured_list()
         matches!(adapter.control(), Some(DapControl::SetBreakpoints { breakpoints, .. }) if breakpoints.is_empty())
     );
     owner.set_breakpoint_disabled(&path, 20, false, &empty_editor());
+    let BreakpointRequest::Pending(enabled_id, ..) = owner.latest_breakpoints[&path] else {
+        panic!("enabling a breakpoint must update the adapter");
+    };
+    let request = adapter.control();
     assert!(
-        matches!(adapter.control(), Some(DapControl::SetBreakpoints { breakpoints, .. }) if breakpoints.len() == 1)
+        matches!(&request, Some(DapControl::SetBreakpoints { breakpoints, .. }) if breakpoints == &[at(20)])
     );
+    let changed = |request_id| DapEvent::Response {
+        adapter: "same-name".into(),
+        stop_id: 0,
+        request_id,
+        request: None,
+        response: DapResponse::BreakpointChanged {
+            path: path.clone(),
+            requested: 20,
+            request_index: 0,
+            verified: true,
+            line: Some(21),
+            removed: false,
+        },
+    };
+    adapter.event(0, changed(previous_id));
+    owner.try_event(&empty_editor()).unwrap();
+    assert_eq!(
+        owner.breakpoint_state(&path, 20, &empty_editor()),
+        Some(DapBreakpointState::Requested { accepted: true })
+    );
+
     adapter.event(
         0,
         DapEvent::Response {
             adapter: "same-name".into(),
             stop_id: 0,
-            request_id: 0,
-            request: None,
-            response: DapResponse::BreakpointChanged {
-                path: path.clone(),
-                requested: 20,
-                verified: true,
-                line: Some(21),
-                removed: false,
-            },
+            request_id: enabled_id,
+            request,
+            response: DapResponse::Breakpoints(vec![(false, None, None)]),
         },
     );
+    owner.try_event(&empty_editor()).unwrap();
+    adapter.event(0, changed(previous_id));
+    owner.try_event(&empty_editor()).unwrap();
+    assert_eq!(
+        owner.breakpoint_state(&path, 20, &empty_editor()),
+        Some(DapBreakpointState::Requested { accepted: false })
+    );
+    adapter.event(0, changed(enabled_id));
     owner.try_event(&empty_editor()).unwrap();
     assert_eq!(
         owner.breakpoint_state(&path, 20, &empty_editor()),
@@ -2305,13 +3560,20 @@ fn startup_breakpoints_reset_enabled_verdicts_for_the_new_adapter() {
         &DapResponse::Breakpoints(vec![(true, Some(11), None)]),
         &empty_editor(),
     );
-    owner.stop().unwrap();
-    let (service, _adapter) = crate::debugger::test_session();
-    owner.service = service;
     assert_eq!(
         owner.breakpoint_state(&path, 10, &empty_editor()),
         Some(DapBreakpointState::Verified { line: 11 })
     );
+    owner.stop().unwrap();
+    assert_eq!(owner.breakpoint_state(&path, 10, &empty_editor()), None);
+    assert!(
+        owner
+            .displayed_breakpoint(&path, 11, &empty_editor())
+            .is_none(),
+        "the stopped adapter's relocated gutter sign must not remain visible"
+    );
+    let (service, _adapter) = crate::debugger::test_session();
+    owner.service = service;
     assert_eq!(
         owner.startup_breakpoints(&empty_editor()),
         [(path.clone(), vec![at(10)])]
@@ -2361,6 +3623,7 @@ fn restoring_breakpoints_clears_removed_adapter_paths_and_old_verdicts() {
     while owner.control(DapControl::Threads).is_ok() {}
     owner.restore(
         vec![PersistedBreakpoint {
+            id: None,
             path: kept.clone(),
             line: 10,
             disabled: false,

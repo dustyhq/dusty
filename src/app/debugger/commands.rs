@@ -29,7 +29,7 @@ pub(in crate::app) fn register_commands(
     register(
         registry,
         "dap.breakpoints.states",
-        "Show what is true about each breakpoint rather than what was asked for",
+        "List and remove breakpoints",
         ContextRequirement::Workspace,
         ArgumentSchema::default(),
         |_invocation| Ok(AppEffect::DebuggerBreakpointStates),
@@ -426,27 +426,14 @@ impl App {
                 let Some((path, line)) = self.cursor_breakpoint_place() else {
                     return Ok(());
                 };
-                let row = self
-                    .debugger_session
-                    .breakpoint_at(&path, line, &self.state)
-                    .unwrap_or(DapSourceBreakpoint {
-                        path,
-                        line,
-                        column: None,
-                        condition: None,
-                        hit_condition: None,
-                        log_message: None,
-                    });
-                self.open_prompt(
-                    PromptKind::BreakpointCondition,
-                    row.condition.clone().unwrap_or_default(),
-                );
-                if let Some((_, location)) = self.input.take_pending_breakpoint() {
-                    location.remove_mark(&mut self.state);
+                let (initial, target) =
+                    self.debugger_session
+                        .breakpoint_condition_target(path, line, &mut self.state);
+                self.open_prompt(PromptKind::BreakpointCondition, initial);
+                if let Some(previous) = self.input.take_pending_breakpoint() {
+                    previous.cancel(&mut self.state);
                 }
-                let location =
-                    super::BreakpointLocation::attach(&row.path, row.line, &mut self.state);
-                self.input.set_pending_breakpoint(row, location);
+                self.input.set_pending_breakpoint(target);
             }
             AppEffect::DapBreakpointConfigure {
                 condition,
@@ -454,21 +441,10 @@ impl App {
                 log_message,
             } => self.configure_breakpoint(condition, hit_condition, log_message),
             AppEffect::DapBreakpointToggle => {
-                let Some(view) = self.state.active_view() else {
+                let Some((path, line)) = self.cursor_breakpoint_place() else {
                     return Ok(());
                 };
-                let buffer = &self.state.buffers[self.state.views[view].buffer];
-                let Some(path) = buffer.path.clone() else {
-                    return Ok(());
-                };
-                let Ok(line) = buffer
-                    .text
-                    .byte_to_line(self.state.views[view].cursor)
-                    .map(|line| line as u64 + 1)
-                else {
-                    return Ok(());
-                };
-                match self.debugger_session.breakpoint(
+                match self.debugger_session.breakpoint_on_display_line(
                     DapSourceBreakpoint {
                         path,
                         line,

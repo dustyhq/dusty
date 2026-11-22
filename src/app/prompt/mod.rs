@@ -216,8 +216,8 @@ impl App {
                 view.scroll_column = column;
             }
         }
-        if let Some((_, location)) = self.input.take_pending_breakpoint() {
-            location.remove_mark(&mut self.state);
+        if let Some(target) = self.input.take_pending_breakpoint() {
+            target.cancel(&mut self.state);
         }
         if self
             .input
@@ -568,19 +568,16 @@ impl App {
                 }
             }
             PromptKind::BreakpointCondition => {
-                let row = self.input.take_pending_breakpoint();
+                let target = self.input.take_pending_breakpoint();
                 self.close_prompt();
-                if let Some((mut row, location)) = row {
-                    row.line = location.line(&row.path, &self.state);
-                    location.remove_mark(&mut self.state);
-                    let condition = prompt.input.trim();
-                    row.condition = (!condition.is_empty()).then(|| condition.to_owned());
-                    if let Err(error) =
-                        self.debugger_session
-                            .breakpoint(row, false, &mut self.state)
-                    {
-                        self.show_error(error);
-                    }
+                if let Some(target) = target
+                    && let Err(error) = self.debugger_session.set_breakpoint_condition(
+                        target,
+                        &prompt.input,
+                        &mut self.state,
+                    )
+                {
+                    self.show_error(error);
                 }
             }
             PromptKind::AgentPermission => self.answer_agent_permission(

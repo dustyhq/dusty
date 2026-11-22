@@ -20,6 +20,10 @@ use std::sync::Arc;
 #[derive(Clone, Debug)]
 pub(in crate::app) enum PickerPayload {
     Selection(String),
+    Breakpoint {
+        path: PathBuf,
+        identity: crate::app::debugger::BreakpointId,
+    },
     Plugin(crate::app::plugins::browser::PluginChoice),
     /// A row whose whole text opens in a popup with this title, such as a past notice.
     Notice {
@@ -102,6 +106,7 @@ pub(in crate::app) struct PickerEpoch(Arc<()>);
 #[derive(Clone, Copy)]
 pub(in crate::app) enum PickerOrigin {
     General,
+    Breakpoints,
     Plugins,
     PluginProvider(u64),
     WorkspaceEdit(crate::workspace::ProposalId),
@@ -371,6 +376,21 @@ impl Search {
             .is_some_and(|picker| matches!(picker.origin, PickerOrigin::Plugins))
     }
 
+    pub(in crate::app) fn breakpoint_picker_open(
+        &self,
+        scope: WorkspaceVersion,
+        configuration: u64,
+    ) -> bool {
+        let source = (scope, configuration);
+        [
+            self.picker.interaction.as_ref(),
+            self.picker.suspended.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        .any(|picker| matches!(picker.origin, PickerOrigin::Breakpoints) && picker.source == source)
+    }
+
     pub(in crate::app) fn install_picker(
         &mut self,
         content: PickerContent,
@@ -388,7 +408,8 @@ impl Search {
             let same_origin = match (picker.origin, content.origin) {
                 (PickerOrigin::Files, PickerOrigin::Files)
                 | (PickerOrigin::Grep, PickerOrigin::Grep)
-                | (PickerOrigin::Plugins, PickerOrigin::Plugins) => true,
+                | (PickerOrigin::Plugins, PickerOrigin::Plugins)
+                | (PickerOrigin::Breakpoints, PickerOrigin::Breakpoints) => true,
                 (PickerOrigin::PluginProvider(a), PickerOrigin::PluginProvider(b)) => a == b,
                 (PickerOrigin::WorkspaceEdit(a), PickerOrigin::WorkspaceEdit(b)) => a == b,
                 _ => false,
@@ -443,6 +464,7 @@ impl Search {
                     | PickerOrigin::PluginProvider(_)
                     | PickerOrigin::Plugins
                     | PickerOrigin::WorkspaceEdit(_)
+                    | PickerOrigin::Breakpoints
             ) {
                 query = previous_query.to_owned();
             }
@@ -452,7 +474,10 @@ impl Search {
         }
         if matches!(
             content.origin,
-            PickerOrigin::Files | PickerOrigin::PluginProvider(_) | PickerOrigin::WorkspaceEdit(_)
+            PickerOrigin::Files
+                | PickerOrigin::PluginProvider(_)
+                | PickerOrigin::WorkspaceEdit(_)
+                | PickerOrigin::Breakpoints
         ) {
             state.set_query(query);
         } else {
@@ -574,6 +599,7 @@ impl Search {
             picker.source != (scope, configuration)
                 || match picker.origin {
                     PickerOrigin::General
+                    | PickerOrigin::Breakpoints
                     | PickerOrigin::Plugins
                     | PickerOrigin::WorkspaceEdit(_)
                     | PickerOrigin::PluginProvider(_) => false,
@@ -1473,6 +1499,14 @@ impl App {
         self.configuration.preview_theme(theme);
         let context = self.active_input_context();
         let theme_picker = self.search.theme_picker_key().is_some();
+        let accept_action = if matches!(
+            self.search.selected_picker_payload(),
+            Some(PickerPayload::Breakpoint { .. })
+        ) {
+            "remove breakpoint"
+        } else {
+            "accept"
+        };
         if let Some(picker) = &mut self.ui.picker {
             let (mode, commands): (&str, &[(&str, &str)]) =
                 if self.search.workspace_picker().is_some() {
@@ -1491,7 +1525,7 @@ impl App {
                         "Normal",
                         &[
                             ("picker.mode.insert", "edit"),
-                            ("picker.accept", "accept"),
+                            ("picker.accept", accept_action),
                             ("picker.cancel", "close"),
                         ],
                     )
@@ -1500,7 +1534,7 @@ impl App {
                         "Insert",
                         &[
                             ("picker.mode.normal", "normal"),
-                            ("picker.accept", "accept"),
+                            ("picker.accept", accept_action),
                             ("picker.cancel", "close"),
                         ],
                     )
@@ -1851,6 +1885,12 @@ impl App {
         } else {
             None
         };
+        if let Some(PickerPayload::Breakpoint { path, identity }) =
+            self.search.selected_picker_payload().cloned()
+        {
+            self.remove_picked_breakpoint(&path, identity);
+            return;
+        }
         let mut payload = self.search.take_picker_payload();
         if let (Some(line), Some(PickerPayload::MatcherSource(source))) =
             (review_line, &mut payload)
