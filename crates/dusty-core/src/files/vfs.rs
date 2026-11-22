@@ -723,6 +723,14 @@ impl VfsWorker {
                                                             .as_ref()
                                                             == Some(&path)
                                                 });
+                                            // Save As only: `:w!` to a buffer's own file is fine
+                                            // while another name for it is open.
+                                            if force
+                                                && !current_file
+                                                && has_open_hard_link(&path, &paths)
+                                            {
+                                                return Err(VfsError::OpenBufferDestination);
+                                            }
                                             if !current_file
                                                 && matches!(expectation, WriteExpectation::Exact(_))
                                             {
@@ -2241,6 +2249,20 @@ pub(super) fn apply_resource_intent(intent: &CheckedResourceIntent) -> Result<()
     }
 }
 
+fn has_open_hard_link(target: &Path, open_paths: &[PathBuf]) -> bool {
+    if open_paths.is_empty() {
+        return false;
+    }
+    let Ok(Some(identity)) = linked_document_identity(target) else {
+        return false;
+    };
+    open_paths.iter().any(|other| {
+        crate::files::canonicalize(other)
+            .and_then(|other| linked_document_identity(&other))
+            .is_ok_and(|other| other == Some(identity))
+    })
+}
+
 fn canonical_write_path(path: &Path) -> io::Result<PathBuf> {
     crate::files::canonicalize(path).or_else(|error| {
         if error.kind() != io::ErrorKind::NotFound {
@@ -2542,7 +2564,16 @@ fn linked_document_identity(path: &Path) -> io::Result<Option<(u64, u64)>> {
     }
     #[cfg(windows)]
     {
-        let information = winapi_util::file::information(&open_path(path)?)?;
+        use std::os::windows::fs::OpenOptionsExt;
+        // Not `open_path`: it refuses every reparse point, and cloud (OneDrive) and
+        // deduplicated files are ordinary files with one. OPEN_REPARSE_POINT opens a link
+        // substituted since the check above instead of following it.
+        let file = fs::OpenOptions::new()
+            .access_mode(0)
+            .share_mode(7)
+            .custom_flags(0x02000000 | 0x00200000) // BACKUP_SEMANTICS | OPEN_REPARSE_POINT
+            .open(path)?;
+        let information = winapi_util::file::information(&file)?;
         Ok((information.number_of_links() > 1)
             .then(|| (information.volume_serial_number(), information.file_index())))
     }

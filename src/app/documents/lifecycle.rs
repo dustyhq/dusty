@@ -2,6 +2,7 @@
 
 use crate::app::documents::DocumentEvent;
 use crate::app::documents::Documents;
+use crate::app::documents::FormatterRefusal;
 use crate::app::windows::NavigationStamp;
 use crate::app::workspace::WorkspaceVersion;
 use crate::editor::BufferId;
@@ -93,6 +94,7 @@ enum Operation {
         target: PathBuf,
         quit: bool,
         close: Option<crate::app::windows::EditorCloseSave>,
+        formatter_refusal: Option<FormatterRefusal>,
     },
 }
 pub(in crate::app) struct FileReply {
@@ -170,6 +172,7 @@ pub(in crate::app) enum DocumentChange {
         target: PathBuf,
         quit: bool,
         close: Option<crate::app::windows::EditorCloseSave>,
+        formatter_refusal: Option<FormatterRefusal>,
     },
 }
 pub(in crate::app) struct DocumentCommit {
@@ -337,9 +340,7 @@ impl Documents {
                     }),
             );
         if request.other_open_paths.iter().any(|path| path == &target) {
-            return Err(DocumentFailure::Error(
-                "save-as target belongs to another open buffer".into(),
-            ));
+            return Err(VfsError::OpenBufferDestination.into());
         }
         let bytes = configured_file_bytes(view.text, request.policy);
         let expectation = if request.force {
@@ -376,6 +377,7 @@ impl Documents {
                     target,
                     quit: request.quit,
                     close: request.close,
+                    formatter_refusal: request.formatter_refusal,
                 },
             },
         );
@@ -511,6 +513,7 @@ impl Documents {
                     target: _,
                     quit,
                     close,
+                    formatter_refusal,
                 },
                 VfsResult::Write {
                     result,
@@ -537,6 +540,7 @@ impl Documents {
                     target,
                     quit: quit && same_workspace,
                     close: if same_workspace { close } else { None },
+                    formatter_refusal,
                 }
             }
             _ => {
@@ -603,6 +607,7 @@ pub(in crate::app) struct SaveRequest<'a> {
     pub force: bool,
     pub quit: bool,
     pub close: Option<crate::app::windows::EditorCloseSave>,
+    pub formatter_refusal: Option<FormatterRefusal>,
     pub other_open_paths: Vec<PathBuf>,
 }
 
@@ -825,6 +830,7 @@ mod tests {
                         force: true,
                         quit: false,
                         close: None,
+                        formatter_refusal: None,
                         other_open_paths: Vec::new(),
                     }
                 )
@@ -926,6 +932,7 @@ mod tests {
                     target: "/workspace/file".into(),
                     quit: false,
                     close: None,
+                    formatter_refusal: None,
                 },
             },
             event: VfsResult::Write {
@@ -1025,6 +1032,7 @@ mod tests {
                     target: "/workspace/file".into(),
                     quit: true,
                     close: None,
+                    formatter_refusal: None,
                 },
             },
             event: VfsResult::Write {

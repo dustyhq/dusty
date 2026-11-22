@@ -46,6 +46,8 @@ pub enum VfsError {
         .0.parent().unwrap_or(std::path::Path::new("")).display()
     )]
     DestinationExists(PathBuf),
+    #[error("save-as target belongs to another open buffer")]
+    OpenBufferDestination,
     #[error("path is outside the permitted filesystem scope: `{}`", .0.display())]
     OutsideScope(PathBuf),
     #[error("invalid recovery journal `{}`: {reason}", path.display())]

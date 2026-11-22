@@ -446,6 +446,68 @@ fn save_as_reload_close_and_external_change_protection_work() {
     assert!(app.state.active_view().is_none());
 }
 
+#[cfg(unix)]
+#[test]
+fn forced_save_as_refuses_a_hard_link_to_an_open_buffer() {
+    let (_app_dirs, mut app) = app();
+    let open = app.state.workspace_root.join("open.txt");
+    let alias = app.state.workspace_root.join("alias.txt");
+    fs::write(&open, "original").unwrap();
+    fs::hard_link(&open, &alias).unwrap();
+    app.state
+        .open_text(TextBuffer::from_text("original"), Some(open.clone()))
+        .unwrap();
+    app.state
+        .open_text(TextBuffer::from_text("replacement"), None)
+        .unwrap();
+    app.set_dashboard_visibility(false);
+
+    app.start_save(false, Some("alias.txt".into()), true);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while app.documents.file_work_pending() {
+        app.process_vfs_results();
+        assert!(Instant::now() < deadline, "save completion timed out");
+        thread::yield_now();
+    }
+
+    assert!(app.ui.notification_error);
+    assert_eq!(
+        app.ui.notification.as_deref(),
+        Some("save-as target belongs to another open buffer")
+    );
+    assert_eq!(fs::read(&open).unwrap(), b"original");
+    assert_eq!(fs::read(&alias).unwrap(), b"original");
+}
+
+#[cfg(unix)]
+#[test]
+fn forced_save_to_its_own_file_works_while_another_link_name_is_open() {
+    let (_app_dirs, mut app) = app();
+    let open = app.state.workspace_root.join("open.txt");
+    let alias = app.state.workspace_root.join("alias.txt");
+    fs::write(&open, "original").unwrap();
+    fs::hard_link(&open, &alias).unwrap();
+    app.state
+        .open_text(TextBuffer::from_text("original"), Some(open.clone()))
+        .unwrap();
+    app.state
+        .open_text(TextBuffer::from_text("edited"), Some(alias.clone()))
+        .unwrap();
+    app.set_dashboard_visibility(false);
+
+    app.start_save(false, None, true);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while app.documents.file_work_pending() {
+        app.process_vfs_results();
+        assert!(Instant::now() < deadline, "save completion timed out");
+        thread::yield_now();
+    }
+
+    assert!(!app.ui.notification_error, "{:?}", app.ui.notification);
+    assert_eq!(fs::read(&alias).unwrap(), b"edited");
+    assert_eq!(fs::read(&open).unwrap(), b"edited");
+}
+
 #[test]
 fn dirty_quit_is_blocked_but_forced_quit_succeeds() {
     let (_app_dirs, mut app) = app();
