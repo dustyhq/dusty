@@ -330,14 +330,17 @@ impl GitScreen {
         if !unstage && module.head == module.index {
             return Err("Commit changes inside the submodule before staging its revision".into());
         }
-        let mut args: Vec<OsString> = vec!["--literal-pathspecs".into()];
         if unstage {
             let index = git_index_fingerprint(&self.root).map_err(|error| error.to_string())?;
             let head = git_head_id(&self.root).map_err(|error| error.to_string())?;
             return self.unstage_paths([path].into(), index, head, None);
         }
-        args.push(path.into_os_string());
-        self.write(args)
+        self.write(vec![
+            "--literal-pathspecs".into(),
+            "add".into(),
+            "--".into(),
+            path.into_os_string(),
+        ])
     }
 
     pub(super) fn initialize_submodule(&mut self) {
@@ -430,13 +433,18 @@ impl GitScreen {
             None => warning,
         };
         self.form(
-            &format!(
-                "Remove clean, unlocked worktree {}?",
-                worktree.path.display()
-            ),
-            FormAction::RemoveWorktree(worktree.name.clone()),
+            &title,
+            FormAction::RemoveWorktree {
+                name,
+                reviewed,
+                warning,
+                note_top: std::cell::Cell::new(0),
+            },
             Vec::new(),
         );
+        if changed && let Some(form) = &mut self.form {
+            form.selected = form.fields.len() + 1;
+        }
     }
 
     pub(super) fn fetch_sidebar_remote(&mut self) {

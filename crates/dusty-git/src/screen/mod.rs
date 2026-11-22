@@ -100,7 +100,23 @@ enum FormAction {
     Worktree,
     CheckoutDetached(String),
     DetachedWorktree(String),
-    RemoveWorktree(String),
+    RemoveWorktree {
+        name: String,
+        reviewed: crate::GitWorktreeRemoval,
+        warning: String,
+        note_top: std::cell::Cell<usize>,
+    },
+    ActionMessage {
+        message: String,
+        checking_removal: bool,
+        note_top: std::cell::Cell<usize>,
+    },
+    RemovingWorktree,
+    SwitchBranch(Box<ops::Checkout>),
+    OverwriteIgnored {
+        plan: Box<ops::OverwriteIgnored>,
+        note_top: std::cell::Cell<usize>,
+    },
     Reference(refs::Action),
     Confirm(Vec<OsString>),
     StageAnyway(Box<staging::BulkStage>),
@@ -529,9 +545,9 @@ pub struct GitScreen {
     /// `s` (stage only) or `u` (unstage only) for the staging key being handled; `-` toggles.
     stage_intent: Option<bool>,
     stage_notice: Option<String>,
-    warned_markers: Option<(PathBuf, [u8; 32], GitIndexFingerprint)>,
     /// The confirmed pull, undo, rewrite or tag push still running (`ops.rs`).
     running: Option<ops::Running>,
+    checkout_reply: Option<ops::CheckoutReply>,
     /// What the event in hand asks of the host besides drawing (a clipboard copy).
     outcome: Option<ScreenOutcome>,
 }
@@ -657,8 +673,8 @@ impl GitScreen {
             commit_draft: None,
             stage_intent: None,
             stage_notice: None,
-            warned_markers: None,
             running: None,
+            checkout_reply: None,
             outcome: None,
         };
         // The last status, History and branches paint at once; git's answers replace them.
@@ -1066,7 +1082,25 @@ impl GitScreen {
             reload_preview = self.last_list == 0;
             changed = true;
         }
-        match self.branches.poll() {
+        let reviewing_removal = self.form.as_ref().is_some_and(|form| {
+            matches!(
+                form.action,
+                FormAction::ActionMessage {
+                    checking_removal: true,
+                    ..
+                }
+            )
+        });
+        let removal_progress = reviewing_removal
+            || self
+                .form
+                .as_ref()
+                .is_some_and(|form| matches!(form.action, FormAction::RemovingWorktree));
+        let branch_reply = self.branches.poll();
+        if removal_progress && !matches!(&branch_reply, Ok(None)) {
+            self.form = None;
+        }
+        match branch_reply {
             Ok(Some(GitBranchResult::List(list))) => {
                 self.refs_loading = false;
                 if !self.refreshing {
@@ -1075,6 +1109,28 @@ impl GitScreen {
                 self.refs = Some(list.clone());
                 reload_preview |=
                     self.last_list == 1 || self.last_list == 0 && self.files_view != 0;
+                changed = true;
+            }
+            Ok(Some(GitBranchResult::RemovalReview {
+                name,
+                reviewed,
+                change,
+            })) => {
+                let (name, reviewed, change) = (name.clone(), reviewed.clone(), change.clone());
+                self.branch_mutation = false;
+                self.busy = false;
+                if reviewing_removal {
+                    self.confirm_sidebar_worktree_remove(name, reviewed, change);
+                }
+                changed = true;
+            }
+            Err(error @ crate::GitBranchError::RemovalIncomplete(_)) => {
+                self.branch_mutation = false;
+                self.busy = false;
+                let result = self.refresh();
+                self.refreshing_after_write = result.is_ok();
+                self.report(result);
+                self.show_action_message("Worktree removal stopped", error.to_string());
                 changed = true;
             }
             Ok(Some(GitBranchResult::Changed)) => {
@@ -1101,6 +1157,10 @@ impl GitScreen {
                 changed = true;
             }
             _ => {}
+        }
+        if reviewing_removal && self.branches.removing_worktree() {
+            self.show_removing_worktree();
+            changed = true;
         }
         match self.hunks.poll() {
             Ok(Some(snapshot)) => {
@@ -1203,7 +1263,7 @@ impl GitScreen {
                         self.preview = error.into();
                     }
                 }
-                (Request::Write, result) => {
+                (Request::Write, mut result) => {
                     // A sheet with a second command (an amend's autosquash) runs it now.
                     if self.next_op_step(&mut result, &mut warning) {
                         continue;
@@ -1329,6 +1389,7 @@ impl GitScreen {
             self.select_history();
             self.load_preview();
         }
+        changed |= self.poll_checkout();
         self.save_warm();
         // Forge lessons end on forge state too (a page, a reader tab, a confirmed write).
         let tutor_changed = if changed || github_changed || self.tutor_waiting() {
@@ -2129,6 +2190,9 @@ impl GitScreen {
                 self.rewrite_diagnostic = None;
                 self.busy = true;
             }
+            FormAction::ActionMessage { .. } | FormAction::RemovingWorktree => {
+                unreachable!("handled above")
+            }
             FormAction::SourceSearch => self.find_source(values[0].clone())?,
             FormAction::Commit => {
                 let subject = values[0].trim();
@@ -2166,12 +2230,15 @@ impl GitScreen {
                 self.write(args)?;
             }
             FormAction::CheckoutDetached(id) => {
-                self.write(vec![
-                    "checkout".into(),
-                    "--detach".into(),
-                    id.clone().into(),
-                    "--".into(),
-                ])?;
+                return self.submit_checkout(ops::Checkout::detached(id.clone()));
+            }
+            FormAction::SwitchBranch(checkout) => {
+                return self.submit_checkout(checkout.as_ref().clone());
+            }
+            FormAction::OverwriteIgnored { plan, .. } => {
+                if plan.can_replace() && !form.cancel_focused() {
+                    self.overwrite_ignored(plan.as_ref().clone())?;
+                }
             }
             FormAction::DetachedWorktree(id) => {
                 let (path, name) = self.reflog_worktree_path(&values[0])?;
@@ -2217,25 +2284,29 @@ impl GitScreen {
                 self.busy = true;
                 self.branch_mutation = true;
             }
-            FormAction::RemoveWorktree(name) => {
+            FormAction::RemoveWorktree { name, reviewed, .. } => {
                 self.branches
                     .start(GitBranchRequest::RemoveWorktree {
                         repository: self.root.clone(),
                         name: name.clone(),
-                        deadline: Duration::from_secs(15),
+                        reviewed: Some(reviewed.clone()),
+                        deadline: GitBranchRequest::REMOVAL_STATUS_TIMEOUT,
                     })
                     .map_err(|error| error.to_string())?;
-                self.busy = true;
-                self.branch_mutation = true;
+                self.show_removal_check();
+                return Ok(());
             }
             FormAction::Reference(action) => self.submit_reference(action.clone(), &values)?,
             FormAction::Confirm(args) => self.write(args.clone())?,
             FormAction::StageAnyway(plan) => {
-                // Ctrl-Enter must not bypass the default Cancel button either.
-                let confirmed = form.selected == form.fields.len();
-                let plan = confirmed.then(|| plan.as_ref().clone());
+                let plan = plan.as_ref().clone();
                 self.form = None;
-                return plan.map_or(Ok(()), |plan| self.stage_anyway(plan));
+                return self.stage_anyway(plan);
+            }
+            FormAction::StageConflict { plan, .. } => {
+                let plan = plan.as_ref().clone();
+                self.form = None;
+                return self.apply_stage_file(plan);
             }
             FormAction::ConfirmStash {
                 action,
@@ -2258,7 +2329,12 @@ impl GitScreen {
             }
             FormAction::Run(op) => {
                 let reads = !op.writes();
+                let checkout = matches!(op.as_ref(), ops::Op::Undo(undo)
+                    if matches!(&undo.moved, crate::history::Move::Checkout { .. }));
                 self.submit_op(op.as_ref().clone(), &values)?;
+                if checkout {
+                    return Ok(());
+                }
                 // A copy is done at once: close the sheet and keep its `Copied …` notice.
                 if reads {
                     self.form = None;
@@ -3230,22 +3306,19 @@ impl GitScreen {
                                             "Create a local branch tracking {}?",
                                             row.value.display()
                                         ),
-                                        FormAction::Confirm(vec![
-                                            "switch".into(),
-                                            "--track".into(),
-                                            "--".into(),
+                                        FormAction::SwitchBranch(Box::new(ops::Checkout::branch(
                                             row.value.into_os_string(),
-                                        ]),
+                                            true,
+                                        ))),
                                         Vec::new(),
                                     );
                                 } else if self.last_list == 1 && self.subview == 0 {
                                     self.form(
                                         &format!("Switch to {}?", row.value.display()),
-                                        FormAction::Confirm(vec![
-                                            "switch".into(),
-                                            "--".into(),
+                                        FormAction::SwitchBranch(Box::new(ops::Checkout::branch(
                                             row.value.into_os_string(),
-                                        ]),
+                                            false,
+                                        ))),
                                         Vec::new(),
                                     );
                                 } else {

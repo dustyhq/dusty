@@ -115,7 +115,18 @@ fn wrap_note(note: &str, cells: usize) -> Vec<(String, bool)> {
             if !row.is_empty() {
                 row.push(' ');
             }
-            row.push_str(word);
+            if word.width() > cells {
+                let wrapped = wrap_code(word, cells);
+                let mut parts = wrapped.into_iter().peekable();
+                while let Some(part) = parts.next() {
+                    row.push_str(&part);
+                    if parts.peek().is_some() {
+                        rows.push((std::mem::take(&mut row), index == 0));
+                    }
+                }
+            } else {
+                row.push_str(word);
+            }
         }
         rows.push((row, index == 0));
     }
@@ -352,17 +363,26 @@ fn radio(frame: &mut Frame, field: &Field, x: u16, y: u16, right: u16, focused: 
 
 /// `[ primary ]  [ Cancel ]   hints`, on one row.
 fn buttons(frame: &mut Frame, form: &Form, x: u16, y: u16, right: u16, primary: &str, hints: &str) {
+    if matches!(form.action, FormAction::RemovingWorktree) {
+        return;
+    }
     let count = form.fields.len();
     // `Cancel` beside `Cancel run` would read as the same verb.
-    let secondary = if matches!(
+    let secondary = if matches!(&form.action, FormAction::ActionMessage { .. }) {
+        ""
+    } else if matches!(
         &form.action,
-        FormAction::Github(super::super::github::Action::Cancel(_))
+        FormAction::Github(action) if matches!(action.unscoped(), super::super::github::Action::Cancel(_))
     ) {
         "Keep running"
     } else {
         "Cancel"
     };
-    let selected = form.selected.checked_sub(count).filter(|index| *index < 2);
+    let selected = if secondary.is_empty() {
+        Some(0)
+    } else {
+        form.selected.checked_sub(count).filter(|index| *index < 2)
+    };
     let at = button_pair(frame, x, y, right, [primary, secondary], selected);
     button_hints(frame, at, y, right, hints);
 }
@@ -381,6 +401,9 @@ pub(in crate::screen) fn button_pair(
 ) -> u16 {
     let mut at = x;
     for (index, label) in labels.into_iter().enumerate() {
+        if label.is_empty() {
+            continue;
+        }
         let chosen = selected == Some(index);
         let style = if chosen {
             bold(GitRole::OnFocus, GitSurface::ChipActive)
@@ -761,11 +784,13 @@ fn generic(app: &GitScreen, frame: &mut Frame, form: &Form, lay: &Layout) {
     let note_rows = if note.is_empty() {
         0
     } else {
-        note.len() as u16 + 1
+        u16::try_from(note.len())
+            .unwrap_or(u16::MAX)
+            .saturating_add(1)
     };
-    let content = content + note_rows;
-    // Top padding, fields, an optional status row, the button row, borders.
-    let wanted = content + 1 + u16::from(status.is_some()) + 1 + 2;
+    let content = content.saturating_add(note_rows);
+    // Top padding, fields, status rows, the button row, borders.
+    let wanted = content.saturating_add(status_rows).saturating_add(4);
     let h = wanted.min(body.h.saturating_sub(2)).max(5);
     // One placement rule at every width: centred on the screen.
     let x = body.x + (body.w - w) / 2;

@@ -33,6 +33,7 @@ use crate::git::GitStatusRequestId;
 use crate::git::GitStatusSnapshot;
 use crate::git::GitStatusWorker;
 use crate::git::GitUnsavedDocument;
+use crate::git::GitWorktreeRemoval;
 use crate::git::aggregate_git_status;
 use crate::git::git_branch_name;
 use crate::git::git_head_id;
@@ -126,12 +127,18 @@ pub(super) enum GitMutationOutcome {
 /// target, so an answer can never be applied to a different one than was shown.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum GitDestructiveAction {
-    RemoveWorktree(String),
+    RemoveWorktree(String, Option<GitWorktreeRemoval>),
 }
 
 /// Whichever branch-list outcome arrived, so no outcome is dropped.
 pub(super) enum GitBranchOutcome {
     List(GitBranchList),
+    RemovalReview {
+        name: String,
+        reviewed: GitWorktreeRemoval,
+        change: Option<String>,
+    },
+    RemovalIncomplete(String),
     Changed,
 }
 
@@ -1085,12 +1092,32 @@ impl Git {
     pub(in crate::app) fn take_pending_destructive(&mut self) -> Option<GitDestructiveAction> {
         self.pending_destructive.take()
     }
+    fn review_worktree_removal(&mut self, repository: &Path, name: String) -> Result<(), String> {
+        if self.branch_request_id.is_some() {
+            return Err("a Git worktree request is already running".into());
+        }
+        let status = self
+            .status_snapshot
+            .as_ref()
+            .ok_or("Git status is not ready")?;
+        let request = GitBranchRequest::ReviewRemoval {
+            repository: repository.to_path_buf(),
+            name,
+            deadline: GitBranchRequest::REMOVAL_STATUS_TIMEOUT,
+        };
+        self.branch_request_id = Some(self.branches.start(request).map_err(|e| e.to_string())?);
+        self.branch_root = Some((status.root_revision, status.scope_root.clone()));
+        self.branch_list_scope = Some((repository.to_path_buf(), status.root_revision));
+        Ok(())
+    }
+
     /// Remove a worktree and its directory. This never deletes a branch.
     pub(in crate::app) fn start_worktree_remove(
         &mut self,
         editor: &EditorState,
         repository: &Path,
         name: &str,
+        reviewed: Option<GitWorktreeRemoval>,
     ) -> Result<(), String> {
         if self.branch_request_id.is_some() {
             return Err("a Git worktree request is already running".into());
@@ -1116,7 +1143,8 @@ impl Git {
         let request = GitBranchRequest::RemoveWorktree {
             repository: repository.to_path_buf(),
             name: name.to_owned(),
-            deadline: Duration::from_secs(10),
+            reviewed,
+            deadline: GitBranchRequest::REMOVAL_STATUS_TIMEOUT,
         };
         let status = self
             .status_snapshot
@@ -1126,6 +1154,14 @@ impl Git {
         self.branch_root = Some((status.root_revision, status.scope_root.clone()));
         Ok(())
     }
+    pub(in crate::app) fn cancel_worktree_check(&self) -> bool {
+        self.branches.cancel_removal_check()
+    }
+
+    pub(in crate::app) fn removing_worktree(&self) -> bool {
+        self.branches.removing_worktree()
+    }
+
     /// Create a worktree for a branch. The destination and occupancy checks are the model's.
     /// The worktree list reopens when the running change finishes.
     pub(in crate::app) fn show_worktrees_after_change(&mut self) {
@@ -1182,6 +1218,13 @@ impl Git {
             self.show_worktrees = false;
         }
         if self.branch_request_id.is_none() {
+            // Scope changes may abandon a cancellable recheck while the worker
+            // still owns its result. Drain it before accepting another mutation.
+            if self.branches.removal_pending()
+                && let Err(error @ GitBranchError::RemovalIncomplete(_)) = self.branches.poll()
+            {
+                return Ok(Some(GitBranchOutcome::RemovalIncomplete(error.to_string())));
+            }
             return Ok(None);
         }
         if !self
@@ -1203,6 +1246,26 @@ impl Git {
                 self.branch_request_id = None;
                 self.branch_list_scope = None;
                 Ok(Some(GitBranchOutcome::List(list.clone())))
+            }
+            Ok(Some(crate::git::GitBranchResult::RemovalReview {
+                name,
+                reviewed,
+                change,
+            })) => {
+                self.branch_request_id = None;
+                self.branch_list_scope = None;
+                self.show_worktrees = false;
+                Ok(Some(GitBranchOutcome::RemovalReview {
+                    name: name.clone(),
+                    reviewed: reviewed.clone(),
+                    change: change.clone(),
+                }))
+            }
+            Err(error @ GitBranchError::RemovalIncomplete(_)) => {
+                self.branch_request_id = None;
+                self.branch_list_scope = None;
+                self.show_worktrees = false;
+                Ok(Some(GitBranchOutcome::RemovalIncomplete(error.to_string())))
             }
             Ok(Some(crate::git::GitBranchResult::Changed)) => {
                 self.branch_request_id = None;
@@ -2002,7 +2065,7 @@ mod regression_tests {
         editor.buffers[id].dirty = true;
         assert!(
             session
-                .start_worktree_remove(&editor, dir.path(), "review")
+                .start_worktree_remove(&editor, dir.path(), "review", None)
                 .unwrap_err()
                 .contains("unsaved")
         );
@@ -2010,7 +2073,7 @@ mod regression_tests {
         assert!(path.join("a.txt").is_file());
         editor.buffers[id].dirty = false;
         session
-            .start_worktree_remove(&editor, dir.path(), "review")
+            .start_worktree_remove(&editor, dir.path(), "review", None)
             .unwrap();
         let deadline = Instant::now() + Duration::from_secs(30);
         while session.branch_pending() {
@@ -2584,14 +2647,14 @@ impl App {
             "Yes"
         };
         self.git
-            .set_pending_destructive(crate::app::git::GitDestructiveAction::RemoveWorktree(
-                name.clone(),
-            ));
-        self.open_confirmation(
+            .set_pending_destructive(GitDestructiveAction::RemoveWorktree(name, Some(reviewed)));
+        self.open_confirmation_actions(
             PromptKind::GitDestructive,
-            "Remove worktree".into(),
-            format!("Remove worktree `{name}` and its directory? No branch is deleted."),
+            title.into(),
+            message,
             crate::ui::ConfirmationChoice::No,
+            confirm,
+            if reapproval { "Cancel" } else { "No" },
         );
     }
 }
@@ -2651,12 +2714,16 @@ impl App {
             return;
         };
         let result = match action {
-            crate::app::git::GitDestructiveAction::RemoveWorktree(name) => self
-                .git
-                .start_worktree_remove(&self.state, &status.repository, &name),
+            GitDestructiveAction::RemoveWorktree(name, reviewed) => {
+                self.git
+                    .start_worktree_remove(&self.state, &status.repository, &name, reviewed)
+            }
         };
         match result {
-            Ok(()) => self.git.show_worktrees_after_change(),
+            Ok(()) => {
+                self.git.show_worktrees_after_change();
+                self.show_worktree_check();
+            }
             Err(error) => self.show_error(error),
         }
     }
@@ -2665,10 +2732,21 @@ impl App {
 impl App {
     pub(in crate::app) fn process_git_branch_events(&mut self) {
         // One poll per handler call: the service is one shot.
-        let outcome = match self
+        let reviewing_removal = self
+            .input
+            .prompt()
+            .is_some_and(|prompt| prompt.kind == PromptKind::GitWorktreeCheck);
+        let result = self
             .git
-            .poll_branch_outcome(self.workspace.root_revision(), &self.state.workspace_root)
-        {
+            .poll_branch_outcome(self.workspace.root_revision(), &self.state.workspace_root);
+        if reviewing_removal {
+            if self.git.removing_worktree() {
+                self.show_worktree_removing();
+            } else if !self.git.branches.removal_pending() {
+                self.close_prompt();
+            }
+        }
+        let outcome = match result {
             Ok(Some(outcome)) => Some(outcome),
             Ok(None) => None,
             Err(error) => {
@@ -2678,6 +2756,20 @@ impl App {
         };
         let list = match outcome {
             Some(crate::app::git::GitBranchOutcome::List(list)) => list,
+            Some(GitBranchOutcome::RemovalReview {
+                name,
+                reviewed,
+                change,
+            }) => {
+                if reviewing_removal {
+                    self.show_worktree_removal(name, reviewed, change);
+                }
+                return;
+            }
+            Some(GitBranchOutcome::RemovalIncomplete(message)) => {
+                self.show_incomplete_worktree_removal(message);
+                return;
+            }
             Some(crate::app::git::GitBranchOutcome::Changed) => {
                 self.start_git_status_refresh();
                 self.notify_message("Git branch or worktree updated".into(), false);

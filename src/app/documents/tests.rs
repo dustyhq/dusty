@@ -1556,9 +1556,6 @@ fn a_previewed_replacement_writes_nothing_until_it_is_confirmed() {
         )],
     );
     app.request_git_worktree_remove();
-    app.input
-        .select_confirmation(crate::ui::ConfirmationChoice::Yes);
-    app.submit_prompt();
     while app.git.branch_pending() {
         app.process_git_branch_events();
         assert!(Instant::now() < deadline);

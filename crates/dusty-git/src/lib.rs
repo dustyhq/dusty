@@ -63,6 +63,7 @@ pub use branches::GitBranchResult;
 pub use branches::GitBranchWorker;
 pub use branches::GitSubmoduleEntry;
 pub use branches::GitWorktreeEntry;
+pub use branches::GitWorktreeRemoval;
 pub use hunks::GitDiffLayer;
 pub use hunks::GitDiffLine;
 pub use hunks::GitDiffLineKind;

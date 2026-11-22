@@ -233,6 +233,8 @@ pub enum PromptKind {
     RecoveryDiscard,
     GitStageUnsaved,
     GitDestructive,
+    GitWorktreeCheck,
+    GitWorktreeNotice,
     AgentPermission,
     ReviewComment,
     BreakpointCondition,
@@ -259,6 +261,8 @@ impl PromptKind {
             Self::RecoveryDiscard => "Discard unsaved work",
             Self::GitStageUnsaved => "Stage unsaved changes",
             Self::GitDestructive => "Confirm Git change",
+            Self::GitWorktreeCheck => "Checking worktree",
+            Self::GitWorktreeNotice => "Worktree removal stopped",
             Self::AgentPermission => "Agent permission",
             Self::ReviewComment => "Review comment",
             Self::BreakpointCondition => "Breakpoint condition",
@@ -285,6 +289,8 @@ impl PromptKind {
             | Self::RecoveryDiscard
             | Self::GitStageUnsaved
             | Self::GitDestructive
+            | Self::GitWorktreeCheck
+            | Self::GitWorktreeNotice
             | Self::AgentPermission
             | Self::SubstituteConfirm => "",
             Self::ReviewComment => ">",
@@ -1596,7 +1602,12 @@ pub struct ConfirmationLayout {
     pub fully_visible: bool,
 }
 
-fn confirmation_lines(text: &str, width: u16, config: &Config) -> (Vec<ConfirmationLine>, bool) {
+fn confirmation_lines(
+    text: &str,
+    width: u16,
+    config: &Config,
+    literal: bool,
+) -> (Vec<ConfirmationLine>, bool) {
     let policy = CellGrid::new_with_policy(
         0,
         0,
@@ -1623,7 +1634,12 @@ fn confirmation_lines(text: &str, width: u16, config: &Config) -> (Vec<Confirmat
         }
         if !units.is_empty() && used.saturating_add(unit_width) > width {
             // Break after the last word that fits; a path or command with no space breaks anywhere.
-            let carry = match units.iter().rposition(|(unit, _)| unit == " ") {
+            let space = if literal {
+                None
+            } else {
+                units.iter().rposition(|(unit, _)| unit == " ")
+            };
+            let carry = match space {
                 Some(space) => {
                     let carry = units.split_off(space + 1);
                     units.pop();
@@ -1635,7 +1651,7 @@ fn confirmation_lines(text: &str, width: u16, config: &Config) -> (Vec<Confirmat
                 units: std::mem::replace(&mut units, carry),
             });
             used = units.iter().map(|(_, width)| *width).sum();
-            if grapheme == " " && units.is_empty() {
+            if !literal && grapheme == " " && units.is_empty() {
                 continue;
             }
         }
@@ -1666,7 +1682,16 @@ pub fn confirmation_layout(
         };
     };
     let content_width = geometry.width.saturating_sub(4);
-    let (lines, oversized) = confirmation_lines(&confirmation.message, content_width, config);
+    let (lines, oversized) = match (prompt.kind, confirmation.message.split_once('\n')) {
+        (PromptKind::GitWorktreeNotice, Some((message, path))) => {
+            let (mut lines, oversized) = confirmation_lines(message, content_width, config, false);
+            // The path is literal: a space at a wrap boundary is part of its name.
+            let (path, oversized_path) = confirmation_lines(path, content_width, config, true);
+            lines.extend(path);
+            (lines, oversized || oversized_path)
+        }
+        _ => confirmation_lines(&confirmation.message, content_width, config, false),
+    };
     let desired_height = u16::try_from(lines.len())
         .unwrap_or(u16::MAX)
         .saturating_add(3);
@@ -1678,10 +1703,17 @@ pub fn confirmation_layout(
     } else {
         2.min(terminal_height.saturating_sub(geometry.height))
     };
-    let buttons = format!(
-        "[ {} ] [ {} ]",
-        confirmation.positive_label, confirmation.negative_label
-    );
+    let buttons =
+        if confirmation.positive_label.is_empty() && confirmation.negative_label.is_empty() {
+            String::new()
+        } else if confirmation.negative_label.is_empty() {
+            format!("[ {} ]", confirmation.positive_label)
+        } else {
+            format!(
+                "[ {} ] [ {} ]",
+                confirmation.positive_label, confirmation.negative_label
+            )
+        };
     let buttons_width =
         u16::try_from(text_width(&buttons, config.editor.ambiguous_width)).unwrap_or(u16::MAX);
     let fully_visible = !oversized

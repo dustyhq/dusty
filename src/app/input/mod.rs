@@ -329,6 +329,8 @@ impl InputState {
                 | crate::ui::PromptKind::RecoveryDiscard
                 | crate::ui::PromptKind::GitStageUnsaved => "confirmation_prompt",
                 crate::ui::PromptKind::GitDestructive
+                | crate::ui::PromptKind::GitWorktreeCheck
+                | crate::ui::PromptKind::GitWorktreeNotice
                 | crate::ui::PromptKind::AgentPermission
                 | crate::ui::PromptKind::SubstituteConfirm => "confirmation_prompt",
             });
@@ -1013,6 +1015,7 @@ impl InputState {
             .prompt
             .as_mut()
             .and_then(|prompt| prompt.confirmation.as_mut())
+            && !confirmation.negative_label.is_empty()
         {
             confirmation.selected = selected;
         }
@@ -1023,6 +1026,9 @@ impl InputState {
             .as_mut()
             .and_then(|prompt| prompt.confirmation.as_mut())
         {
+            if confirmation.negative_label.is_empty() {
+                return;
+            }
             confirmation.selected = match confirmation.selected {
                 ConfirmationChoice::Yes => ConfirmationChoice::No,
                 ConfirmationChoice::No => ConfirmationChoice::Yes,
@@ -1255,6 +1261,9 @@ impl InputState {
     pub(in crate::app) fn prompt_move(&mut self, movement: PromptMove) {
         if let Some(prompt) = &mut self.prompt {
             if let Some(confirmation) = &mut prompt.confirmation {
+                if confirmation.negative_label.is_empty() {
+                    return;
+                }
                 confirmation.selected = match movement {
                     PromptMove::Left | PromptMove::WordLeft | PromptMove::Home => {
                         ConfirmationChoice::Yes
@@ -1286,6 +1295,8 @@ impl InputState {
                 | PromptKind::RecoveryDiscard
                 | PromptKind::GitStageUnsaved
                 | PromptKind::GitDestructive
+                | PromptKind::GitWorktreeCheck
+                | PromptKind::GitWorktreeNotice
                 | PromptKind::AgentPermission
                 | PromptKind::ReviewComment
                 | PromptKind::BreakpointCondition

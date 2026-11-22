@@ -1,11 +1,306 @@
 //! Pull, undo and redo, history rewriting and tag push on the Git tab:
 //! each opens a sheet that shows what will move and the command, then runs as a write job.
 use super::*;
+use crate::command::{CHECKOUT_TIMEOUT, GitOutput, supervised_git_output};
 use crate::history::{self, Edit, PullMode, Run};
+use std::sync::mpsc::{Receiver, TryRecvError, sync_channel};
 
 /// A network write (pull, tag push) may take minutes; a local rebase far less.
 const NETWORK: Duration = Duration::from_secs(300);
 const LOCAL: Duration = Duration::from_secs(120);
+
+#[derive(Clone)]
+pub(super) struct Checkout {
+    run: Run,
+    target: OsString,
+    undo: Option<history::Undo>,
+    timeout: Duration,
+}
+
+impl Checkout {
+    pub(super) fn branch(target: OsString, track: bool) -> Self {
+        let mut args = vec!["switch".into()];
+        if track {
+            args.push("--track".into());
+        }
+        args.extend(["--".into(), target.clone()]);
+        Self {
+            run: Run::new(crate::command::protect_checkout(args)),
+            target,
+            undo: None,
+            timeout: CHECKOUT_TIMEOUT,
+        }
+    }
+
+    #[cfg(all(test, unix))]
+    pub(super) fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
+    }
+
+    pub(super) fn detached(id: String) -> Self {
+        let target = OsString::from(id);
+        let args = crate::command::protect_checkout([
+            "checkout".into(),
+            "--detach".into(),
+            target.clone(),
+            "--".into(),
+        ]);
+        Self {
+            run: Run::new(args),
+            target,
+            undo: None,
+            timeout: CHECKOUT_TIMEOUT,
+        }
+    }
+}
+
+#[derive(Clone)]
+pub(super) struct OverwriteIgnored {
+    checkout: Checkout,
+    paths: Vec<PathBuf>,
+}
+
+impl OverwriteIgnored {
+    pub(super) fn warning(&self) -> String {
+        let paths = crate::command::display_paths(self.paths.iter().take(3).map(PathBuf::as_path));
+        let target = self.checkout.target.to_string_lossy();
+        if self.can_replace() {
+            format!(
+                "Switching to {target} would replace ignored files:\n{paths}\nA copy will be kept in Stashes."
+            )
+        } else {
+            format!(
+                "Switching to {target} would replace {} ignored files.\nMove these files before switching.\n{paths}, …",
+                self.paths.len()
+            )
+        }
+    }
+
+    pub(super) fn can_replace(&self) -> bool {
+        self.paths.len() <= 3
+    }
+}
+
+pub(super) enum CheckoutOutcome {
+    Finished(String),
+    Collision(Box<OverwriteIgnored>),
+    StashRecovery(String),
+}
+
+pub(super) type CheckoutReply = Receiver<Result<CheckoutOutcome, String>>;
+
+enum CheckoutAttempt {
+    Applied(String),
+    Refused(GitOutput),
+}
+
+fn run_checkout(root: &Path, checkout: &Checkout) -> Result<CheckoutAttempt, String> {
+    let check = checkout.run.check.as_ref();
+    if let Some(check) = check {
+        check.verify(root)?;
+    }
+    let result = supervised_git_output(
+        root,
+        &checkout.run.args,
+        &checkout.run.env,
+        checkout.timeout,
+    );
+    if let Ok(output) = &result
+        && output.success()
+    {
+        return Ok(CheckoutAttempt::Applied(checkout_success(checkout, output)));
+    }
+    if let Some(undo) = &checkout.undo
+        && check.is_some_and(|check| check.undo_landed(root))
+    {
+        // HEAD and its reflog marker have already moved; don't retry the switch
+        // or offer recovery for an ignored-file collision.
+        let done = if undo.redo { "Redone." } else { "Undone." };
+        let warning = match result {
+            Ok(output) => match output_message(&output).lines().next() {
+                Some(detail) => format!("The post-checkout hook failed: {}", detail.trim()),
+                None => "The post-checkout hook failed.".into(),
+            },
+            Err(error) => error,
+        };
+        return Ok(CheckoutAttempt::Applied(format!("{done} {warning}")));
+    }
+    result.map(CheckoutAttempt::Refused)
+}
+
+fn checkout_success(checkout: &Checkout, output: &GitOutput) -> String {
+    if let Some(undo) = &checkout.undo {
+        let (_, to) = undo.head();
+        let verb = if undo.redo { "Redid" } else { "Undid" };
+        format!("{verb} {} · HEAD at {to}", undo.entry)
+    } else {
+        output_message(output)
+    }
+}
+
+fn output_message(output: &GitOutput) -> String {
+    let stream = if output.stderr.iter().all(u8::is_ascii_whitespace) {
+        &output.stdout
+    } else {
+        &output.stderr
+    };
+    String::from_utf8_lossy(stream).trim().into()
+}
+
+fn attempt_checkout(root: &Path, checkout: Checkout) -> Result<CheckoutOutcome, String> {
+    let output = match run_checkout(root, &checkout) {
+        Ok(CheckoutAttempt::Applied(message)) => return Ok(CheckoutOutcome::Finished(message)),
+        Ok(CheckoutAttempt::Refused(output)) => output,
+        Err(error) if error == history::CHECKOUT_CHANGED => {
+            return Err(history::CHECKOUT_CHANGED_AFTER_CLOSE.into());
+        }
+        Err(error) => return Err(error),
+    };
+    // Commit Undo used to be an ordinary write job: don't offer to stash
+    // ignored files on that path. Checkout Undo retains its collision flow.
+    let paths = if matches!(
+        &checkout.run.check,
+        Some(history::CheckoutCheck::CommitUndo { .. })
+    ) {
+        Vec::new()
+    } else {
+        crate::command::checkout_ignored(root, &output.stderr)?
+    };
+    if paths.is_empty() {
+        let message = output_message(&output);
+        return Err(if message.is_empty() {
+            "Git command failed".into()
+        } else {
+            message
+        });
+    }
+    Ok(CheckoutOutcome::Collision(Box::new(OverwriteIgnored {
+        checkout,
+        paths,
+    })))
+}
+
+fn stash_tip(root: &Path) -> Result<Option<String>, String> {
+    let result = supervised_git_output(
+        root,
+        &[
+            "rev-parse".into(),
+            "--verify".into(),
+            "--quiet".into(),
+            "refs/stash".into(),
+        ],
+        &[],
+        CHECKOUT_TIMEOUT,
+    )?;
+    if result.success() {
+        let id = String::from_utf8_lossy(&result.stdout).trim().to_owned();
+        if !id.is_empty() && id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Ok(Some(id));
+        }
+    } else if result.code == Some(1) {
+        return Ok(None);
+    }
+    Err("Can't find the ignored files in Stashes".into())
+}
+
+fn stash_selector(root: &Path, id: &str) -> String {
+    let args = ["stash".into(), "list".into(), "--format=%H %gd".into()];
+    if let Ok(result) = supervised_git_output(root, &args, &[], CHECKOUT_TIMEOUT)
+        && result.success()
+        && let Some(selector) = String::from_utf8_lossy(&result.stdout)
+            .lines()
+            .find_map(|line| {
+                let (hash, selector) = line.split_once(' ')?;
+                (hash == id).then_some(selector)
+            })
+    {
+        return selector.to_owned();
+    }
+    id.to_owned()
+}
+
+/// Check out just the saved untracked tree, using a private index. Without
+/// --force, checkout-index will not overwrite a file that appeared meanwhile.
+fn restore_ignored(root: &Path, stash: &str, paths: &[PathBuf]) -> bool {
+    let Ok(temp) = tempfile::tempdir() else {
+        return false;
+    };
+    let env = [(
+        "GIT_INDEX_FILE".into(),
+        temp.path().join("index").into_os_string(),
+    )];
+    let tree = ["read-tree".into(), format!("{stash}^3").into()];
+    let mut restore = vec!["checkout-index".into(), "--".into()];
+    restore.extend(paths.iter().map(|path| path.as_os_str().to_owned()));
+    let run = |args: &[OsString]| {
+        supervised_git_output(root, args, &env, CHECKOUT_TIMEOUT)
+            .is_ok_and(|result| result.success())
+    };
+    run(&tree) && run(&restore)
+}
+
+fn replace_ignored(root: &Path, plan: OverwriteIgnored) -> Result<CheckoutOutcome, String> {
+    let OverwriteIgnored { checkout, paths } = plan;
+    // Retry without moving anything first. Git, not a second ref resolver,
+    // decides whether these same paths still block the selected checkout.
+    let output = match run_checkout(root, &checkout)? {
+        CheckoutAttempt::Applied(message) => return Ok(CheckoutOutcome::Finished(message)),
+        CheckoutAttempt::Refused(output) => output,
+    };
+    if crate::command::checkout_ignored(root, &output.stderr)? != paths {
+        return Err("The branch or ignored files changed. Cancel and try again.".into());
+    }
+    let before = stash_tip(root)?;
+    let mut save = [
+        "--literal-pathspecs",
+        "stash",
+        "push",
+        "--all",
+        "--message",
+        "Ignored files saved before switching",
+        "--",
+    ]
+    .map(OsString::from)
+    .to_vec();
+    save.extend(paths.iter().map(|path| path.as_os_str().to_owned()));
+    let saved = supervised_git_output(root, &save, &[], CHECKOUT_TIMEOUT);
+    let Some(stash) = stash_tip(root)?.filter(|after| Some(after) != before.as_ref()) else {
+        return Err(saved
+            .err()
+            .unwrap_or_else(|| "Can't save the ignored files in Stashes".into()));
+    };
+    let failure = match saved {
+        Ok(saved) if saved.success() => match run_checkout(root, &checkout) {
+            Ok(CheckoutAttempt::Applied(message)) => {
+                let saved = "Ignored files saved in Stashes";
+                let notice = if checkout.undo.is_some() {
+                    format!("{message} · {saved}")
+                } else {
+                    saved.into()
+                };
+                return Ok(CheckoutOutcome::Finished(notice));
+            }
+            Ok(CheckoutAttempt::Refused(output)) => output_message(&output),
+            Err(error) => error,
+        },
+        Ok(_) => "Can't save the ignored files in Stashes".into(),
+        Err(error) => error,
+    };
+    if restore_ignored(root, &stash, &paths) {
+        Err(failure)
+    } else {
+        let selector = stash_selector(root, &stash);
+        // Leave room for the recovery entry even if a hook prints pages of output.
+        let failure = match failure.char_indices().nth(8192) {
+            Some((end, _)) => format!("{}…", &failure[..end]),
+            None => failure,
+        };
+        Ok(CheckoutOutcome::StashRecovery(format!(
+            "Switch failed. Your ignored files were saved in Stashes. Stash: {selector}.\n{failure}"
+        )))
+    }
+}
 
 /// What a confirmed sheet runs.
 #[derive(Clone)]

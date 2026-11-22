@@ -1027,7 +1027,9 @@ fn sidebar_tabs_use_real_worktrees_remote_refs_tags_and_reflog_events() {
     assert_eq!(git(root, &["rev-parse", "HEAD"]), head_before_confirmation);
     key(&mut screen, KeyCode::Escape);
     key(&mut screen, KeyCode::Char('d'));
-    assert!(view(&mut screen).contains("Remove clean, unlocked worktree"));
+    wait(&mut screen, |screen| {
+        view(screen).contains("Remove clean, unlocked worktree")
+    });
     control(&mut screen, KeyCode::Enter);
     wait(&mut screen, |screen| !screen.busy());
     assert!(!linked.exists());

@@ -1,17 +1,24 @@
 //! Branch, worktree and submodule listing, plus worktree creation and removal.
 //! Check refusal conditions before writes;
 //! retain running mutations until their completion is handled.
+use std::collections::BTreeMap;
+use std::ffi::OsString;
+use std::fs;
+use std::io::ErrorKind;
 use std::path::Path;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc;
 use std::sync::mpsc::Receiver;
 use std::sync::mpsc::TryRecvError;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 use std::time::Instant;
+use std::time::UNIX_EPOCH;
+
+use sha2::{Digest, Sha256};
 
 use thiserror::Error;
 
@@ -33,9 +40,16 @@ pub enum GitBranchRequest {
         reference: String,
         deadline: Duration,
     },
+    ReviewRemoval {
+        repository: PathBuf,
+        name: String,
+        deadline: Duration,
+    },
     RemoveWorktree {
         repository: PathBuf,
         name: String,
+        /// The local-only files shown in the removal confirmation.
+        reviewed: Option<GitWorktreeRemoval>,
         deadline: Duration,
     },
     /// Check out a REVISION rather than a branch. A review must not create or move a ref, so its
@@ -95,6 +109,11 @@ pub struct GitBranchList {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum GitBranchResult {
     List(GitBranchList),
+    RemovalReview {
+        name: String,
+        reviewed: GitWorktreeRemoval,
+        change: Option<String>,
+    },
     Changed,
 }
 #[derive(Debug, Error, Eq, PartialEq)]
@@ -113,6 +132,18 @@ pub enum GitBranchError {
     RefusedCheckedOut(String),
     #[error("worktree `{0}` has uncommitted changes")]
     RefusedDirtyWorktree(String),
+    #[error("Can't check which files would be deleted")]
+    RemovalInventory,
+    #[error("Can't remove the worktree")]
+    RemovalFailed,
+    #[error("Worktree removal stopped part-way. Delete the leftover folder manually:\n{0}")]
+    RemovalIncomplete(String),
+    #[error(
+        "Save local files from the submodules, then deinitialize them before removing this worktree."
+    )]
+    RemovalSubmodules,
+    #[error("The worktree's files changed")]
+    RemovalChanged,
     #[error("worktree `{0}` is locked")]
     RefusedLockedWorktree(String),
     #[error("worktree `{0}` has a Git operation in progress: {1}")]
@@ -135,6 +166,77 @@ pub enum GitBranchError {
 pub(super) enum GitBranchEvent {
     Complete(Result<GitBranchResult, GitBranchError>),
 }
+const REMOVAL_DISPLAY_LIMIT: usize = 100_000;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RemovalPhase {
+    Checking,
+    Cancelled,
+    Removing,
+}
+
+struct RemovalCheck {
+    phase: Mutex<RemovalPhase>,
+    display_limit: usize,
+    #[cfg(test)]
+    pause: Mutex<Option<RemovalPause>>,
+}
+
+impl Default for RemovalCheck {
+    fn default() -> Self {
+        Self {
+            phase: Mutex::new(RemovalPhase::Checking),
+            display_limit: REMOVAL_DISPLAY_LIMIT,
+            #[cfg(test)]
+            pause: Mutex::new(None),
+        }
+    }
+}
+
+impl RemovalCheck {
+    fn start_removing(&self) -> Result<(), GitBranchError> {
+        let mut phase = self.phase.lock().expect("worktree removal phase");
+        if *phase != RemovalPhase::Checking {
+            return Err(GitBranchError::Cancelled);
+        }
+        *phase = RemovalPhase::Removing;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn pause_at(&self, checkpoint: RemovalCheckpoint) {
+        let pause = {
+            let mut pause = self.pause.lock().expect("worktree test checkpoint");
+            if !pause
+                .as_ref()
+                .is_some_and(|pause| pause.checkpoint == checkpoint)
+            {
+                return;
+            }
+            pause.take().expect("matching worktree test checkpoint")
+        };
+        let _ = pause.reached.send(());
+        pause
+            .resume
+            .recv_timeout(Duration::from_secs(20))
+            .expect("resume worktree worker");
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum RemovalCheckpoint {
+    FirstEntry,
+    BeforeDelete,
+}
+
+#[cfg(test)]
+struct RemovalPause {
+    checkpoint: RemovalCheckpoint,
+    reached: mpsc::Sender<()>,
+    resume: Receiver<()>,
+}
+
 #[derive(Default)]
 pub struct GitBranchWorker {
     pub(super) next: u64,
@@ -143,11 +245,42 @@ pub struct GitBranchWorker {
     receiver: Option<Receiver<GitBranchEvent>>,
     accepted: Option<GitBranchResult>,
     mutating: bool,
+    removal_check: Option<Arc<RemovalCheck>>,
 }
 impl GitBranchWorker {
     pub fn start(
         &mut self,
         request: GitBranchRequest,
+    ) -> Result<GitBranchRequestId, GitBranchError> {
+        self.start_with_removal_check(request, RemovalCheck::default())
+    }
+
+    #[cfg(test)]
+    pub(super) fn start_paused_removal(
+        &mut self,
+        request: GitBranchRequest,
+        checkpoint: RemovalCheckpoint,
+    ) -> Result<(Receiver<()>, mpsc::Sender<()>), GitBranchError> {
+        let (reached, ready) = mpsc::channel();
+        let (resume, wait) = mpsc::channel();
+        self.start_with_removal_check(
+            request,
+            RemovalCheck {
+                pause: Mutex::new(Some(RemovalPause {
+                    checkpoint,
+                    reached,
+                    resume: wait,
+                })),
+                ..RemovalCheck::default()
+            },
+        )?;
+        Ok((ready, resume))
+    }
+
+    fn start_with_removal_check(
+        &mut self,
+        request: GitBranchRequest,
+        removal_check: RemovalCheck,
     ) -> Result<GitBranchRequestId, GitBranchError> {
         if !valid_request(&request) {
             return Err(GitBranchError::Invalid);
@@ -156,25 +289,61 @@ impl GitBranchWorker {
             return Err(GitBranchError::Busy);
         }
         self.cancel();
-        let mutating = !matches!(request, GitBranchRequest::List(_));
+        let mutating = !matches!(
+            request,
+            GitBranchRequest::List(_) | GitBranchRequest::ReviewRemoval { .. }
+        );
         self.next = self.next.saturating_add(1);
         let request_id = GitBranchRequestId(self.next);
         let cancel = Arc::new(AtomicBool::new(false));
         let worker = Arc::clone(&cancel);
+        let removal_check = Arc::new(removal_check);
+        let worker_check = Arc::clone(&removal_check);
+        let removal = matches!(
+            request,
+            GitBranchRequest::ReviewRemoval { .. } | GitBranchRequest::RemoveWorktree { .. }
+        );
         let (tx, rx) = mpsc::sync_channel(1);
         thread::Builder::new()
             .name(format!("dusty-git-branch-{}", request_id.0))
             .spawn(move || {
-                let result = run(request_id, &request, &worker);
+                let result = run_with_removal_check(request_id, &request, &worker, &worker_check);
                 let _ = tx.send(GitBranchEvent::Complete(result));
             })
             .map_err(|_| GitBranchError::Stopped)?;
         self.mutating = mutating;
+        self.removal_check = removal.then_some(removal_check);
         self.active = Some(request_id);
         self.cancel = Some(cancel);
         self.receiver = Some(rx);
         Ok(request_id)
     }
+    /// Gate cancellation against the final transition into deletion. Once deletion
+    /// starts, let Git finish and keep polling for errors or partial removal.
+    pub fn cancel_removal_check(&self) -> bool {
+        let (Some(check), Some(cancel)) = (&self.removal_check, &self.cancel) else {
+            return false;
+        };
+        let mut phase = check.phase.lock().expect("worktree removal phase");
+        if *phase != RemovalPhase::Checking {
+            return false;
+        }
+        cancel.store(true, Ordering::Release);
+        *phase = RemovalPhase::Cancelled;
+        true
+    }
+
+    /// Whether the worker has committed to deletion and can no longer cancel it.
+    pub fn removing_worktree(&self) -> bool {
+        self.removal_check.as_ref().is_some_and(|check| {
+            *check.phase.lock().expect("worktree removal phase") == RemovalPhase::Removing
+        })
+    }
+
+    pub fn removal_pending(&self) -> bool {
+        self.removal_check.is_some()
+    }
+
     pub fn cancel(&mut self) {
         if self.removal_check.is_some() {
             self.cancel_removal_check();
@@ -200,6 +369,7 @@ impl GitBranchWorker {
                 self.receiver = None;
                 self.cancel = None;
                 self.mutating = false;
+                self.removal_check = None;
                 let result = result?;
                 // A page carries its request_id; a mutation is accepted for the active request.
                 if let GitBranchResult::List(list) = &result
@@ -225,6 +395,12 @@ impl Drop for GitBranchWorker {
     }
 }
 
+/// Only the native status subprocess uses this ceiling; the filesystem walk
+/// runs until it finishes or the user cancels.
+impl GitBranchRequest {
+    pub const REMOVAL_STATUS_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
+}
+
 fn valid_request(request: &GitBranchRequest) -> bool {
     let (repository, deadline) = match request {
         GitBranchRequest::List(request) => (&request.repository, request.deadline),
@@ -241,15 +417,21 @@ fn valid_request(request: &GitBranchRequest) -> bool {
             }
             (repository, *deadline)
         }
-        GitBranchRequest::RemoveWorktree {
+        GitBranchRequest::ReviewRemoval {
             repository,
             name,
             deadline,
+        }
+        | GitBranchRequest::RemoveWorktree {
+            repository,
+            name,
+            deadline,
+            ..
         } => {
-            if name.trim().is_empty() {
-                return false;
-            }
-            (repository, *deadline)
+            return !repository.as_os_str().is_empty()
+                && !name.trim().is_empty()
+                && !deadline.is_zero()
+                && *deadline <= GitBranchRequest::REMOVAL_STATUS_TIMEOUT;
         }
         GitBranchRequest::CreateDetachedWorktree {
             repository,
@@ -271,10 +453,16 @@ fn open(repository: &Path) -> Result<git2::Repository, GitBranchError> {
     git2::Repository::open(repository).map_err(|_| GitBranchError::NotRepository)
 }
 
-fn check_request(cancel: &AtomicBool, expires: Instant) -> Result<(), GitBranchError> {
+fn check_cancel(cancel: &AtomicBool) -> Result<(), GitBranchError> {
     if cancel.load(Ordering::Acquire) {
-        Err(GitBranchError::Cancelled)
-    } else if Instant::now() >= expires {
+        return Err(GitBranchError::Cancelled);
+    }
+    Ok(())
+}
+
+fn check_request(cancel: &AtomicBool, expires: Instant) -> Result<(), GitBranchError> {
+    check_cancel(cancel)?;
+    if Instant::now() >= expires {
         Err(GitBranchError::Deadline)
     } else {
         Ok(())
@@ -661,6 +849,7 @@ fn list_worktree_state(
     Ok((dirty, submodules))
 }
 
+#[cfg(test)]
 fn has_changes(
     repository: &git2::Repository,
     cancel: &AtomicBool,
@@ -675,6 +864,19 @@ fn has_changes_with_options(
     expires: Instant,
     ignore_submodules: bool,
 ) -> Result<bool, GitBranchError> {
+    let mut args = vec!["status", "--porcelain", "--untracked-files=normal"];
+    if ignore_submodules {
+        args.push("--ignore-submodules=all");
+    }
+    status_has_changes(repository, cancel, expires, &args)
+}
+
+fn status_has_changes(
+    repository: &git2::Repository,
+    cancel: &AtomicBool,
+    expires: Instant,
+    args: &[&str],
+) -> Result<bool, GitBranchError> {
     check_request(cancel, expires)?;
     let workdir = repository.workdir().ok_or(GitBranchError::NotRepository)?;
     // libgit2's status scan can't be stopped, so `git status` runs as a job the deadline kills.
@@ -687,12 +889,8 @@ fn has_changes_with_options(
         maximum_path_bytes: 512,
         deadline: expires.saturating_duration_since(started),
     };
-    let mut args = vec!["status", "--porcelain", "--untracked-files=normal"];
-    if ignore_submodules {
-        args.push("--ignore-submodules=all");
-    }
     let (output, truncated) = crate::status::status_command(
-        workdir, &args, &policy, started, cancel,
+        workdir, args, &policy, started, cancel,
     )
     .map_err(|error| match error {
         crate::status::GitStatusError::Deadline => GitBranchError::Deadline,
@@ -864,9 +1062,19 @@ fn run(
     request: &GitBranchRequest,
     cancel: &AtomicBool,
 ) -> Result<GitBranchResult, GitBranchError> {
+    run_with_removal_check(request_id, request, cancel, &RemovalCheck::default())
+}
+
+fn run_with_removal_check(
+    request_id: GitBranchRequestId,
+    request: &GitBranchRequest,
+    cancel: &AtomicBool,
+    removal_check: &RemovalCheck,
+) -> Result<GitBranchResult, GitBranchError> {
     let deadline = match request {
         GitBranchRequest::List(request) => request.deadline,
         GitBranchRequest::CreateWorktree { deadline, .. }
+        | GitBranchRequest::ReviewRemoval { deadline, .. }
         | GitBranchRequest::RemoveWorktree { deadline, .. }
         | GitBranchRequest::CreateDetachedWorktree { deadline, .. } => *deadline,
     };
@@ -1021,49 +1229,69 @@ fn run(
             check_request(cancel, expires)?;
             Ok(GitBranchResult::Changed)
         }
-        GitBranchRequest::RemoveWorktree {
+        GitBranchRequest::ReviewRemoval {
             repository, name, ..
         } => {
             let repository = open(repository)?;
-            let worktree = repository
-                .find_worktree(name)
-                .map_err(|_| GitBranchError::UnknownWorktree(name.clone()))?;
-            if !matches!(
-                worktree
-                    .is_locked()
-                    .unwrap_or(git2::WorktreeLockStatus::Unlocked),
-                git2::WorktreeLockStatus::Unlocked
+            let worktree = removal_target(&repository, name)?;
+            let reviewed =
+                removal_inventory(&repository, &worktree, name, cancel, expires, removal_check)?;
+            check_cancel(cancel)?;
+            Ok(GitBranchResult::RemovalReview {
+                name: name.clone(),
+                reviewed,
+                change: None,
+            })
+        }
+        GitBranchRequest::RemoveWorktree {
+            repository,
+            name,
+            reviewed,
+            ..
+        } => {
+            let repository = open(repository)?;
+            let worktree = removal_target(&repository, name)?;
+            let actual = match removal_inventory(
+                &repository,
+                &worktree,
+                name,
+                cancel,
+                expires,
+                removal_check,
             ) {
-                return Err(GitBranchError::RefusedLockedWorktree(name.clone()));
-            }
-            let path = worktree.path().to_path_buf();
-            if path.try_exists().map_err(backend)? {
-                let opened = git2::Repository::open(&path).map_err(backend)?;
-                let workdir = opened
-                    .workdir()
-                    .and_then(|path| crate::files::canonicalize(path).ok());
-                if workdir != Some(crate::files::canonicalize(&path).map_err(backend)?) {
+                Err(GitBranchError::RefusedDirtyWorktree(_)) if reviewed.is_some() => {
+                    return Err(GitBranchError::RemovalChanged);
+                }
+                result => result?,
+            };
+            check_cancel(cancel)?;
+            match reviewed {
+                Some(reviewed) if *reviewed != actual => {
+                    return Ok(GitBranchResult::RemovalReview {
+                        name: name.clone(),
+                        change: Some(reviewed.change_notice(&actual)),
+                        reviewed: actual,
+                    });
+                }
+                None if !actual.is_clean() => {
                     return Err(GitBranchError::RefusedDirtyWorktree(name.clone()));
                 }
-                if has_changes(&opened, cancel, expires)? {
-                    return Err(GitBranchError::RefusedDirtyWorktree(name.clone()));
-                }
-                if let Some(operation) = operation_name(opened.state()) {
-                    return Err(GitBranchError::RefusedActiveOperation(
-                        name.clone(),
-                        operation,
-                    ));
-                }
+                _ => {}
             }
-            check_request(cancel, expires)?;
-            // Keep the administrative data if deletion fails, so the checkout remains registered.
-            if path.exists() {
-                remove_checkout(&path).map_err(backend)?;
+            // Cancel and deletion share this gate. Do not enter the
+            // non-cancellable phase until a deletion will actually run.
+            removal_check.start_removing()?;
+            #[cfg(test)]
+            removal_check.pause_at(RemovalCheckpoint::BeforeDelete);
+            if actual.is_missing() {
+                // Prune just this registration, not all stale worktrees in the repository.
+                worktree.prune(None).map_err(backend)?;
+            } else {
+                remove_registered_worktree(&repository, name, worktree.path(), |cwd, args| {
+                    crate::command::git_output(cwd, args, &[])
+                        .is_ok_and(|output| output.status.success())
+                })?;
             }
-            let mut options = git2::WorktreePruneOptions::new();
-            options.valid(true);
-            worktree.prune(Some(&mut options)).map_err(backend)?;
-            check_request(cancel, expires)?;
             Ok(GitBranchResult::Changed)
         }
     }
@@ -1159,9 +1387,10 @@ impl TreeDigest {
     }
 }
 
-fn remove_checkout_once(path: &Path) -> std::io::Result<()> {
-    if !path.exists() {
-        return Ok(());
+impl GitWorktreeRemoval {
+    /// The checkout path, even if its directory has already been deleted.
+    pub fn path(&self) -> &Path {
+        &self.path
     }
 
     /// A missing checkout can only have its worktree registration pruned.
@@ -1233,7 +1462,6 @@ fn remove_checkout_once(path: &Path) -> std::io::Result<()> {
             Some(detail) => format!("{detail} {instruction}"),
             None => format!("The worktree's files changed. {instruction}"),
         }
-        remove_entry(&entry_path, entry.file_type()?)?;
     }
 
     /// Warnings to show with a removal confirmation.
@@ -1269,7 +1497,6 @@ fn remove_checkout_once(path: &Path) -> std::io::Result<()> {
                     .then(|| "Listed directories will be deleted with their contents.".into()),
             )
     }
-    std::fs::remove_dir(path)
 }
 
 fn removal_inventory(
@@ -1546,6 +1773,279 @@ mod exclude_tests {
     }
 
     #[test]
+    fn removing_a_worktree_requires_reviewing_ignored_files() {
+        let main = tempfile::tempdir().unwrap();
+        let destination = tempfile::tempdir().unwrap();
+        let path = destination.path().join("review");
+        let repository = repository_with_commit(main.path());
+        fs::write(repository.path().join("info/exclude"), "local.env\ndata/\n").unwrap();
+        let deadline = Duration::from_secs(10);
+        let cancel = AtomicBool::new(false);
+        run(
+            GitBranchRequestId(1),
+            &GitBranchRequest::CreateDetachedWorktree {
+                repository: main.path().into(),
+                name: "review".into(),
+                path: path.clone(),
+                revision: "HEAD".into(),
+                deadline,
+            },
+            &cancel,
+        )
+        .unwrap();
+        fs::write(path.join("local.env"), "local only\n").unwrap();
+        fs::create_dir(path.join("data")).unwrap();
+        fs::write(path.join("data/old.db"), "database").unwrap();
+
+        let remove = |reviewed| {
+            run(
+                GitBranchRequestId(2),
+                &GitBranchRequest::RemoveWorktree {
+                    repository: main.path().into(),
+                    name: "review".into(),
+                    reviewed,
+                    deadline,
+                },
+                &cancel,
+            )
+        };
+        assert!(remove(None).is_err());
+        assert_eq!(
+            fs::read_to_string(path.join("local.env")).unwrap(),
+            "local only\n"
+        );
+
+        let review = || {
+            let GitBranchResult::RemovalReview { reviewed, .. } = run(
+                GitBranchRequestId(3),
+                &GitBranchRequest::ReviewRemoval {
+                    repository: main.path().into(),
+                    name: "review".into(),
+                    deadline,
+                },
+                &cancel,
+            )
+            .unwrap() else {
+                panic!("expected a removal review")
+            };
+            reviewed
+        };
+        let reviewed = review();
+        let warnings = reviewed.warnings().collect::<Vec<_>>();
+        assert_eq!(
+            warnings,
+            [
+                "Also deletes 2 ignored paths: data/, local.env",
+                "Listed directories will be deleted with their contents."
+            ]
+        );
+        let rereview = |previous, expected: &str| {
+            let GitBranchResult::RemovalReview {
+                name,
+                reviewed,
+                change: Some(change),
+            } = remove(Some(previous)).unwrap()
+            else {
+                panic!("files changed under the ignored directory; require another confirmation");
+            };
+            assert_eq!(name, "review");
+            assert!(change.starts_with(expected), "{change}");
+            assert_eq!(reviewed.warnings().collect::<Vec<_>>(), warnings);
+            reviewed
+        };
+        fs::write(path.join("data/new.db"), "arrived after review\n").unwrap();
+        let added = Path::new("data").join("new.db");
+        let reviewed = rereview(reviewed, &format!("{} was added.", added.display()));
+        assert!(path.join("data/new.db").is_file());
+        fs::write(path.join("data/old.db"), "changed after the second review").unwrap();
+        let edited = Path::new("data").join("old.db");
+        let reviewed = rereview(reviewed, &format!("{} changed.", edited.display()));
+        assert_eq!(
+            fs::read_to_string(path.join("data/old.db")).unwrap(),
+            "changed after the second review"
+        );
+
+        assert_eq!(remove(Some(reviewed)), Ok(GitBranchResult::Changed));
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn worktree_review_does_not_apply_the_display_cap_to_descendants() {
+        assert_ignored_dependency_tree_can_be_removed(256, 8, 256);
+    }
+
+    // Run separately: cargo test -p dusty-git worktree_review_accepts_a_large_ignored_dependency_tree -- --ignored
+    #[test]
+    #[ignore = "creates and deletes 100,000 files"]
+    fn worktree_review_accepts_a_large_ignored_dependency_tree() {
+        assert_ignored_dependency_tree_can_be_removed(REMOVAL_DISPLAY_LIMIT, 100, 1000);
+    }
+
+    fn assert_ignored_dependency_tree_can_be_removed(
+        display_limit: usize,
+        packages: usize,
+        files_per_package: usize,
+    ) {
+        let main = tempfile::tempdir().unwrap();
+        let destination = tempfile::tempdir().unwrap();
+        let path = destination.path().join("review");
+        let repository = repository_with_commit(main.path());
+        fs::write(repository.path().join("info/exclude"), "node_modules/\n").unwrap();
+        repository.worktree("review", &path, None).unwrap();
+        let modules = path.join("node_modules");
+        fs::create_dir(&modules).unwrap();
+        for package in 0..packages {
+            let package = modules.join(package.to_string());
+            fs::create_dir(&package).unwrap();
+            for file in 0..files_per_package {
+                fs::File::create(package.join(file.to_string())).unwrap();
+            }
+        }
+        let cancel = AtomicBool::new(false);
+        let deadline = GitBranchRequest::REMOVAL_STATUS_TIMEOUT;
+        let check = || RemovalCheck {
+            display_limit,
+            ..RemovalCheck::default()
+        };
+        let GitBranchResult::RemovalReview { reviewed, .. } = run_with_removal_check(
+            GitBranchRequestId(1),
+            &GitBranchRequest::ReviewRemoval {
+                repository: main.path().into(),
+                name: "review".into(),
+                deadline,
+            },
+            &cancel,
+            &check(),
+        )
+        .unwrap() else {
+            panic!("expected a removal confirmation for the ignored tree");
+        };
+        assert!(
+            reviewed
+                .warnings()
+                .any(|warning| warning.contains("node_modules/"))
+        );
+        let inventory = reviewed.inventory.as_ref().unwrap();
+        assert_eq!(inventory.summary.len(), 1);
+        assert_eq!(inventory.trees.len(), 1);
+        let descendants = 1 + packages as u64 * (1 + files_per_package as u64);
+        assert!(descendants > display_limit as u64);
+        assert_eq!(inventory.trees[0].entries, descendants);
+        assert_eq!(inventory.samples.len(), REMOVAL_SAMPLES);
+        let request = GitBranchRequest::RemoveWorktree {
+            repository: main.path().into(),
+            name: "review".into(),
+            reviewed: Some(reviewed),
+            deadline,
+        };
+        assert_eq!(
+            run_with_removal_check(GitBranchRequestId(2), &request, &cancel, &check()),
+            Ok(GitBranchResult::Changed)
+        );
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn cancelling_a_live_recheck_keeps_the_checkout_and_its_files() {
+        let main = tempfile::tempdir().unwrap();
+        let destination = tempfile::tempdir().unwrap();
+        let path = destination.path().join("review");
+        let repository = repository_with_commit(main.path());
+        repository.worktree("review", &path, None).unwrap();
+        fs::write(repository.path().join("info/exclude"), "data/\n").unwrap();
+        fs::create_dir(path.join("data")).unwrap();
+        let local = path.join("data/local.db");
+        fs::write(&local, "keep me").unwrap();
+        let deadline = GitBranchRequest::REMOVAL_STATUS_TIMEOUT;
+        let GitBranchResult::RemovalReview { reviewed, .. } = run(
+            GitBranchRequestId(1),
+            &GitBranchRequest::ReviewRemoval {
+                repository: main.path().into(),
+                name: "review".into(),
+                deadline,
+            },
+            &AtomicBool::new(false),
+        )
+        .unwrap() else {
+            panic!("expected a removal confirmation");
+        };
+        let mut worker = GitBranchWorker::default();
+        let (scanning, resume) = worker
+            .start_paused_removal(
+                GitBranchRequest::RemoveWorktree {
+                    repository: main.path().into(),
+                    name: "review".into(),
+                    reviewed: Some(reviewed),
+                    deadline,
+                },
+                RemovalCheckpoint::FirstEntry,
+            )
+            .unwrap();
+        scanning.recv_timeout(Duration::from_secs(20)).unwrap();
+        assert!(!worker.removing_worktree());
+        assert!(worker.cancel_removal_check());
+        resume.send(()).unwrap();
+
+        let expires = Instant::now() + Duration::from_secs(20);
+        loop {
+            match worker.poll() {
+                Ok(None) => {
+                    assert!(Instant::now() < expires, "cancelled scan did not return");
+                    thread::yield_now();
+                }
+                result => {
+                    assert_eq!(result, Err(GitBranchError::Cancelled));
+                    break;
+                }
+            }
+        }
+        assert!(path.join("tracked.txt").is_file());
+        assert_eq!(fs::read_to_string(local).unwrap(), "keep me");
+        assert!(repository.find_worktree("review").is_ok());
+    }
+
+    #[test]
+    fn partial_worktree_removal_reports_the_unregistered_leftover_path() {
+        for git_link_remains in [true, false] {
+            assert_partial_worktree_removal_reports_leftover(git_link_remains);
+        }
+    }
+
+    fn assert_partial_worktree_removal_reports_leftover(git_link_remains: bool) {
+        let main = tempfile::tempdir().unwrap();
+        let destination = tempfile::tempdir().unwrap();
+        let path = destination.path().join("review");
+        let repository = repository_with_commit(main.path());
+        repository.worktree("review", &path, None).unwrap();
+        let leftover = path.join("local.env");
+        fs::write(&leftover, "local only").unwrap();
+        let error = remove_registered_worktree(&repository, "review", &path, |common, _| {
+            // Reproduce Git's partial cleanup without relying on OS permission
+            // behavior, open files, or a particular version of Git.
+            if !git_link_remains {
+                fs::remove_file(path.join(".git")).unwrap();
+            }
+            fs::remove_dir_all(common.join("worktrees/review")).unwrap();
+            false
+        })
+        .unwrap_err();
+        assert_eq!(
+            error,
+            GitBranchError::RemovalIncomplete(path.display().to_string())
+        );
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "Worktree removal stopped part-way. Delete the leftover folder manually:\n{}",
+                path.display()
+            )
+        );
+        assert!(repository.find_worktree("review").is_err());
+        assert_eq!(path.join(".git").is_file(), git_link_remains);
+        assert_eq!(fs::read_to_string(leftover).unwrap(), "local only");
+    }
+
+    #[test]
     fn change_checks_run_git_under_the_request_deadline() {
         let root = tempfile::tempdir().unwrap();
         let repository = repository_with_commit(root.path());
@@ -1647,35 +2147,5 @@ mod exclude_tests {
                 "{name}"
             );
         }
-    }
-}
-
-#[cfg(all(test, unix))]
-mod checkout_removal_tests {
-    use super::remove_checkout;
-    use std::os::unix::fs::PermissionsExt;
-
-    #[test]
-    fn a_checkout_that_cannot_be_fully_deleted_keeps_its_git_link() {
-        let dir = tempfile::tempdir().unwrap();
-        let checkout = dir.path().join("review");
-        let locked = checkout.join("locked");
-        std::fs::create_dir_all(&locked).unwrap();
-        std::fs::write(checkout.join(".git"), "gitdir: elsewhere\n").unwrap();
-        std::fs::write(checkout.join("a.txt"), "a\n").unwrap();
-        std::fs::write(locked.join("held.txt"), "held\n").unwrap();
-        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o555)).unwrap();
-
-        let result = remove_checkout(&checkout);
-        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
-        // Permissions do not stop root; there is nothing to hold the deletion then.
-        if result.is_err() {
-            assert!(
-                checkout.join(".git").is_file(),
-                "the link survives a failed deletion"
-            );
-            remove_checkout(&checkout).unwrap();
-        }
-        assert!(!checkout.exists());
     }
 }

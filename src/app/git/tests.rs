@@ -1795,10 +1795,8 @@ fn a_locked_worktree_refuses_removal() {
     // Removal is refused through the command and names the lock.
     select_worktree_row(&mut app);
     invoke(&mut app, "workspace.git.worktree.remove");
-    app.input
-        .select_confirmation(crate::ui::ConfirmationChoice::Yes);
-    app.submit_prompt();
     drain(&mut app);
+    assert!(app.input.prompt().is_none());
     assert!(
         app.ui.notification_error,
         "a locked worktree refuses removal through the command"

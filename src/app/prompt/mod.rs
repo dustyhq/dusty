@@ -398,7 +398,8 @@ impl App {
         };
         if prompt.confirmation.as_ref().is_some_and(|confirmation| {
             prompt.kind == PromptKind::DirtyClose
-                || confirmation.selected == crate::ui::ConfirmationChoice::Yes
+                || !confirmation.negative_label.is_empty()
+                    && confirmation.selected == crate::ui::ConfirmationChoice::Yes
         }) {
             let (width, height) = crate::ui::prompt_surface_dimensions(
                 &self.state,
@@ -418,8 +419,11 @@ impl App {
         if !matches!(
             prompt.kind,
             PromptKind::Text
+                | PromptKind::Command
                 | PromptKind::WorkspaceTrust
                 | PromptKind::GitReset
+                | PromptKind::GitWorktreeCheck
+                | PromptKind::GitWorktreeNotice
                 | PromptKind::ExplorerDelete
                 | PromptKind::ExplorerRename
                 | PromptKind::PluginConfirmation
@@ -496,6 +500,7 @@ impl App {
                     self.notify_message("Nothing was removed".into(), false);
                 }
             }
+            PromptKind::GitWorktreeCheck | PromptKind::GitWorktreeNotice => self.close_prompt(),
             PromptKind::GitStageUnsaved => {
                 let selected = prompt
                     .confirmation
