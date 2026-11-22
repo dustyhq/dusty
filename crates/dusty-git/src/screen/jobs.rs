@@ -35,11 +35,25 @@ pub(super) enum Request {
     Write,
 }
 
+struct WriteOptions {
+    env: Vec<(String, OsString)>,
+    timeout: Duration,
+    check: Option<CheckoutCheck>,
+}
+
 struct Pending {
     request: Request,
     stdout: Vec<u8>,
     stderr: Vec<u8>,
-    truncated: bool,
+    clipped: bool,
+    stdout_clipped: bool,
+    abandoned: AbandonedStreams,
+}
+
+pub(super) struct Reply {
+    pub request: Request,
+    pub result: Result<String, String>,
+    pub warning: Option<String>,
 }
 
 pub(super) struct Jobs {
@@ -151,8 +165,7 @@ impl Jobs {
         request: Request,
         args: Vec<OsString>,
         stdin: Option<Vec<u8>>,
-        extra: &[(String, OsString)],
-        timeout: Duration,
+        write: Option<WriteOptions>,
     ) -> Result<(), String> {
         if request == Request::Preview {
             self.cancel_preview();
@@ -202,34 +215,44 @@ impl Jobs {
             // Even a content-clean diff can refresh stat data in the index.
             environment.insert("GIT_OPTIONAL_LOCKS".into(), "0".into());
         }
-        for (key, value) in extra {
-            environment.insert(key.clone(), value.clone());
+        let mut timeout = Duration::from_secs(30);
+        let mut check = None;
+        if let Some(write) = write {
+            environment.extend(write.env);
+            timeout = write.timeout;
+            check = write.check;
         }
-        let id = self
-            .supervisor
-            .start(JobRequest {
-                program: crate::process::discover_executable("git")
-                    .ok_or("Git is not installed or not on PATH")?,
-                argv0: None,
-                arguments,
-                cwd: root.into(),
-                environment,
-                root_revision: 0,
-                stdin,
-                policy: JobPolicy {
-                    maximum_output_bytes: output_limit(request),
-                    timeout,
-                    ..JobPolicy::default()
-                },
-            })
-            .map_err(|e| e.to_string())?;
+        let job = JobRequest {
+            program: crate::process::discover_executable("git")
+                .ok_or("Git is not installed or not on PATH")?,
+            argv0: None,
+            arguments,
+            cwd: root.into(),
+            environment,
+            root_revision: 0,
+            stdin,
+            policy: JobPolicy {
+                maximum_output_bytes: output_limit(request),
+                timeout,
+                ..JobPolicy::default()
+            },
+        };
+        let id = match check {
+            Some(check) => self
+                .supervisor
+                .start_checked(job, move |root| check.verify(root)),
+            None => self.supervisor.start(job),
+        }
+        .map_err(|e| e.to_string())?;
         self.pending.insert(
             id,
             Pending {
                 request,
                 stdout: Vec::new(),
                 stderr: Vec::new(),
-                truncated: false,
+                clipped: false,
+                stdout_clipped: false,
+                abandoned: AbandonedStreams::default(),
             },
         );
         if request == Request::Preview {
@@ -239,7 +262,7 @@ impl Jobs {
         Ok(())
     }
 
-    pub fn poll(&mut self) -> Vec<(Request, Result<String, String>)> {
+    pub fn poll(&mut self) -> Vec<Reply> {
         let mut replies = Vec::new();
         for event in self.supervisor.poll() {
             match event {
@@ -248,9 +271,15 @@ impl Jobs {
                     stream,
                     bytes,
                     truncated,
+                    abandoned,
                 } => {
                     if let Some(pending) = self.pending.get_mut(&job) {
-                        pending.truncated |= truncated;
+                        if abandoned {
+                            pending.abandoned.insert(stream);
+                            continue;
+                        }
+                        pending.clipped |= truncated;
+                        pending.stdout_clipped |= truncated && stream == JobStream::Stdout;
                         let output = if stream == JobStream::Stdout {
                             &mut pending.stdout
                         } else {
@@ -266,9 +295,21 @@ impl Jobs {
                     timed_out,
                 } => {
                     if let Some(pending) = self.pending.remove(&job) {
+                        let write = pending.request == Request::Write;
+                        let warning = write
+                            .then(|| {
+                                crate::rewrite::capture_warning(pending.clipped, pending.abandoned)
+                            })
+                            .flatten();
                         let result = if timed_out {
                             Err("Git command timed out".into())
-                        } else if pending.truncated
+                        } else if !write && pending.abandoned.contains(JobStream::Stdout) {
+                            Err(format!(
+                                "Some Git output may be missing ({})",
+                                pending.abandoned.names().unwrap_or("standard output")
+                            ))
+                        } else if !write
+                            && pending.stdout_clipped
                             && matches!(
                                 pending.request,
                                 Request::Files | Request::CommitInfo | Request::Reflog
@@ -277,7 +318,7 @@ impl Jobs {
                             Err("Git response exceeds the preview limit".into())
                         } else if code == Some(0) {
                             let mut text = String::from_utf8_lossy(&pending.stdout).into_owned();
-                            if pending.truncated {
+                            if !write && pending.stdout_clipped {
                                 text.push_str("\n[output truncated]\n");
                             }
                             Ok(text)
@@ -294,12 +335,20 @@ impl Jobs {
                                 message
                             })
                         };
-                        replies.push((pending.request, result));
+                        replies.push(Reply {
+                            request: pending.request,
+                            result,
+                            warning,
+                        });
                     }
                 }
                 JobEvent::Failed { job, message } => {
                     if let Some(pending) = self.pending.remove(&job) {
-                        replies.push((pending.request, Err(message)));
+                        replies.push(Reply {
+                            request: pending.request,
+                            result: Err(message),
+                            warning: None,
+                        });
                     }
                 }
                 JobEvent::Started { .. } => {}
@@ -377,9 +426,10 @@ mod tests {
             let replies = jobs.poll();
             if !replies.is_empty() {
                 assert_eq!(replies.len(), 1);
-                let (completed, result) = replies.into_iter().next().unwrap();
-                assert_eq!(completed, request);
-                return result.expect("Git job must complete successfully");
+                let reply = replies.into_iter().next().unwrap();
+                assert_eq!(reply.request, request);
+                assert!(reply.warning.is_none());
+                return reply.result.expect("Git job must complete successfully");
             }
             assert!(
                 Instant::now() < deadline,
@@ -387,6 +437,65 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn commit_keeps_its_screen_receipt_when_a_hook_holds_stderr_open() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = committed_file();
+        let root = dir.path();
+        let hook = root.join("empty-hooks/post-commit");
+        fs::write(&hook, "#!/bin/sh\nsleep 4 >/dev/null &\n").unwrap();
+        fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::write(root.join("tracked.txt"), "changed\n").unwrap();
+        git(root, &["add", "--", "tracked.txt"]);
+        let mut screen = super::super::GitScreen::open(root).unwrap();
+        screen
+            .jobs
+            .start_run(
+                root,
+                crate::history::Run::new(["commit", "-m", "hook receipt"]),
+                Duration::from_millis(1500),
+            )
+            .unwrap();
+        screen.busy = true;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while screen.busy {
+            screen.poll();
+            assert!(Instant::now() < deadline, "commit did not finish");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            screen
+                .receipt
+                .as_ref()
+                .is_some_and(|(_, text)| text.contains("hook receipt")),
+            "missing commit receipt: {}",
+            screen.notice
+        );
+        let frame = screen.frame(120, 40);
+        let footer = frame.grid.row_text(39);
+        assert!(
+            footer.contains("⚠ Some Git output may be missing (standard error)"),
+            "{footer}"
+        );
+        assert!(!footer.contains('✕'), "{footer}");
+        let mark = (0..120)
+            .find_map(|column| frame.grid.get(column, 39).filter(|cell| cell.symbol == "⚠"))
+            .expect("warning mark");
+        use crate::ui::{Emphasis, GitRole, GitSurface, Style};
+        assert_eq!(
+            mark.style,
+            Style::Git {
+                role: GitRole::Modified,
+                surface: GitSurface::TopBar,
+                emphasis: Emphasis::Bold,
+            }
+        );
+        assert!((0..39).any(|row| frame.grid.row_text(row).contains("hook receipt")));
+        assert_eq!(git(root, &["log", "-1", "--format=%s"]), b"hook receipt\n");
     }
 
     #[test]

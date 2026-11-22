@@ -11,7 +11,7 @@ pub(super) mod sheet;
 
 use super::GitScreen;
 use crate::ui::{CellGrid, Frame, GitRole, GitSurface, Style};
-use chrome::{Tab, TopBar, bold, st};
+use chrome::{FooterSeverity, Tab, TopBar, bold, st};
 use glyphs::Glyph;
 use layout::{Mode, Rect};
 use std::collections::HashMap;
@@ -530,6 +530,10 @@ fn footer(app: &GitScreen, frame: &mut Frame, rect: Rect) {
         }
     }
     let grid = &mut frame.grid;
+    let write_notice = app
+        .write_footer
+        .as_ref()
+        .map(|(text, severity)| (text.as_str(), *severity));
     if app.form.is_some() {
         let commit = app
             .form
@@ -551,16 +555,27 @@ fn footer(app: &GitScreen, frame: &mut Frame, rect: Rect) {
             hints.push(("Esc", "normal mode"));
         }
         // A refusal answering this form stays visible beside it.
-        let message = (!app.busy && !app.notice.is_empty()).then_some((app.notice.as_str(), true));
-        chrome::footer(grid, rect, &hints, "", message);
+        let message = if app.busy {
+            None
+        } else if app.notice.is_empty() {
+            write_notice
+        } else {
+            Some((app.notice.as_str(), FooterSeverity::Error))
+        };
+        chrome::footer_with_notice(grid, rect, &hints, "", message);
         return;
     }
     let message = if app.busy {
-        Some((app.busy_line(), false))
+        Some((app.busy_line(), FooterSeverity::Info))
     } else if !app.notice.is_empty() {
-        Some((app.notice.as_str(), looks_like_error(&app.notice)))
+        // Ordinary screen notices keep their legacy presentation. The outcome
+        // of a write with missing output carries its severity from the result.
+        Some((
+            app.notice.as_str(),
+            FooterSeverity::from_error(looks_like_error(&app.notice)),
+        ))
     } else {
-        None
+        write_notice
     };
     let staged = app.preview_staged();
     let marked = app.file_selection_context() && !app.file_selection.marked.is_empty();
@@ -640,14 +655,21 @@ fn footer(app: &GitScreen, frame: &mut Frame, rect: Rect) {
             ],
             // Commit before lazygit's `a` (stage or unstage all): a narrow footer keeps the
             // first ones. `/` is on `?`.
-            (0, ..) => vec![
-                ("s", "stage"),
-                ("u", "unstage"),
-                ("c", "commit"),
-                ("a", "all"),
-                ("v", "lines"),
-                ("d", "discard"),
-            ],
+            (0, ..) => {
+                let mut hints = vec![("s", "stage"), ("u", "unstage"), ("c", "commit")];
+                if !app.all_files {
+                    hints.push((
+                        "a",
+                        if app.filters[0].active() {
+                            "shown files"
+                        } else {
+                            "all"
+                        },
+                    ));
+                }
+                hints.extend([("v", "lines"), ("d", "discard")]);
+                hints
+            }
             (1, _, 2, _) => vec![("Enter", "open"), ("f", "fetch"), ("/", "find")],
             (1, _, 3, _) => vec![
                 ("Enter", "inspect"),
@@ -708,7 +730,7 @@ fn footer(app: &GitScreen, frame: &mut Frame, rect: Rect) {
     } else {
         String::new()
     };
-    chrome::footer(grid, rect, &hints, &context, message);
+    chrome::footer_with_notice(grid, rect, &hints, &context, message);
 }
 
 fn looks_like_error(text: &str) -> bool {

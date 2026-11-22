@@ -542,8 +542,12 @@ pub fn run_process(
                     stream,
                     bytes,
                     truncated,
+                    abandoned,
                     ..
                 } => {
+                    if abandoned {
+                        return Err(TransportError::IncompleteOutput(stream));
+                    }
                     if truncated {
                         return Err(TransportError::TooLarge(spec.cap));
                     }

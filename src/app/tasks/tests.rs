@@ -572,6 +572,7 @@ fn formatter_stderr_is_visible_without_entering_the_replacement_payload() {
         stream: JobStream::Stderr,
         bytes: b"syntax error at line 4\n".to_vec(),
         truncated: false,
+        abandoned: false,
     });
     assert!(matches!(
         tasks.next_update(&workspace, 1),
@@ -615,6 +616,7 @@ fn finished_output_keeps_its_name_exit_status_and_source_location() {
         stream: JobStream::Stderr,
         bytes: b"  --> src/main.rs:2:3\n".to_vec(),
         truncated: false,
+        abandoned: false,
     });
     tasks.events.push_back(JobEvent::Exited {
         job: JobId(1000),
@@ -651,6 +653,7 @@ fn task_output_enter_and_gf_open_the_selected_source() {
                 stream: JobStream::Stderr,
                 text: "task-source.rs:2:3: error".into(),
                 truncated: false,
+                capture_notice: None,
             }],
         );
         app.show_output_picker("build");
@@ -680,6 +683,7 @@ fn task_list_opens_output_and_plain_rows_open_the_full_message() {
             stream: JobStream::Stdout,
             text: message.clone(),
             truncated: false,
+            capture_notice: None,
         }],
     );
     app.show_task_picker();
@@ -789,6 +793,7 @@ fn output_tabs_expand_without_altering_the_matcher_payload() {
         stream: JobStream::Stdout,
         bytes: b"A\tB".to_vec(),
         truncated: false,
+        abandoned: false,
     });
     assert!(matches!(
         tasks.next_update(&workspace, 1),

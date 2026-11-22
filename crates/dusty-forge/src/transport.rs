@@ -455,6 +455,9 @@ impl From<TransportError> for ForgeError {
             TransportError::TooLarge(cap) => {
                 ForgeError::BadResponse(format!("response exceeds {} MiB", cap / (1024 * 1024)))
             }
+            TransportError::IncompleteOutput(stream) => {
+                ForgeError::BadResponse(format!("Forge command {} is incomplete", stream.name()))
+            }
             TransportError::Insecure(message) => ForgeError::Failed(message),
             TransportError::Spawn(message) => ForgeError::Failed(crate::cli::redact(&message)),
             TransportError::Cli { cli, code, stderr } => crate::cli::classify(cli, &stderr, code),
@@ -775,6 +778,7 @@ impl Transport for ReadOnly {
                 TransportError::Timeout => "timeout",
                 TransportError::Cancelled => "cancelled",
                 TransportError::TooLarge(_) => "too-large",
+                TransportError::IncompleteOutput(_) => "incomplete-output",
                 TransportError::Insecure(_) => "insecure",
                 TransportError::Spawn(_) => "spawn",
                 TransportError::Cli { .. } => "cli",

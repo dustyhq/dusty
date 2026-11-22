@@ -643,6 +643,29 @@ pub fn footer_rect(rect: Rect) -> Rect {
     Rect::new(rect.x + inset, rect.y, rect.w - inset, rect.h)
 }
 
+#[derive(Clone, Copy)]
+pub(in crate::screen) enum FooterSeverity {
+    Info,
+    Warning,
+    Error,
+}
+
+impl FooterSeverity {
+    pub(super) fn from_error(error: bool) -> Self {
+        if error { Self::Error } else { Self::Info }
+    }
+}
+
+pub(super) fn footer_with_notice(
+    grid: &mut CellGrid,
+    rect: Rect,
+    hints: &[(&str, &str)],
+    context: &str,
+    message: Option<(&str, FooterSeverity)>,
+) {
+    footer_ranked(grid, rect, hints, context, message, 6, false);
+}
+
 /// The last row: at most five `key label` pairs, then `? keys`; context on the right.
 pub fn footer(
     grid: &mut CellGrid,
@@ -664,7 +687,15 @@ pub fn footer_with(
     message: Option<(&str, bool)>,
     most: usize,
 ) {
-    footer_ranked(grid, rect, hints, context, message, most, false);
+    footer_ranked(
+        grid,
+        rect,
+        hints,
+        context,
+        message.map(|(text, error)| (text, FooterSeverity::from_error(error))),
+        most,
+        false,
+    );
 }
 
 /// `footer` whose context is decoration (a repository tag, a standing query): keys outrank
@@ -676,7 +707,15 @@ pub fn footer_keys_first(
     context: &str,
     message: Option<(&str, bool)>,
 ) {
-    footer_ranked(grid, rect, hints, context, message, 6, true);
+    footer_ranked(
+        grid,
+        rect,
+        hints,
+        context,
+        message.map(|(text, error)| (text, FooterSeverity::from_error(error))),
+        6,
+        true,
+    );
 }
 
 /// [`footer_keys_first`] without the six-hint cap: the width alone decides how many show,
@@ -688,7 +727,15 @@ pub fn footer_keys_first_fill(
     context: &str,
     message: Option<(&str, bool)>,
 ) {
-    footer_ranked(grid, rect, hints, context, message, usize::MAX, true);
+    footer_ranked(
+        grid,
+        rect,
+        hints,
+        context,
+        message.map(|(text, error)| (text, FooterSeverity::from_error(error))),
+        usize::MAX,
+        true,
+    );
 }
 
 fn footer_ranked(
@@ -696,7 +743,7 @@ fn footer_ranked(
     rect: Rect,
     hints: &[(&str, &str)],
     context: &str,
-    message: Option<(&str, bool)>,
+    message: Option<(&str, FooterSeverity)>,
     most: usize,
     keys_first: bool,
 ) {
@@ -720,11 +767,11 @@ fn footer_ranked(
     // toast never takes away the keys. Only a notice too long to share the row takes it.
     let notice = message
         .filter(|(text, _)| !text.is_empty())
-        .map(|(text, error)| {
-            let (mark, role) = if error {
-                ("✕ ", GitRole::Removed)
-            } else {
-                ("", GitRole::Modified)
+        .map(|(text, severity)| {
+            let (mark, role) = match severity {
+                FooterSeverity::Info => ("", GitRole::Modified),
+                FooterSeverity::Warning => ("⚠ ", GitRole::Modified),
+                FooterSeverity::Error => ("✕ ", GitRole::Removed),
             };
             // Git's multi-line errors read as one line, never as raw line breaks.
             let text = text
@@ -1190,7 +1237,10 @@ mod tests {
             Rect::new(0, 0, 120, 1),
             &[],
             "",
-            Some(("error: cannot lock ref\r\n\r\n  hint: retry\n", true)),
+            Some((
+                "error: cannot lock ref\r\n\r\n  hint: retry\n",
+                FooterSeverity::Error,
+            )),
             usize::MAX,
             true,
         );

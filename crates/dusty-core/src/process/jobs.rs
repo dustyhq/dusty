@@ -7,12 +7,15 @@ use std::io::BufRead;
 use std::io::BufReader;
 use std::io::Read;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Child;
 use std::process::Command;
 use std::process::Stdio;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::atomic::AtomicBool;
+#[cfg(windows)]
+use std::sync::atomic::AtomicU8;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc;
@@ -22,6 +25,9 @@ use std::thread;
 use std::time::Duration;
 use std::time::Instant;
 use thiserror::Error;
+
+const OUTPUT_DRAIN_GRACE: Duration = Duration::from_millis(100);
+
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct JobId(pub u64);
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -29,6 +35,54 @@ pub enum JobStream {
     Stdout,
     Stderr,
 }
+
+impl JobStream {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Stdout => "standard output",
+            Self::Stderr => "standard error",
+        }
+    }
+
+    fn index(self) -> usize {
+        match self {
+            Self::Stdout => 0,
+            Self::Stderr => 1,
+        }
+    }
+}
+/// Streams whose capture was abandoned before EOF.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct AbandonedStreams(u8);
+
+impl AbandonedStreams {
+    pub const EMPTY: Self = Self(0);
+
+    pub fn insert(&mut self, stream: JobStream) {
+        self.0 |= 1 << stream.index();
+    }
+
+    pub fn contains(self, stream: JobStream) -> bool {
+        self.0 & (1 << stream.index()) != 0
+    }
+
+    pub fn merge(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+
+    pub fn names(self) -> Option<&'static str> {
+        match (
+            self.contains(JobStream::Stdout),
+            self.contains(JobStream::Stderr),
+        ) {
+            (false, false) => None,
+            (true, false) => Some("standard output"),
+            (false, true) => Some("standard error"),
+            (true, true) => Some("standard output and error"),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct JobPolicy {
     pub maximum_output_bytes: usize,
@@ -67,7 +121,11 @@ pub enum JobEvent {
         job: JobId,
         stream: JobStream,
         bytes: Vec<u8>,
+        /// Capture is incomplete. At the job cap, reported once per affected
+        /// stream, possibly with no captured bytes.
         truncated: bool,
+        /// The supervisor stopped draining without reaching EOF, not a size limit.
+        abandoned: bool,
     },
     Exited {
         job: JobId,
@@ -278,16 +336,23 @@ impl JobSupervisor {
         self.jobs
             .get(&id)
             .ok_or(JobError::Unknown(id))?
+            .cancel
             .store(true, Ordering::Release);
         Ok(())
+    }
+    /// Reports that an active job exceeded an output limit, even if its event is queued.
+    pub fn output_clipped(&self, id: JobId) -> bool {
+        self.jobs
+            .get(&id)
+            .is_some_and(|job| job.output_drain.clipped.load(Ordering::Acquire))
     }
     pub fn is_running(&self, id: JobId) -> bool {
         self.jobs.contains_key(&id)
     }
     pub fn begin_shutdown(&mut self) {
         self.stop.store(true, Ordering::Release);
-        for cancel in self.jobs.values() {
-            cancel.store(true, Ordering::Release);
+        for job in self.jobs.values() {
+            job.cancel.store(true, Ordering::Release);
         }
     }
     pub fn abandon(&mut self) {
@@ -324,13 +389,16 @@ impl JobReservation<'_> {
         supervisor.next = next.checked_add(1);
         let id = JobId(next);
         let cancel = Arc::new(AtomicBool::new(false));
+        let output_drain = Arc::new(OutputDrain::default());
         supervisor
             .sender
             .try_send(Submission {
+                preflight,
                 root,
                 id,
                 request,
                 cancel: cancel.clone(),
+                output_drain: output_drain.clone(),
                 slot: self.slot,
                 input,
             })
@@ -338,7 +406,13 @@ impl JobReservation<'_> {
                 mpsc::TrySendError::Full(_) => JobError::Full,
                 mpsc::TrySendError::Disconnected(_) => JobError::Stopped,
             })?;
-        supervisor.jobs.insert(id, cancel);
+        supervisor.jobs.insert(
+            id,
+            JobControl {
+                cancel,
+                output_drain,
+            },
+        );
         Ok(id)
     }
 }
@@ -416,13 +490,156 @@ struct RunningJob {
     started: Instant,
     timeout: Duration,
     cancel: Arc<AtomicBool>,
+    input_cancel: Arc<AtomicBool>,
     readers: Arc<AtomicUsize>,
     io_failed: Arc<AtomicBool>,
     status: Option<Option<i32>>,
+    output_drain: Arc<OutputDrain>,
+    skip_pending_io: bool,
     timed_out: bool,
     killed: bool,
     _slot: Arc<JobSlot>,
 }
+impl RunningJob {
+    fn observe_exit(&mut self, now: Instant) -> io::Result<()> {
+        if self.status.is_none()
+            && let Some(status) = job_exit_status(&mut self.child)?
+        {
+            self.status = Some(status);
+            let _ = self.output_drain.exited_at.set(now);
+        }
+        Ok(())
+    }
+}
+#[derive(Default)]
+struct OutputDrain {
+    exited_at: OnceLock<Instant>,
+    deadline_elapsed: AtomicBool,
+    abandoned: [AtomicBool; 2],
+    overflowed_at: OnceLock<Instant>,
+    #[cfg(windows)]
+    read_phase: [AtomicU8; 2],
+    clipped: AtomicBool,
+}
+
+#[cfg(windows)]
+#[repr(u8)]
+enum PipeReadPhase {
+    BetweenReads = 0,
+    Reading,
+    Finished,
+    Detached,
+}
+
+impl OutputDrain {
+    #[cfg(windows)]
+    fn detach_blocked_readers(&self, readers: &AtomicUsize) {
+        if !self.cutoff_elapsed() {
+            return;
+        }
+        // Queue backpressure is not a blocked read. A detached worker keeps
+        // its slot until the handle unblocks, bounding resident workers.
+        for stream in [JobStream::Stdout, JobStream::Stderr] {
+            if self.read_phase[stream.index()]
+                .compare_exchange(
+                    PipeReadPhase::Reading as u8,
+                    PipeReadPhase::Detached as u8,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+            {
+                self.abandoned(stream).store(true, Ordering::Release);
+                readers.fetch_sub(1, Ordering::AcqRel);
+            }
+        }
+    }
+
+    fn abandoned(&self, stream: JobStream) -> &AtomicBool {
+        &self.abandoned[stream.index()]
+    }
+
+    #[cfg(windows)]
+    fn read_pipe(
+        &self,
+        stream: JobStream,
+        pipe: &mut impl Read,
+        bytes: &mut [u8],
+    ) -> io::Result<usize> {
+        let phase = &self.read_phase[stream.index()];
+        if phase
+            .compare_exchange(
+                PipeReadPhase::BetweenReads as u8,
+                PipeReadPhase::Reading as u8,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return Ok(0);
+        }
+        let result = pipe.read(bytes);
+        if phase
+            .compare_exchange(
+                PipeReadPhase::Reading as u8,
+                PipeReadPhase::BetweenReads as u8,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return Ok(0);
+        }
+        result
+    }
+
+    fn cutoff_elapsed(&self) -> bool {
+        // Start the short grace only once both events have happened. Overflow can
+        // be discovered late, for example after a backpressured record is sent.
+        self.deadline_elapsed.load(Ordering::Acquire)
+            || self
+                .exited_at
+                .get()
+                .zip(self.overflowed_at.get())
+                .is_some_and(|(exit, overflow)| exit.max(overflow).elapsed() >= OUTPUT_DRAIN_GRACE)
+    }
+}
+
+struct JobOutputPipe<T> {
+    pipe: super::CancellablePipe<T>,
+    drain: Arc<OutputDrain>,
+    stream: JobStream,
+    closed: bool,
+}
+
+impl<T: Read> Read for JobOutputPipe<T> {
+    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+        if self.closed {
+            return Ok(0);
+        }
+        self.pipe.retry(None, |pipe| {
+            #[cfg(windows)]
+            let result = self.drain.read_pipe(self.stream, pipe, bytes);
+            #[cfg(not(windows))]
+            let result = pipe.read(bytes);
+            match result {
+                Err(error)
+                    if error.kind() == io::ErrorKind::WouldBlock && self.drain.cutoff_elapsed() =>
+                {
+                    // A read that can still return bytes always gets a chance to do so.
+                    // Blocking Windows reads are detached by the engine instead.
+                    self.closed = true;
+                    self.drain
+                        .abandoned(self.stream)
+                        .store(true, Ordering::Release);
+                    Ok(0)
+                }
+                result => result,
+            }
+        })
+    }
+}
+
 struct JobEngine {
     jobs: HashMap<JobId, RunningJob>,
     sender: SyncSender<JobEvent>,
@@ -441,10 +658,12 @@ impl JobEngine {
     }
     fn start(&mut self, submission: Submission) -> Result<(), JobError> {
         let Submission {
+            preflight,
             root,
             id,
             request,
             cancel,
+            output_drain,
             slot,
             input,
         } = submission;
@@ -526,7 +745,7 @@ impl JobEngine {
             if let Some(input) = input {
                 let mut stdin = stdin.expect("streaming stdin is piped");
                 let initial = request.stdin.unwrap_or_default();
-                let cancelled = cancel.clone();
+                let cancelled = input_cancel.clone();
                 let lease = slot.clone();
                 thread::Builder::new()
                     .name("dusty-job-stdin".into())
@@ -553,7 +772,7 @@ impl JobEngine {
                 let lease = slot.clone();
                 let pending = readers.clone();
                 let failed = io_failed.clone();
-                let cancelled = cancel.clone();
+                let cancelled = input_cancel.clone();
                 pending.fetch_add(1, Ordering::AcqRel);
                 thread::Builder::new()
                     .name("dusty-job-stdin".into())
@@ -569,8 +788,12 @@ impl JobEngine {
             if let Some(stdout) = stdout {
                 stream_reader(
                     id,
-                    JobStream::Stdout,
-                    stdout,
+                    JobOutputPipe {
+                        pipe: stdout,
+                        drain: output_drain.clone(),
+                        stream: JobStream::Stdout,
+                        closed: false,
+                    },
                     self.sender.clone(),
                     total.clone(),
                     (request.policy.clone(), streaming),
@@ -585,8 +808,12 @@ impl JobEngine {
             if let Some(stderr) = stderr {
                 stream_reader(
                     id,
-                    JobStream::Stderr,
-                    stderr,
+                    JobOutputPipe {
+                        pipe: stderr,
+                        drain: output_drain.clone(),
+                        stream: JobStream::Stderr,
+                        closed: false,
+                    },
                     self.sender.clone(),
                     total,
                     (request.policy.clone(), streaming),
@@ -602,6 +829,7 @@ impl JobEngine {
         })();
         if let Err(error) = setup_io {
             cancel.store(true, Ordering::Release);
+            input_cancel.store(true, Ordering::Release);
             terminate_tree(&mut child, false);
             let _ = child.wait();
             return Err(JobError::Spawn(error));
@@ -613,9 +841,12 @@ impl JobEngine {
                 started: Instant::now(),
                 timeout: request.policy.timeout,
                 cancel,
+                input_cancel,
                 readers,
                 io_failed,
                 status: None,
+                output_drain,
+                skip_pending_io: false,
                 timed_out: false,
                 killed: false,
                 _slot: slot,
@@ -626,15 +857,35 @@ impl JobEngine {
 
     fn expire(&mut self) {
         for running in self.jobs.values_mut() {
-            if running.status.is_none()
-                && let Ok(Some(status)) = job_exit_status(&mut running.child)
-            {
-                running.status = Some(status);
-            }
-            let expired = running.started.elapsed() >= running.timeout;
+            let now = Instant::now();
+            let _ = running.observe_exit(now);
+            let expired = now.duration_since(running.started) >= running.timeout;
             running.timed_out |= running.status.is_none() && expired;
-            // The leader may have exited while a descendant still holds its pipes open.
-            if !running.killed && (expired || running.cancel.load(Ordering::Acquire)) {
+            // After exit, a full queue must not prevent buffered output from reaching EOF.
+            // Only a live leader can be stopped by the job deadline.
+            let stop_for_timeout = expired && running.status.is_none();
+            if expired || running.cancel.load(Ordering::Acquire) {
+                running.input_cancel.store(true, Ordering::Release);
+            }
+            if expired && !stop_for_timeout {
+                running
+                    .output_drain
+                    .deadline_elapsed
+                    .store(true, Ordering::Release);
+            }
+            #[cfg(windows)]
+            if running.status.is_some() {
+                running
+                    .output_drain
+                    .detach_blocked_readers(&running.readers);
+            }
+            if stop_for_timeout
+                && running.readers.load(Ordering::Acquire) != 0
+                && !running.cancel.swap(true, Ordering::AcqRel)
+            {
+                running.skip_pending_io = true;
+            }
+            if !running.killed && (stop_for_timeout || running.cancel.load(Ordering::Acquire)) {
                 if running.timed_out {
                     running.cancel.store(true, Ordering::Release);
                 }
@@ -655,29 +906,40 @@ impl JobEngine {
         let mut done = Vec::new();
         let mut terminals = Vec::new();
         for (id, running) in &mut self.jobs {
-            if running.status.is_none() {
-                match job_exit_status(&mut running.child) {
-                    Ok(Some(status)) => running.status = Some(status),
-                    Ok(None) => {}
-                    Err(error) => {
-                        running.cancel.store(true, Ordering::Release);
-                        terminate_tree(&mut running.child, false);
-                        let _ = running.child.wait();
-                        events.push(JobEvent::Failed {
-                            job: *id,
-                            message: error.to_string(),
-                        });
-                        done.push(*id);
-                        continue;
-                    }
-                }
+            if let Err(error) = running.observe_exit(Instant::now()) {
+                running.cancel.store(true, Ordering::Release);
+                running.input_cancel.store(true, Ordering::Release);
+                terminate_tree(&mut running.child, false);
+                let _ = running.child.wait();
+                events.push(JobEvent::Failed {
+                    job: *id,
+                    message: error.to_string(),
+                });
+                done.push(*id);
+                continue;
             }
             if let Some(code) = running.status
-                && running.readers.load(Ordering::Acquire) == 0
+                && (running.skip_pending_io || running.readers.load(Ordering::Acquire) == 0)
             {
                 running.cancel.store(true, Ordering::Release);
-                // No later cleanup can signal this group once the leader is reaped.
+                running.input_cancel.store(true, Ordering::Release);
+                // Abandoning a pipe is not cancellation of the helpers holding it.
                 let _ = running.child.wait();
+                for stream in [JobStream::Stdout, JobStream::Stderr] {
+                    if running
+                        .output_drain
+                        .abandoned(stream)
+                        .load(Ordering::Acquire)
+                    {
+                        terminals.push(JobEvent::Output {
+                            job: *id,
+                            stream,
+                            bytes: Vec::new(),
+                            truncated: true,
+                            abandoned: true,
+                        });
+                    }
+                }
                 terminals.push(if running.io_failed.load(Ordering::Acquire) {
                     JobEvent::Failed {
                         job: *id,
@@ -693,8 +955,8 @@ impl JobEngine {
                 done.push(*id);
             }
         }
-        // Every selected terminal's readers had finished before this bounded drain.
-        // At most capacity messages can precede their EOF in this FIFO.
+        // Drain queued output before publishing exits. Abandoned readers are cancelled;
+        // the supervisor discards any output racing in after their exit.
         if !terminals.is_empty() {
             for _ in 0..self.capacity {
                 match self.receiver.try_recv() {
@@ -714,6 +976,7 @@ impl Drop for JobEngine {
     fn drop(&mut self) {
         for job in self.jobs.values_mut() {
             job.cancel.store(true, Ordering::Release);
+            job.input_cancel.store(true, Ordering::Release);
             if !job.killed {
                 terminate_tree(&mut job.child, job.status.is_some());
             }
@@ -723,8 +986,7 @@ impl Drop for JobEngine {
 }
 fn stream_reader(
     id: JobId,
-    stream: JobStream,
-    reader: impl Read + Send + 'static,
+    reader: JobOutputPipe<impl Read + Send + 'static>,
     sender: SyncSender<JobEvent>,
     total: Arc<AtomicUsize>,
     (policy, streaming): (JobPolicy, bool),
@@ -740,21 +1002,55 @@ fn stream_reader(
     thread::Builder::new()
         .name("dusty-job-output".into())
         .spawn(move || {
-            struct End(Arc<AtomicUsize>);
+            struct End {
+                readers: Arc<AtomicUsize>,
+                #[cfg(windows)]
+                drain: Arc<OutputDrain>,
+                #[cfg(windows)]
+                stream: JobStream,
+            }
             impl Drop for End {
                 fn drop(&mut self) {
-                    self.0.fetch_sub(1, Ordering::AcqRel);
+                    #[cfg(windows)]
+                    if self.drain.read_phase[self.stream.index()]
+                        .swap(PipeReadPhase::Finished as u8, Ordering::AcqRel)
+                        == PipeReadPhase::Detached as u8
+                    {
+                        // The engine already accounted for this reader at detachment.
+                        return;
+                    }
+                    self.readers.fetch_sub(1, Ordering::AcqRel);
                 }
             }
-            let _end = End(readers);
+            let _end = End {
+                readers,
+                #[cfg(windows)]
+                drain: reader.drain.clone(),
+                #[cfg(windows)]
+                stream: reader.stream,
+            };
             let _slot = slot;
+            let drain = reader.drain.clone();
+            let stream = reader.stream;
             let mut reader = BufReader::new(reader);
+            let mut output_limit_reported = false;
             loop {
                 if cancel.load(Ordering::Acquire) {
                     break;
                 }
+                if output_limit_reported && drain.cutoff_elapsed() {
+                    drain.abandoned(stream).store(true, Ordering::Release);
+                    break;
+                }
                 let mut bytes = Vec::new();
-                let result = if streaming {
+                let capture = total.load(Ordering::Relaxed) < policy.maximum_output_bytes;
+                let result = if !capture {
+                    // Keep the pipe open for the producer, reusing the reader's buffer.
+                    reader
+                        .fill_buf()
+                        .map(<[u8]>::len)
+                        .inspect(|&read| reader.consume(read))
+                } else if streaming {
                     bytes.resize(8192.min(policy.maximum_line_bytes), 0);
                     reader
                         .read(&mut bytes)
@@ -765,6 +1061,12 @@ fn stream_reader(
                         .take(policy.maximum_line_bytes.saturating_add(1) as u64)
                         .read_until(b'\n', &mut bytes)
                 };
+                #[cfg(windows)]
+                if drain.read_phase[stream.index()].load(Ordering::Acquire)
+                    == PipeReadPhase::Detached as u8
+                {
+                    break;
+                }
                 let read = match result {
                     Ok(read) => read,
                     Err(_) => {
@@ -780,15 +1082,31 @@ fn stream_reader(
                 let line_truncated = bytes.len() > policy.maximum_line_bytes;
                 let discard_tail = line_truncated && !bytes.ends_with(b"\n");
                 bytes.truncate(policy.maximum_line_bytes);
-                let allowed = reserve_output(&total, policy.maximum_output_bytes, bytes.len());
+                let allowed = if capture {
+                    reserve_output(&total, policy.maximum_output_bytes, bytes.len())
+                } else {
+                    0
+                };
+                let output_truncated = !capture || allowed < bytes.len();
                 bytes.truncate(allowed);
-                let truncated = line_truncated || bytes.len() < read || allowed < read;
+                let truncated = line_truncated || output_truncated && !output_limit_reported;
+                output_limit_reported |= output_truncated;
+                if output_truncated {
+                    // Either pipe can consume the shared allowance. An exact fit,
+                    // or a single overlong line, does not by itself mean overflow.
+                    drain.overflowed_at.get_or_init(Instant::now);
+                }
+                if truncated {
+                    // Stop can arrive while this event is waiting for queue space.
+                    drain.clipped.store(true, Ordering::Release);
+                }
                 if !bytes.is_empty() || truncated {
                     let mut event = JobEvent::Output {
                         job: id,
                         stream,
                         bytes,
                         truncated,
+                        abandoned: false,
                     };
                     loop {
                         if cancel.load(Ordering::Acquire) {
@@ -804,12 +1122,13 @@ fn stream_reader(
                         }
                     }
                 }
-                if truncated && allowed == 0 {
-                    break;
-                }
-                if discard_tail {
+                if discard_tail && !output_truncated {
                     // Discard the rest of this physical line without allocating for it.
                     loop {
+                        if drain.cutoff_elapsed() {
+                            drain.abandoned(stream).store(true, Ordering::Release);
+                            return;
+                        }
                         match reader.fill_buf() {
                             Ok([]) => break,
                             Ok(tail) => {
@@ -865,6 +1184,8 @@ pub enum JobError {
     InvalidPolicy,
     #[error("cannot spawn job: {0}")]
     Spawn(#[source] io::Error),
+    #[error("{0}")]
+    Preflight(String),
     #[error("unknown job {0:?}")]
     Unknown(JobId),
     #[error("job queue is full")]
@@ -877,6 +1198,208 @@ pub enum JobError {
     Cancelled,
     #[error("task execution root filesystem identity changed")]
     RootChanged,
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+
+    #[test]
+    fn windows_total_cap_grace_detaches_both_quiet_pipes() {
+        let (stdout, mut stdout_writer) = io::pipe().unwrap();
+        let (stderr, stderr_writer) = io::pipe().unwrap();
+        let mut engine = JobEngine::new(16);
+        let id = JobId(1);
+        let system_root = PathBuf::from(std::env::var_os("SystemRoot").unwrap());
+        let child = Command::new(system_root.join("System32/cmd.exe"))
+            .args(["/D", "/C", "exit 0"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let drain = Arc::new(OutputDrain::default());
+        let cancel = Arc::new(AtomicBool::new(false));
+        let readers = Arc::new(AtomicUsize::new(0));
+        let slot = Arc::new(JobSlot(Arc::new(AtomicUsize::new(1))));
+        let failed = Arc::new(AtomicBool::new(false));
+        let timeout = Duration::from_secs(30);
+        let policy = JobPolicy {
+            maximum_output_bytes: 4,
+            timeout,
+            ..JobPolicy::default()
+        };
+        let total = Arc::new(AtomicUsize::new(0));
+        for (stream, pipe) in [(JobStream::Stdout, stdout), (JobStream::Stderr, stderr)] {
+            stream_reader(
+                id,
+                JobOutputPipe {
+                    pipe: crate::process::CancellablePipe::new(pipe, cancel.clone()).unwrap(),
+                    drain: drain.clone(),
+                    stream,
+                    closed: false,
+                },
+                engine.sender.clone(),
+                total.clone(),
+                (policy.clone(), false),
+                (
+                    readers.clone(),
+                    failed.clone(),
+                    slot.clone(),
+                    cancel.clone(),
+                ),
+            )
+            .unwrap();
+        }
+        stdout_writer.write_all(b"abc\ndef\n").unwrap();
+        let until = Instant::now() + Duration::from_secs(5);
+        while drain.overflowed_at.get().is_none()
+            || drain
+                .read_phase
+                .iter()
+                .any(|phase| phase.load(Ordering::Acquire) != PipeReadPhase::Reading as u8)
+        {
+            assert!(
+                Instant::now() < until,
+                "reader did not block after clipping"
+            );
+            thread::sleep(Duration::from_millis(2));
+        }
+        engine.jobs.insert(
+            id,
+            RunningJob {
+                child,
+                started: Instant::now(),
+                timeout,
+                cancel,
+                input_cancel: Arc::new(AtomicBool::new(false)),
+                readers,
+                io_failed: failed,
+                status: None,
+                output_drain: drain,
+                skip_pending_io: false,
+                timed_out: false,
+                killed: false,
+                _slot: slot,
+            },
+        );
+        let mut clipped = false;
+        let mut abandoned = AbandonedStreams::default();
+        let mut exited = false;
+        while !exited {
+            for event in engine.poll() {
+                match event {
+                    JobEvent::Output {
+                        stream,
+                        abandoned: true,
+                        ..
+                    } => {
+                        assert!(clipped && !exited);
+                        abandoned.insert(stream);
+                    }
+                    JobEvent::Output {
+                        truncated: true,
+                        abandoned: false,
+                        ..
+                    } => clipped = true,
+                    JobEvent::Output { bytes, .. } => assert_eq!(bytes, b"abc\n"),
+                    JobEvent::Exited {
+                        code, timed_out, ..
+                    } => {
+                        assert_eq!(code, Some(0));
+                        assert!(!timed_out);
+                        assert!(abandoned.contains(JobStream::Stdout));
+                        assert!(abandoned.contains(JobStream::Stderr));
+                        exited = true;
+                    }
+                    other => panic!("unexpected job event: {other:?}"),
+                }
+            }
+            assert!(
+                Instant::now() < until,
+                "quiet clipped pipe blocked completion"
+            );
+            thread::sleep(Duration::from_millis(2));
+        }
+        // Both writers stayed open until after the terminal arrived.
+        drop((stdout_writer, stderr_writer));
+    }
+
+    #[test]
+    fn exited_windows_job_drains_its_full_queue_past_deadline() {
+        let root = tempfile::tempdir().unwrap();
+        let system_root =
+            PathBuf::from(std::env::var_os("SystemRoot").expect("Windows system root"));
+        let mut engine = JobEngine::new(64);
+        let id = JobId(1);
+        let request = JobRequest {
+            program: system_root.join("System32/cmd.exe"),
+            argv0: None,
+            arguments: ["/D", "/S", "/C", "for /L %i in (1,1,1000) do @echo x"]
+                .into_iter()
+                .map(Into::into)
+                .collect(),
+            cwd: root.path().into(),
+            environment: BTreeMap::from([("SystemRoot".into(), system_root.into_os_string())]),
+            root_revision: 1,
+            stdin: None,
+            policy: JobPolicy {
+                timeout: Duration::from_secs(10),
+                ..JobPolicy::default()
+            },
+        };
+        engine
+            .start(Submission {
+                preflight: None,
+                root: None,
+                id,
+                request,
+                cancel: Arc::new(AtomicBool::new(false)),
+                output_drain: Arc::new(OutputDrain::default()),
+                slot: Arc::new(JobSlot(Arc::new(AtomicUsize::new(1)))),
+                input: None,
+            })
+            .unwrap();
+        let until = Instant::now() + Duration::from_secs(10);
+        let running = engine.jobs.get_mut(&id).unwrap();
+        while running.status.is_none()
+            || running.output_drain.read_phase[JobStream::Stderr.index()].load(Ordering::Acquire)
+                != PipeReadPhase::Finished as u8
+        {
+            running.observe_exit(Instant::now()).unwrap();
+            assert!(
+                Instant::now() < until,
+                "leader and stderr reader did not exit with the stdout queue full"
+            );
+            thread::yield_now();
+        }
+        assert_eq!(running.status, Some(Some(0)));
+        running.started = Instant::now() - running.timeout;
+        let mut lines = 0;
+        while !engine.jobs.is_empty() {
+            for event in engine.poll() {
+                match event {
+                    JobEvent::Output {
+                        bytes, truncated, ..
+                    } => {
+                        assert!(!truncated);
+                        assert_eq!(bytes, b"x\r\n");
+                        lines += 1;
+                    }
+                    JobEvent::Exited {
+                        code, timed_out, ..
+                    } => {
+                        assert_eq!(code, Some(0));
+                        assert!(!timed_out);
+                    }
+                    other => panic!("unexpected job event: {other:?}"),
+                }
+            }
+            assert!(Instant::now() < until, "short lines did not drain");
+            thread::yield_now();
+        }
+        assert_eq!(lines, 1000);
+    }
 }
 
 #[cfg(all(test, unix))]
@@ -1051,9 +1574,11 @@ mod tests {
             Submission {
                 root: None,
                 input: None,
+                preflight: None,
                 id: JobId(1),
                 request,
                 cancel: Arc::new(AtomicBool::new(false)),
+                output_drain: Arc::new(OutputDrain::default()),
                 slot: Arc::new(JobSlot(residents.clone())),
             },
             residents,
@@ -1215,28 +1740,55 @@ mod tests {
     #[test]
     fn job_deadline_releases_descendant_pipes_after_parent_exit() {
         let root = tempfile::tempdir().unwrap();
-        let (queued, residents) = submission(root.path(), "sleep 30 & printf spawned");
+        let (queued, residents) = submission(
+            root.path(),
+            "(while [ ! -e release ]; do sleep 0.05; done; printf alive > survived) >/dev/null & printf '%s\\n' \"$!\"",
+        );
         let mut engine = JobEngine::new(16);
         engine.start(queued).unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
-        while engine.jobs[&JobId(1)].status.is_none() {
-            engine.poll();
+        let mut helper = None;
+        while helper.is_none() || engine.jobs[&JobId(1)].status.is_none() {
+            for event in engine.poll() {
+                if let JobEvent::Output { bytes, .. } = event {
+                    let pid = std::str::from_utf8(&bytes).unwrap().trim().parse().unwrap();
+                    helper = Some(nix::unistd::Pid::from_raw(pid));
+                }
+            }
             assert!(Instant::now() < deadline);
             thread::sleep(Duration::from_millis(2));
         }
-        let running = engine.jobs.get_mut(&JobId(1)).unwrap();
-        assert_ne!(running.readers.load(Ordering::Acquire), 0);
-        running.started = Instant::now() - running.timeout;
+        struct Helper(nix::unistd::Pid);
+        impl Drop for Helper {
+            fn drop(&mut self) {
+                let _ = nix::sys::signal::kill(self.0, nix::sys::signal::Signal::SIGKILL);
+            }
+        }
+        let _helper = Helper(helper.unwrap());
+        assert_ne!(engine.jobs[&JobId(1)].readers.load(Ordering::Acquire), 0);
+        let mut stderr_abandoned = false;
         let mut exited = false;
         while !engine.jobs.is_empty() || residents.load(Ordering::Acquire) != 0 {
             for event in engine.poll() {
-                if let JobEvent::Exited {
-                    code, timed_out, ..
-                } = event
-                {
-                    assert_eq!(code, Some(0));
-                    assert!(!timed_out);
-                    exited = true;
+                match event {
+                    JobEvent::Output {
+                        stream,
+                        abandoned: true,
+                        ..
+                    } => {
+                        assert_eq!(stream, JobStream::Stderr);
+                        assert!(!exited);
+                        stderr_abandoned = true;
+                    }
+                    JobEvent::Exited {
+                        code, timed_out, ..
+                    } => {
+                        assert_eq!(code, Some(0));
+                        assert!(!timed_out);
+                        assert!(stderr_abandoned);
+                        exited = true;
+                    }
+                    other => panic!("unexpected job event: {other:?}"),
                 }
             }
             assert!(
@@ -1245,7 +1797,268 @@ mod tests {
             );
             thread::sleep(Duration::from_millis(2));
         }
-        assert!(exited);
+        assert!(stderr_abandoned && exited);
+        std::fs::write(root.path().join("release"), []).unwrap();
+        while !std::fs::read(root.path().join("survived")).is_ok_and(|data| data == b"alive") {
+            assert!(Instant::now() < deadline, "abandonment stopped the helper");
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn total_cap_grace_releases_both_pipes_without_stopping_the_helper() {
+        let root = tempfile::tempdir().unwrap();
+        let (mut queued, _) = submission(
+            root.path(),
+            "(while [ -d gate ]; do sleep 0.05; done; printf alive > survived) & printf 'abc\ndef\n'",
+        );
+        let gate = root.path().join("gate");
+        std::fs::create_dir(&gate).unwrap();
+        queued.request.policy.maximum_output_bytes = 4;
+        queued.request.policy.timeout = Duration::from_secs(30);
+        let mut engine = JobEngine::new(1);
+        engine.start(queued).unwrap();
+        let until = Instant::now() + Duration::from_secs(5);
+        let mut records = Vec::new();
+        let mut abandoned = AbandonedStreams::default();
+        let mut exited = false;
+        while !exited {
+            for event in engine.poll() {
+                match event {
+                    JobEvent::Output {
+                        stream,
+                        abandoned: true,
+                        ..
+                    } => {
+                        assert!(!exited);
+                        assert_eq!(records, [(b"abc\n".to_vec(), false), (Vec::new(), true)]);
+                        abandoned.insert(stream);
+                    }
+                    JobEvent::Output {
+                        stream,
+                        bytes,
+                        truncated,
+                        ..
+                    } => {
+                        assert_eq!(stream, JobStream::Stdout);
+                        records.push((bytes, truncated));
+                    }
+                    JobEvent::Exited {
+                        code, timed_out, ..
+                    } => {
+                        assert_eq!(code, Some(0));
+                        assert!(!timed_out);
+                        assert!(abandoned.contains(JobStream::Stdout));
+                        assert!(abandoned.contains(JobStream::Stderr));
+                        exited = true;
+                    }
+                    other => panic!("unexpected job event: {other:?}"),
+                }
+            }
+            assert!(
+                Instant::now() < until,
+                "both pipes should hit the short grace"
+            );
+            thread::sleep(Duration::from_millis(2));
+        }
+        std::fs::remove_dir(gate).unwrap();
+        while !std::fs::read(root.path().join("survived")).is_ok_and(|data| data == b"alive") {
+            assert!(Instant::now() < until, "abandonment stopped the helper");
+            thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    #[test]
+    fn oversized_line_does_not_cut_off_later_in_budget_records() {
+        let root = tempfile::tempdir().unwrap();
+        let (mut queued, _) = submission(
+            root.path(),
+            "(printf 'oversized'; sleep 0.4; printf '\\nready\\n') &",
+        );
+        queued.request.policy.maximum_line_bytes = 6;
+        queued.request.policy.maximum_output_bytes = 64;
+        let mut engine = JobEngine::new(16);
+        engine.start(queued).unwrap();
+        let until = Instant::now() + Duration::from_secs(5);
+        let mut records = Vec::new();
+        while !engine.jobs.is_empty() {
+            for event in engine.poll() {
+                match event {
+                    JobEvent::Output {
+                        bytes,
+                        truncated,
+                        abandoned,
+                        ..
+                    } => {
+                        assert!(!abandoned);
+                        records.push((bytes, truncated));
+                    }
+                    JobEvent::Exited {
+                        code, timed_out, ..
+                    } => {
+                        assert_eq!(code, Some(0));
+                        assert!(!timed_out);
+                    }
+                    other => panic!("unexpected job event: {other:?}"),
+                }
+            }
+            assert!(Instant::now() < until);
+            thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(
+            records,
+            [(b"oversi".to_vec(), true), (b"ready\n".to_vec(), false)]
+        );
+    }
+
+    #[test]
+    fn helper_can_write_late_output_and_stay_alive_after_the_leader_exits() {
+        struct Helper(nix::unistd::Pid);
+        impl Drop for Helper {
+            fn drop(&mut self) {
+                let _ = nix::sys::signal::kill(self.0, nix::sys::signal::Signal::SIGKILL);
+            }
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let (mut queued, _) = submission(
+            root.path(),
+            "(sleep 1; printf 'ready\\n'; exec sleep 30 >/dev/null 2>&1) & printf '%s\\n' \"$!\"",
+        );
+        queued.request.policy.timeout = Duration::from_secs(5);
+        let mut engine = JobEngine::new(16);
+        engine.start(queued).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut helper = None;
+        let mut ready = false;
+        let mut exited = false;
+        while !exited {
+            for event in engine.poll() {
+                match event {
+                    JobEvent::Output {
+                        bytes, truncated, ..
+                    } => {
+                        assert!(!truncated, "in-budget helper output was abandoned");
+                        if bytes == b"ready\n" {
+                            ready = true;
+                        } else {
+                            let pid = std::str::from_utf8(&bytes).unwrap().trim().parse().unwrap();
+                            helper = Some(Helper(nix::unistd::Pid::from_raw(pid)));
+                        }
+                    }
+                    JobEvent::Exited {
+                        code, timed_out, ..
+                    } => {
+                        assert_eq!(code, Some(0));
+                        assert!(!timed_out);
+                        exited = true;
+                    }
+                    other => panic!("unexpected job event: {other:?}"),
+                }
+            }
+            assert!(Instant::now() < deadline, "helper did not finish writing");
+            thread::yield_now();
+        }
+        assert!(ready, "late helper output was lost");
+        nix::sys::signal::kill(helper.expect("helper PID").0, None).unwrap();
+    }
+
+    #[test]
+    fn short_lines_drain_past_deadline_after_exit_with_a_full_output_queue() {
+        let root = tempfile::tempdir().unwrap();
+        let (mut queued, _) = submission(
+            root.path(),
+            "i=0; while [ \"$i\" -lt 1500 ]; do printf 'x\\n'; i=$((i + 1)); done",
+        );
+        queued.request.policy.timeout = Duration::from_secs(10);
+        let mut engine = JobEngine::new(64);
+        engine.start(queued).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let running = engine.jobs.get_mut(&JobId(1)).unwrap();
+        while job_exit_status(&mut running.child).unwrap().is_none() {
+            assert!(
+                Instant::now() < deadline,
+                "leader did not exit with the queue full"
+            );
+            thread::yield_now();
+        }
+        // Expire the job after observing its exit, without emptying the output queue.
+        running.observe_exit(Instant::now()).unwrap();
+        assert_eq!(running.status, Some(Some(0)));
+        running.started = Instant::now() - running.timeout;
+
+        let mut lines = 0;
+        let mut exited = false;
+        while !exited {
+            for event in engine.poll() {
+                match event {
+                    JobEvent::Output {
+                        bytes, truncated, ..
+                    } => {
+                        assert!(!truncated);
+                        assert_eq!(bytes, b"x\n");
+                        lines += 1;
+                    }
+                    JobEvent::Exited {
+                        code, timed_out, ..
+                    } => {
+                        assert_eq!(code, Some(0));
+                        assert!(!timed_out);
+                        exited = true;
+                    }
+                    other => panic!("unexpected job event: {other:?}"),
+                }
+            }
+            assert!(Instant::now() < deadline, "short lines did not drain");
+            thread::yield_now();
+        }
+        assert_eq!(lines, 1500);
+    }
+
+    #[test]
+    fn clipped_streaming_job_finishes_when_detached_writer_outlives_leader() {
+        let root = tempfile::tempdir().unwrap();
+        let (mut queued, residents) = submission(
+            root.path(),
+            "exec python3 -c 'import os,signal\nif os.fork() == 0:\n os.setsid()\n os.close(2)\n signal.alarm(5)\n while True: os.write(1, b\"x\" * 4096)\n'",
+        );
+        let (_input, reader) = mpsc::sync_channel(1);
+        queued.input = Some(reader);
+        queued.request.policy.maximum_output_bytes = 16;
+        queued.request.policy.timeout = Duration::from_secs(2);
+        let mut engine = JobEngine::new(16);
+        engine.start(queued).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut clipped = false;
+        let mut captured = 0;
+        let mut exited = false;
+        while !exited || residents.load(Ordering::Acquire) != 0 {
+            for event in engine.poll() {
+                match event {
+                    JobEvent::Output {
+                        bytes, truncated, ..
+                    } => {
+                        captured += bytes.len();
+                        clipped |= truncated;
+                    }
+                    JobEvent::Exited {
+                        code, timed_out, ..
+                    } => {
+                        assert_eq!(code, Some(0));
+                        assert!(!timed_out);
+                        assert!(clipped, "capture must be marked incomplete before exit");
+                        exited = true;
+                    }
+                    other => panic!("unexpected job event: {other:?}"),
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "detached writer kept the clipped job running past its deadline"
+            );
+            thread::yield_now();
+        }
+        assert_eq!(captured, 16);
     }
 
     #[test]

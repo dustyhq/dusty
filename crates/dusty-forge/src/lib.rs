@@ -716,8 +716,12 @@ impl ForgeCommands<'_> {
                         stream,
                         bytes,
                         truncated,
+                        abandoned,
                         ..
                     } => {
+                        if abandoned {
+                            return Err(format!("{program}: {} is incomplete", stream.name()));
+                        }
                         if truncated {
                             return Err(format!("{program}: output exceeds the forge limit"));
                         }

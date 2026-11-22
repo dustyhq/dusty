@@ -31,7 +31,7 @@ use crate::ui::{Frame, KeyInputKind, PromptKind, PromptState, UiEvent};
 use crate::windows::SpatialDirection;
 use jobs::{Jobs, Request};
 use preview::Preview;
-use shell::chrome::ReceiptTone;
+use shell::chrome::{FooterSeverity, ReceiptTone};
 
 const DIFF_REFRESHING: &str = "The diff is refreshing; wait before changing code";
 use std::collections::BTreeSet;
@@ -499,6 +499,7 @@ pub struct GitScreen {
     /// The paused operation's sides and conflict hunk counts (`conflicts.rs`).
     conflict: Option<conflicts::Context>,
     notice: String,
+    write_footer: Option<(String, FooterSeverity)>,
     form: Option<Form>,
     help: bool,
     busy: bool,
@@ -637,6 +638,7 @@ impl GitScreen {
             paused_replay: None,
             conflict: None,
             notice: String::new(),
+            write_footer: None,
             form: None,
             help: false,
             busy: false,
@@ -1142,7 +1144,12 @@ impl GitScreen {
         }
         changed |= self.op_progress();
         changed |= self.poll_rewrite();
-        for (request, result) in self.jobs.poll() {
+        for jobs::Reply {
+            request,
+            result,
+            mut warning,
+        } in self.jobs.poll()
+        {
             changed = true;
             match (request, result) {
                 (Request::Preview, Ok(text)) => {
@@ -1216,6 +1223,7 @@ impl GitScreen {
                     if let Some(notice) = finished.or(stage_notice) {
                         self.notice = notice;
                     }
+                    self.note_write_capture(warning, succeeded);
                     // A stopped merge can still have updated the index and working files.
                     let result = self.refresh();
                     self.refreshing_after_write = result.is_ok();
@@ -1332,6 +1340,22 @@ impl GitScreen {
             self.selected[slot] = self.selected[slot].min(self.rows(pane).len().saturating_sub(1));
         }
     }
+    fn note_write_capture(&mut self, warning: Option<String>, succeeded: bool) {
+        self.write_footer = warning.map(|warning| {
+            let mut message = std::mem::take(&mut self.notice);
+            if !message.is_empty() {
+                message.push_str(" · ");
+            }
+            message.push_str(&warning);
+            let severity = if succeeded {
+                FooterSeverity::Warning
+            } else {
+                FooterSeverity::Error
+            };
+            (message, severity)
+        });
+    }
+
     fn report(&mut self, result: Result<(), String>) {
         if let Err(e) = result {
             self.notice = self.rewrite_diagnostic.clone().unwrap_or(e);
@@ -2381,7 +2405,6 @@ impl GitScreen {
                 self.save_form_draft();
                 self.form = None;
             }
-            return Ok(());
         }
         if key.code == KeyCode::Enter
             && (key.modifiers.control

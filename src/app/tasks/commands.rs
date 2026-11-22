@@ -251,10 +251,7 @@ impl App {
                         lint: true,
                     }) => self.run_trusted(TrustedAction::RunLinter { name, matcher }),
                     Some(AdapterContext::Formatter { source }) => {
-                        match crate::app::tasks::FormatterSource::capture(
-                            &self.state,
-                            source.buffer(),
-                        ) {
+                        match self.capture_task_formatter(&name, source.buffer()) {
                             Ok(source) => {
                                 self.run_trusted(TrustedAction::RunFormatter { name, source })
                             }
@@ -292,7 +289,7 @@ impl App {
                     return Ok(());
                 };
                 let buffer = view.buffer;
-                match crate::app::tasks::FormatterSource::capture(&self.state, buffer) {
+                match self.capture_task_formatter(&name, buffer) {
                     Ok(source) => self.run_trusted(TrustedAction::RunFormatter { name, source }),
                     Err(error) => self.show_error(error),
                 }

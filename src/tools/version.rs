@@ -326,8 +326,12 @@ pub(super) fn probe_tool_version(
                     stream,
                     bytes,
                     truncated,
+                    abandoned,
                     ..
                 } => {
+                    if abandoned {
+                        return Err(format!("Version probe {} is incomplete", stream.name()));
+                    }
                     if truncated {
                         return Err("version probe output exceeded its limit".into());
                     }

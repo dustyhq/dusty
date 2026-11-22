@@ -570,8 +570,11 @@ impl App {
                         stream,
                         bytes,
                         truncated,
+                        abandoned,
                     } => {
-                        let value = if truncated {
+                        let value = if abandoned {
+                            Err("Some process output may be missing".into())
+                        } else if truncated {
                             Err("process output limit exceeded".into())
                         } else {
                             Ok(wit::SystemValue::Process(match stream {

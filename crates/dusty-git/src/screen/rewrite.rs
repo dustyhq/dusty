@@ -127,18 +127,24 @@ impl GitScreen {
             .as_ref()
             .err()
             .map(|error| error.replace(['\n', '\r'], " "));
-        self.notice = match result {
-            Ok(outcome) => format!(
-                "{} {}",
-                match outcome.kind {
-                    Kind::Amend => "Amended",
-                    Kind::Reword => "Reworded",
-                    Kind::Fixup(_) => "Fixup",
-                },
-                &outcome.head.to_string()[..8]
-            ),
-            Err(error) => error.replace(['\n', '\r'], " "),
-        };
+        match result {
+            Ok(outcome) => {
+                self.notice = format!(
+                    "{} {}",
+                    match outcome.kind {
+                        Kind::Amend => "Amended",
+                        Kind::Reword => "Reworded",
+                        Kind::Fixup(_) => "Fixup",
+                    },
+                    &outcome.head.to_string()[..8]
+                );
+                self.note_write_capture(outcome.capture_warning, true);
+            }
+            Err(error) => {
+                self.write_footer = None;
+                self.notice = error.replace(['\n', '\r'], " ");
+            }
+        }
     }
 
     fn finish_rewrite_refresh(&mut self, refreshed: Result<(), String>) {
@@ -266,6 +272,30 @@ mod tests {
     }
 
     #[test]
+    fn successful_rewrites_render_missing_stderr_as_a_warning() {
+        for (kind, verb) in [(Kind::Amend, "Amended"), (Kind::Reword, "Reworded")] {
+            let (_directory, mut screen, head) = screen_with_draft();
+            screen.reflog_submitting = true;
+            screen.accept_rewrite_result(Ok(crate::rewrite::Outcome {
+                kind,
+                head,
+                recovery: format!("refs/dusty/rewrite/{head}"),
+                capture_warning: Some("Some Git output may be missing (standard error)".into()),
+            }));
+            let frame = screen.frame(120, 40);
+            let footer = frame.grid.row_text(39);
+            assert!(
+                footer.contains(&format!(
+                    "⚠ {verb} {} · Some Git output may be missing (standard error)",
+                    &head.to_string()[..8]
+                )),
+                "{footer}"
+            );
+            assert!(!footer.contains('✕'), "{footer}");
+        }
+    }
+
+    #[test]
     fn rewrite_success_and_hook_rejection_clear_submission_ownership() {
         let (_directory, mut screen, head) = screen_with_draft();
         screen.accept_rewrite_result(Err("commit-msg hook rejected message".into()));
@@ -277,6 +307,7 @@ mod tests {
             kind: Kind::Reword,
             head,
             recovery: format!("refs/dusty/rewrite/{head}"),
+            capture_warning: None,
         }));
         assert!(!screen.busy && !screen.reflog_submitting);
         assert!(screen.form.is_none() && screen.rewrite_diagnostic.is_none());

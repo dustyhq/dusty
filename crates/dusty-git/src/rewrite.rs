@@ -1,5 +1,6 @@
 //! Identity-bound local commits. Git owns commit creation (hooks and signing);
 //! publication is a separately locked update, never a reset or checkout.
+use crate::process::{AbandonedStreams, JobStream};
 use git2::{Oid, Repository, RepositoryState};
 use sha2::{Digest, Sha256};
 use std::fs;
@@ -140,6 +141,7 @@ pub struct Outcome {
     pub kind: Kind,
     pub head: Oid,
     pub recovery: String,
+    pub capture_warning: Option<String>,
 }
 impl Worker {
     pub fn start(&mut self, plan: Plan, message: String) -> Result<(), String> {
@@ -379,9 +381,11 @@ fn execute(plan: Plan, message: String, commit_timeout: Duration) -> Result<Outc
         }
     })
     .map_err(error)?;
-    command_result.map_err(|e| format!("{e} · HEAD unchanged; recovery {recovery}"))?;
+    let capture =
+        command_result.map_err(|e| format!("{e} · HEAD unchanged; recovery {recovery}"))?;
     let reject = |why: &str| format!("{why}; HEAD unchanged. Prepared commit: {result_ref}");
-    plan.validate(&repo).map_err(|e| reject(&e))?;
+    plan.validate(&repo, crate::history::CHECKOUT_CHANGED)
+        .map_err(|e| reject(&e))?;
     if created.tree_id() != plan.tree {
         return Err(reject(
             "A hook changed the intended commit tree; review its changes",
@@ -452,6 +456,7 @@ fn execute(plan: Plan, message: String, commit_timeout: Duration) -> Result<Outc
         kind: plan.kind,
         head: created.id(),
         recovery,
+        capture_warning: capture_warning(capture.clipped, capture.abandoned),
     })
 }
 
@@ -570,13 +575,46 @@ fn no_reference_hook(path: &Path) -> Result<(), String> {
     }
 }
 
+pub(super) fn capture_warning(clipped: bool, abandoned: AbandonedStreams) -> Option<String> {
+    const CLIPPED: &str = "Some Git output was cut because it was too long";
+    match (clipped, abandoned.names()) {
+        (true, Some(streams)) => Some(format!(
+            "{CLIPPED} · Some Git output may be missing ({streams})"
+        )),
+        (false, Some(streams)) => Some(format!("Some Git output may be missing ({streams})")),
+        (true, None) => Some(CLIPPED.into()),
+        (false, None) => None,
+    }
+}
+
+#[derive(Default)]
+struct GitCapture {
+    stdout: Vec<u8>,
+    clipped: bool,
+    stdout_clipped: bool,
+    abandoned: AbandonedStreams,
+}
+
+impl GitCapture {
+    fn required_stdout(self) -> Result<Vec<u8>, String> {
+        if self.abandoned.contains(JobStream::Stdout) {
+            return Err("Some Git output may be missing (standard output)".into());
+        }
+        if self.stdout_clipped {
+            return Err("Some Git output was cut because it was too long (standard output)".into());
+        }
+        Ok(self.stdout)
+    }
+}
+
 fn run_git(
     root: &Path,
     environment: std::collections::BTreeMap<String, std::ffi::OsString>,
     arguments: Vec<std::ffi::OsString>,
     input: Option<Vec<u8>>,
-) -> Result<Vec<u8>, String> {
-    use crate::process::{JobEvent, JobPolicy, JobRequest, JobStream, JobSupervisor};
+    timeout: Duration,
+) -> Result<GitCapture, String> {
+    use crate::process::{JobEvent, JobPolicy, JobRequest, JobSupervisor};
     let mut jobs = JobSupervisor::try_new(16).map_err(error)?;
     jobs.start(JobRequest {
         program: crate::process::discover_executable("git")
@@ -590,14 +628,13 @@ fn run_git(
         policy: JobPolicy {
             maximum_output_bytes: 64 * 1024,
             maximum_line_bytes: 64 * 1024,
-            timeout: Duration::from_secs(120),
+            timeout,
             ..JobPolicy::default()
         },
     })
     .map_err(error)?;
-    let mut output = Vec::new();
+    let mut capture = GitCapture::default();
     let mut diagnostics = Vec::new();
-    let mut truncated_output = false;
     loop {
         for event in jobs.poll() {
             match event {
@@ -605,34 +642,94 @@ fn run_git(
                     stream,
                     bytes,
                     truncated,
+                    abandoned,
                     ..
                 } => {
-                    let target = if stream == JobStream::Stdout {
-                        &mut output
+                    if abandoned {
+                        capture.abandoned.insert(stream);
+                        continue;
+                    }
+                    capture.clipped |= truncated;
+                    if stream == JobStream::Stdout {
+                        capture.stdout_clipped |= truncated;
+                        capture.stdout.extend(bytes);
                     } else {
-                        &mut diagnostics
-                    };
-                    let remaining = (64 * 1024usize).saturating_sub(target.len());
-                    truncated_output |= truncated || bytes.len() > remaining;
-                    target.extend(bytes.into_iter().take(remaining));
+                        diagnostics.extend(bytes);
+                    }
                 }
                 JobEvent::Exited {
                     code, timed_out, ..
                 } => {
-                    return if code == Some(0) && !timed_out && !truncated_output {
-                        Ok(output)
+                    if code == Some(0) && !timed_out {
+                        return Ok(capture);
+                    }
+                    let status = if timed_out {
+                        "Git command timed out".into()
                     } else {
-                        Err(format!(
-                            "Git command failed (exit {code:?}, timeout {timed_out}, output limit {truncated_output}): {} {}",
-                            String::from_utf8_lossy(&diagnostics).trim(),
-                            String::from_utf8_lossy(&output).trim()
-                        ))
+                        format!("Git command failed (exit {code:?})")
                     };
+                    let mut failure = format!(
+                        "{status}: {} {}",
+                        String::from_utf8_lossy(&diagnostics).trim(),
+                        String::from_utf8_lossy(&capture.stdout).trim()
+                    );
+                    if let Some(warning) = capture_warning(capture.clipped, capture.abandoned) {
+                        failure.push_str(" · ");
+                        failure.push_str(&warning);
+                    }
+                    return Err(failure);
                 }
                 JobEvent::Failed { message, .. } => return Err(message),
                 JobEvent::Started { .. } => {}
             }
         }
         std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn amend_and_reword_publish_when_the_commit_hook_leaves_stderr_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        let mut config = repo.config().unwrap();
+        config.set_str("user.name", "Rewrite capture test").unwrap();
+        config
+            .set_str("user.email", "rewrite@example.invalid")
+            .unwrap();
+        config.set_bool("commit.gpgsign", false).unwrap();
+        let hooks = dir.path().join("test-hooks");
+        fs::create_dir(&hooks).unwrap();
+        config
+            .set_str("core.hooksPath", hooks.to_str().unwrap())
+            .unwrap();
+        let hook = hooks.join("post-commit");
+        fs::write(&hook, "#!/bin/sh\nsleep 4 >/dev/null &\n").unwrap();
+        fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut index = repo.index().unwrap();
+        let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+        index.write().unwrap();
+        let signature = git2::Signature::now("Rewrite", "rewrite@example.invalid").unwrap();
+        let mut previous = repo
+            .commit(Some("HEAD"), &signature, &signature, "Original", &tree, &[])
+            .unwrap();
+
+        for (kind, message) in [(Kind::Amend, "Amended"), (Kind::Reword, "Reworded")] {
+            let plan = Plan::capture(dir.path(), kind).unwrap();
+            let outcome = execute(plan, message.into(), Duration::from_millis(1500)).unwrap();
+            assert_ne!(outcome.head, previous);
+            let head = repo.head().unwrap().peel_to_commit().unwrap();
+            assert_eq!(head.id(), outcome.head);
+            assert_eq!(head.summary(), Some(message));
+            assert_eq!(
+                outcome.capture_warning.as_deref(),
+                Some("Some Git output may be missing (standard error)")
+            );
+            previous = head.id();
+        }
     }
 }

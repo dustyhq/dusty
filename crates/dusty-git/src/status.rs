@@ -603,8 +603,12 @@ pub(super) fn status_command(
                     stream: JobStream::Stdout,
                     bytes,
                     truncated: clipped,
+                    abandoned,
                     ..
                 } => {
+                    if abandoned {
+                        return Err(backend("Git status standard output is incomplete"));
+                    }
                     if !truncated {
                         output.extend(bytes);
                     }

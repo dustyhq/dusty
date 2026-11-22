@@ -19,6 +19,7 @@ use std::time::Instant;
 use thiserror::Error;
 
 mod jobs;
+pub use jobs::AbandonedStreams;
 pub use jobs::JobError;
 pub use jobs::JobEvent;
 pub use jobs::JobId;

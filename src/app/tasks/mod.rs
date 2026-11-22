@@ -30,8 +30,8 @@ use crate::process::JobEvent;
 use crate::process::JobId;
 use crate::process::JobPolicy;
 use crate::process::JobRequest;
-use crate::process::JobStream;
 use crate::process::JobSupervisor;
+use crate::process::{AbandonedStreams, JobStream};
 use crate::workspace::DiagnosticProducer;
 use crate::workspace::PickerAction;
 use crate::workspace::PickerItem;
@@ -43,7 +43,6 @@ pub(super) use sources::TaskDiagnosticRun;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::collections::HashMap;
-use std::collections::HashSet;
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -71,7 +70,82 @@ pub(in crate::app) struct TaskOutputRecord {
     pub(in crate::app) stream: JobStream,
     pub(in crate::app) text: String,
     pub(in crate::app) truncated: bool,
+    capture_notice: Option<CaptureNotice>,
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct CaptureNotice {
+    clipped: bool,
+    abandoned: AbandonedStreams,
+}
+
+impl CaptureNotice {
+    const CLIPPED: Self = Self {
+        clipped: true,
+        abandoned: AbandonedStreams::EMPTY,
+    };
+
+    fn from_event(stream: JobStream, clipped: bool, abandoned: bool) -> Option<Self> {
+        if abandoned {
+            let mut streams = AbandonedStreams::default();
+            streams.insert(stream);
+            Some(Self {
+                clipped,
+                abandoned: streams,
+            })
+        } else {
+            clipped.then_some(Self::CLIPPED)
+        }
+    }
+
+    fn merge(self, other: Self) -> Self {
+        Self {
+            clipped: self.clipped || other.clipped,
+            abandoned: self.abandoned.merge(other.abandoned),
+        }
+    }
+
+    fn text(self) -> String {
+        const CLIPPED: &str = "Output too long; some text was cut";
+        match (self.clipped, self.abandoned.names()) {
+            (true, Some(streams)) => {
+                format!("Some task output may be missing ({streams}); output was too long")
+            }
+            (false, Some(streams)) => format!("Some task output may be missing ({streams})"),
+            (_, None) => CLIPPED.into(),
+        }
+    }
+
+    fn lint_warning(self) -> String {
+        let streams = match (
+            self.abandoned.contains(JobStream::Stdout),
+            self.abandoned.contains(JobStream::Stderr),
+        ) {
+            (true, false) => "standard output",
+            (false, true) => "error output",
+            (true, true) => "standard output and error output",
+            (false, false) => return CLIPPED_LINT_NOTICE.into(),
+        };
+        let cause = if self.clipped {
+            "output was too long and "
+        } else {
+            ""
+        };
+        format!("No lint results shown: {cause}some {streams} may be missing")
+    }
+}
+
+const CLIPPED_LINT_NOTICE: &str = "No lint results shown: output was too long";
+
+fn trim_output_rows(rows: &mut Vec<TaskOutputRecord>) {
+    let excess = rows.len().saturating_sub(10_000);
+    if excess != 0 {
+        rows.extract_if(.., |row| row.capture_notice.is_none())
+            .take(excess)
+            .for_each(drop);
+    }
+}
+
 pub(in crate::app) struct RunningTask {
     output: Vec<u8>,
     cancelled: bool,
@@ -93,6 +167,9 @@ impl RunningTask {
     }
     pub(in crate::app) fn adapter(&self) -> &AdapterContext {
         &self.adapter
+    }
+    fn is_explicit_linter(&self) -> bool {
+        matches!(self.adapter, AdapterContext::Linter { lint: true, .. })
     }
 }
 #[derive(Clone, Debug)]
@@ -168,7 +245,8 @@ pub(super) enum TaskUpdate {
     Finished {
         task: Box<RunningTask>,
         code: Option<i32>,
-        truncated: bool,
+        timed_out: bool,
+        capture_notice: Option<CaptureNotice>,
         next: bool,
     },
     Failed {
@@ -186,7 +264,7 @@ pub(super) struct Tasks {
     adapters: HashMap<String, AdapterContext>,
     rows: HashMap<String, Vec<TaskOutputRecord>>,
     active_output: Option<String>,
-    truncated: HashSet<JobId>,
+    capture_notices: HashMap<JobId, CaptureNotice>,
     statuses: HashMap<String, String>,
     tests: HashMap<String, Vec<TestCaseResult>>,
     matchers: HashMap<String, regex::Regex>,
@@ -206,7 +284,7 @@ impl Tasks {
             adapters: HashMap::new(),
             rows: HashMap::new(),
             active_output: None,
-            truncated: HashSet::new(),
+            capture_notices: HashMap::new(),
             statuses: HashMap::new(),
             tests: HashMap::new(),
             matchers: HashMap::new(),
@@ -641,6 +719,35 @@ impl Tasks {
         if !found && !running {
             return Err("task is not running".into());
         }
+        if let Some(key) = &current {
+            // Stop invalidates results, but not clipping that was already reported.
+            self.events.extend(self.jobs.poll());
+            let notice = self
+                .events
+                .iter()
+                .filter_map(|event| {
+                    let JobEvent::Output {
+                        job,
+                        stream,
+                        truncated,
+                        abandoned,
+                        ..
+                    } = event
+                    else {
+                        return None;
+                    };
+                    let task = self.running.get(job)?;
+                    if task.requested == name && Arc::ptr_eq(&key.epoch, &task.key.epoch) {
+                        CaptureNotice::from_event(*stream, *truncated && !*abandoned, *abandoned)
+                    } else {
+                        None
+                    }
+                })
+                .reduce(CaptureNotice::merge);
+            if let Some(notice) = notice {
+                self.note_output_capture(name, notice);
+            }
+        }
         self.preflights.retain(|_, step| step.requested != name);
         self.keys.remove(name);
         self.plans.remove(name);
@@ -656,12 +763,16 @@ impl Tasks {
                     .as_ref()
                     .is_some_and(|key| Arc::ptr_eq(&key.epoch, &task.key.epoch))
                 {
+                    clipped |= self.jobs.output_clipped(*id);
                     producer = task
                         .diagnostic_source
                         .as_ref()
                         .map(|source| source.producer().clone());
                 }
             }
+        }
+        if clipped {
+            self.note_output_capture(name, CaptureNotice::CLIPPED);
         }
         if found {
             self.statuses.insert(name.into(), "cancelled".into());
@@ -727,6 +838,7 @@ impl Tasks {
                     stream,
                     bytes,
                     truncated,
+                    abandoned,
                 } => {
                     if !self
                         .running
@@ -738,17 +850,13 @@ impl Tasks {
                     let Some(task) = self.running.get_mut(&job) else {
                         continue;
                     };
-                    if truncated {
-                        self.truncated.insert(job);
-                    }
+                    let mut clipped = truncated && !abandoned;
                     let formatter_stderr = matches!(task.adapter, AdapterContext::Formatter { .. })
                         && stream == JobStream::Stderr;
                     let accepted = &bytes[..bytes
                         .len()
                         .min(self.maximum_output.saturating_sub(task.output.len()))];
-                    if accepted.len() != bytes.len() {
-                        self.truncated.insert(job);
-                    }
+                    clipped |= accepted.len() != bytes.len();
                     if !formatter_stderr {
                         task.output.extend_from_slice(accepted);
                         // Job output events contain complete records, including an unterminated
@@ -760,7 +868,7 @@ impl Tasks {
                             if task.output.len() < self.maximum_output {
                                 task.output.push(b'\n');
                             } else {
-                                self.truncated.insert(job);
+                                clipped = true;
                             }
                         }
                     }
@@ -772,10 +880,19 @@ impl Tasks {
                             stream,
                             text,
                             truncated,
+                            capture_notice: None,
                         });
                     }
-                    if rows.len() > 10_000 {
-                        rows.drain(..rows.len() - 10_000);
+                    trim_output_rows(rows);
+                    if let Some(notice) = CaptureNotice::from_event(stream, clipped, abandoned) {
+                        let notice = self
+                            .capture_notices
+                            .get(&job)
+                            .map_or(notice, |old| old.merge(notice));
+                        if self.capture_notices.insert(job, notice) != Some(notice) {
+                            let name = task.requested.clone();
+                            self.note_output_capture(&name, notice);
+                        }
                     }
                     return Some(TaskUpdate::Output);
                 }
@@ -787,16 +904,17 @@ impl Tasks {
                     let Some(task) = self.running.remove(&job) else {
                         continue;
                     };
-                    let truncated = self.truncated.remove(&job) || timed_out;
+                    let capture_notice = self.capture_notices.remove(&job);
+                    let succeeded = !timed_out && code == Some(0);
                     if !self.current(&task, workspace, configuration) {
                         continue;
                     }
                     // A run with a failing test exits non-zero, and that is the run with results
                     // worth seeing.
-                    if !truncated {
+                    if capture_notice.is_none() && !timed_out {
                         self.apply_test_result(&task);
                     }
-                    let next = if code == Some(0) && !truncated {
+                    let next = if succeeded {
                         self.plans.get_mut(&task.requested).is_some_and(|plan| {
                             plan.awaiting = false;
                             !plan.remaining.is_empty()
@@ -811,7 +929,7 @@ impl Tasks {
                         task.requested.clone(),
                         if next {
                             "queued"
-                        } else if !truncated
+                        } else if !timed_out
                             && (code == Some(0)
                                 && matches!(task.adapter, AdapterContext::Formatter { .. })
                                 || matches!(code, Some(0 | 1))
@@ -821,7 +939,7 @@ impl Tasks {
                                     ))
                         {
                             "process exited"
-                        } else if code == Some(0) && !truncated {
+                        } else if succeeded {
                             "succeeded"
                         } else {
                             "failed"
@@ -839,12 +957,12 @@ impl Tasks {
                     self.append_output_status(
                         &task.requested,
                         format!("[{} · {status}]", task.name),
-                        truncated,
                     );
                     return Some(TaskUpdate::Finished {
                         task: Box::new(task),
                         code,
-                        truncated,
+                        timed_out,
+                        capture_notice,
                         next,
                     });
                 }
@@ -852,7 +970,7 @@ impl Tasks {
                     let Some(task) = self.running.remove(&job) else {
                         continue;
                     };
-                    self.truncated.remove(&job);
+                    let capture_notice = self.capture_notices.remove(&job);
                     if !self.current(&task, workspace, configuration) {
                         // Stopping a task can end its output early; that isn't a failure.
                         if task.cancelled {
@@ -869,8 +987,14 @@ impl Tasks {
                     self.append_output_status(
                         &task.requested,
                         format!("[{} · failed: {message}]", task.name),
-                        false,
                     );
+                    let mut message = message;
+                    if task.is_explicit_linter()
+                        && let Some(notice) = capture_notice
+                    {
+                        message.push_str(". ");
+                        message.push_str(&notice.lint_warning());
+                    }
                     return Some(TaskUpdate::Failed {
                         source: task
                             .diagnostic_source
@@ -896,17 +1020,34 @@ impl Tasks {
             })
             .collect()
     }
-    fn append_output_status(&mut self, name: &str, text: String, truncated: bool) {
+    fn note_output_capture(&mut self, name: &str, notice: CaptureNotice) {
+        let rows = self.rows.entry(name.into()).or_default();
+        if let Some(row) = rows.iter_mut().find(|row| row.capture_notice.is_some()) {
+            let notice = row.capture_notice.map_or(notice, |old| old.merge(notice));
+            row.text = notice.text();
+            row.capture_notice = Some(notice);
+        } else {
+            rows.push(TaskOutputRecord {
+                source: None,
+                stream: JobStream::Stdout,
+                text: notice.text(),
+                truncated: false,
+                capture_notice: Some(notice),
+            });
+            trim_output_rows(rows);
+        }
+    }
+
+    fn append_output_status(&mut self, name: &str, text: String) {
         let rows = self.rows.entry(name.into()).or_default();
         rows.push(TaskOutputRecord {
             source: None,
             stream: JobStream::Stdout,
             text,
-            truncated,
+            truncated: false,
+            capture_notice: None,
         });
-        if rows.len() > 10_000 {
-            rows.drain(..rows.len() - 10_000);
-        }
+        trim_output_rows(rows);
     }
     pub(in crate::app) fn output_items(&self, name: &str) -> Vec<(PickerItem, PickerPayload)> {
         self.rows
@@ -1135,39 +1276,97 @@ impl App {
     }
 }
 
+enum FormatterAdmissionError {
+    NotFormatter,
+    Missing,
+}
+
 impl App {
-    pub(in crate::app) fn start_task_plan(&mut self, name: &str, adapter: AdapterContext) {
-        let managed = match &adapter {
-            AdapterContext::Formatter { source }
-                if !self.configuration.settings().tasks.contains_key(name) =>
-            {
-                let path = self.state.buffers[source.buffer()]
-                    .path
-                    .clone()
-                    .unwrap_or_default();
-                let Some(tool) = managed_formatter(|tool| tool.id == name, &path) else {
-                    self.show_error(self.message("formatter_missing", &[("name", name.into())]));
-                    return;
-                };
-                let mut config = self.configuration.settings().clone();
-                config.tasks.insert(
-                    name.into(),
-                    crate::config::TaskConfig {
-                        kind: crate::config::TaskKind::Formatter,
-                        executable: tool.executable.clone(),
-                        arguments: Vec::new(),
-                        cwd: None,
-                        environment: BTreeMap::new(),
-                        dependencies: Vec::new(),
-                        timeout_ms: Some(10_000),
-                        stdin: true,
-                        matcher: None,
-                    },
-                );
-                Some((config, tool))
+    fn resolve_task_formatter(
+        &self,
+        name: &str,
+        buffer: BufferId,
+    ) -> Result<Option<crate::tools::ManagedFormatter>, FormatterAdmissionError> {
+        // A configured task takes precedence over a tool with the same name.
+        if let Some(task) = self.configuration.settings().tasks.get(name) {
+            if task.kind == crate::config::TaskKind::Formatter && task.stdin {
+                return Ok(None);
             }
-            _ => None,
+            return Err(FormatterAdmissionError::NotFormatter);
+        }
+        let path = self
+            .state
+            .buffers
+            .get(buffer)
+            .and_then(|buffer| buffer.path.as_deref())
+            .unwrap_or_else(|| std::path::Path::new(""));
+        managed_formatter(|tool| tool.id == name, path)
+            .map(Some)
+            .ok_or(FormatterAdmissionError::Missing)
+    }
+
+    fn formatter_admission_message(&self, name: &str, error: FormatterAdmissionError) -> String {
+        match error {
+            FormatterAdmissionError::NotFormatter => format!("{name:?} is not a formatter"),
+            FormatterAdmissionError::Missing => {
+                self.message("formatter_missing", &[("name", name.into())])
+            }
+        }
+    }
+
+    pub(in crate::app) fn capture_save_task_formatter(
+        &self,
+        name: &str,
+        buffer: BufferId,
+    ) -> Result<FormatterSource, String> {
+        self.resolve_task_formatter(name, buffer)
+            .map_err(|error| match error {
+                FormatterAdmissionError::Missing => format!("No formatter named {name:?}"),
+                other => self.formatter_admission_message(name, other),
+            })?;
+        FormatterSource::capture(&self.state, buffer)
+    }
+
+    pub(in crate::app) fn capture_task_formatter(
+        &self,
+        name: &str,
+        buffer: BufferId,
+    ) -> Result<FormatterSource, String> {
+        self.resolve_task_formatter(name, buffer)
+            .map_err(|error| self.formatter_admission_message(name, error))?;
+        FormatterSource::capture(&self.state, buffer)
+    }
+
+    pub(in crate::app) fn start_task_plan(&mut self, name: &str, adapter: AdapterContext) {
+        let managed = if let AdapterContext::Formatter { source } = &adapter {
+            match self.resolve_task_formatter(name, source.buffer()) {
+                Ok(tool) => tool,
+                Err(error) => {
+                    self.show_error(self.formatter_admission_message(name, error));
+                    return;
+                }
+            }
+        } else {
+            None
         };
+        let managed = managed.map(|tool| {
+            let mut config = self.configuration.settings().clone();
+            config.tasks.insert(
+                name.into(),
+                TaskConfig {
+                    kind: crate::config::TaskKind::Formatter,
+                    executable: tool.executable.clone(),
+                    arguments: Vec::new(),
+                    cwd: None,
+                    environment: BTreeMap::new(),
+                    dependencies: Vec::new(),
+                    timeout_ms: Some(10_000),
+                    stdin: true,
+                    matcher: None,
+                },
+            );
+            (config, tool)
+        });
         match self.tasks.plan(
             name,
             &adapter,
@@ -1187,6 +1386,8 @@ impl App {
         if let Ok(owner) = DiagnosticOwner::new(format!("task:{name}")) {
             self.diagnostics.clear_owner(&owner);
             self.sync_ui_diagnostics();
+        } else {
+            self.refresh_problems_panel();
         }
         self.start_task_step(name.into());
     }
@@ -1216,7 +1417,7 @@ impl App {
 }
 
 impl App {
-    fn apply_formatter_result(&mut self, task: &RunningTask) {
+    fn apply_formatter_result(&mut self, task: &RunningTask) -> bool {
         let transaction = self.transaction_id();
         match self.tasks.formatter_transaction(
             task,
@@ -1233,11 +1434,18 @@ impl App {
             {
                 Ok(()) => {
                     self.notify_message(self.message("formatter_applied", &[]), false);
+                    true
                 }
-                Err(error) => self.show_error(error),
+                Err(error) => {
+                    self.show_error(error);
+                    false
+                }
             },
-            Ok(None) => {}
-            Err(error) => self.show_error(error),
+            Ok(None) => false,
+            Err(error) => {
+                self.show_error(error);
+                false
+            }
         }
     }
 }
@@ -1327,6 +1535,14 @@ impl App {
             .get(name)
             .map_or(title.clone(), |status| format!("{title} · {status}"));
         self.install_surface_picker(PickerSurfaceKind::Output, title, items);
+        if let Some(notice) = self
+            .tasks
+            .rows
+            .get(name)
+            .and_then(|rows| rows.iter().find_map(|row| row.capture_notice))
+        {
+            self.search.set_picker_footer(notice.text());
+        }
         self.search.restore_picker_view(previous, follow_tail);
         self.input.set_picker_normal(normal);
         self.sync_picker_ui();
@@ -1376,7 +1592,8 @@ impl App {
                 crate::app::tasks::TaskUpdate::Finished {
                     task,
                     code,
-                    truncated,
+                    timed_out,
+                    capture_notice,
                     next,
                 } => {
                     if !self.tasks.current(

@@ -6,7 +6,9 @@ use crate::app::App;
 use crate::app::TrustedAction;
 use crate::app::picker::PickerPayload;
 use crate::app::workspace::WorkspaceVersion;
-use crate::process::{JobEvent, JobId, JobPolicy, JobRequest, JobStream, JobSupervisor};
+use crate::process::{
+    AbandonedStreams, JobEvent, JobId, JobPolicy, JobRequest, JobStream, JobSupervisor,
+};
 use crate::tools::{ToolEntry, ToolStatus};
 use crate::workspace::{PickerAction, PickerItem, PickerItemId};
 use serde::Deserialize;
@@ -60,6 +62,7 @@ pub(super) struct CargoBuild {
     stdout: Vec<u8>,
     stderr: Vec<u8>,
     truncated: bool,
+    incomplete_output: AbandonedStreams,
     listing_tests: bool,
 }
 
@@ -517,6 +520,7 @@ impl App {
                     stdout: Vec::new(),
                     stderr: Vec::new(),
                     truncated: false,
+                    incomplete_output: AbandonedStreams::default(),
                     listing_tests,
                 });
             }
@@ -651,7 +655,12 @@ impl App {
                     stream,
                     bytes,
                     truncated,
+                    abandoned,
                 } if job == build.job => {
+                    if abandoned {
+                        build.incomplete_output.insert(stream);
+                        continue;
+                    }
                     let output = if stream == JobStream::Stdout {
                         &mut build.stdout
                     } else {
@@ -679,6 +688,12 @@ impl App {
                 .cargo_build
                 .take()
                 .expect("finished build");
+            if let Some(streams) = build.incomplete_output.names() {
+                self.show_error(format!(
+                    "Some debug build output may be missing ({streams})"
+                ));
+                return;
+            }
             if !success || build.truncated {
                 self.show_error(format!("Debug build failed: {}. Fix the build in the terminal (Ctrl-/), then Space d s", String::from_utf8_lossy(&build.stderr).chars().take(1500).collect::<String>()));
                 return;
