@@ -225,6 +225,12 @@ pub(super) struct TestKey {
     run: Arc<()>,
     pub(super) index: usize,
 }
+impl TestKey {
+    pub(super) fn same(&self, other: &Self) -> bool {
+        self.name == other.name && self.index == other.index && Arc::ptr_eq(&self.run, &other.run)
+    }
+}
+
 struct Plan {
     remaining: VecDeque<(String, TaskConfig)>,
     formatter: Option<crate::tools::ManagedFormatter>,
@@ -751,6 +757,7 @@ impl Tasks {
         self.preflights.retain(|_, step| step.requested != name);
         self.keys.remove(name);
         self.plans.remove(name);
+        let mut clipped = false;
         for (id, task) in &mut self.running {
             if task.requested == name {
                 match self.jobs.cancel(*id) {
@@ -1255,16 +1262,24 @@ use std::time::Instant;
 impl App {
     pub(in crate::app) fn rebuild_matcher_cache(&mut self) {
         self.tasks.configure(self.configuration.settings());
+        self.refresh_problems_panel();
     }
 }
 
 impl App {
     pub(in crate::app) fn stop_task(&mut self, name: &str) {
-        match self.tasks.stop(name) {
+        let stopped = self.tasks.stop(name);
+        self.refresh_problems_panel();
+        match stopped {
             Ok(source) => {
                 if let Some(source) = source {
                     self.diagnostics.clear_source(&source);
                     self.sync_ui_diagnostics();
+                }
+                if self.tasks.active_output() == Some(name)
+                    && self.search.picker_surface() == PickerSurfaceKind::Output
+                {
+                    self.show_output_picker(name);
                 }
                 self.notify_message(
                     self.message("task_stopped", &[("name", name.into())]),
@@ -1603,34 +1618,54 @@ impl App {
                     ) {
                         continue;
                     }
+                    if matches!(task.adapter(), AdapterContext::Test { .. }) {
+                        self.refresh_problems_panel();
+                    }
                     let next_step = next.then(|| task.requested().clone());
+                    let succeeded = !timed_out && code == Some(0);
+                    let linter_ran =
+                        !timed_out && task.is_explicit_linter() && matches!(code, Some(0 | 1));
+                    let lint_warning = capture_notice
+                        .filter(|_| task.is_explicit_linter())
+                        .map(CaptureNotice::lint_warning);
                     if !next {
-                        if code == Some(0) && !truncated {
-                            self.apply_formatter_result(&task);
-                        } else if truncated
-                            && matches!(task.adapter(), AdapterContext::Formatter { .. })
-                        {
-                            self.show_error(self.message("formatter_truncated", &[]));
-                        }
-                        // Whatever the formatter did, the save it was holding back goes on.
-                        if let AdapterContext::Formatter { source } = task.adapter()
-                            && self
+                        if let AdapterContext::Formatter { source } = task.adapter() {
+                            let applied = if succeeded {
+                                match capture_notice {
+                                    Some(CaptureNotice::CLIPPED) => {
+                                        self.show_error(self.message("formatter_truncated", &[]));
+                                        false
+                                    }
+                                    Some(notice) => {
+                                        self.show_error(notice.text());
+                                        false
+                                    }
+                                    None => self.apply_formatter_result(&task),
+                                }
+                            } else {
+                                false
+                            };
+                            // Whatever the formatter did, the save it was holding back goes on.
+                            if self
                                 .format_on_save
                                 .get(&source.buffer())
                                 .is_some_and(|pending| {
                                     pending.formatter.as_ref() == Some(task.requested())
                                 })
-                        {
-                            self.finish_format_on_save(source.buffer());
+                            {
+                                if applied {
+                                    self.note_save_formatter_ran(source.buffer());
+                                }
+                                self.finish_format_on_save(source.buffer());
+                            }
                         }
-                        let linter_ran =
-                            matches!(task.adapter(), AdapterContext::Linter { lint: true, .. })
-                                && matches!(code, Some(0 | 1));
                         if !linter_ran
                             && (!matches!(task.adapter(), AdapterContext::Formatter { .. })
-                                || code != Some(0))
+                                || !succeeded)
                         {
-                            self.notify_message(
+                            let mut notice = if timed_out {
+                                format!("Task {} timed out", task.name())
+                            } else {
                                 self.message(
                                     "task_exited",
                                     &[
@@ -1640,23 +1675,19 @@ impl App {
                                             code.map_or_else(|| "signal".into(), |v| v.to_string()),
                                         ),
                                     ],
-                                ),
-                                code != Some(0),
-                            );
+                                )
+                            };
+                            if let Some(warning) = lint_warning.as_deref() {
+                                notice.push_str(". ");
+                                notice.push_str(warning);
+                            }
+                            self.notify_message(notice, !succeeded);
                         }
                     }
                     // Interpret dependency output too, before advancing to the next step.
-                    let (matched, lint) = match task.adapter() {
-                        AdapterContext::Linter { lint, .. } => (true, *lint),
-                        _ => (false, false),
-                    };
-                    let linter_ran = lint && matches!(code, Some(0 | 1));
-                    if truncated && matches!(task.adapter(), AdapterContext::Linter { .. }) {
-                        self.show_error("linter output truncated; diagnostics not published");
-                    }
-                    if matched
-                        && (linter_ran || !lint)
-                        && !truncated
+                    if capture_notice.is_none()
+                        && !timed_out
+                        && matches!(task.adapter(), AdapterContext::Linter { lint, .. } if linter_ran || !lint)
                         && let Err(error) = self.tasks.begin_linter(
                             *task,
                             &self.state,
@@ -1670,6 +1701,9 @@ impl App {
                     }
                     if let Some(name) = next_step {
                         self.start_task_step(name);
+                    }
+                    if linter_ran && let Some(warning) = lint_warning {
+                        self.notify_warning(warning);
                     }
                 }
                 crate::app::tasks::TaskUpdate::Failed { source, message } => {

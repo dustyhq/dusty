@@ -5053,8 +5053,100 @@ desc = "Tools"
 id = "builtin.global.diagnostics"
 context = "global"
 keys = "<leader> x x"
-command = "diagnostic.open"
-desc = "Diagnostics"
+command = "diagnostic.panel.toggle"
+desc = "Problems panel"
+
+[[keymap]]
+id = "builtin.global.diagnostics-file"
+context = "global"
+keys = "<leader> x X"
+command = "diagnostic.panel.buffer"
+desc = "Problems (this file)"
+
+# Problems panel controls.
+[[keymap]]
+id = "builtin.problems.next-j"
+context = "problems_panel"
+keys = "j"
+command = "diagnostic.panel.next"
+
+[[keymap]]
+id = "builtin.problems.next-down"
+context = "problems_panel"
+keys = "down"
+command = "diagnostic.panel.next"
+
+[[keymap]]
+id = "builtin.problems.previous-k"
+context = "problems_panel"
+keys = "k"
+command = "diagnostic.panel.previous"
+
+[[keymap]]
+id = "builtin.problems.previous-up"
+context = "problems_panel"
+keys = "up"
+command = "diagnostic.panel.previous"
+
+[[keymap]]
+id = "builtin.problems.open"
+context = "problems_panel"
+keys = "enter"
+command = "diagnostic.panel.jump"
+
+[[keymap]]
+id = "builtin.problems.open-close"
+context = "problems_panel"
+keys = "o"
+command = "diagnostic.panel.jump_close"
+
+[[keymap]]
+id = "builtin.problems.close-q"
+context = "problems_panel"
+keys = "q"
+command = "diagnostic.panel.close"
+
+[[keymap]]
+id = "builtin.problems.close-escape"
+context = "problems_panel"
+keys = "escape"
+command = "diagnostic.panel.close"
+
+[[keymap]]
+id = "builtin.problems.focus-left"
+context = "problems_panel"
+keys = "ctrl-h"
+command = "surface.focus.left"
+
+[[keymap]]
+id = "builtin.problems.focus-down"
+context = "problems_panel"
+keys = "ctrl-j"
+command = "surface.focus.down"
+
+[[keymap]]
+id = "builtin.problems.focus-up"
+context = "problems_panel"
+keys = "ctrl-k"
+command = "surface.focus.up"
+
+[[keymap]]
+id = "builtin.problems.focus-right"
+context = "problems_panel"
+keys = "ctrl-l"
+command = "surface.focus.right"
+
+[[keymap]]
+id = "builtin.problems.overflow-left"
+context = "problems_panel"
+keys = "h"
+command = "surface.focus.left"
+
+[[keymap]]
+id = "builtin.problems.overflow-right"
+context = "problems_panel"
+keys = "l"
+command = "surface.focus.right"
 
 [[keymap]]
 id = "builtin.global.debug-breakpoint"

@@ -21,14 +21,14 @@ use tempfile::tempdir;
 fn successful_task_dependencies_publish_their_matched_diagnostics() {
     let root = tempdir().unwrap();
     let state_dir = tempdir().unwrap();
-    fs::write(root.path().join("a.txt"), "source\n").unwrap();
+    fs::write(root.path().join("a.txt"), "éx\n").unwrap();
     let mut loaded = crate::config::load_bundled_config();
     let dependency = crate::config::TaskConfig {
         kind: crate::config::TaskKind::Task,
         executable: "/bin/sh".into(),
         arguments: vec![
             "-c".into(),
-            "printf 'a.txt:1:warning:dependency warning\\n'".into(),
+            "printf 'a.txt:1:3:warning:dependency warning\\n'".into(),
         ],
         cwd: None,
         environment: BTreeMap::new(),
@@ -36,11 +36,11 @@ fn successful_task_dependencies_publish_their_matched_diagnostics() {
         timeout_ms: Some(2000),
         stdin: false,
         matcher: Some(crate::config::ProblemMatcherConfig {
-            pattern: r"(?m)^(?P<path>[^:]+):(?P<line>\d+):(?P<severity>[^:]+):(?P<message>[^\n]+)$"
+            pattern: r"(?m)^(?P<path>[^:]+):(?P<line>\d+):(?P<column>\d+):(?P<severity>[^:]+):(?P<message>[^\n]+)$"
                 .into(),
             path_group: "path".into(),
             line_group: "line".into(),
-            column_group: None,
+            column_group: Some("column".into()),
             column_encoding: None,
             severity_group: Some("severity".into()),
             message_group: "message".into(),
@@ -52,7 +52,7 @@ fn successful_task_dependencies_publish_their_matched_diagnostics() {
     let mut parent = dependency.clone();
     parent.arguments = vec![
         "-c".into(),
-        "printf 'a.txt:1:warning:parent warning\\n'; printf done > parent-finished".into(),
+        "printf 'a.txt:1:3:warning:parent warning\\n'; printf done > parent-finished".into(),
     ];
     parent.dependencies = vec!["dependency".into()];
     loaded.config.tasks.insert("dependency".into(), dependency);
@@ -83,6 +83,9 @@ fn successful_task_dependencies_publish_their_matched_diagnostics() {
         assert!(Instant::now() < deadline, "{:?}", app.ui.notification);
         thread::sleep(Duration::from_millis(2));
     }
+    for (_, row, _) in app.diagnostics.choices() {
+        assert_eq!(app.diagnostics.point(row, &app.state), Some((0, 1)));
+    }
     app.open_builtin_picker(PickerKind::Diagnostics);
     let rows = &app.ui.picker.as_ref().unwrap().rows;
     assert_eq!(rows.len(), 2);
@@ -96,6 +99,76 @@ fn successful_task_dependencies_publish_their_matched_diagnostics() {
             .any(|row| row.label == "a.txt" && row.detail == "parent warning"),
         "{rows:?}"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn clipped_task_output_does_not_fail_the_task_or_block_its_dependent() {
+    let root = tempdir().unwrap();
+    let state_dir = tempdir().unwrap();
+    let mut loaded = crate::config::load_bundled_config();
+    let verbose = crate::config::TaskConfig {
+        kind: crate::config::TaskKind::Task,
+        executable: "/bin/sh".into(),
+        arguments: vec![
+            "-ec".into(),
+            "yes \"$(printf '%4096s' x)\" | head -c 33554432; head -c 2097152 /dev/zero >&2".into(),
+        ],
+        cwd: None,
+        environment: BTreeMap::new(),
+        dependencies: vec![],
+        timeout_ms: Some(20_000),
+        stdin: false,
+        matcher: None,
+    };
+    let parent = crate::config::TaskConfig {
+        arguments: vec!["-ec".into(), "printf done > parent-finished".into()],
+        dependencies: vec!["verbose".into()],
+        ..verbose.clone()
+    };
+    loaded.config.tasks.insert("verbose".into(), verbose);
+    loaded.config.tasks.insert("parent".into(), parent);
+    let mut app = App::new(
+        StartupTarget::Dashboard {
+            root: root.path().into(),
+        },
+        loaded,
+        false,
+        state_dir.path().into(),
+        false,
+        false,
+        std::sync::Arc::new(crate::clock::SystemClock),
+    )
+    .unwrap();
+    prepare_trust_identity(&mut app);
+    for root in app.workspace.roots().to_vec() {
+        app.workspace.fixture_trust_identity(root.identity);
+    }
+    app.reconcile_workspace_trust();
+
+    app.process_effect(AppEffect::TaskRun("parent".into()));
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while app.tasks.is_running("parent") {
+        app.process_execution_preflight();
+        app.process_job_events();
+        assert!(Instant::now() < deadline, "{:?}", app.ui.notification);
+        thread::yield_now();
+    }
+    let output = &app.tasks.rows["parent"];
+    assert!(
+        output.iter().any(|row| row.text == "[verbose · exit 0]"),
+        "verbose task did not exit successfully: {:?}",
+        output.last().map(|row| &row.text)
+    );
+    assert_eq!(
+        output
+            .iter()
+            .filter(|row| row.text == "Output too long; some text was cut")
+            .count(),
+        1
+    );
+    assert_eq!(app.tasks.statuses["parent"], "succeeded");
+    assert!(root.path().join("parent-finished").exists());
 }
 
 #[cfg(unix)]
@@ -246,6 +319,73 @@ fn task_formatter_uses_authorized_worker_and_refuses_reloaded_snapshot() {
 
 #[cfg(unix)]
 #[test]
+fn format_run_refuses_an_ordinary_task_without_changing_the_buffer() {
+    let root = tempdir().unwrap();
+    let state_dir = tempdir().unwrap();
+    let mut loaded = crate::config::load_bundled_config();
+    loaded.config.tasks.insert(
+        "build".into(),
+        crate::config::TaskConfig {
+            kind: crate::config::TaskKind::Task,
+            executable: "/bin/sh".into(),
+            arguments: vec![
+                "-ec".into(),
+                "cat >/dev/null; printf wrong > build-ran".into(),
+            ],
+            cwd: None,
+            environment: BTreeMap::new(),
+            dependencies: vec![],
+            timeout_ms: Some(2000),
+            stdin: false,
+            matcher: None,
+        },
+    );
+    let mut app = App::new(
+        StartupTarget::Dashboard {
+            root: root.path().into(),
+        },
+        loaded,
+        false,
+        state_dir.path().into(),
+        false,
+        false,
+        std::sync::Arc::new(crate::clock::SystemClock),
+    )
+    .unwrap();
+    app.window_session.observe_size((80, 24));
+    let (buffer, _) = app
+        .state
+        .open_text(TextBuffer::from_text("keep this code\n"), None)
+        .unwrap();
+    app.set_dashboard_visibility(false);
+    app.reconcile_editor_windows();
+    prepare_trust_identity(&mut app);
+    for root in app.workspace.roots().to_vec() {
+        app.workspace.fixture_trust_identity(root.identity);
+    }
+    app.reconcile_workspace_trust();
+
+    app.process_effect(AppEffect::FormatRun("build".into()));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while app.tasks.is_running("build") {
+        app.process_execution_preflight();
+        app.process_job_events();
+        assert!(Instant::now() < deadline, "{:?}", app.ui.notification);
+        thread::yield_now();
+    }
+    assert_eq!(
+        app.state.buffers[buffer].text.to_string(),
+        "keep this code\n"
+    );
+    assert!(!root.path().join("build-ran").exists());
+    assert_eq!(
+        app.ui.notification.as_deref(),
+        Some("\"build\" is not a formatter")
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn a_task_inherits_the_shell_environment_and_its_own_settings_win() {
     let root = tempdir().unwrap();
     let state_dir = tempdir().unwrap();
@@ -317,7 +457,7 @@ fn linter_job_and_vfs_publish_only_original_source_then_recover() {
             executable: "/bin/sh".into(),
             arguments: vec![
                 "-c".into(),
-                "printf 'open.txt:1:1:open message\ndisk.txt:1:1:disk message\n'".into(),
+                "printf 'open.txt:1:1:open message\ndisk.txt:1:1:disk message\n'; if [ -e hold-stderr ]; then sleep 4 >/dev/null & fi".into(),
             ],
             cwd: None,
             environment: BTreeMap::new(),
@@ -366,9 +506,38 @@ fn linter_job_and_vfs_publish_only_original_source_then_recover() {
         app.workspace.fixture_trust_identity(root.identity.clone());
     }
     app.reconcile_workspace_trust();
-    for stale in [true, false] {
+    for (stale, incomplete) in [(true, false), (false, true), (false, false)] {
+        let hold = root.path().join("hold-stderr");
+        if incomplete {
+            fs::write(&hold, []).unwrap();
+        }
         app.process_effect(AppEffect::LintRun("owned-lint".into()));
-        let deadline = Instant::now() + Duration::from_secs(3);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        if incomplete {
+            let warning = "No lint results shown: some error output may be missing";
+            while app.ui.notification.as_deref() != Some(warning) {
+                app.process_execution_preflight();
+                app.process_job_events();
+                app.process_vfs_results();
+                assert!(
+                    Instant::now() < deadline,
+                    "lint did not warn: {:?}",
+                    app.notices.history().collect::<Vec<_>>()
+                );
+                thread::sleep(Duration::from_millis(2));
+            }
+            assert!(app.ui.notification_warning);
+            assert_eq!(app.tasks.linter_count(), 0);
+            assert_eq!(app.diagnostics.choices().count(), 0);
+            assert!(
+                app.tasks
+                    .output_items("owned-lint")
+                    .iter()
+                    .any(|(row, _)| { row.label.contains("open.txt:1:1:open message") })
+            );
+            fs::remove_file(hold).unwrap();
+            continue;
+        }
         while app.tasks.linter_count() == 0 && Instant::now() < deadline {
             app.process_execution_preflight();
             app.process_job_events();
@@ -638,6 +807,176 @@ fn finished_output_keeps_its_name_exit_status_and_source_location() {
     };
     assert_eq!(source.path, root.path().join("nested/src/main.rs"));
     assert_eq!((source.line, source.column), (1, 2));
+}
+
+#[test]
+fn stop_keeps_the_clipping_note_in_the_open_output_footer() {
+    let (_dirs, mut app) = app();
+    let (buffer, _) = app
+        .state
+        .open_text(TextBuffer::from_text("text"), None)
+        .unwrap();
+    let revision = app.configuration.binding_revision();
+    app.tasks
+        .fixture_formatter_result("task", buffer, b"", &app.state, &app.workspace, revision);
+    app.tasks
+        .append_output_status("task", "before clipping".into());
+    app.show_output_picker("task");
+    assert!(app.search.picker_follows_tail());
+    app.tasks.events.push_front(JobEvent::Output {
+        job: JobId(1000),
+        stream: JobStream::Stdout,
+        bytes: Vec::new(),
+        truncated: true,
+        abandoned: false,
+    });
+    app.stop_task("task");
+    app.process_job_events();
+    assert!(app.search.picker_follows_tail());
+    assert_eq!(
+        app.ui.picker.as_ref().unwrap().footer.as_deref(),
+        Some("Output too long; some text was cut")
+    );
+    assert_eq!(app.tasks.statuses["task"], "cancelled");
+    let items = app.tasks.output_items("task");
+    assert_eq!(items.len(), 2);
+    assert_eq!(items[1].0.label, "Output too long; some text was cut");
+}
+
+#[cfg(unix)]
+#[test]
+fn stop_keeps_clipping_before_the_marker_reaches_the_app_queue() {
+    let (root, _editor, _workspace, mut tasks) = fixture();
+    tasks.jobs = JobSupervisor::new(256);
+    tasks.events.clear();
+    let job = tasks
+        .jobs
+        .start(JobRequest {
+            program: "/bin/sh".into(),
+            argv0: None,
+            arguments: vec![
+                "-c".into(),
+                "i=0; while [ \"$i\" -lt 301 ]; do printf 'x\\n'; i=$((i + 1)); done".into(),
+            ],
+            cwd: root.path().into(),
+            environment: BTreeMap::new(),
+            root_revision: 1,
+            stdin: None,
+            policy: JobPolicy {
+                maximum_output_bytes: 600,
+                timeout: Duration::from_secs(10),
+                ..JobPolicy::default()
+            },
+        })
+        .unwrap();
+    let task = tasks.running.remove(&JobId(1000)).unwrap();
+    tasks.running.insert(job, task);
+    // At least 300 output records precede the marker, so Stop's single poll
+    // (at most 256 events) cannot see it.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !tasks.jobs.output_clipped(job) {
+        assert!(Instant::now() < deadline, "reader never reached the cap");
+        thread::yield_now();
+    }
+    tasks.stop("task").unwrap();
+    let rows = tasks.output_items("task");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].0.label, "Output too long; some text was cut");
+}
+
+#[test]
+fn incomplete_lint_output_warns_instead_of_publishing_partial_results() {
+    for (code, timed_out, abandoned, expected) in [
+        (
+            Some(7),
+            false,
+            false,
+            "task lint exited (7). No lint results shown: output was too long",
+        ),
+        (
+            None,
+            true,
+            false,
+            "Task lint timed out. No lint results shown: output was too long",
+        ),
+        (
+            Some(0),
+            false,
+            true,
+            "No lint results shown: output was too long and some error output may be missing",
+        ),
+    ] {
+        let (_dirs, mut app) = app();
+        let (buffer, _) = app
+            .state
+            .open_text(TextBuffer::from_text("text"), None)
+            .unwrap();
+        app.tasks.fixture_formatter_result(
+            "lint",
+            buffer,
+            b"",
+            &app.state,
+            &app.workspace,
+            app.configuration.binding_revision(),
+        );
+        let job = JobId(1000);
+        app.tasks.running.get_mut(&job).unwrap().adapter = AdapterContext::Linter {
+            lint: true,
+            matcher: crate::config::ProblemMatcherConfig {
+                pattern: String::new(),
+                path_group: "path".into(),
+                line_group: "line".into(),
+                column_group: None,
+                column_encoding: None,
+                severity_group: None,
+                message_group: "message".into(),
+                name_group: None,
+                status_group: None,
+                duration_group: None,
+            },
+        };
+        app.tasks.events.clear();
+        if abandoned {
+            app.tasks.events.push_back(JobEvent::Output {
+                job,
+                stream: JobStream::Stdout,
+                bytes: Vec::new(),
+                truncated: true,
+                abandoned: false,
+            });
+        }
+        app.tasks.events.extend([
+            JobEvent::Output {
+                job,
+                stream: JobStream::Stderr,
+                bytes: Vec::new(),
+                truncated: true,
+                abandoned,
+            },
+            JobEvent::Exited {
+                job,
+                code,
+                timed_out,
+            },
+        ]);
+        app.process_job_events();
+        assert_eq!(
+            app.tasks.statuses["lint"],
+            if abandoned {
+                "process exited"
+            } else {
+                "failed"
+            }
+        );
+        assert_eq!(app.ui.notification_error, !abandoned);
+        assert_eq!(app.ui.notification_warning, abandoned);
+        assert_eq!(app.ui.notification.as_deref(), Some(expected));
+        if abandoned {
+            assert!(app.tasks.output_items("lint").iter().any(|(row, _)| {
+                row.label == "Some task output may be missing (standard error); output was too long"
+            }));
+        }
+    }
 }
 
 #[test]
@@ -960,4 +1299,134 @@ fn task_owner_rejects_stale_plans_and_formatter_instances_before_materialization
     assert!(owner.resolve_test(&key).is_some());
     owner.cancel_workspace_tasks();
     assert!(owner.resolve_test(&key).is_none());
+}
+
+#[test]
+fn problems_uses_workspace_paths_and_drops_failed_tests_after_config_reload() {
+    use crate::app::diagnostics::{DiagnosticBatch, DiagnosticDocument, DiagnosticValidity};
+    use crate::app::tests::driver::TestSession;
+    use crate::editor::text::{ByteRange, PositionEncoding};
+    use crate::ui::render::problems::ProblemsRow;
+    use crate::workspace::{Diagnostic, DiagnosticSeverity};
+
+    let mut loaded = crate::config::load_bundled_config();
+    let matcher = crate::config::ProblemMatcherConfig {
+        pattern: r"(?m)^(?P<status>\S+) (?P<path>[^:]+):(?P<line>\d+):(?P<column>\d+) (?P<message>[^\n]+)$".into(),
+        path_group: "path".into(),
+        line_group: "line".into(),
+        column_group: Some("column".into()),
+        column_encoding: Some(PositionEncoding::Utf8),
+        severity_group: None,
+        message_group: "message".into(),
+        name_group: None,
+        status_group: Some("status".into()),
+        duration_group: None,
+    };
+    loaded.config.tasks.insert(
+        "unit".into(),
+        TaskConfig {
+            kind: crate::config::TaskKind::Test,
+            executable: crate::files::absolute_test_path("/usr/bin/fixture-test"),
+            arguments: vec![],
+            cwd: None,
+            environment: BTreeMap::new(),
+            dependencies: vec![],
+            timeout_ms: None,
+            stdin: false,
+            matcher: Some(matcher.clone()),
+        },
+    );
+    let mut session = TestSession::new(loaded);
+    let app = session.application_mut();
+    let root = app.state.workspace_root.clone();
+    let path = root.join("src/a.rs");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, "éx\n").unwrap();
+    let (buffer, view) = app
+        .state
+        .open_text(TextBuffer::from_text("éx\n"), Some(path.clone()))
+        .unwrap();
+    app.set_dashboard_visibility(false);
+    app.reconcile_editor_windows();
+    let producer = DiagnosticProducer::new(DiagnosticOwner::new("lsp.fixture").unwrap());
+    let uri = crate::language::lsp::file_uri(&path);
+    app.diagnostics.activate(producer.clone());
+    app.diagnostics
+        .publish(
+            DiagnosticBatch {
+                producer,
+                uri: uri.clone(),
+                document: DiagnosticDocument::capture(&app.state, buffer),
+                validity: DiagnosticValidity::UnversionedReport,
+                disk_points: Default::default(),
+                items: vec![Diagnostic {
+                    uri,
+                    version: None,
+                    range: ByteRange::new(ByteOffset(2), ByteOffset(3)).unwrap(),
+                    severity: DiagnosticSeverity::Warning,
+                    source: "fixture".into(),
+                    code: None,
+                    message: "nearby warning".into(),
+                    related: vec![],
+                    tags: vec![],
+                    fixes: vec![],
+                    data: None,
+                    timestamp: std::time::SystemTime::UNIX_EPOCH,
+                }],
+            },
+            &app.state,
+        )
+        .unwrap();
+    app.sync_ui_diagnostics();
+    let adapter = AdapterContext::Test { matcher };
+    app.tasks
+        .plan_checked(
+            "unit",
+            &adapter,
+            app.configuration.settings(),
+            &app.workspace,
+            app.configuration.binding_revision(),
+        )
+        .unwrap();
+    let report = if cfg!(windows) {
+        b"FAILED .\\src\\a.rs:1:3 failure\n"
+    } else {
+        b"FAILED ./src/a.rs:1:3 failure\n"
+    };
+    let task = RunningTask {
+        output: report.to_vec(),
+        cancelled: false,
+        key: app.tasks.keys["unit"].clone(),
+        diagnostic_source: None,
+        requested: "unit".into(),
+        name: "unit".into(),
+        adapter,
+        root: root.clone(),
+        cwd: root,
+    };
+    app.tasks.apply_test_result(&task);
+    let test_key = app.tasks.failed_tests()[0].3.clone();
+    for key in ["space", "x", "X"] {
+        session.key(key);
+    }
+    let app = session.application();
+    let panel = app.ui.problems_panel.as_ref().unwrap();
+    assert!(matches!(&*panel.rows, [ProblemsRow::File { count: 2, .. },
+        ProblemsRow::Problem { message, location, .. },
+        ProblemsRow::Problem { message: warning, location: diagnostic_location, .. }]
+        if message == "test: failure" && warning == "nearby warning"
+            && location == "1:2" && diagnostic_location == location));
+    session.key("enter");
+    assert_eq!(
+        session.application().state.views[view].cursor,
+        ByteOffset(2)
+    );
+    session
+        .apply_candidate(crate::config::load_bundled_config())
+        .unwrap();
+    let app = session.application();
+    assert!(app.tasks.resolve_test(&test_key).is_none());
+    let panel = app.ui.problems_panel.as_ref().unwrap();
+    assert!(matches!(&*panel.rows, [ProblemsRow::File { count: 1, .. },
+        ProblemsRow::Problem { message, .. }] if message == "nearby warning"));
 }

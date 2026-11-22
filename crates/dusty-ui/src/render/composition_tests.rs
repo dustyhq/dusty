@@ -201,6 +201,7 @@ pub(super) fn attach_test_compositor(
             terminal: terminal_window,
             dashboard: dashboard_window,
             picker: picker_window.map(|(window, _)| window),
+            problems_panel: None,
         },
     });
 }
@@ -2263,8 +2264,8 @@ fn key_hints_anchor_clip_and_preserve_protected_rows() {
 #[test]
 fn key_hints_use_available_rows_and_stay_inside_a_lower_workspace() {
     let hints = crate::render::KeyHintUiState {
-        prefix: "space".into(),
-        rows: (0..8)
+        prefix: "space u".into(),
+        rows: (0..12)
             .map(|index| crate::render::KeyHintUiRow {
                 next_key: index.to_string(),
                 label: format!("Action {index}"),
@@ -2294,7 +2295,7 @@ fn key_hints_use_available_rows_and_stay_inside_a_lower_workspace() {
     for index in 0..8 {
         assert!((30..37).any(|y| frame.grid.row_text(y).contains(&format!("Action {index}"))));
     }
-    for y in (0..30).chain(37..40) {
+    for y in (0..30).chain(36..40) {
         assert!(
             (0..80)
                 .all(|x| frame.grid.get(x, y).unwrap().style == crate::Style::TerminalBackground)

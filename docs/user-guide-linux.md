@@ -160,7 +160,9 @@ Text-entry modes keep `?` as text, and the editor/dashboard retain their existin
 
 ## Diagnostics and LSP
 
-Diagnostics render directly beside the affected source line. Navigating to a diagnostic expands every matching message for that line below it.
+Diagnostic messages appear beside the affected source line by default. Navigating to a diagnostic expands every matching message for that line below it.
+
+**Turning things off:** `Space u d` toggles messages beside code for now. To set a default, use **Settings → Messages Beside Code**, or set `inline_diagnostics = "off"` (or `"errors"`) under `[lsp]`. Underlines and gutter marks stay visible, and `Space x x` still lists problems. `Space u c` toggles completion while typing; to set a default, use **Settings → Completion While Typing** or set `auto_completion = false` under `[lsp]`. `Ctrl-Space` still opens completion. Both toggles reset to their configured values whenever Dusty reloads its config, even on an automatic reload. `Space u h` toggles inlay hints; set `inlay_hints = false` under `[lsp]` to turn them off by default.
 
 | Action | Next | Previous |
 |---|---|---|
@@ -169,7 +171,7 @@ Diagnostics render directly beside the affected source line. Navigating to a dia
 | Error or warning | `]d` | `[d` |
 | Git hunk | `]h` | `[h` |
 
-`Space x x` opens all workspace problems. The status line shows error/warning counts for the active buffer.
+`Space x x` toggles the **Problems panel** below the editor; `Space x X` opens it for just the current file. It groups diagnostics and failed tests by file and updates while you edit, even when messages beside code are off. Use `j`/`k` or the arrows to move, `Enter` (or double-click) to jump and keep the panel open, `o` to jump and close it, and `q` or `Esc` to close it. `Ctrl-k` moves focus up. `]d` and `[d` also select the problem you jump to in the panel. Use `Space s d` for the floating, searchable Problems picker. The status line shows error/warning counts for the active buffer.
 
 For an existing named file, LSP synchronization uses every in-memory buffer revision. Saving is **not** required for diagnostics, completion, hover, semantic data, or inlay hints to update. Server startup still requires a named file inside a recognized project and a trusted workspace.
 

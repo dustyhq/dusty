@@ -12,6 +12,8 @@ use crate::windows::WindowId;
 pub(in crate::app) enum FocusTarget {
     #[default]
     Editor,
+    ProblemsPanel,
+    Agent,
     Explorer(u64),
     Terminal(u64),
     Plugin(WindowId),
@@ -105,6 +107,9 @@ impl Windows {
             return;
         };
         match self.core.native.target_for_window(window) {
+            Some(NativeSurfaceTarget::Picker(crate::ui::PickerSurfaceKind::ProblemsPanel)) => {
+                self.focus = FocusTarget::ProblemsPanel;
+            }
             Some(NativeSurfaceTarget::Picker(_)) => {} // temporary capture, not terminal selection
             Some(NativeSurfaceTarget::Explorer) => self.focus = FocusTarget::Explorer(1),
             Some(NativeSurfaceTarget::ExplorerView(view)) => {

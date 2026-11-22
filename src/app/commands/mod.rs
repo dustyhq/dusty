@@ -474,6 +474,7 @@ pub enum AppEffect {
     SnippetCancel,
     LspFoldToggle,
     LspSelectionExpand,
+    ProblemsPanel(crate::app::diagnostics::problems::PanelCommand),
     DiagnosticNavigate {
         direction: i8,
         filter: DiagnosticFilter,
@@ -1108,7 +1109,7 @@ impl App {
             effect @ (AppEffect::LspDocumentationScroll(..) | AppEffect::LspDocumentationClose) => {
                 self.process_documentation_effect(effect)
             }
-            effect @ AppEffect::DiagnosticNavigate { .. } => {
+            effect @ (AppEffect::DiagnosticNavigate { .. } | AppEffect::ProblemsPanel(_)) => {
                 self.process_diagnostics_effect(effect)
             }
             effect @ (AppEffect::HelpForForm

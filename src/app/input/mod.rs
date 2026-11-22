@@ -1842,7 +1842,13 @@ impl App {
             transaction_id,
             extend_selection,
         );
+        let focus_editor = !extend_selection
+            && self.window_session.focus() == crate::app::windows::FocusTarget::ProblemsPanel;
         let Some(plan) = plan else {
+            // A press below EOF still targets the pane, just not a cursor position.
+            if focus_editor {
+                self.focus_mouse_pane();
+            }
             return;
         };
         self.diagnostics.dismiss_expansion();
@@ -1855,7 +1861,24 @@ impl App {
                 return;
             }
         };
-        if let Err(error) = self.apply_authoritative_editor_transaction(transaction) {
+        // The mouse transaction already selects the pane. If Problems owns keyboard
+        // focus, commit that gesture with an explicit editor focus target as well.
+        let focus = if focus_editor {
+            match self.window_session.plan_focus(
+                pane_id,
+                &self.state.window_version(),
+                self.extension.contributions().version(),
+            ) {
+                Ok(plan) => Some(plan),
+                Err(error) => {
+                    self.show_error(error);
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+        if let Err(error) = self.commit_editor_transaction(transaction, focus) {
             self.show_error(error);
         } else {
             let source = self.state.window_version();
@@ -1869,6 +1892,21 @@ impl App {
             });
             self.input.accept_mouse_plan(plan, &source, current);
             self.ensure_cursor_visible();
+        }
+    }
+}
+
+pub(super) struct DockDrag {
+    terminal: PtyId,
+    edge: DockEdge,
+    axis_position: u16,
+}
+
+impl DockDrag {
+    fn axis_position(edge: DockEdge, column: u16, row: u16) -> u16 {
+        match edge {
+            DockEdge::Left | DockEdge::Right => column,
+            DockEdge::Top | DockEdge::Bottom => row,
         }
     }
 }
@@ -1903,18 +1941,34 @@ impl App {
                         } && rect_contains_point(rect, column, row);
                         on_edge.then_some((id, edge))
                     });
-                self.dock_drag = edge_at.map(|(id, _)| id);
+                self.dock_drag = edge_at.map(|(terminal, edge)| DockDrag {
+                    terminal,
+                    edge,
+                    axis_position: DockDrag::axis_position(edge, column, row),
+                });
                 // The bottom panel's top row holds its tabs, so a click there still picks one.
                 edge_at.is_some_and(|(_, edge)| matches!(edge, DockEdge::Left | DockEdge::Right))
             }
             Some(TerminalMouseInput::LeftDrag) => {
-                let Some(id) = self.dock_drag else {
+                let Some(drag) = &self.dock_drag else {
                     return false;
                 };
-                let Some((edge, rect)) = docked(self, id) else {
+                let id = drag.terminal;
+                let Some((edge, rect)) = docked(self, id).filter(|(edge, _)| *edge == drag.edge)
+                else {
                     self.dock_drag = None;
                     return false;
                 };
+                let axis_position = DockDrag::axis_position(edge, column, row);
+                if axis_position == drag.axis_position {
+                    // Motion along the border is not a resize, even if Problems clips the dock.
+                    return true;
+                }
+                self.dock_drag = Some(DockDrag {
+                    terminal: id,
+                    edge,
+                    axis_position,
+                });
                 let (width, height) = (self.window_session.width(), self.window_session.height());
                 let size = match edge {
                     DockEdge::Right => rect.x.saturating_add(rect.width).saturating_sub(column),
@@ -1977,6 +2031,10 @@ impl App {
     fn handle_border_drag(&mut self, key: &KeyEvent, column: u16, row: u16) -> bool {
         use crate::editor::input::TerminalMouseInput;
         use crate::windows::TileAxis;
+        let mouse = key.terminal_mouse();
+        if mouse == Some(TerminalMouseInput::LeftUp) {
+            return self.border_drag.take().is_some();
+        }
         let Some(projection) = self.compositor_projection() else {
             return false;
         };
@@ -1987,7 +2045,7 @@ impl App {
                 .filter(|window| rect_contains_point(window.rect, x, y))
                 .find_map(|window| self.state.window_view(window.window).map(|_| window.window))
         };
-        match key.terminal_mouse() {
+        match mouse {
             Some(TerminalMouseInput::LeftDown) => {
                 let sides = projection
                     .borders
@@ -2068,11 +2126,15 @@ impl App {
                     .set_split_ratio_between(first, second, u16::try_from(ratio).unwrap_or(900))
                     .is_ok()
                 {
-                    self.reconcile_editor_windows();
+                    if self.problems_panel.is_some() {
+                        self.resize_active_terminal_to_panel();
+                        self.sync_terminal_panel();
+                    } else {
+                        self.reconcile_editor_windows();
+                    }
                 }
                 true
             }
-            Some(TerminalMouseInput::LeftUp) => self.border_drag.take().is_some(),
             _ => false,
         }
     }
@@ -2398,6 +2460,19 @@ impl App {
             }
             UiEvent::Mouse { key, column, row } => {
                 self.input.observe_mouse(column, row);
+                // Captured drags don't depend on the surface under the pointer.
+                // The initial press still goes through the usual border and tab hit tests.
+                if matches!(
+                    key.terminal_mouse(),
+                    Some(
+                        crate::editor::input::TerminalMouseInput::LeftDrag
+                            | crate::editor::input::TerminalMouseInput::LeftUp
+                    )
+                ) && ((self.dock_drag.is_some() && self.handle_dock_drag(&key, column, row))
+                    || (self.border_drag.is_some() && self.handle_border_drag(&key, column, row)))
+                {
+                    return;
+                }
                 if self.ui.settings.is_some()
                     && self.ui.picker.is_none()
                     && self.input.prompt().is_none()
@@ -2430,6 +2505,9 @@ impl App {
                         }
                         _ => {}
                     }
+                }
+                if self.handle_problems_mouse(&key, column, row) {
+                    return;
                 }
                 let over_floating = self.compositor_projection().is_some_and(|projection| {
                     projection
@@ -2776,6 +2854,9 @@ impl App {
                     TerminalPanelMode::Visual => "terminal_visual",
                 })
                 .into();
+        }
+        if self.window_session.focus() == crate::app::windows::FocusTarget::ProblemsPanel {
+            return "problems_panel".into();
         }
         if self.ui.language_completion.is_some() {
             return "completion".into();

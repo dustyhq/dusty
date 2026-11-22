@@ -212,19 +212,8 @@ impl App {
             .iter()
             .find(|(_, buffer)| buffer.path.as_ref() == Some(&source.path))
         {
-            let position = document
-                .text
-                .line_to_byte(source.line)
-                .ok()
-                .map(|offset| {
-                    ByteOffset(
-                        offset
-                            .get()
-                            .saturating_add(source.column)
-                            .min(document.text.len_bytes()),
-                    )
-                })
-                .filter(|offset| document.text.validate_offset(*offset).is_ok())
+            let position = PositionCodec::new(&document.text)
+                .lsp_to_byte(source.line, source.column, source.encoding)
                 .unwrap_or(ByteOffset(0));
             let transaction = self.transaction_id();
             match self
@@ -356,8 +345,9 @@ impl App {
             self.show_error(error);
         } else {
             self.diagnostics
-                .expand(key, filter.severities(), &self.state);
+                .expand(key.clone(), filter.severities(), &self.state);
             self.sync_ui_diagnostics();
+            self.select_panel_diagnostic(&key);
             self.clear_notice();
             self.ensure_cursor_visible();
         }

@@ -162,6 +162,7 @@ impl App {
         };
         self.diagnostics.publish(
             DiagnosticBatch {
+                disk_points: Default::default(),
                 producer,
                 uri,
                 document: Some(document),

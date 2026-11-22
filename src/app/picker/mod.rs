@@ -1181,61 +1181,63 @@ impl App {
     pub(in crate::app) fn open_builtin_picker(&mut self, kind: PickerKind) {
         match kind {
             PickerKind::Diagnostics => {
-                let mut items: Vec<_> = self
-                    .diagnostics
-                    .choices()
+                use crate::app::diagnostics::problems::ProblemEntry;
+
+                let items = self
+                    .problem_entries()
                     .enumerate()
-                    .map(|(index, (key, problem, _))| {
-                        let id = PickerItemId(format!("diagnostic:{index}:{}", problem.uri));
-                        let path = path_from_file_uri(&problem.uri);
-                        let line = path.as_ref().and_then(|path| {
-                            let open = self
-                                .state
-                                .buffers
-                                .iter()
-                                .find(|(_, buffer)| buffer.path.as_ref() == Some(path));
-                            open?.1.text.byte_to_line(problem.range.start).ok()
-                        });
-                        let place = path.map_or_else(
-                            || problem.uri.clone(),
-                            |path| self.workspace_relative_label(&path),
-                        );
-                        let place =
-                            line.map_or(place.clone(), |line| format!("{place}:{}", line + 1));
-                        // Where comes first: at any width the row says which file to look at.
-                        let message = problem.message.lines().map(str::trim).collect::<Vec<_>>();
-                        (
-                            PickerItem {
-                                badge: String::new(),
-                                kind: crate::workspace::PickerItemKind::Entry,
-                                id,
-                                label: place,
-                                detail: message.join(" "),
-                                source: problem.source.clone(),
-                                action: PickerAction::None,
-                            },
-                            PickerPayload::Diagnostic(key),
-                        )
+                    .map(|(index, entry)| match entry {
+                        ProblemEntry::Diagnostic(key, problem) => {
+                            let id = PickerItemId(format!("diagnostic:{index}:{}", problem.uri));
+                            let path = path_from_file_uri(&problem.uri);
+                            let line = path.as_ref().and_then(|path| {
+                                let open = self
+                                    .state
+                                    .buffers
+                                    .iter()
+                                    .find(|(_, buffer)| buffer.path.as_ref() == Some(path));
+                                open?.1.text.byte_to_line(problem.range.start).ok()
+                            });
+                            let place = path.map_or_else(
+                                || problem.uri.clone(),
+                                |path| self.workspace_relative_label(&path),
+                            );
+                            let place =
+                                line.map_or(place.clone(), |line| format!("{place}:{}", line + 1));
+                            // Where comes first: at any width the row says which file to look at.
+                            let message =
+                                problem.message.lines().map(str::trim).collect::<Vec<_>>();
+                            (
+                                PickerItem {
+                                    badge: String::new(),
+                                    kind: crate::workspace::PickerItemKind::Entry,
+                                    id,
+                                    label: place,
+                                    detail: message.join(" "),
+                                    source: problem.source.clone(),
+                                    action: PickerAction::None,
+                                },
+                                PickerPayload::Diagnostic(key),
+                            )
+                        }
+                        ProblemEntry::Test(path, line, summary, key) => {
+                            let place = self.workspace_relative_label(&path);
+                            let summary = summary.lines().map(str::trim).collect::<Vec<_>>();
+                            (
+                                PickerItem {
+                                    badge: String::new(),
+                                    kind: crate::workspace::PickerItemKind::Entry,
+                                    id: PickerItemId(format!("test:{}:{}", key.name, key.index)),
+                                    label: format!("{place}:{}", line + 1),
+                                    detail: summary.join(" "),
+                                    source: key.name.clone(),
+                                    action: PickerAction::None,
+                                },
+                                PickerPayload::TaskTest(key),
+                            )
+                        }
                     })
                     .collect();
-                items.extend(self.tasks.failed_tests().into_iter().map(
-                    |(path, line, summary, key)| {
-                        let place = self.workspace_relative_label(&path);
-                        let summary = summary.lines().map(str::trim).collect::<Vec<_>>();
-                        (
-                            PickerItem {
-                                badge: String::new(),
-                                kind: crate::workspace::PickerItemKind::Entry,
-                                id: PickerItemId(format!("test:{}:{}", key.name, key.index)),
-                                label: format!("{place}:{}", line + 1),
-                                detail: summary.join(" "),
-                                source: key.name.clone(),
-                                action: PickerAction::None,
-                            },
-                            PickerPayload::TaskTest(key),
-                        )
-                    },
-                ));
                 self.install_surface_picker(
                     PickerSurfaceKind::Problems,
                     self.message("picker_diagnostics_title", &[]),
@@ -1969,14 +1971,7 @@ impl App {
             Some(PickerPayload::LspLocation(location, encoding)) => {
                 self.navigate_lsp_location_encoded(&location, encoding)
             }
-            Some(PickerPayload::Diagnostic(key)) => {
-                if let Some(row) = self.diagnostics.resolve(&key, &self.state) {
-                    let (uri, range) = (row.uri.clone(), row.range);
-                    self.navigate_byte_location(&uri, range);
-                } else {
-                    self.show_error("diagnostic source is stale");
-                }
-            }
+            Some(PickerPayload::Diagnostic(key)) => self.jump_to_problem_diagnostic(&key),
             Some(PickerPayload::CodeAction(_)) => {
                 let offered = match code_action.expect("selected code action") {
                     Ok(offered) => offered,
@@ -2126,13 +2121,7 @@ impl App {
                 }
             }
             Some(PickerPayload::TaskOutput(name)) => self.show_output_picker(&name),
-            Some(PickerPayload::TaskTest(key)) => {
-                if let Some(source) = self.tasks.resolve_test(&key) {
-                    self.navigate_matcher_source(source);
-                } else {
-                    self.show_error("test result source is stale");
-                }
-            }
+            Some(PickerPayload::TaskTest(key)) => self.jump_to_problem_test(&key),
             Some(PickerPayload::MatcherSource(source)) => self.navigate_matcher_source(source),
             Some(PickerPayload::PersistedLocation(location)) => {
                 self.navigate_persisted_location(location)

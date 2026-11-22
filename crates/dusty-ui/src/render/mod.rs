@@ -87,6 +87,7 @@ pub use editor::workspace_title;
 use overlays::content_tab_width;
 
 use picker::render_picker;
+pub mod problems;
 
 use plugins::render_plugin_surface;
 
@@ -815,6 +816,8 @@ pub enum PickerSurfaceKind {
     #[default]
     Generic,
     Problems,
+    /// The native dock; unlike the picker, it does not capture input when unfocused.
+    ProblemsPanel,
     Output,
     Logs,
     Debug,
@@ -1249,6 +1252,7 @@ pub struct NativeSurfaceWindowBinding {
     pub terminal: Option<(u64, WindowId)>,
     pub dashboard: Option<WindowId>,
     pub picker: Option<WindowId>,
+    pub problems_panel: Option<WindowId>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1470,6 +1474,7 @@ pub struct UiState {
     pub diagnostics: Vec<UiDiagnostic>,
     pub expanded_diagnostic: Option<ExpandedDiagnosticState>,
     pub picker: Option<PickerUiState>,
+    pub problems_panel: Option<problems::ProblemsPanelUi>,
     /// The operation bar: present only while an operation with a lifecycle is paused, so its
     /// presence is itself the statement that something is in progress.
     pub operation_bar: Option<OperationBarState>,

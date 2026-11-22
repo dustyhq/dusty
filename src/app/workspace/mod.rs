@@ -1185,6 +1185,7 @@ impl App {
             }
         }
         self.tasks.cancel_workspace_tasks();
+        self.refresh_problems_panel();
         self.clear_git_status();
         self.search.cancel();
         if self.workspace_edits.preparing() || self.workspace_edits.proposal().is_some() {

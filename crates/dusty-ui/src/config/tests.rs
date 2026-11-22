@@ -1303,6 +1303,7 @@ label = "Files"
     let surfaces = [
         ("editor-normal", "editor", "normal"),
         ("explorer", "explorer", ""),
+        ("problems-panel", "problems_panel", ""),
         ("dashboard", "dashboard", ""),
         ("terminal-normal", "terminal_normal", ""),
         ("tool-manager", "tool_manager", ""),

@@ -4,6 +4,7 @@ use crate::editor::EditorState;
 use crate::editor::EditorWindowVersion;
 use crate::editor::text::BufferRevision;
 use crate::editor::text::ByteOffset;
+use crate::editor::text::ByteRange;
 use crate::editor::text::TextVersion;
 use crate::ui::ContentTabDiagnostic;
 use crate::ui::ContentTabDiagnosticSeverity;
@@ -67,6 +68,7 @@ pub(super) struct DiagnosticBatch {
     pub document: Option<DiagnosticDocument>,
     pub validity: DiagnosticValidity,
     pub items: Vec<Diagnostic>,
+    pub disk_points: DiskPoints,
 }
 #[derive(Clone, Debug)]
 pub(super) struct DiagnosticKey {
@@ -78,6 +80,43 @@ impl DiagnosticKey {
         Arc::ptr_eq(&self.epoch, &other.epoch) && self.index == other.index
     }
 }
+pub(super) type DiskPoints = BTreeMap<ByteOffset, (usize, usize)>;
+
+#[derive(Clone, Debug)]
+pub(super) struct DiagnosticAnchor {
+    document: DiagnosticDocument,
+    revision: BufferRevision,
+}
+
+impl DiagnosticAnchor {
+    pub(super) fn map_range(&self, editor: &EditorState, range: ByteRange) -> Option<ByteRange> {
+        let buffer = editor.buffers.get(self.document.id)?;
+        if !self.document.editor.same_editor(&editor.window_version())
+            || self.document.path != buffer.path
+            || !buffer
+                .text
+                .source_version()
+                .same_instance(&self.document.text)
+        {
+            return None;
+        }
+        map_diagnostic_range(&buffer.text, self.revision, range)
+    }
+}
+
+fn map_diagnostic_range(
+    text: &crate::editor::text::TextBuffer,
+    revision: BufferRevision,
+    range: ByteRange,
+) -> Option<ByteRange> {
+    let limit = ByteOffset(text.len_bytes());
+    let start = text.map_offset_since(revision, range.start)?.min(limit);
+    let end = text
+        .map_offset_since(revision, range.end)?
+        .clamp(start, limit);
+    ByteRange::new(start, end).ok()
+}
+
 struct Batch {
     epoch: Arc<()>,
     path: Option<PathBuf>,
@@ -85,6 +124,7 @@ struct Batch {
     validity: DiagnosticValidity,
     /// The text the ranges point into; edits since then move them.
     revision: Option<BufferRevision>,
+    disk_points: DiskPoints,
 }
 impl Batch {
     pub(in crate::app) fn current(&self, editor: &EditorState) -> bool {
@@ -254,6 +294,10 @@ impl Diagnostics {
         if unchanged {
             if let Some(old) = self.batches.get_mut(&set) {
                 old.revision = revision;
+                if old.disk_points != batch.disk_points {
+                    old.disk_points = batch.disk_points;
+                    self.dirty = true;
+                }
             }
             return Ok(false);
         }
@@ -265,6 +309,7 @@ impl Diagnostics {
                 document: batch.document,
                 validity: batch.validity,
                 revision,
+                disk_points: batch.disk_points,
             },
         );
         Ok(true)
@@ -357,6 +402,32 @@ impl Diagnostics {
             return None;
         }
         Some(&row.problem)
+    }
+    pub(super) fn anchor(&self, row: &ProblemRow) -> Option<DiagnosticAnchor> {
+        let batch = self.batches.get(&(row.owner.clone(), row.uri.clone()))?;
+        Some(DiagnosticAnchor {
+            document: batch.document.clone()?,
+            revision: batch.revision?,
+        })
+    }
+
+    pub(in crate::app) fn point(
+        &self,
+        row: &ProblemRow,
+        editor: &EditorState,
+    ) -> Option<(usize, usize)> {
+        let batch = self.batches.get(&(row.owner.clone(), row.uri.clone()))?;
+        match &batch.document {
+            Some(document) => {
+                crate::editor::text::PositionCodec::new(&editor.buffers.get(document.id)?.text)
+                    .byte_to_lsp(
+                        row.range.start,
+                        crate::editor::text::PositionEncoding::Utf32,
+                    )
+                    .ok()
+            }
+            None => batch.disk_points.get(&row.range.start).copied(),
+        }
     }
     pub(in crate::app) fn counts(&self) -> &BTreeMap<PathBuf, ContentTabDiagnostic> {
         &self.counts
@@ -476,17 +547,8 @@ impl Diagnostics {
             {
                 continue;
             }
-            let length = ByteOffset(text.len_bytes());
             self.store.move_ranges(owner, uri, |range| {
-                let start = text
-                    .map_offset_since(revision, range.start)
-                    .unwrap_or(range.start)
-                    .min(length);
-                let end = text
-                    .map_offset_since(revision, range.end)
-                    .unwrap_or(range.end)
-                    .clamp(start, length);
-                crate::editor::text::ByteRange::new(start, end).unwrap_or(range)
+                map_diagnostic_range(text, revision, range).unwrap_or(range)
             });
             // Sorted row indices may now refer to different diagnostics when ranges collapse.
             batch.epoch = Arc::new(());
@@ -528,6 +590,25 @@ impl Diagnostics {
     }
 }
 
+/// Store only reported locations, not disk text, so the panel never has to read files.
+pub(super) fn disk_points(
+    items: &[Diagnostic],
+    text: &crate::editor::text::TextBuffer,
+) -> DiskPoints {
+    use crate::editor::text::{PositionCodec, PositionEncoding};
+    let codec = PositionCodec::new(text);
+    items
+        .iter()
+        .filter_map(|item| {
+            let offset = item.range.start;
+            Some((
+                offset,
+                codec.byte_to_lsp(offset, PositionEncoding::Utf32).ok()?,
+            ))
+        })
+        .collect()
+}
+
 pub(in crate::app) fn document_uri(id: BufferId, path: Option<&std::path::Path>) -> String {
     use slotmap::Key;
     path.map(crate::language::lsp::file_uri)
@@ -536,11 +617,14 @@ pub(in crate::app) fn document_uri(id: BufferId, path: Option<&std::path::Path>)
 
 use crate::app::App;
 
+pub(super) mod problems;
+
 impl App {
     pub(in crate::app) fn sync_ui_diagnostics(&mut self) {
         if let Some(candidate) = self.diagnostics.projection(&self.state) {
             self.ui.diagnostics = candidate;
             self.window_session.diagnostics_changed();
+            self.refresh_problems_panel();
         }
         self.ui.expanded_diagnostic = self.diagnostics.expanded(&self.state);
     }
@@ -598,6 +682,7 @@ pub(in crate::app) fn register_commands(
             move |_| AppEffect::OpenPicker(kind),
         )?;
     }
+    problems::register_commands(registry)?;
     for (id, title, direction, filter) in [
         (
             "diagnostic.next",
@@ -658,6 +743,7 @@ impl App {
         effect: AppEffect,
     ) -> Result<(), AppEffect> {
         match effect {
+            AppEffect::ProblemsPanel(command) => self.handle_problems_command(command),
             AppEffect::DiagnosticNavigate {
                 direction,
                 filter,
@@ -688,6 +774,7 @@ mod tests {
         let mut owner = Diagnostics::new(10, 10);
         owner.activate(producer.clone());
         let batch = |data: i32| DiagnosticBatch {
+            disk_points: Default::default(),
             producer: producer.clone(),
             uri: uri.clone(),
             document: DiagnosticDocument::capture(&editor, buffer),
@@ -735,6 +822,7 @@ mod tests {
         let mut owner = Diagnostics::new(4, 2);
         let batch =
             |producer: &DiagnosticProducer, message: &str, editor: &EditorState| DiagnosticBatch {
+                disk_points: Default::default(),
                 producer: producer.clone(),
                 uri: uri.clone(),
                 document: DiagnosticDocument::capture(editor, buffer),
@@ -881,6 +969,7 @@ mod tests {
         owner
             .publish(
                 DiagnosticBatch {
+                    disk_points: Default::default(),
                     producer,
                     uri: uri.clone(),
                     document: DiagnosticDocument::capture(&editor, buffer),
@@ -945,6 +1034,7 @@ mod tests {
         owner.activate(producer.clone());
         // At the end of the first line, as rust-analyzer reports "expected COMMA".
         let batch = DiagnosticBatch {
+            disk_points: Default::default(),
             producer,
             uri: uri.clone(),
             document: DiagnosticDocument::capture(&editor, buffer),

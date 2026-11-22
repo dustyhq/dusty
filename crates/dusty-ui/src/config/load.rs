@@ -123,6 +123,7 @@ fn parse_bundled_config() -> LoadedConfig {
     keymaps.bundled_group_count = keymaps.groups.len();
     keymaps.user_spans.clear();
     keymaps.user_group_spans.clear();
+    keymaps.user_lines.clear();
     let dashboard = toml::from_str::<DashboardConfig>(BUNDLED_DASHBOARD)
         .expect("bundled dashboard must be covered by tests");
     dashboard
@@ -138,6 +139,7 @@ fn parse_bundled_config() -> LoadedConfig {
         user_configuration: false,
         user_setting_keys: BTreeSet::new(),
         user_setting_spans: BTreeMap::new(),
+        keymap_policy_lines: BTreeMap::new(),
         config,
         path: PathBuf::from("<bundled:config>"),
         diagnostic: None,
@@ -156,7 +158,30 @@ fn parse_bundled_config() -> LoadedConfig {
 pub(super) enum CapturedText {
     Missing,
     Text(String),
-    Error(String),
+    Error(CaptureError),
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct CaptureError {
+    detail: String,
+    reason: &'static str,
+}
+
+impl CaptureError {
+    fn io(error: std::io::Error) -> Self {
+        use std::io::ErrorKind;
+
+        let reason = match error.kind() {
+            ErrorKind::NotFound => "it doesn't exist",
+            ErrorKind::PermissionDenied => "permission denied",
+            ErrorKind::InvalidInput | ErrorKind::IsADirectory => "not a regular file",
+            _ => "there was a problem accessing it",
+        };
+        Self {
+            detail: error.to_string(),
+            reason,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -187,21 +212,7 @@ impl ConfigurationSourceBundle {
         let bundled = load_bundled_config();
         let mut loaded = load_config_capture(&self.config);
         loaded.user_configuration = true;
-        let user_keymaps = match &self.keymaps.text {
-            CapturedText::Missing => LoadedKeymaps {
-                path: self.keymaps.path.clone(),
-                ..LoadedKeymaps::default()
-            },
-            CapturedText::Text(source) => parse_keymaps(source, self.keymaps.path.clone()),
-            CapturedText::Error(error) => LoadedKeymaps {
-                path: self.keymaps.path.clone(),
-                diagnostic: Some(format!(
-                    "cannot read {}: {error}",
-                    self.keymaps.path.display()
-                )),
-                ..LoadedKeymaps::default()
-            },
-        };
+        let user_keymaps = keymaps_from_capture(&self.keymaps);
         let (bundled_entries, bundled_groups) = (bundled.keymaps.entries, bundled.keymaps.groups);
         let bundled_count = bundled_entries.len();
         let bundled_group_count = bundled_groups.len();
@@ -220,6 +231,7 @@ impl ConfigurationSourceBundle {
             diagnostic: user_keymaps.diagnostic,
             user_spans: user_keymaps.user_spans,
             user_group_spans: user_keymaps.user_group_spans,
+            user_lines: user_keymaps.user_lines,
         };
         match parse_dashboard_capture(&self.dashboard) {
             Ok(Some(dashboard)) => {
@@ -358,7 +370,7 @@ pub(super) fn capture_source(path: PathBuf) -> CapturedSource {
                     content_hash: None,
                 },
                 path,
-                text: CapturedText::Error(error.to_string()),
+                text: CapturedText::Error(CaptureError::io(error)),
             };
         }
     };
@@ -378,20 +390,29 @@ pub(super) fn capture_source(path: PathBuf) -> CapturedSource {
                 || bytes.len() as u64 > WATCH_FINGERPRINT_BYTE_LIMIT
             {
                 (
-                    CapturedText::Error(format!(
-                        "configuration source exceeds {} byte limit",
-                        WATCH_FINGERPRINT_BYTE_LIMIT
-                    )),
+                    CapturedText::Error(CaptureError {
+                        detail: format!(
+                            "configuration source exceeds {} byte limit",
+                            WATCH_FINGERPRINT_BYTE_LIMIT
+                        ),
+                        reason: "the file is too large",
+                    }),
                     hash,
                 )
             } else {
                 match String::from_utf8(bytes) {
                     Ok(source) => (CapturedText::Text(source), hash),
-                    Err(error) => (CapturedText::Error(error.to_string()), hash),
+                    Err(error) => (
+                        CapturedText::Error(CaptureError {
+                            detail: error.to_string(),
+                            reason: "the text isn't valid UTF-8",
+                        }),
+                        hash,
+                    ),
                 }
             }
         }
-        Err(error) => (CapturedText::Error(error.to_string()), None),
+        Err(error) => (CapturedText::Error(CaptureError::io(error)), None),
     };
     CapturedSource {
         identity: SourceFingerprint {
@@ -405,35 +426,36 @@ pub(super) fn capture_source(path: PathBuf) -> CapturedSource {
     }
 }
 
-pub(super) fn read_configuration_source(path: &Path) -> std::io::Result<String> {
-    match capture_source(path.to_path_buf()).text {
-        CapturedText::Text(source) => Ok(source),
-        CapturedText::Missing => Err(std::io::Error::from(std::io::ErrorKind::NotFound)),
-        CapturedText::Error(error) => {
-            Err(std::io::Error::new(std::io::ErrorKind::InvalidData, error))
-        }
+#[must_use]
+pub fn load_keymaps(path: &Path) -> LoadedKeymaps {
+    keymaps_from_capture(&capture_source(path.to_path_buf()))
+}
+
+fn keymaps_from_capture(captured: &CapturedSource) -> LoadedKeymaps {
+    let path = &captured.path;
+    match &captured.text {
+        CapturedText::Text(source) => parse_keymaps(source, path.clone()),
+        CapturedText::Missing => LoadedKeymaps {
+            path: path.clone(),
+            ..LoadedKeymaps::default()
+        },
+        CapturedText::Error(error) => LoadedKeymaps {
+            path: path.clone(),
+            diagnostic: Some(format!(
+                "{}: Couldn't read the file: {}",
+                path.display(),
+                error.reason
+            )),
+            ..LoadedKeymaps::default()
+        },
     }
 }
 
-#[must_use]
-pub fn load_keymaps(path: &Path) -> LoadedKeymaps {
-    let source = match read_configuration_source(path) {
-        Ok(source) => source,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return LoadedKeymaps {
-                path: path.to_path_buf(),
-                ..LoadedKeymaps::default()
-            };
-        }
-        Err(error) => {
-            return LoadedKeymaps {
-                path: path.to_path_buf(),
-                diagnostic: Some(format!("cannot read {}: {error}", path.display())),
-                ..LoadedKeymaps::default()
-            };
-        }
-    };
-    parse_keymaps(&source, path.to_path_buf())
+fn source_line(source: &str, offset: usize) -> usize {
+    1 + source.as_bytes()[..offset.min(source.len())]
+        .iter()
+        .filter(|&&byte| byte == b'\n')
+        .count()
 }
 
 pub fn parse_keymaps(source: &str, path: PathBuf) -> LoadedKeymaps {
@@ -449,9 +471,23 @@ pub fn parse_keymaps(source: &str, path: PathBuf) -> LoadedKeymaps {
         Ok(file) => {
             let (entries, user_spans) = expand_global_keymaps(file.keymap);
             let (groups, user_group_spans) = expand_global_groups(file.key_group);
+            let line_starts = std::iter::once(0)
+                .chain(source.match_indices('\n').map(|(offset, _)| offset + 1))
+                .collect::<Vec<_>>();
+            let user_lines = user_spans
+                .iter()
+                .chain(&user_group_spans)
+                .map(|span| {
+                    (
+                        span.start,
+                        line_starts.partition_point(|&start| start <= span.start),
+                    )
+                })
+                .collect();
             LoadedKeymaps {
                 user_spans,
                 user_group_spans,
+                user_lines,
                 entries,
                 groups,
                 bundled_count: 0,
@@ -460,14 +496,18 @@ pub fn parse_keymaps(source: &str, path: PathBuf) -> LoadedKeymaps {
                 diagnostic: None,
             }
         }
-        Err(error) => LoadedKeymaps {
-            diagnostic: Some(format!(
-                "invalid {}: {error}; ignoring keymaps",
-                path.display()
-            )),
-            path,
-            ..LoadedKeymaps::default()
-        },
+        Err(error) => {
+            let line = error.span().map(|span| source_line(source, span.start));
+            let mut location = path.display().to_string();
+            if let Some(line) = line {
+                location.push_str(&format!(", line {line}"));
+            }
+            LoadedKeymaps {
+                diagnostic: Some(format!("{location}: {}", error.message())),
+                path,
+                ..LoadedKeymaps::default()
+            }
+        }
     }
 }
 
@@ -494,7 +534,7 @@ pub(super) fn parse_theme_capture(captured: &CapturedSource) -> Result<ThemeConf
                 captured.path.display()
             ));
         }
-        CapturedText::Error(error) => {
+        CapturedText::Error(CaptureError { detail: error, .. }) => {
             return Err(format!(
                 "cannot read theme {}: {error}",
                 captured.path.display()
@@ -528,7 +568,7 @@ pub(super) fn parse_dashboard_capture(
     let source = match &captured.text {
         CapturedText::Text(source) => source,
         CapturedText::Missing => return Ok(None),
-        CapturedText::Error(error) => {
+        CapturedText::Error(CaptureError { detail: error, .. }) => {
             return Err(format!("cannot read {}: {error}", captured.path.display()));
         }
     };
@@ -555,6 +595,7 @@ pub(super) fn fallback_config(diagnostic: Option<String>) -> LoadedConfig {
         user_configuration: false,
         user_setting_keys: BTreeSet::new(),
         user_setting_spans: BTreeMap::new(),
+        keymap_policy_lines: BTreeMap::new(),
         config: bundled_settings(),
         path: PathBuf::from("<bundled:config>"),
         diagnostic,
@@ -572,7 +613,7 @@ pub(super) fn fallback_config(diagnostic: Option<String>) -> LoadedConfig {
 pub(super) fn load_config_capture(captured: &CapturedSource) -> LoadedConfig {
     match &captured.text {
         CapturedText::Missing => fallback_config(None),
-        CapturedText::Error(error) => fallback_config(Some(format!(
+        CapturedText::Error(CaptureError { detail: error, .. }) => fallback_config(Some(format!(
             "cannot read {}: {error}",
             captured.path.display()
         ))),
@@ -587,33 +628,44 @@ pub fn load_config(path: &Path) -> LoadedConfig {
 
 pub(super) fn parse_config_source(path: &Path, source: &str) -> LoadedConfig {
     match settings_from_source(source) {
-        Ok((config, user_setting_keys, _, ignored)) => LoadedConfig {
-            source_fingerprint: None,
-            installed_plugins: BTreeSet::new(),
-            user_configuration: false,
-            user_setting_keys,
-            user_setting_spans: setting_spans(source),
-            config,
-            path: path.to_path_buf(),
-            diagnostic: None,
-            warning: (!ignored.is_empty()).then(|| {
-                let file = path.file_name().map_or_else(
-                    || path.display().to_string(),
-                    |name| name.to_string_lossy().into_owned(),
-                );
-                format!(
-                    "left out settings Dusty doesn't have from {file}: {}",
-                    ignored.join(", ")
-                )
-            }),
-            keymaps: LoadedKeymaps::default(),
-            dashboard: DashboardConfig::default(),
-            dashboard_path: PathBuf::from("<bundled:dashboard>"),
-            dashboard_spans: BTreeMap::new(),
-            theme: bundled_theme(),
-            theme_path: PathBuf::from("<bundled:theme:dusty>"),
-            theme_spans: BTreeMap::new(),
-        },
+        Ok((config, user_setting_keys, _, ignored)) => {
+            let user_setting_spans = setting_spans(source);
+            let keymap_policy_lines = ["input.keymaps.leader", "input.keymaps.local_leader"]
+                .into_iter()
+                .filter_map(|key| {
+                    let span = user_setting_spans.get(key)?;
+                    Some((key.to_owned(), source_line(source, span.start)))
+                })
+                .collect();
+            LoadedConfig {
+                source_fingerprint: None,
+                installed_plugins: BTreeSet::new(),
+                user_configuration: false,
+                user_setting_keys,
+                user_setting_spans,
+                keymap_policy_lines,
+                config,
+                path: path.to_path_buf(),
+                diagnostic: None,
+                warning: (!ignored.is_empty()).then(|| {
+                    let file = path.file_name().map_or_else(
+                        || path.display().to_string(),
+                        |name| name.to_string_lossy().into_owned(),
+                    );
+                    format!(
+                        "left out settings Dusty doesn't have from {file}: {}",
+                        ignored.join(", ")
+                    )
+                }),
+                keymaps: LoadedKeymaps::default(),
+                dashboard: DashboardConfig::default(),
+                dashboard_path: PathBuf::from("<bundled:dashboard>"),
+                dashboard_spans: BTreeMap::new(),
+                theme: bundled_theme(),
+                theme_path: PathBuf::from("<bundled:theme:dusty>"),
+                theme_spans: BTreeMap::new(),
+            }
+        }
         // What happens next is the caller's to say: startup uses the bundled settings, a reload
         // keeps the ones in use.
         Err(error) => fallback_config(Some(format!("invalid {}: {error}", path.display()))),
@@ -792,11 +844,50 @@ pub struct ConfigurationWorker {
     thread: Option<JoinHandle<()>>,
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum ConfigurationCandidateError {
+    #[error("{0}")]
+    Keymaps(String),
+    #[error("{0}")]
+    Other(String),
+}
+
+impl ConfigurationCandidateError {
+    pub fn keymap_source(path: &Path, detail: &str) -> Self {
+        let short = detail
+            .strip_prefix(path.to_string_lossy().as_ref())
+            .map_or_else(
+                || detail.to_owned(),
+                |rest| {
+                    format!(
+                        "{}{rest}",
+                        path.file_name()
+                            .unwrap_or(path.as_os_str())
+                            .to_string_lossy()
+                    )
+                },
+            );
+        Self::Keymaps(short)
+    }
+}
+
+impl From<String> for ConfigurationCandidateError {
+    fn from(detail: String) -> Self {
+        Self::Other(detail)
+    }
+}
+
+impl From<&str> for ConfigurationCandidateError {
+    fn from(detail: &str) -> Self {
+        Self::Other(detail.to_owned())
+    }
+}
+
 #[derive(Debug)]
 pub struct ConfigurationWorkerResult {
     pub reload_id: u64,
     pub automatic: bool,
-    pub candidate: Result<LoadedConfig, String>,
+    pub candidate: Result<LoadedConfig, ConfigurationCandidateError>,
 }
 
 pub(super) enum ConfigurationRequest {
@@ -866,7 +957,7 @@ impl ConfigurationWorker {
                                             fingerprint = configuration_fingerprint(&theme);
                                             changed_at = Some(Instant::now());
                                         }
-                                        Err(diagnostic)
+                                        Err(diagnostic.into())
                                     }
                                 };
                             if results
@@ -982,27 +1073,26 @@ pub(super) fn map_configuration_send_error(
 }
 
 pub(super) struct CandidateAttempt {
-    pub(super) candidate: Result<LoadedConfig, String>,
+    pub(super) candidate: Result<LoadedConfig, ConfigurationCandidateError>,
     pub(super) theme: String,
 }
 
 pub(super) fn candidate_attempt_from_loaded(loaded: LoadedConfig) -> CandidateAttempt {
     let theme = loaded.config.ui.theme.clone();
-    let mut diagnostics = Vec::new();
-    diagnostics.extend(loaded.diagnostic.iter().cloned());
-    diagnostics.extend(loaded.keymaps.diagnostic.iter().cloned());
-    CandidateAttempt {
-        candidate: if diagnostics.is_empty() {
-            Ok(loaded)
-        } else {
-            Err(diagnostics.join("; "))
-        },
-        theme,
-    }
+    let candidate = match (&loaded.diagnostic, &loaded.keymaps.diagnostic) {
+        (Some(settings), Some(keymaps)) => Err(format!("{settings}; {keymaps}").into()),
+        (Some(settings), None) => Err(settings.clone().into()),
+        (None, Some(keymaps)) => Err(ConfigurationCandidateError::keymap_source(
+            &loaded.keymaps.path,
+            keymaps,
+        )),
+        (None, None) => Ok(loaded),
+    };
+    CandidateAttempt { candidate, theme }
 }
 
 pub(super) struct ConsistentCandidate<F> {
-    pub(super) candidate: Result<LoadedConfig, String>,
+    pub(super) candidate: Result<LoadedConfig, ConfigurationCandidateError>,
     pub(super) theme: String,
     pub(super) fingerprint: Option<F>,
 }
@@ -1173,6 +1263,7 @@ pub enum ConfigurationWorkerError {
 const GLOBAL_KEYMAP_TARGETS: &[(&str, &str)] = &[
     ("editor", "normal"),
     ("explorer", ""),
+    ("problems_panel", ""),
     ("dashboard", ""),
     ("terminal_normal", ""),
     ("tool_manager", ""),

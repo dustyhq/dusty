@@ -38,13 +38,15 @@ struct Read {
     path: PathBuf,
     raw: Vec<Raw>,
 }
+type FileDiagnostics = (Vec<Diagnostic>, crate::app::diagnostics::DiskPoints);
+
 struct Build {
     name: String,
     key: RunKey,
     source: TaskDiagnosticRun,
     unread: BTreeMap<PathBuf, Vec<Raw>>,
     pending: HashMap<RequestId, Read>,
-    grouped: BTreeMap<PathBuf, Vec<Diagnostic>>,
+    grouped: BTreeMap<PathBuf, FileDiagnostics>,
     maximum: u64,
     failed: Option<String>,
 }
@@ -282,13 +284,16 @@ impl Tasks {
             }) {
                 grouped.insert(
                     path.clone(),
-                    convert(
-                        &path,
-                        raw,
-                        &buffer.text,
-                        Some(buffer.text.revision()),
-                        &task.requested,
-                    )?,
+                    (
+                        convert(
+                            &path,
+                            raw,
+                            &buffer.text,
+                            Some(buffer.text.revision()),
+                            &task.requested,
+                        )?,
+                        Default::default(),
+                    ),
                 );
             } else {
                 unread.insert(path, raw);
@@ -411,7 +416,8 @@ impl Tasks {
             }
             let text = TextBuffer::from_bytes(&bytes).map_err(|e| e.to_string())?;
             let items = convert(&path, read.raw, &text, None, &build.name)?;
-            build.grouped.insert(path, items);
+            let points = crate::app::diagnostics::disk_points(&items, &text);
+            build.grouped.insert(path, (items, points));
             Ok(())
         })();
         if let Err(error) = result {
@@ -477,7 +483,7 @@ impl Tasks {
         let result = build
             .grouped
             .into_iter()
-            .map(|(path, mut items)| {
+            .map(|(path, (mut items, disk_points))| {
                 let document = build.source.document(&path, editor)?;
                 // Reads share a canonical identity, but open-buffer diagnostics use the
                 // buffer's own path, as required by the diagnostic publisher and gutter.
@@ -491,6 +497,7 @@ impl Tasks {
                     item.uri = uri.clone();
                 }
                 Ok(DiagnosticBatch {
+                    disk_points,
                     document,
                     producer: build.source.producer().clone(),
                     uri,

@@ -176,13 +176,17 @@ impl GitBranchWorker {
         Ok(request_id)
     }
     pub fn cancel(&mut self) {
-        if let Some(cancel) = self.cancel.take() {
-            cancel.store(true, Ordering::Release)
+        if self.removal_check.is_some() {
+            self.cancel_removal_check();
+            self.cancel = None;
+        } else if let Some(cancel) = self.cancel.take() {
+            cancel.store(true, Ordering::Release);
         }
         // A mutation may already be writing. Keep its completion owned until poll handles it.
         if !self.mutating {
             self.active = None;
             self.receiver = None;
+            self.removal_check = None;
         }
     }
     pub fn poll(&mut self) -> Result<Option<&GitBranchResult>, GitBranchError> {
@@ -854,6 +858,7 @@ fn add_worktree(
     Ok(())
 }
 
+#[cfg(test)]
 fn run(
     request_id: GitBranchRequestId,
     request: &GitBranchRequest,
@@ -1064,21 +1069,92 @@ fn run(
     }
 }
 
-/// Deletes a worktree's checkout, its `.git` link last, so a deletion that fails part way
-/// leaves a worktree Git still recognises rather than a folder that is no longer a repository.
-/// Windows refuses to delete a file another process has open, such as a file watcher or a Git
-/// process that was still reading the checkout, and those usually let go within moments, so a
-/// failed deletion is tried again a few times.
-fn remove_checkout(path: &Path) -> std::io::Result<()> {
-    let mut attempt = 0;
-    loop {
-        match remove_checkout_once(path) {
-            Ok(()) => return Ok(()),
-            Err(error) if attempt >= 4 => return Err(error),
-            Err(_) => {
-                std::thread::sleep(Duration::from_millis(100 << attempt));
-                attempt += 1;
-            }
+fn remove_registered_worktree(
+    repository: &git2::Repository,
+    name: &str,
+    path: &Path,
+    remove: impl FnOnce(&Path, &[OsString]) -> bool,
+) -> Result<(), GitBranchError> {
+    // Run from the common Git directory, never the checkout being removed.
+    let common = repository.commondir();
+    let args = [
+        "worktree".into(),
+        "remove".into(),
+        "--force".into(),
+        "--".into(),
+        path.as_os_str().to_owned(),
+    ];
+    if remove(common, &args) {
+        return Ok(());
+    }
+    let missing = |path: &Path| {
+        path.symlink_metadata()
+            .is_err_and(|error| error.kind() == ErrorKind::NotFound)
+    };
+    if path
+        .symlink_metadata()
+        .is_ok_and(|metadata| metadata.is_dir())
+        && missing(&common.join("worktrees").join(name))
+    {
+        return Err(GitBranchError::RemovalIncomplete(
+            crate::command::display_paths([path]),
+        ));
+    }
+    Err(GitBranchError::RemovalFailed)
+}
+
+fn removal_target(
+    repository: &git2::Repository,
+    name: &str,
+) -> Result<git2::Worktree, GitBranchError> {
+    let worktree = repository
+        .find_worktree(name)
+        .map_err(|_| GitBranchError::UnknownWorktree(name.into()))?;
+    if !matches!(
+        worktree.is_locked().map_err(backend)?,
+        git2::WorktreeLockStatus::Unlocked
+    ) {
+        return Err(GitBranchError::RefusedLockedWorktree(name.into()));
+    }
+    Ok(worktree)
+}
+
+/// The selected checkout and its local-only paths at the time of review.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GitWorktreeRemoval {
+    path: PathBuf,
+    inventory: Option<Arc<RemovalInventory>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RemovalInventory {
+    summary: Vec<LocalPath>,
+    trees: Vec<TreeDigest>,
+    samples: BTreeMap<PathBuf, [u8; 32]>,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct LocalPath {
+    relative: PathBuf,
+    ignored: bool,
+    directory: bool,
+}
+
+const REMOVAL_SAMPLES: usize = 128;
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct TreeDigest {
+    entries: u64,
+    sum: [u64; 4],
+}
+
+impl TreeDigest {
+    fn add(&mut self, hash: [u8; 32]) {
+        self.entries += 1;
+        // Addition is independent of read_dir order, unlike a running SHA or
+        // sorting every filename. Each contribution already includes its path.
+        for (sum, bytes) in self.sum.iter_mut().zip(hash.chunks_exact(8)) {
+            *sum = sum.wrapping_add(u64::from_le_bytes(bytes.try_into().expect("eight bytes")));
         }
     }
 }
@@ -1087,28 +1163,367 @@ fn remove_checkout_once(path: &Path) -> std::io::Result<()> {
     if !path.exists() {
         return Ok(());
     }
-    let link = path.join(".git");
-    for entry in std::fs::read_dir(path)? {
-        let entry = entry?;
-        let entry_path = entry.path();
-        if entry_path == link {
-            continue;
+
+    /// A missing checkout can only have its worktree registration pruned.
+    pub fn is_missing(&self) -> bool {
+        self.inventory.is_none()
+    }
+
+    /// Whether no local-only paths were found.
+    pub fn is_clean(&self) -> bool {
+        self.inventory
+            .as_ref()
+            .is_none_or(|inventory| inventory.summary.is_empty())
+    }
+
+    fn change_notice(&self, actual: &Self) -> String {
+        let detail = self
+            .inventory
+            .as_deref()
+            .zip(actual.inventory.as_deref())
+            .and_then(|(old, new)| {
+                let known_absent = |sample: &BTreeMap<PathBuf, [u8; 32]>, path: &Path| {
+                    sample.len() < REMOVAL_SAMPLES
+                        || sample
+                            .last_key_value()
+                            .is_some_and(|(last, _)| path <= last.as_path())
+                };
+                for (path, hash) in &new.samples {
+                    let change = match old.samples.get(path) {
+                        Some(before) if before != hash => "changed",
+                        None if known_absent(&old.samples, path) => "was added",
+                        _ => continue,
+                    };
+                    return Some(format!(
+                        "{} {change}.",
+                        crate::command::display_paths([path.as_path()])
+                    ));
+                }
+                for path in old.samples.keys() {
+                    if !new.samples.contains_key(path) && known_absent(&new.samples, path) {
+                        return Some(format!(
+                            "{} was removed.",
+                            crate::command::display_paths([path.as_path()])
+                        ));
+                    }
+                }
+                for (entry, digest) in new.summary.iter().zip(&new.trees) {
+                    let change = match old.summary.binary_search(entry) {
+                        Ok(index) if old.trees[index] != *digest => "changed",
+                        Err(_) => "was added",
+                        _ => continue,
+                    };
+                    return Some(format!(
+                        "{} {change}.",
+                        crate::command::display_paths([entry.relative.as_path()])
+                    ));
+                }
+                old.summary
+                    .iter()
+                    .find(|entry| new.summary.binary_search(entry).is_err())
+                    .map(|entry| {
+                        format!(
+                            "{} was removed.",
+                            crate::command::display_paths([entry.relative.as_path()])
+                        )
+                    })
+            });
+        let instruction = "Review what will be deleted again.";
+        match detail {
+            Some(detail) => format!("{detail} {instruction}"),
+            None => format!("The worktree's files changed. {instruction}"),
         }
         remove_entry(&entry_path, entry.file_type()?)?;
     }
-    if let Ok(metadata) = link.symlink_metadata() {
-        remove_entry(&link, metadata.file_type())?;
+
+    /// Warnings to show with a removal confirmation.
+    pub fn warnings(&self) -> impl Iterator<Item = String> + '_ {
+        let summary = self
+            .inventory
+            .as_ref()
+            .map_or(&[][..], |inventory| inventory.summary.as_slice());
+        [("untracked", false), ("ignored", true)]
+            .into_iter()
+            .filter_map(move |(label, ignored)| {
+                let mut paths = summary.iter().filter(|entry| entry.ignored == ignored);
+                let first: Vec<_> = paths.by_ref().take(3).collect();
+                let mut directories = first.iter().any(|entry| entry.directory);
+                let count = paths.fold(first.len(), |count, entry| {
+                    directories |= entry.directory;
+                    count + 1
+                });
+                (count != 0).then(|| {
+                    let noun = if directories { "path" } else { "file" };
+                    let suffix = if count == 1 { "" } else { "s" };
+                    let more = if count > first.len() { ", …" } else { "" };
+                    let paths = crate::command::display_paths(
+                        first.iter().map(|entry| entry.relative.as_path()),
+                    );
+                    format!("Also deletes {count} {label} {noun}{suffix}: {paths}{more}")
+                })
+            })
+            .chain(
+                summary
+                    .iter()
+                    .any(|entry| entry.directory)
+                    .then(|| "Listed directories will be deleted with their contents.".into()),
+            )
     }
     std::fs::remove_dir(path)
 }
 
-/// Removes a file, a symbolic link (including a Windows directory link) or a directory tree.
-fn remove_entry(path: &Path, kind: std::fs::FileType) -> std::io::Result<()> {
-    if kind.is_dir() {
-        std::fs::remove_dir_all(path)
-    } else {
-        std::fs::remove_file(path).or_else(|error| std::fs::remove_dir(path).map_err(|_| error))
+fn removal_inventory(
+    repository: &git2::Repository,
+    worktree: &git2::Worktree,
+    name: &str,
+    cancel: &AtomicBool,
+    expires: Instant,
+    check: &RemovalCheck,
+) -> Result<GitWorktreeRemoval, GitBranchError> {
+    check_request(cancel, expires)?;
+    let registered = worktree.path();
+    match registered.symlink_metadata() {
+        Ok(_) => {}
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            return Ok(GitWorktreeRemoval {
+                path: registered.into(),
+                inventory: None,
+            });
+        }
+        Err(_) => return Err(GitBranchError::RemovalInventory),
     }
+    let canonical =
+        |p: &Path| crate::files::canonicalize(p).map_err(|_| GitBranchError::RemovalInventory);
+    let path = canonical(registered)?;
+    let opened = open(&path).map_err(|_| GitBranchError::RemovalInventory)?;
+    let gitdir = repository.commondir().join("worktrees").join(name);
+    if !opened.is_worktree()
+        || opened.workdir().map(canonical).transpose()?.as_ref() != Some(&path)
+        || canonical(opened.path())? != canonical(&gitdir)?
+    {
+        return Err(GitBranchError::RemovalInventory);
+    }
+    if let Some(operation) = operation_name(opened.state()) {
+        return Err(GitBranchError::RefusedActiveOperation(
+            name.into(),
+            operation,
+        ));
+    }
+    let started = Instant::now();
+    let policy = crate::status::GitStatusPolicy {
+        root: path.clone(),
+        root_revision: 0,
+        maximum_files: check.display_limit,
+        maximum_path_bytes: 16 * 1024 * 1024,
+        deadline: expires.saturating_duration_since(started),
+    };
+    let (output, truncated) = crate::status::status_command(
+        &path,
+        &[
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--ignored=traditional",
+            "--untracked-files=normal",
+            "--ignore-submodules=none",
+        ],
+        &policy,
+        started,
+        cancel,
+    )
+    .map_err(removal_status_error)?;
+    if truncated || (!output.is_empty() && !output.ends_with(&[0])) {
+        return Err(GitBranchError::RemovalInventory);
+    }
+    // The superproject's status does not list ignored files inside initialized
+    // submodules. Do not force-remove a checkout containing unreviewed submodule data.
+    if opened.path().join("modules").is_dir() || path.join(".gitmodules").is_file() {
+        let (submodules, truncated) = crate::status::status_command(
+            &path,
+            &["submodule", "status"],
+            &policy,
+            started,
+            cancel,
+        )
+        .map_err(removal_status_error)?;
+        if truncated
+            || submodules
+                .split(|byte| *byte == b'\n')
+                .any(|line| !line.is_empty() && !line.starts_with(b"-"))
+            || (submodules.is_empty() && opened.path().join("modules").is_dir())
+        {
+            return Err(GitBranchError::RemovalSubmodules);
+        }
+    }
+    let mut summary = Vec::new();
+    for entry in output
+        .split(|byte| *byte == 0)
+        .filter(|entry| !entry.is_empty())
+    {
+        let (ignored, relative) = if let Some(path) = entry.strip_prefix(b"!! ") {
+            (true, path)
+        } else if let Some(path) = entry.strip_prefix(b"?? ") {
+            (false, path)
+        } else {
+            return Err(GitBranchError::RefusedDirtyWorktree(name.into()));
+        };
+        let directory = relative.ends_with(b"/");
+        let relative =
+            crate::command::native_path(relative).ok_or(GitBranchError::RemovalInventory)?;
+        if summary.len() == check.display_limit {
+            return Err(GitBranchError::RemovalInventory);
+        }
+        summary.push(LocalPath {
+            relative,
+            ignored,
+            directory,
+        });
+    }
+    summary.sort_unstable();
+    let mut samples = BTreeMap::new();
+    let trees = summary
+        .iter()
+        .map(|entry| digest_removal_tree(&path, entry, &mut samples, cancel, check))
+        .collect::<Result<_, _>>()?;
+    Ok(GitWorktreeRemoval {
+        path,
+        inventory: Some(Arc::new(RemovalInventory {
+            summary,
+            trees,
+            samples,
+        })),
+    })
+}
+
+fn removal_status_error(error: crate::status::GitStatusError) -> GitBranchError {
+    match error {
+        crate::status::GitStatusError::Deadline => GitBranchError::Deadline,
+        crate::status::GitStatusError::Cancelled => GitBranchError::Cancelled,
+        _ => GitBranchError::RemovalInventory,
+    }
+}
+
+/// Walk one collapsed status path without following symlinks. Keep only the
+/// depth-first traversal stack, a digest and a bounded sample across all trees.
+fn digest_removal_tree(
+    root: &Path,
+    entry: &LocalPath,
+    samples: &mut BTreeMap<PathBuf, [u8; 32]>,
+    cancel: &AtomicBool,
+    check: &RemovalCheck,
+) -> Result<TreeDigest, GitBranchError> {
+    #[cfg(not(test))]
+    let _ = check;
+    let unreadable = |_| GitBranchError::RemovalInventory;
+    // Strip Git's trailing slash before lstat so it cannot follow a symlink.
+    let relative: PathBuf = entry
+        .relative
+        .components()
+        .map(|part| part.as_os_str())
+        .collect();
+    let mut path = root.join(relative);
+    let mut digest = TreeDigest::default();
+    let mut stack = Vec::new();
+    let mut expected_directory = Some(entry.directory);
+    loop {
+        check_cancel(cancel)?;
+        let metadata = path.symlink_metadata().map_err(unreadable)?;
+        let kind = metadata.file_type();
+        if expected_directory
+            .take()
+            .is_some_and(|expected| expected != kind.is_dir())
+        {
+            return Err(GitBranchError::RemovalInventory);
+        }
+        let relative = path
+            .strip_prefix(root)
+            .map_err(|_| GitBranchError::RemovalInventory)?;
+        let hash = removal_stamp(relative, &path, &metadata)?;
+        digest.add(hash);
+        #[cfg(test)]
+        if digest.entries == 1 {
+            check.pause_at(RemovalCheckpoint::FirstEntry);
+        }
+        if kind.is_dir() {
+            stack.push(fs::read_dir(&path).map_err(unreadable)?);
+        } else {
+            // Keep the lexically first paths so the sample does not depend on
+            // directory iteration order. Avoid sampling directory mtimes: a
+            // child's addition otherwise looks like an edit to its parent.
+            if samples.len() < REMOVAL_SAMPLES {
+                samples.insert(relative.to_path_buf(), hash);
+            } else if let Some((last, _)) = samples.last_key_value()
+                && relative <= last.as_path()
+            {
+                samples.insert(relative.to_path_buf(), hash);
+                if samples.len() > REMOVAL_SAMPLES {
+                    samples.pop_last();
+                }
+            }
+            path.pop();
+        }
+        loop {
+            check_cancel(cancel)?;
+            let Some(directory) = stack.last_mut() else {
+                return Ok(digest);
+            };
+            if let Some(child) = directory.next() {
+                path.push(child.map_err(unreadable)?.file_name());
+                break;
+            }
+            stack.pop();
+            path.pop();
+        }
+    }
+}
+
+fn removal_stamp(
+    relative: &Path,
+    path: &Path,
+    metadata: &fs::Metadata,
+) -> Result<[u8; 32], GitBranchError> {
+    fn hash_path(hash: &mut Sha256, path: &Path) {
+        let bytes = path.as_os_str().as_encoded_bytes();
+        hash.update((bytes.len() as u64).to_le_bytes());
+        hash.update(bytes);
+    }
+
+    let mut hash = Sha256::new();
+    hash_path(&mut hash, relative);
+    let kind = metadata.file_type();
+    hash.update([
+        kind.is_dir() as u8,
+        kind.is_file() as u8,
+        kind.is_symlink() as u8,
+        metadata.permissions().readonly() as u8,
+    ]);
+    hash.update(metadata.len().to_le_bytes());
+    let modified = metadata
+        .modified()
+        .map_err(|_| GitBranchError::RemovalInventory)?;
+    let (before_epoch, modified) = match modified.duration_since(UNIX_EPOCH) {
+        Ok(duration) => (false, duration),
+        Err(error) => (true, error.duration()),
+    };
+    hash.update([before_epoch as u8]);
+    hash.update(modified.as_secs().to_le_bytes());
+    hash.update(modified.subsec_nanos().to_le_bytes());
+    if kind.is_symlink() {
+        hash_path(
+            &mut hash,
+            &fs::read_link(path).map_err(|_| GitBranchError::RemovalInventory)?,
+        );
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        hash.update(metadata.dev().to_le_bytes());
+        hash.update(metadata.ino().to_le_bytes());
+        hash.update(metadata.mode().to_le_bytes());
+        hash.update(metadata.ctime().to_le_bytes());
+        hash.update(metadata.ctime_nsec().to_le_bytes());
+    }
+    Ok(hash.finalize().into())
 }
 
 #[cfg(test)]

@@ -214,6 +214,7 @@ struct App {
     extension: crate::app::plugins::Plugins,
     workspace: crate::app::workspace::Workspace,
     diagnostics: crate::app::diagnostics::Diagnostics,
+    problems_panel: Option<diagnostics::problems::ProblemsPanel>,
     workspace_edits: crate::app::workspace::edits::WorkspaceEdits,
     commands: CommandRegistry<AppEffect>,
     effect_authority: crate::editor::CommandAuthority,
@@ -238,7 +239,7 @@ struct App {
     /// The split border being dragged with the mouse: the panes on its two sides.
     border_drag: Option<(crate::windows::WindowId, crate::windows::WindowId, bool)>,
     /// The docked terminal whose inner edge is being dragged with the mouse.
-    dock_drag: Option<PtyId>,
+    dock_drag: Option<input::DockDrag>,
     /// The column a buffer tab was last dragged at with the mouse.
     tab_drag: Option<u16>,
     /// Where `dusty --remote` from Dusty's own terminals reaches this session.

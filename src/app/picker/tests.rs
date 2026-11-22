@@ -650,6 +650,7 @@ fn diagnostic_picker_keeps_the_path_separate_from_the_message_for_fitting() {
     app.diagnostics
         .publish(
             DiagnosticBatch {
+                disk_points: Default::default(),
                 producer,
                 uri: uri.clone(),
                 document: DiagnosticDocument::capture(&app.state, buffer),

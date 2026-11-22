@@ -504,6 +504,7 @@ impl App {
             ),
             workspace,
             diagnostics,
+            problems_panel: None,
             workspace_edits: crate::app::workspace::edits::WorkspaceEdits::default(),
             commands,
             effect_authority: crate::editor::CommandAuthority::Host,

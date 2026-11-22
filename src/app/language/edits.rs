@@ -1777,7 +1777,7 @@ impl LspEditSources {
                     .lsp_to_byte(position.line, position.character, context.encoding())
                     .is_ok()
         };
-        let items = diagnostics
+        let items: Vec<_> = diagnostics
             .into_iter()
             .filter(|diagnostic| {
                 (pull && !behind) || (fits(&diagnostic.range.start) && fits(&diagnostic.range.end))
@@ -1832,6 +1832,11 @@ impl LspEditSources {
             })
             .collect::<Result<_, String>>()?;
         Ok(crate::app::diagnostics::DiagnosticBatch {
+            disk_points: if id.is_none() {
+                crate::app::diagnostics::disk_points(&items, current_text)
+            } else {
+                Default::default()
+            },
             producer,
             uri: uri.into(),
             document: id

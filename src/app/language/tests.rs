@@ -6994,6 +6994,7 @@ fn explicit_lsp_stop_clears_push_and_pull_diagnostic_sources() {
             app.diagnostics
                 .publish(
                     DiagnosticBatch {
+                        disk_points: Default::default(),
                         producer,
                         uri: crate::language::lsp::file_uri(&path),
                         document: DiagnosticDocument::capture(&app.state, buffer),

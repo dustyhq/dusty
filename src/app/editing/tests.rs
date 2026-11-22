@@ -476,6 +476,7 @@ fn counted_diagnostic_commands_move_the_requested_number_of_problems() {
     app.diagnostics
         .publish(
             DiagnosticBatch {
+                disk_points: Default::default(),
                 producer,
                 uri,
                 document: DiagnosticDocument::capture(&app.state, buffer),
@@ -1113,6 +1114,51 @@ fn counted_macro_replay_stops_when_a_nested_macro_fails() {
     assert_eq!(app.state.buffers[buffer].text.to_string(), "bcdef");
     assert_eq!(app.input.replay_depth(), 0);
     assert!(app.ui.notification_error);
+}
+
+#[test]
+fn root_key_hints_keep_editor_text_visible_above_a_twelve_row_dock() {
+    let mut session =
+        crate::app::tests::driver::TestSession::new(crate::config::load_bundled_config());
+    let app = session.application_mut();
+    app.state
+        .open_text(
+            crate::editor::text::TextBuffer::from_text("source text remains visible"),
+            None,
+        )
+        .unwrap();
+    app.set_dashboard_visibility(false);
+    session.terminal_fixture();
+    session
+        .place_terminal(crate::windows::WindowPlacement::Docked {
+            edge: crate::windows::DockEdge::Bottom,
+            size: 12,
+        })
+        .unwrap();
+    session.terminal_unfocus();
+    let before = session.frame();
+    let source_row = (0..before.grid.height())
+        .find(|&row| {
+            before
+                .grid
+                .row_text(row)
+                .contains("source text remains visible")
+        })
+        .expect("source text should be visible before opening key hints");
+
+    session.key("space");
+    session.advance_input(Duration::from_millis(500));
+    let hints = session.projection().key_hints.as_ref().unwrap();
+    assert_eq!(hints.prefix, "space");
+    assert!(hints.rows.iter().any(|hint| hint.next_key == "x"));
+    let frame = session.frame();
+    assert!((0..10).any(|y| frame.grid.row_text(y).contains("Keys: space")));
+    assert!((0..10).any(|y| frame.grid.row_text(y).contains("[x]")));
+    assert!(frame.grid.row_text(source_row).contains("source text"));
+    assert_eq!(
+        frame.grid.get(18, 0).unwrap().style,
+        crate::ui::Style::KeyHintBorder
+    );
 }
 
 #[test]

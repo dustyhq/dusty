@@ -131,6 +131,54 @@ fn reply(documents: &mut Documents, editor: &EditorState, workspace: &Workspace)
     }
 }
 #[test]
+fn a_closed_file_linter_result_keeps_scalar_display_coordinates() {
+    let (root, editor, workspace, config, mut tasks, mut diagnostics) = fixture();
+    std::fs::write(root.path().join("closed"), "éx\n").unwrap();
+    let task = completed(
+        &mut tasks,
+        &config,
+        &workspace,
+        &editor,
+        &mut diagnostics,
+        "first",
+        b"closed:1:3:problem\n",
+    );
+    tasks
+        .begin_linter(task, &editor, &workspace, 1, &diagnostics, (100, 1024))
+        .unwrap();
+    let mut docs = documents(VfsWorker::start(1), &editor, &workspace);
+    assert!(
+        docs.submit_linter_read(
+            tasks
+                .linter_read(&editor, &workspace, &1, &diagnostics)
+                .unwrap()
+        )
+        .unwrap()
+    );
+    tasks
+        .accept_linter_read(
+            reply(&mut docs, &editor, &workspace),
+            &editor,
+            &workspace,
+            1,
+            &diagnostics,
+        )
+        .unwrap();
+    let Some(LinterUpdate::Publish { producer, batches }) =
+        tasks.next_linter_update(&editor, &workspace, 1, &diagnostics)
+    else {
+        panic!("missing closed-file publication")
+    };
+    assert!(batches[0].document.is_none());
+    diagnostics
+        .replace_source(&producer, batches, &editor)
+        .unwrap();
+    let (_, row, _) = diagnostics.choices().next().unwrap();
+    assert_eq!(row.range.start, crate::editor::text::ByteOffset(2));
+    assert_eq!(diagnostics.point(row, &editor), Some((0, 1)));
+}
+
+#[test]
 fn linter_owner_validates_whole_sources_and_invalidates_original_publications() {
     let (root, mut editor, workspace, config, mut tasks, mut diagnostics) = fixture();
     let (id, _) = editor

@@ -802,11 +802,11 @@ keys = ":lint name=todo<enter><wait>"
 [[step]]
 chapter = "Problems"
 text = "Problems from language servers and linters are listed together."
-press = "Press `<leader>` `x` `x` to list every problem, then `esc` `esc` to close it."
-done = ["diagnostic.open"]
+press = "Press `<leader>` `x` `x` to open the Problems panel, then `esc` to close it."
+done = ["diagnostic.panel.toggle"]
 setup = "tasks"
 open = "README.md"
-keys = "<leader>xx<wait><escape><escape>"
+keys = "<leader>xx<wait><escape>"
 
 [[step]]
 chapter = "Problems"

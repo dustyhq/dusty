@@ -31,6 +31,9 @@ pub(in crate::app) struct NativeSurfaceSignature {
     pub picker_rect: Option<crate::windows::WindowRect>,
     pub picker_surface: Option<PickerSurfaceKind>,
     pub picker_title: String,
+    pub problems_panel: bool,
+    pub problems_top_inset: u16,
+    pub problems_panel_focused: bool,
     pub protected_prompt_height: u16,
     pub configuration_reload_id: u64,
     pub screen_bottom: u16,
@@ -71,9 +74,28 @@ pub(in crate::app) struct NativeSurfaces {
     terminal_default_placement: Option<WindowPlacement>,
     terminal_placements: HashMap<u64, WindowPlacement>,
     terminal_restore_placements: HashMap<u64, WindowPlacement>,
+    covered_shell: Option<CoveredShell>,
     configured_placements: BTreeMap<String, WindowPlacement>,
     workspace_tab: Option<WorkspaceTabId>,
     signature: Option<NativeSurfaceSignature>,
+}
+
+/// Bottom terminals stay at the outside edge; Problems is nearest the editor regardless of
+/// which surface was opened first. Other window layers keep their order.
+fn order_problems_dock(snapshot: &mut CompositorSnapshot, panel: WindowId) {
+    if let Some(index) = snapshot.windows.iter().position(|window| {
+        window.window == panel
+            && matches!(
+                window.placement,
+                WindowPlacement::Docked {
+                    edge: crate::windows::DockEdge::Bottom,
+                    ..
+                }
+            )
+    }) {
+        let window = snapshot.windows.remove(index);
+        snapshot.windows.push(window);
+    }
 }
 
 impl NativeSurfaces {
@@ -106,6 +128,7 @@ impl NativeSurfaces {
             && !signature.explorer_visible
             && !signature.dashboard_visible
             && signature.picker_rect.is_none()
+            && !signature.problems_panel
             && terminals.is_empty()
         {
             self.signature = Some(signature);
@@ -337,7 +360,9 @@ impl NativeSurfaces {
 
         let active_picker = signature.picker_rect.zip(signature.picker_surface);
         for (kind, ids) in &self.pickers {
-            if active_picker.is_none_or(|(_, active)| active != *kind) {
+            if active_picker.is_none_or(|(_, active)| active != *kind)
+                && (*kind != PickerSurfaceKind::ProblemsPanel || !signature.problems_panel)
+            {
                 graph.rehost(ids.window, tab, ids.view, WindowPlacement::Hidden, true)?;
             }
         }
@@ -348,6 +373,7 @@ impl NativeSurfaces {
                 | PickerSurfaceKind::Files
                 | PickerSurfaceKind::Grep => "builtin.picker",
                 PickerSurfaceKind::Problems => "builtin.problems",
+                PickerSurfaceKind::ProblemsPanel => "builtin.problems.panel",
                 PickerSurfaceKind::Output => "builtin.output",
                 PickerSurfaceKind::Logs => "builtin.logs",
                 PickerSurfaceKind::Debug => "builtin.debug",
@@ -383,6 +409,43 @@ impl NativeSurfaces {
                 self.pickers.insert(kind, ids);
                 Some(ids)
             }
+        } else {
+            None
+        };
+
+        let problems_panel = if signature.problems_panel {
+            let kind = PickerSurfaceKind::ProblemsPanel;
+            let placement =
+                self.picker_placements
+                    .get(&kind)
+                    .copied()
+                    .unwrap_or(WindowPlacement::Docked {
+                        edge: crate::windows::DockEdge::Bottom,
+                        size: 10,
+                    });
+            let ids = if let Some(ids) = self.pickers.get(&kind).copied() {
+                graph.rehost(ids.window, tab, ids.view, placement, true)?;
+                ids
+            } else {
+                let content = graph.create_content(
+                    ContentTypeId::new("builtin.problems.panel")?,
+                    ContentAdapterKind::DeclarativeUi,
+                    "Problems".into(),
+                    false,
+                    owner,
+                    instance_id,
+                )?;
+                let view = graph.create_view(content, owner, instance_id)?;
+                let window = graph.open_window(tab, view, placement, true, owner, instance_id)?;
+                let ids = NativeSurfaceIds {
+                    content,
+                    view,
+                    window,
+                };
+                self.pickers.insert(kind, ids);
+                ids
+            };
+            Some(ids)
         } else {
             None
         };
@@ -522,6 +585,8 @@ impl NativeSurfaces {
             }
         }
         if signature.picker_rect.is_none()
+            && !signature.agent_focused
+            && !signature.problems_panel_focused
             && !signature.terminal_focused
             && signature.focused_explorer.is_none()
             && let Some(plugin) = retained_plugin_focus
@@ -545,6 +610,171 @@ impl NativeSurfaces {
         graph.validate()?;
         self.signature = Some(signature);
         Ok(())
+    }
+
+    /// Fit only the compositor's temporary layout input. Graph placements, including
+    /// the normal terminal size used by hide, resize and session save, are unchanged.
+    pub(super) fn fit_problems_projection(&self, snapshot: &mut CompositorSnapshot) {
+        if let Some(signature) = &self.signature
+            && signature.problems_panel
+            && let Some(panel) = self.problems_panel()
+        {
+            self.fit_problems_dock(
+                snapshot,
+                panel.window,
+                self.picker().map(|ids| ids.window),
+                signature,
+            );
+        }
+    }
+
+    /// Budget both docks before projecting either, regardless of creation order.
+    fn fit_problems_dock(
+        &self,
+        snapshot: &mut CompositorSnapshot,
+        panel: WindowId,
+        picker: Option<WindowId>,
+        signature: &NativeSurfaceSignature,
+    ) -> bool {
+        use crate::windows::{DockEdge, PANE_MINIMUM_HEIGHT, PANE_MINIMUM_WIDTH, TiledInsets};
+        const MINIMUM_PROBLEMS: u16 = 2; // title and one selectable/empty row
+        const MINIMUM_TERMINAL: u16 = 3; // terminal renderer's minimum
+        const MINIMUM_PICKER: u16 = 6;
+
+        let Some(panel_index) = snapshot
+            .windows
+            .iter()
+            .position(|window| window.window == panel)
+        else {
+            return false;
+        };
+        let panel_placement = snapshot.windows[panel_index].placement;
+        let bounds = WindowRect {
+            x: 0,
+            y: 0,
+            width: signature.terminal_width,
+            height: signature.terminal_height,
+        };
+        let insets = TiledInsets {
+            screen_bottom: signature.screen_bottom,
+            top: signature.problems_top_inset,
+            ..TiledInsets::default()
+        };
+        let picker_index =
+            picker.and_then(|id| snapshot.windows.iter().position(|w| w.window == id));
+        let picker_placement = picker_index.map(|index| snapshot.windows[index].placement);
+        if let WindowPlacement::Docked {
+            edge: DockEdge::Bottom,
+            size: requested,
+        } = panel_placement
+        {
+            let main_terminal = signature
+                .active_terminal
+                .into_iter()
+                .chain(signature.shown_terminals.iter().copied())
+                .filter_map(|id| self.terminals.get(&id))
+                .find_map(|ids| {
+                    let index = snapshot
+                        .windows
+                        .iter()
+                        .position(|window| window.window == ids.window)?;
+                    match snapshot.windows[index].placement {
+                        WindowPlacement::Docked {
+                            edge: edge @ (DockEdge::Top | DockEdge::Bottom),
+                            size,
+                        } => Some((index, edge, size)),
+                        _ => None,
+                    }
+                });
+            let workspace_min = if matches!(
+                picker_placement,
+                Some(WindowPlacement::Floating(_) | WindowPlacement::Overlay(_))
+            ) {
+                PANE_MINIMUM_HEIGHT.max(MINIMUM_PICKER)
+            } else {
+                PANE_MINIMUM_HEIGHT
+            };
+            let budget = snapshot.windows.iter().enumerate().fold(
+                bounds
+                    .height
+                    .saturating_sub(insets.screen_bottom)
+                    .saturating_sub(insets.top)
+                    .saturating_sub(workspace_min),
+                |available, (index, window)| match window.placement {
+                    WindowPlacement::Docked {
+                        edge: DockEdge::Top | DockEdge::Bottom,
+                        size,
+                    } if window.window != panel
+                        && main_terminal.is_none_or(|(terminal, _, _)| index != terminal) =>
+                    {
+                        available.saturating_sub(size)
+                    }
+                    _ => available,
+                },
+            );
+            let terminal_min = main_terminal.map_or(0, |(_, _, size)| size.min(MINIMUM_TERMINAL));
+            if bounds.width == 0
+                || budget < MINIMUM_PROBLEMS + terminal_min
+                || snapshot
+                    .windows
+                    .iter()
+                    .any(|window| window.placement == WindowPlacement::Fullscreen)
+            {
+                return false;
+            }
+            let terminal_rows =
+                main_terminal.map_or(0, |(_, _, size)| size.min(budget - MINIMUM_PROBLEMS));
+            if let Some((index, edge, _)) = main_terminal {
+                snapshot.windows[index].placement = WindowPlacement::Docked {
+                    edge,
+                    size: terminal_rows,
+                };
+            }
+            snapshot.windows[panel_index].placement = WindowPlacement::Docked {
+                edge: DockEdge::Bottom,
+                size: requested.clamp(MINIMUM_PROBLEMS, budget - terminal_rows),
+            };
+        }
+
+        order_problems_dock(snapshot, panel);
+        let projected = snapshot.project_with_tiled_insets(
+            bounds,
+            PANE_MINIMUM_WIDTH,
+            PANE_MINIMUM_HEIGHT,
+            insets,
+        );
+        let Some(panel_rect) = projected
+            .window(panel)
+            .map(|window| window.rect)
+            .filter(|rect| rect.height >= MINIMUM_PROBLEMS)
+        else {
+            return false;
+        };
+        if let Some(
+            placement @ (WindowPlacement::Overlay(mut rect) | WindowPlacement::Floating(mut rect)),
+        ) = picker_placement
+            && panel_rect.y < rect.y.saturating_add(rect.height)
+            && rect.y < panel_rect.y.saturating_add(panel_rect.height)
+        {
+            // Put the picker above the dock, rather than painting it and masking its rows.
+            // Renderer and mouse input use the same projected rectangle.
+            rect.height = rect.height.min(panel_rect.y);
+            rect.y = panel_rect.y.saturating_sub(rect.height) / 2;
+            let placement = if matches!(placement, WindowPlacement::Overlay(_)) {
+                WindowPlacement::Overlay(rect)
+            } else {
+                WindowPlacement::Floating(rect)
+            };
+            if rect.height >= MINIMUM_PICKER
+                && let Some(window) = snapshot
+                    .windows
+                    .iter_mut()
+                    .find(|window| Some(window.window) == picker)
+            {
+                window.placement = placement;
+            }
+        }
+        true
     }
 
     pub(in crate::app) fn workspace_tab(&self) -> Option<WorkspaceTabId> {
@@ -585,6 +815,10 @@ impl NativeSurfaces {
             .as_ref()
             .and_then(|signature| signature.picker_surface)
             .and_then(|kind| self.pickers.get(&kind).copied())
+    }
+
+    pub(in crate::app) fn problems_panel(&self) -> Option<NativeSurfaceIds> {
+        self.pickers.get(&PickerSurfaceKind::ProblemsPanel).copied()
     }
 
     #[cfg(test)]

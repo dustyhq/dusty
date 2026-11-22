@@ -97,6 +97,7 @@ fn diagnostic_navigation_filters_severity_wraps_and_expands_the_landed_line() {
     app.diagnostics
         .publish(
             crate::app::diagnostics::DiagnosticBatch {
+                disk_points: Default::default(),
                 producer,
                 uri: uri.clone(),
                 document: crate::app::diagnostics::DiagnosticDocument::capture(&app.state, buffer),
@@ -201,6 +202,7 @@ fn accepting_a_disk_diagnostic_opens_its_file_and_validates_the_range() {
     app.diagnostics
         .publish(
             crate::app::diagnostics::DiagnosticBatch {
+                disk_points: Default::default(),
                 producer,
                 uri: uri.clone(),
                 document: None,
@@ -2588,6 +2590,7 @@ fn a_previewed_replacement_writes_nothing_until_it_is_confirmed_slot5() {
     app.git
         .set_pending_destructive(crate::app::git::GitDestructiveAction::RemoveWorktree(
             "missing".into(),
+            None,
         ));
     assert!(!app.git.has_pending_replacement());
     app.git.set_pending_replacement(replacement);
@@ -2600,6 +2603,7 @@ fn a_previewed_replacement_writes_nothing_until_it_is_confirmed_slot5() {
     app.git
         .set_pending_destructive(crate::app::git::GitDestructiveAction::RemoveWorktree(
             "missing".into(),
+            None,
         ));
     app.open_confirmation(
         crate::ui::PromptKind::GitDestructive,
@@ -3162,6 +3166,158 @@ fn configured_file_format_policy_is_applied_at_save_boundary() {
     assert!(!app.ui.notification_error, "{:?}", app.ui.notification);
     assert!(!app.state.buffers[buffer].dirty);
     assert_eq!(fs::read(path).unwrap(), b"a\nb\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn save_after_formatter_refusal_keeps_the_warning_and_reports_newer_edits() {
+    let (_dirs, mut app) = app();
+    let mut fixture = app.configuration.fixture_snapshot();
+    fixture.settings.lsp.format_on_save = true;
+    fixture.settings.tasks.insert(
+        "build".into(),
+        crate::config::TaskConfig {
+            kind: crate::config::TaskKind::Task,
+            executable: "/bin/sh".into(),
+            arguments: vec!["-c".into(), "printf wrong > build-ran".into()],
+            cwd: None,
+            environment: BTreeMap::new(),
+            dependencies: vec![],
+            timeout_ms: Some(2000),
+            stdin: false,
+            matcher: None,
+        },
+    );
+    app.configuration.install_fixture(fixture);
+    app.documents.set_formatters(
+        "rust".into(),
+        vec![super::save_work::Formatter::Tool("build".into())],
+    );
+    let path = app.state.workspace_root.join("unformatted.rs");
+    fs::write(&path, "let x=1;\n").unwrap();
+    let (buffer, _) = app
+        .state
+        .open_text(TextBuffer::from_text("let x=1;\n"), Some(path.clone()))
+        .unwrap();
+    app.set_dashboard_visibility(false);
+    app.invoke_insert_text("// keep this spacing\n".into());
+
+    app.process_effect(AppEffect::Save {
+        quit_after: false,
+        path: None,
+        force: false,
+    });
+    assert_eq!(app.documents.pending_count(), 1);
+    app.invoke_insert_text("// newer edit\n".into());
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while app.documents.has_work() {
+        app.process_vfs_results();
+        assert!(Instant::now() < deadline, "save did not finish");
+        thread::yield_now();
+    }
+
+    assert_eq!(
+        fs::read_to_string(path).unwrap(),
+        "// keep this spacing\nlet x=1;\n"
+    );
+    assert!(app.state.buffers[buffer].dirty);
+    assert!(!app.tasks.is_running("build"));
+    assert!(!app.state.workspace_root.join("build-ran").exists());
+    assert_eq!(
+        app.ui.notification.as_deref(),
+        Some(
+            "Saved unformatted.rs without formatting. \"build\" is not a formatter. Newer edits are not saved yet."
+        ),
+    );
+    assert!(app.ui.notification_warning);
+}
+
+#[cfg(unix)]
+#[test]
+fn save_with_a_configured_task_formatter_has_only_the_normal_confirmation() {
+    let root = tempdir().unwrap();
+    let state_dir = tempdir().unwrap();
+    let mut loaded = crate::config::load_bundled_config();
+    loaded.config.tasks.insert(
+        "save-format".into(),
+        crate::config::TaskConfig {
+            kind: crate::config::TaskKind::Formatter,
+            executable: "/bin/sh".into(),
+            arguments: vec![
+                "-c".into(),
+                "IFS= read -r edit && IFS= read -r source && [ \"$source\" = 'let x=1;' ] && printf '%s\\nlet x = 1;\\n' \"$edit\"".into(),
+            ],
+            cwd: None,
+            environment: BTreeMap::new(),
+            dependencies: vec![],
+            timeout_ms: Some(2000),
+            stdin: true,
+            matcher: None,
+        },
+    );
+    let mut app = App::new(
+        StartupTarget::Dashboard {
+            root: root.path().into(),
+        },
+        loaded,
+        false,
+        state_dir.path().into(),
+        false,
+        false,
+        std::sync::Arc::new(crate::clock::SystemClock),
+    )
+    .unwrap();
+    let mut fixture = app.configuration.fixture_snapshot();
+    fixture.settings.lsp.format_on_save = true;
+    app.configuration.install_fixture(fixture);
+    app.documents.set_formatters(
+        "rust".into(),
+        vec![super::save_work::Formatter::Tool("save-format".into())],
+    );
+    let path = app.state.workspace_root.join("formatted.rs");
+    fs::write(&path, "let x=1;\n").unwrap();
+    let (buffer, _) = app
+        .state
+        .open_text(TextBuffer::from_text("let x=1;\n"), Some(path.clone()))
+        .unwrap();
+    app.window_session.observe_size((80, 24));
+    app.set_dashboard_visibility(false);
+    app.reconcile_editor_windows();
+    prepare_trust_identity(&mut app);
+    for root in app.workspace.roots().to_vec() {
+        app.workspace.fixture_trust_identity(root.identity.clone());
+    }
+    app.reconcile_workspace_trust();
+    let notices_before = app.notices.history().count();
+    app.invoke_insert_text("// edit\n".into());
+    app.process_effect(AppEffect::Save {
+        quit_after: false,
+        path: None,
+        force: false,
+    });
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while app.state.buffers[buffer].dirty {
+        app.process_execution_preflight();
+        app.process_job_events();
+        app.process_save_work();
+        app.process_vfs_results();
+        assert!(Instant::now() < deadline, "save did not finish");
+        thread::sleep(Duration::from_millis(2));
+    }
+    assert_eq!(fs::read_to_string(path).unwrap(), "// edit\nlet x = 1;\n");
+    assert!(!app.state.buffers[buffer].dirty);
+    assert!(!app.ui.notification_warning);
+    assert_eq!(app.ui.notification.as_deref(), Some("saved formatted.rs"));
+    assert!(
+        app.notices
+            .history()
+            .skip(notices_before)
+            .all(|(error, notice)| {
+                !error
+                    && !notice.contains("without formatting")
+                    && !notice.contains("Skipped formatter")
+            })
+    );
 }
 
 #[test]
@@ -3824,6 +3980,7 @@ fn content_line_diagnostics_custom_entries_and_idle_projection_are_pure() {
     app.diagnostics
         .publish(
             crate::app::diagnostics::DiagnosticBatch {
+                disk_points: Default::default(),
                 producer,
                 uri: uri.clone(),
                 document: crate::app::diagnostics::DiagnosticDocument::capture(
@@ -4356,6 +4513,93 @@ fn nested_border_drag_uses_the_border_axis_on_both_sides() {
         }
     }
     assert_eq!(drag(false), drag(true));
+}
+
+#[test]
+fn dirty_close_ignores_repeated_submit_and_choice_keys() {
+    let (_app_dirs, mut app) = app();
+    let path = app.state.workspace_root.join("repeated-close.txt");
+    fs::write(&path, "saved\n").unwrap();
+    let (buffer, _) = app
+        .state
+        .open_text(TextBuffer::from_text("saved\n"), Some(path))
+        .unwrap();
+    app.set_dashboard_visibility(false);
+    app.invoke_insert_text("unsaved ".into());
+    let edited = app.state.buffers[buffer].text.to_string();
+
+    app.close_active_buffer(false);
+    for key in ["enter", "y", "n"] {
+        app.handle_event(UiEvent::Key {
+            key: key.parse().expect("confirmation key"),
+            kind: KeyInputKind::Repeat,
+        });
+        assert_eq!(
+            app.input.prompt().map(|prompt| prompt.kind),
+            Some(crate::ui::PromptKind::DirtyClose),
+            "repeated {key} must not answer the prompt"
+        );
+        assert_eq!(app.state.active_buffer_id(), Some(buffer));
+        assert_eq!(app.state.buffers[buffer].text.to_string(), edited);
+        assert!(app.state.buffers[buffer].dirty);
+        assert!(!app.documents.file_work_pending());
+    }
+}
+
+#[test]
+fn repeated_backspace_edits_git_reset_confirmation() {
+    let (_app_dirs, mut app) = app();
+    app.open_prompt(crate::ui::PromptKind::GitReset, "reset this hunkx".into());
+    app.handle_event(UiEvent::Key {
+        key: "backspace".parse().expect("Backspace"),
+        kind: KeyInputKind::Repeat,
+    });
+    assert_eq!(app.input.prompt().unwrap().input, "reset this hunk");
+}
+
+#[test]
+fn replayed_repeat_does_not_answer_dirty_close() {
+    use crate::app::input::InputCommand;
+    use crate::editor::CommandInvocation;
+    use crate::editor::input::Keymap;
+
+    let (_app_dirs, mut app) = app();
+    let (buffer, _) = app
+        .state
+        .open_text(TextBuffer::from_text("unsaved"), None)
+        .unwrap();
+    app.state.set_buffer_dirty(buffer, true);
+    app.set_dashboard_visibility(false);
+    app.reconcile_editor_windows();
+
+    let n = KeyEvent::character('n');
+    let mut layer = Keymap::default();
+    layer.insert(
+        std::slice::from_ref(&n),
+        CommandInvocation::new("buffer.close", InvocationSource::Keymap)
+            .unwrap()
+            .with_argument("force", crate::editor::CommandValue::Bool(false)),
+    );
+    layer.insert(
+        &[n.clone(), KeyEvent::character('x')],
+        CommandInvocation::new("health.open", InvocationSource::Keymap).unwrap(),
+    );
+    app.process_effect(AppEffect::Input(InputCommand::PushLayer(Box::new(layer))));
+    app.handle_event(UiEvent::Key {
+        key: n.clone(),
+        kind: KeyInputKind::Press,
+    });
+    assert!(app.input.prompt().is_none());
+
+    app.handle_event(UiEvent::Key {
+        key: n,
+        kind: KeyInputKind::Repeat,
+    });
+    assert_eq!(
+        app.input.prompt().map(|prompt| prompt.kind),
+        Some(crate::ui::PromptKind::DirtyClose)
+    );
+    assert!(app.state.buffers[buffer].dirty);
 }
 
 #[test]

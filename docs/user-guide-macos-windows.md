@@ -38,6 +38,10 @@ configuration directory. Recovery, sessions, trust records and managed tools liv
 under the state directory. `dusty --check-config` validates configuration without
 opening the editor.
 
+## Diagnostics
+
+The [Problems panel](user-guide-linux.md#diagnostics-and-lsp) works on both systems, even with messages beside code off. Use `Space x x` to toggle it, `Space x X` for the current file, and `Space s d` to search problems in the floating picker.
+
 ## Shells and external tools
 
 On macOS the bundled shell profile uses `$SHELL`, falling back to `/bin/sh`. On
