@@ -308,6 +308,20 @@ def terminal_cursor(data: bytes, width: int = 100, height: int = 30) -> tuple[in
     return terminal_projection(data, width, height)[1]
 
 
+def assert_shows_path(screen: str, path: pathlib.Path) -> None:
+    """The dashboard shows `path`, or, when it is too long for the room beside the logo, its
+    end after an ellipsis, down to the folder name at least."""
+    text = path.as_posix()
+    if text in screen:
+        return
+    for line in screen.splitlines():
+        for shown in line.split():
+            if shown.startswith("…") and len(shown) > 1 and text.endswith(shown[1:]):
+                assert shown[1:].endswith(path.name), (shown, text)
+                return
+    raise AssertionError(f"{text} is not on the dashboard:\n{screen}")
+
+
 def assert_restored(output: bytes) -> None:
     decoded = output.decode("utf-8", "ignore")
     assert "\x1b[?1049h" in decoded
@@ -1298,7 +1312,7 @@ exit 1
     with tempfile.TemporaryDirectory() as directory:
         code, output, snapshots = run(binary, directory, ["."], [(0.2, b":q\r", None)])
         assert code == 0
-        assert pathlib.Path(directory).as_posix() in terminal_screen(snapshots[0])
+        assert_shows_path(terminal_screen(snapshots[0]), pathlib.Path(directory))
         assert_restored(output)
 
         child = pathlib.Path(directory) / "workspace"
@@ -1310,7 +1324,7 @@ exit 1
             [(0.2, b":q\r", None)],
         )
         assert code == 0
-        assert child.as_posix() in terminal_screen(snapshots[0])
+        assert_shows_path(terminal_screen(snapshots[0]), child)
         assert_restored(output)
 
     with tempfile.TemporaryDirectory() as directory:
