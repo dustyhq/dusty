@@ -335,7 +335,9 @@ fn dashboard_and_prompt_render_at_multiple_sizes() {
                 "{rows:?}"
             );
         }
-        assert!(dashboard.cursor.is_none());
+        if let Some((x, y, _)) = dashboard.cursor {
+            assert!(x < width && y < height);
+        }
         ui.prompt = Some(PromptState::new(PromptKind::Command));
         let prompt = render(&state, &ui, &config, &dashboard_config, width, height);
         let geometry = prompt_geometry(width, height, false);

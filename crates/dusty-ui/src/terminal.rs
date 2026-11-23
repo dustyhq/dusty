@@ -538,15 +538,12 @@ fn queue_style(
         return Ok(());
     }
     if let Style::Pixels(upper, lower) = style {
-        let page = &theme.styles.default;
-        let page = terminal_color(tier_color(
-            page.background,
-            page.background_256,
-            page.background_16,
-            tier,
-        ));
-        let paint = |pixel: Option<crate::PtyColor>| {
-            pixel.map_or(page, |color| terminal_pty_color(color, tier))
+        let colors = LogoColors::new(theme, tier);
+        let paint = |pixel: Option<crate::LogoPixel>| match pixel {
+            None => colors.page,
+            Some(crate::LogoPixel::Letter) => colors.letter,
+            Some(crate::LogoPixel::Shadow) => colors.shadow,
+            Some(crate::LogoPixel::Dust(tone)) => colors.dust[usize::from(tone.min(3))],
         };
         queue!(writer, SetAttribute(Attribute::Reset))?;
         return queue_colors(writer, paint(upper), paint(lower), tier);
@@ -1046,6 +1043,69 @@ fn tier_color(
         ColorTier::TrueColor => primary,
         ColorTier::Ansi256 => ansi_256.or(ansi_16).unwrap_or(primary),
         ColorTier::Ansi16 => ansi_16.unwrap_or(primary).ansi16(),
+    }
+}
+
+/// The dashboard logo's colours from the theme: letters in the text colour, and the dust
+/// and shadow in shades of the accent colour, from towards the text down to near the page.
+/// Without true colour, or with a theme colour that isn't RGB, the shades fall back to the
+/// accent and border colours as they are.
+struct LogoColors {
+    page: Color,
+    letter: Color,
+    shadow: Color,
+    dust: [Color; 4],
+}
+
+impl LogoColors {
+    fn new(theme: &ThemeConfig, tier: ColorTier) -> Self {
+        let styles = &theme.styles;
+        let foreground = |style: &crate::config::ThemeStyle| {
+            tier_color(
+                style.foreground,
+                style.foreground_256,
+                style.foreground_16,
+                tier,
+            )
+        };
+        let page = tier_color(
+            styles.default.background,
+            styles.default.background_256,
+            styles.default.background_16,
+            tier,
+        );
+        let text = foreground(&styles.default);
+        let accent = foreground(&styles.accent);
+        // `percent` of the way from the accent to `toward`, or `fallback` when that can't be
+        // worked out.
+        let shade = |toward: ThemeColor, percent: u16, fallback: ThemeColor| match (accent, toward)
+        {
+            (ThemeColor::Rgb(r, g, b), ThemeColor::Rgb(tr, tg, tb))
+                if tier == ColorTier::TrueColor =>
+            {
+                let mix = |from: u8, to: u8| {
+                    let mixed = (u16::from(from) * (100 - percent) + u16::from(to) * percent) / 100;
+                    u8::try_from(mixed).unwrap_or(u8::MAX)
+                };
+                Color::Rgb {
+                    r: mix(r, tr),
+                    g: mix(g, tg),
+                    b: mix(b, tb),
+                }
+            }
+            _ => terminal_color(fallback),
+        };
+        Self {
+            page: terminal_color(page),
+            letter: terminal_color(text),
+            shadow: shade(page, 65, foreground(&styles.border)),
+            dust: [
+                shade(text, 50, text),
+                shade(page, 0, accent),
+                shade(page, 25, accent),
+                shade(page, 45, accent),
+            ],
+        }
     }
 }
 

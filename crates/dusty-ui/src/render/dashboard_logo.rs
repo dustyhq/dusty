@@ -1,12 +1,12 @@
 //! The dashboard's dust logo: "dusty" in pixel letters with a drop shadow, a thin layer of
 //! dust on the letter tops, and grains the wind lifts off it. Each cell is an upper half
-//! block, so it holds two pixels, one above the other. `scripts/make-logo.py` draws the README's
-//! version of it.
+//! block, so it holds two pixels, one above the other, and the theme colours them.
+//! `scripts/make-logo.py` draws the README's sand-coloured version of it.
 
 use std::sync::OnceLock;
 
 use crate::CellGrid;
-use crate::PtyColor;
+use crate::LogoPixel;
 use crate::Style;
 
 /// Frames in one loop of the blowing dust.
@@ -62,17 +62,17 @@ const LETTERS: [(usize, &[&str]); 5] = [
     ),
 ];
 
-const INK: PtyColor = PtyColor::Rgb(0xf4, 0xe7, 0xc9);
-const SHADOW: PtyColor = PtyColor::Rgb(0x6b, 0x3a, 0x1f);
+const INK: LogoPixel = LogoPixel::Letter;
+const SHADOW: LogoPixel = LogoPixel::Shadow;
 /// Dust from pale to dark.
-const DUST: [PtyColor; 4] = [
-    PtyColor::Rgb(0xf7, 0xe2, 0xa6),
-    PtyColor::Rgb(0xe8, 0xc2, 0x7a),
-    PtyColor::Rgb(0xd3, 0x9a, 0x55),
-    PtyColor::Rgb(0xb8, 0x78, 0x3d),
+const DUST: [LogoPixel; 4] = [
+    LogoPixel::Dust(0),
+    LogoPixel::Dust(1),
+    LogoPixel::Dust(2),
+    LogoPixel::Dust(3),
 ];
 
-type Pixels = [[Option<PtyColor>; WIDTH]; HEIGHT];
+type Pixels = [[Option<LogoPixel>; WIDTH]; HEIGHT];
 
 struct Grain {
     /// The frame the grain lifts off on.

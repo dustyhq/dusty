@@ -132,6 +132,15 @@ pub enum ToolTint {
     Failed,
 }
 
+/// What a pixel of the dashboard logo shows; the theme decides its colour.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum LogoPixel {
+    Letter,
+    Shadow,
+    /// Dust from the palest tone, 0, to the darkest, 3.
+    Dust(u8),
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum Style {
     /// A Dusty Git cell: a semantic role on a semantic surface.
@@ -259,9 +268,9 @@ pub enum Style {
     TerminalStatus,
     TerminalStatusAccent,
     Terminal(PtyStyle),
-    /// One cell of pixel art drawn as an upper half block: the upper pixel's colour, then the
-    /// lower one's. `None` shows the theme's background, so a lone pixel sits on the page.
-    Pixels(Option<crate::PtyColor>, Option<crate::PtyColor>),
+    /// One cell of the dashboard logo drawn as an upper half block: the upper pixel, then the
+    /// lower one. `None` shows the theme's background, so a lone pixel sits on the page.
+    Pixels(Option<LogoPixel>, Option<LogoPixel>),
     /// A Neovim highlight group, coloured by the theme's `[highlights]`.
     Syntax(crate::config::Highlight),
     /// A syntax foreground drawn on the selection background.

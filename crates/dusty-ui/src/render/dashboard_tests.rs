@@ -12,7 +12,7 @@ use crate::render::composition_tests::attach_test_compositor;
 use crate::render::composition_tests::render;
 
 #[test]
-fn notice_popup_shows_on_the_dashboard_without_a_cursor() {
+fn notice_popup_shows_on_the_dashboard_and_leaves_the_cursor_where_it_was() {
     let state = EditorState::new(PathBuf::from("/tmp/dusty-workspace"));
     let ui = UiState {
         documentation_popup: Some(DocumentationPopupState {
@@ -33,7 +33,15 @@ fn notice_popup_shows_on_the_dashboard_without_a_cursor() {
     let config = crate::config::load_bundled_config().config;
     let dashboard = crate::config::load_bundled_config().dashboard;
     let frame = render(&state, &ui, &config, &dashboard, 80, 24);
-    assert!(frame.cursor.is_none());
+    let without = UiState {
+        documentation_popup: None,
+        ..ui.clone()
+    };
+    let cursor = |frame: &crate::Frame| frame.cursor.map(|(x, y, _)| (x, y));
+    assert_eq!(
+        cursor(&frame),
+        cursor(&render(&state, &without, &config, &dashboard, 80, 24))
+    );
     let screen = (0..24)
         .map(|y| {
             (0..80)
@@ -416,7 +424,36 @@ fn a_large_dashboard_shows_the_wordmark_beside_the_workspace_over_four_boxes() {
 
     assert!(rows[38].starts_with(" h j k l move · Enter open · 1-9 recent file"));
     assert_eq!(style(&frame, 0, 38), Style::StatusMuted);
-    assert!(frame.cursor.is_none());
+    // The terminal cursor rests at the start of the selected row.
+    let (x, y, _) = frame.cursor.expect("the dashboard keeps a cursor");
+    assert_eq!(style(&frame, x, y), Style::Selection);
+}
+
+#[test]
+fn the_cursor_rests_on_the_selected_row_of_the_focused_box_or_its_first_row() {
+    let mut ui = workspace_ui();
+    for (panel, row) in [
+        (DashboardPanel::RecentFiles, 1),
+        (DashboardPanel::Changes, 1),
+        (DashboardPanel::Projects, 1),
+        (DashboardPanel::Start, 4),
+    ] {
+        ui.dashboard_focus = Some(panel);
+        ui.dashboard_row = row;
+        ui.dashboard_selected = row;
+        let (frame, _) = draw(&ui, 160, 39);
+        let (x, y, _) = frame.cursor.expect("the dashboard keeps a cursor");
+        assert_eq!(style(&frame, x, y), Style::Selection, "{panel:?}");
+    }
+    // An empty box can't hold the focus, so the cursor goes with it to the actions.
+    ui.dashboard_workspace.recent_files.clear();
+    ui.dashboard_focus = Some(DashboardPanel::RecentFiles);
+    ui.dashboard_selected = 0;
+    let (frame, rows) = draw(&ui, 160, 39);
+    let (x, y, _) = frame.cursor.expect("the dashboard keeps a cursor");
+    assert_eq!(style(&frame, x, y), Style::Selection);
+    let from_cursor: String = rows[usize::from(y)].chars().skip(usize::from(x)).collect();
+    assert!(from_cursor.starts_with(" f  find file"), "{from_cursor:?}");
 }
 
 #[test]
@@ -657,7 +694,9 @@ fn every_size_draws_without_overflowing() {
                 draw(&ui, width, height),
                 draw_configured(&ui, &loaded.dashboard, &loaded.config, width, height),
             ] {
-                assert!(frame.cursor.is_none());
+                if let Some((x, y, _)) = frame.cursor {
+                    assert!(x < width && y < height, "{width}x{height}");
+                }
                 if width < 20 || height < 7 {
                     continue;
                 }
@@ -697,8 +736,8 @@ fn a_tall_dashboard_blows_dust_off_the_pixel_logo_and_shorter_ones_keep_the_word
             .all(|(x, y, _)| (4..54).contains(x) && (1..=8).contains(y)),
         "{first:?}"
     );
-    // The top of the d's stem: two pale pixels in one cell.
-    let ink = Some(crate::PtyColor::Rgb(0xf4, 0xe7, 0xc9));
+    // The top of the d's stem: two letter pixels in one cell.
+    let ink = Some(crate::LogoPixel::Letter);
     assert_eq!(style(&frame, 9, 3), Style::Pixels(ink, ink));
     // The workspace sits beside the letters, and the boxes start below the logo.
     assert_eq!(column(&rows[4], "tally · "), 62, "{rows:#?}");

@@ -23,6 +23,7 @@ use crate::render::dashboard_logo::DUST_LOGO_ROWS;
 use crate::render::dashboard_logo::DUST_LOGO_TEXT_ROW;
 use crate::render::dashboard_logo::DUST_LOGO_WIDTH;
 use crate::render::dashboard_logo::draw_dust_logo;
+use crate::render::editor::cursor_style;
 use crate::render::overlays::truncate_content_title;
 use crate::windows::WindowRect;
 use std::path::Path;
@@ -160,6 +161,7 @@ pub(super) fn render_dashboard(
         icons: editor_config.ui.explorer.icon_mode == ExplorerIconMode::NerdFont,
         focus: dashboard_focus(ui, layout.shown),
         actions: layout.actions,
+        cursor: None,
     };
     if layout.shown.len() == ALL_PANELS.len() {
         screen.draw_header(layout.left, layout.block, layout.logo);
@@ -179,9 +181,12 @@ pub(super) fn render_dashboard(
             .grid
             .put_text_clipped(1, y, HINTS, Style::StatusMuted, width.saturating_sub(1));
     }
+    let cursor = screen
+        .cursor
+        .map(|(x, y)| (x, y, cursor_style(editor_config.ui.cursor.normal)));
     Frame {
         grid: screen.grid,
-        cursor: None,
+        cursor,
     }
 }
 
@@ -523,6 +528,9 @@ struct Screen<'a> {
     icons: bool,
     focus: DashboardPanel,
     actions: ActionWidths,
+    /// Where the terminal cursor rests: the start of the selected row in the focused box, or
+    /// its first row when it has nothing to select.
+    cursor: Option<(u16, u16)>,
 }
 
 impl Screen<'_> {
@@ -728,7 +736,11 @@ impl Screen<'_> {
                 self.put(hint_x, rect.y, &hint, Style::Muted, right);
             }
         }
-        rect.content()
+        let content = rect.content();
+        if focused && content.rows > 0 {
+            self.cursor = Some((content.fill_left, content.y));
+        }
+        content
     }
 
     fn draw_panel(&mut self, panel: DashboardPanel, rect: Rect) {
@@ -799,6 +811,7 @@ impl Screen<'_> {
         for x in content.fill_left..content.fill_right {
             self.grid.set_cell(x, y, " ", Style::Selection);
         }
+        self.cursor = Some((content.fill_left, y));
     }
 
     /// A path with its folder dimmed so the file name stands out.
@@ -942,6 +955,7 @@ impl Screen<'_> {
                     for fill in x.saturating_sub(1)..fill_right {
                         self.grid.set_cell(fill, y, " ", Style::Selection);
                     }
+                    self.cursor = Some((x.saturating_sub(1), y));
                 }
                 if let Some(key) = &action.key {
                     self.put(x, y, key, tone(Style::Accent, chosen), column_right);
