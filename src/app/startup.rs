@@ -573,6 +573,8 @@ impl App {
             git: crate::app::git::Git::default(),
             git_screen: None,
             git_screen_visible: false,
+            host_focused: true,
+            dashboard_logo_epoch: std::time::Instant::now(),
             clipboard: crate::app::editing::clipboard::Clipboard::default(),
             macro_replays: Vec::new(),
             macro_running: false,

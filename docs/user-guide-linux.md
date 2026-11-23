@@ -17,6 +17,8 @@ is ready. After finishing or skipping, press `t` on the dashboard for **Tutor â€
 learn by editing** (also available as `:Tutor`). The tutor never opens automatically.
 Use `:setup` to revisit the questions; skipping it leaves existing settings alone.
 
+In a tall enough window the dashboard's logo has dust blowing off it. It stops while the terminal is in the background. To keep the logo still, turn off **Settings â†’ Dashboard Animation** or set `[startup] dashboard_animation = false`.
+
 A workspace Dusty has not seen before asks whether to trust it after the first frame. Press Enter to trust it (LSP servers, tasks and debuggers may then run project code), or Escape to keep editing without those execution paths. Dusty remembers that it asked. Use `:trust` later to approve the workspace and `:untrust` to revoke it.
 
 ACP agents currently remain executable in safe mode and untrusted workspaces;

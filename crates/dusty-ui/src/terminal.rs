@@ -537,6 +537,20 @@ fn queue_style(
         }
         return Ok(());
     }
+    if let Style::Pixels(upper, lower) = style {
+        let page = &theme.styles.default;
+        let page = terminal_color(tier_color(
+            page.background,
+            page.background_256,
+            page.background_16,
+            tier,
+        ));
+        let paint = |pixel: Option<crate::PtyColor>| {
+            pixel.map_or(page, |color| terminal_pty_color(color, tier))
+        };
+        queue!(writer, SetAttribute(Attribute::Reset))?;
+        return queue_colors(writer, paint(upper), paint(lower), tier);
+    }
     let selected_explorer = matches!(style, Style::ExplorerSelected(_));
     let style = if let Style::ExplorerSelected(role) = style {
         crate::render::explorer_segment_style(role)
@@ -838,7 +852,9 @@ fn queue_style(
         Style::TerminalTitle => &theme.styles.terminal_title,
         Style::TerminalStatus => &theme.styles.terminal_status,
         Style::TerminalStatusAccent => &theme.styles.terminal_status_accent,
-        Style::Terminal(_) => unreachable!("terminal cells are handled above"),
+        Style::Terminal(_) | Style::Pixels(..) => {
+            unreachable!("terminal cells and pixels are handled above")
+        }
         Style::Syntax(group) => theme.highlight(group).unwrap_or(&theme.styles.default),
         Style::MarkdownHeading(group) => {
             derived = theme.markdown_heading(group);

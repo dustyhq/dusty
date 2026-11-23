@@ -10,12 +10,15 @@ use serde::Serialize;
 #[serde(deny_unknown_fields)]
 pub struct StartupConfig {
     pub show_dashboard: bool,
+    /// Blow dust off the dashboard's logo; off keeps the logo still.
+    pub dashboard_animation: bool,
 }
 
 impl Default for StartupConfig {
     fn default() -> Self {
         Self {
             show_dashboard: true,
+            dashboard_animation: true,
         }
     }
 }

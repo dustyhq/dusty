@@ -91,6 +91,33 @@ fn read_git_facts(root: &Path, projects: &[PathBuf], recent_files: &[PathBuf]) -
 }
 
 impl App {
+    /// Move the dashboard logo's dust to its frame for `now` while it animates: the setting
+    /// is on, the dashboard shows and the terminal has focus. The frame is not counted as a
+    /// UI change; the main loop draws when it moves. Returns how long until the next frame.
+    pub(in crate::app) fn advance_dashboard_logo(
+        &mut self,
+        now: std::time::Instant,
+    ) -> Option<std::time::Duration> {
+        use crate::ui::render::{DUST_LOGO_FRAME_MS, DUST_LOGO_FRAMES};
+        if !self.configuration.settings().startup.dashboard_animation
+            || !self.ui.dashboard
+            || self.git_screen_visible
+            || !self.host_focused
+        {
+            return None;
+        }
+        let frame_ms = u128::from(DUST_LOGO_FRAME_MS);
+        let elapsed = now
+            .saturating_duration_since(self.dashboard_logo_epoch)
+            .as_millis();
+        let frame = elapsed / frame_ms % DUST_LOGO_FRAMES as u128;
+        self.ui.value.dashboard_logo_frame = usize::try_from(frame).unwrap_or(0);
+        let wait = u64::try_from(frame_ms - elapsed % frame_ms).unwrap_or(DUST_LOGO_FRAME_MS);
+        Some(std::time::Duration::from_millis(wait))
+    }
+}
+
+impl App {
     pub(in crate::app) fn set_dashboard_visibility(&mut self, visible: bool) {
         if visible {
             self.window_session.open_dashboard();

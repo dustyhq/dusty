@@ -2481,10 +2481,12 @@ impl App {
             }
             UiEvent::Paste(text) => self.handle_configured_paste(text),
             UiEvent::FocusGained => {
+                self.host_focused = true;
                 self.send_terminal_focus_report(true);
                 self.handle_key_in_context("focus", KeyEvent::focus_gained())
             }
             UiEvent::FocusLost => {
+                self.host_focused = false;
                 self.send_terminal_focus_report(false);
                 if self.input.prompt().is_some_and(|prompt| {
                     matches!(

@@ -259,6 +259,9 @@ pub enum Style {
     TerminalStatus,
     TerminalStatusAccent,
     Terminal(PtyStyle),
+    /// One cell of pixel art drawn as an upper half block: the upper pixel's colour, then the
+    /// lower one's. `None` shows the theme's background, so a lone pixel sits on the page.
+    Pixels(Option<crate::PtyColor>, Option<crate::PtyColor>),
     /// A Neovim highlight group, coloured by the theme's `[highlights]`.
     Syntax(crate::config::Highlight),
     /// A syntax foreground drawn on the selection background.

@@ -1,6 +1,7 @@
-//! The start screen: the DUSTY wordmark beside the workspace's name, branch, path and last
+//! The start screen: the dust logo beside the workspace's name, branch, path and last
 //! commit, then four boxes for recent files, changed files, projects and the configured
-//! actions. Smaller windows drop the wordmark first, then show only recent files and actions.
+//! actions. Shorter windows swap the logo for the DUSTY wordmark, then drop it, then show
+//! only recent files and actions.
 
 use crate::CellGrid;
 use crate::SelectedText;
@@ -18,6 +19,10 @@ use crate::grid::Frame;
 use crate::grid::ZERO_WIDTH_REPLACEMENT;
 use crate::render::DashboardPanel;
 use crate::render::UiState;
+use crate::render::dashboard_logo::DUST_LOGO_ROWS;
+use crate::render::dashboard_logo::DUST_LOGO_TEXT_ROW;
+use crate::render::dashboard_logo::DUST_LOGO_WIDTH;
+use crate::render::dashboard_logo::draw_dust_logo;
 use crate::render::overlays::truncate_content_title;
 use crate::windows::WindowRect;
 use std::path::Path;
@@ -27,6 +32,9 @@ const GRID_MIN_WIDTH: u16 = 90;
 const GRID_MIN_HEIGHT: u16 = 19;
 /// The shortest window that also fits the wordmark above the boxes.
 const WORDMARK_MIN_HEIGHT: u16 = 27;
+/// The shortest window that fits the taller dust logo with the boxes as tall as the
+/// wordmark leaves them.
+const DUST_LOGO_MIN_HEIGHT: u16 = WORDMARK_MIN_HEIGHT + DUST_LOGO_ROWS - 5;
 /// The shortest single-column window that fits recent files above the actions.
 const COLUMN_RECENT_MIN_HEIGHT: u16 = 16;
 /// The shortest window that keeps the key hints on its last row.
@@ -237,9 +245,7 @@ impl DashboardLayout {
         };
         let (logo, boxes) = if shown.len() == ALL_PANELS.len() {
             let logo = HeaderLogo::fit(root, ui, configured, config, block, height);
-            let top = logo
-                .as_ref()
-                .map_or(5, |logo| logo.lines.len().max(5) as u16 + 2);
+            let top = logo.as_ref().map_or(5, |logo| logo.rows().max(5) + 2);
             (
                 logo,
                 grid_boxes(left + MARGIN, block - 2 * MARGIN, top, bottom),
@@ -272,8 +278,15 @@ fn column_margin(block: u16) -> u16 {
 }
 
 struct HeaderLogo {
-    lines: Vec<String>,
+    art: LogoArt,
     info_offset: u16,
+}
+
+enum LogoArt {
+    /// The configured logo, or the DUSTY wordmark when the window is too short for the dust.
+    Lines(Vec<String>),
+    /// The pixel logo on this frame of its blowing dust.
+    Dust(usize),
 }
 
 impl HeaderLogo {
@@ -288,18 +301,25 @@ impl HeaderLogo {
         if height < WORDMARK_MIN_HEIGHT {
             return None;
         }
-        let lines = if configured.logo.trim().is_empty() {
-            wordmark()
-        } else {
-            configured.logo.lines().map(str::to_owned).collect()
-        };
         let ambiguous = config.editor.ambiguous_width;
         let width = |text: &str| cell_text_width(text, ambiguous);
-        let art_width = lines.iter().map(|line| width(line)).max().unwrap_or(0);
+        // Half blocks take two cells where ambiguous characters are wide, which would
+        // stretch the pixels, so that setting keeps the wordmark.
+        let art = if !configured.logo.trim().is_empty() {
+            LogoArt::Lines(configured.logo.lines().map(str::to_owned).collect())
+        } else if height >= DUST_LOGO_MIN_HEIGHT && ambiguous != AmbiguousWidth::Wide {
+            LogoArt::Dust(ui.dashboard_logo_frame)
+        } else {
+            LogoArt::Lines(wordmark())
+        };
+        let art_width = match &art {
+            LogoArt::Lines(lines) => lines.iter().map(|line| width(line)).max().unwrap_or(0),
+            LogoArt::Dust(_) => usize::from(DUST_LOGO_WIDTH),
+        };
         let room = usize::from(block - 4 * MARGIN).saturating_sub(art_width);
         // Keep the wordmark's usual threshold before checking the text beside it.
         let gap = room.saturating_sub(30).min(8);
-        if lines.len() > 6 || gap < 4 {
+        if matches!(&art, LogoArt::Lines(lines) if lines.len() > 6) || gap < 4 {
             return None;
         }
 
@@ -309,9 +329,25 @@ impl HeaderLogo {
             info_width += width(&dashboard_version(configured));
         }
         (info_width + gap + usize::from(HEADER_TEXT_GAP) <= room).then_some(Self {
-            lines,
+            art,
             info_offset: u16::try_from(art_width + gap).ok()?,
         })
+    }
+
+    fn rows(&self) -> u16 {
+        match &self.art {
+            LogoArt::Lines(lines) => u16::try_from(lines.len()).unwrap_or(u16::MAX),
+            LogoArt::Dust(_) => DUST_LOGO_ROWS,
+        }
+    }
+
+    /// The row the workspace line goes on: the wordmark's second row, or level with the
+    /// top of the dust logo's small letters.
+    fn info_row(&self) -> u16 {
+        match &self.art {
+            LogoArt::Lines(_) => 2,
+            LogoArt::Dust(_) => 1 + DUST_LOGO_TEXT_ROW,
+        }
     }
 }
 
@@ -509,19 +545,25 @@ impl Screen<'_> {
         let version = dashboard_version(self.configured);
         if let Some(logo) = logo {
             let info_x = x + logo.info_offset;
-            for (row, line) in (1..).zip(&logo.lines) {
-                self.put(x, row, line, Style::Accent, right);
+            let info_y = logo.info_row();
+            match &logo.art {
+                LogoArt::Lines(lines) => {
+                    for (row, line) in (1..).zip(lines) {
+                        self.put(x, row, line, Style::Accent, right);
+                    }
+                }
+                LogoArt::Dust(frame) => draw_dust_logo(&mut self.grid, x, 1, info_x, *frame),
             }
             // The gap only separates the name from something drawn after it.
             let mut name_right = right;
             if self.configured.show_version {
                 let version_x = right.saturating_sub(self.cell_width(&version));
-                self.put(version_x, 2, &version, Style::Muted, right);
+                self.put(version_x, info_y, &version, Style::Muted, right);
                 name_right = version_x.saturating_sub(HEADER_TEXT_GAP);
             }
-            self.draw_workspace_line(info_x, 2, name_right);
-            self.draw_path(info_x, 3, right);
-            self.draw_last_commit(info_x, 5, right);
+            self.draw_workspace_line(info_x, info_y, name_right);
+            self.draw_path(info_x, info_y + 1, right);
+            self.draw_last_commit(info_x, info_y + 3, right);
             return;
         }
         let mut name_right = right;
@@ -958,7 +1000,7 @@ fn tone(style: Style, selected: bool) -> Style {
 }
 
 /// DUSTY in half blocks: each letter twice as wide as its grid, two columns apart.
-fn wordmark() -> Vec<String> {
+pub(super) fn wordmark() -> Vec<String> {
     let rows: Vec<String> = (0..8)
         .map(|row| {
             WORDMARK_LETTERS

@@ -140,6 +140,7 @@ settings = [
 title = "Files & Session"
 settings = [
   { key = "startup.show_dashboard", title = "Show Dashboard", about = "Show the start screen when Dusty opens without a file." },
+  { key = "startup.dashboard_animation", title = "Dashboard Animation", about = "Blow dust off the logo on the start screen. Off keeps the logo still." },
   { key = "persistence.enabled", title = "Remember Session", about = "Remember open files, marks, jumps and recent files between runs." },
   { key = "persistence.restore_on_startup", about = "Reopen the last session's files when Dusty starts." },
   { key = "persistence.undo_history", title = "Persistent Undo", about = "Keep each file's undo history across restarts." },

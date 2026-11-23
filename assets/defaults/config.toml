@@ -288,6 +288,8 @@ explorer_rename_marker = "> "
 
 [startup]
 show_dashboard = true
+# Dust blows off the dashboard's logo while it shows. false keeps the logo still.
+dashboard_animation = true
 
 [search]
 smart_case = true

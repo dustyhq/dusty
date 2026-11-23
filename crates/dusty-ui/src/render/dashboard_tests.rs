@@ -285,7 +285,23 @@ fn workspace_ui() -> UiState {
     }
 }
 
+/// Draw with the DUSTY wordmark in place of the dust logo unless a logo is configured, so
+/// the layout tests keep the wordmark's rows; the dust logo has its own tests.
 fn draw_with(
+    ui: &UiState,
+    configured: &DashboardConfig,
+    config: &Config,
+    width: u16,
+    height: u16,
+) -> (crate::Frame, Vec<String>) {
+    let mut configured = configured.clone();
+    if configured.logo.trim().is_empty() {
+        configured.logo = crate::render::dashboard::wordmark().join("\n");
+    }
+    draw_configured(ui, &configured, config, width, height)
+}
+
+fn draw_configured(
     ui: &UiState,
     configured: &DashboardConfig,
     config: &Config,
@@ -632,20 +648,82 @@ fn the_changes_box_says_when_the_tree_is_clean_or_not_a_repository() {
 
 #[test]
 fn every_size_draws_without_overflowing() {
-    let ui = workspace_ui();
+    let mut ui = workspace_ui();
+    let loaded = crate::config::load_bundled_config();
     for width in (1..=220).step_by(7) {
         for height in 1..=50 {
-            let (frame, rows) = draw(&ui, width, height);
-            assert!(frame.cursor.is_none());
-            if width < 20 || height < 7 {
-                continue;
+            ui.dashboard_logo_frame = usize::from(width + height);
+            for (frame, rows) in [
+                draw(&ui, width, height),
+                draw_configured(&ui, &loaded.dashboard, &loaded.config, width, height),
+            ] {
+                assert!(frame.cursor.is_none());
+                if width < 20 || height < 7 {
+                    continue;
+                }
+                assert!(
+                    rows.iter().any(|row| row.contains("Start")),
+                    "{width}x{height}: {rows:#?}"
+                );
             }
-            assert!(
-                rows.iter().any(|row| row.contains("Start")),
-                "{width}x{height}: {rows:#?}"
-            );
         }
     }
+}
+
+#[test]
+fn a_tall_dashboard_blows_dust_off_the_pixel_logo_and_shorter_ones_keep_the_wordmark() {
+    let mut ui = workspace_ui();
+    let mut loaded = crate::config::load_bundled_config();
+    let pixels = |frame: &crate::Frame| {
+        let mut cells = Vec::new();
+        for y in 0..frame.grid.height() {
+            for x in 0..frame.grid.width() {
+                let cell = frame.grid.get(x, y).unwrap();
+                if matches!(cell.style, Style::Pixels(..)) {
+                    assert_eq!(cell.symbol, "▀", "({x}, {y})");
+                    cells.push((x, y, cell.style));
+                }
+            }
+        }
+        cells
+    };
+    let (frame, rows) = draw_configured(&ui, &loaded.dashboard, &loaded.config, 160, 39);
+    let first = pixels(&frame);
+    // The logo's pixels fill rows 1 to 8 from column 4 and stop before the workspace text.
+    assert!(!first.is_empty());
+    assert!(
+        first
+            .iter()
+            .all(|(x, y, _)| (4..54).contains(x) && (1..=8).contains(y)),
+        "{first:?}"
+    );
+    // The top of the d's stem: two pale pixels in one cell.
+    let ink = Some(crate::PtyColor::Rgb(0xf4, 0xe7, 0xc9));
+    assert_eq!(style(&frame, 9, 3), Style::Pixels(ink, ink));
+    // The workspace sits beside the letters, and the boxes start below the logo.
+    assert_eq!(column(&rows[4], "tally · "), 62, "{rows:#?}");
+    assert!(rows[4].trim_end().ends_with(&version()), "{}", rows[4]);
+    assert_eq!(column(&rows[5], "/work/tally"), 62);
+    assert_eq!(column(&rows[7], "last commit Count characters too"), 62);
+    assert_eq!(column(&rows[10], "╭─ Recent files "), 2);
+    assert_eq!(column(&rows[10], "╭─ Changes "), 81);
+
+    // Another frame moves the dust but not the letters.
+    ui.dashboard_logo_frame = 5;
+    let (frame, _) = draw_configured(&ui, &loaded.dashboard, &loaded.config, 160, 39);
+    assert_ne!(pixels(&frame), first);
+    assert_eq!(style(&frame, 9, 3), Style::Pixels(ink, ink));
+
+    // A window too short for it, or one where ambiguous characters are wide, keeps the
+    // wordmark with the boxes where they were.
+    let (frame, rows) = draw_configured(&ui, &loaded.dashboard, &loaded.config, 160, 29);
+    assert!(pixels(&frame).is_empty());
+    assert!(rows[1].contains("██"), "{rows:#?}");
+    assert_eq!(column(&rows[7], "╭─ Recent files "), 2);
+    loaded.config.editor.ambiguous_width = crate::config::AmbiguousWidth::Wide;
+    let (frame, rows) = draw_configured(&ui, &loaded.dashboard, &loaded.config, 160, 39);
+    assert!(pixels(&frame).is_empty());
+    assert!(rows[1].contains("██"), "{rows:#?}");
 }
 
 #[test]

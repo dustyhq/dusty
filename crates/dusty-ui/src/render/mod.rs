@@ -38,6 +38,10 @@ pub mod overlays;
 use crate::geometry::text_width;
 
 mod dashboard;
+mod dashboard_logo;
+
+pub use dashboard_logo::DUST_LOGO_FRAME_MS;
+pub use dashboard_logo::DUST_LOGO_FRAMES;
 
 pub use dashboard::dashboard_cell;
 pub use dashboard::dashboard_focus;
@@ -1537,6 +1541,8 @@ pub struct UiState {
     pub running_tasks: usize,
     pub lsp_progress: Vec<UiLspProgress>,
     pub lsp_progress_frame: usize,
+    /// Which frame of the blowing dust the dashboard's logo shows.
+    pub dashboard_logo_frame: usize,
     pub syntax_folds: Vec<UiFold>,
     pub large_file_buffers: Vec<crate::editor::BufferId>,
     /// The agent panel, drawn in place of the pane that shows its view.

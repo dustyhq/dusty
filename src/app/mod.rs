@@ -274,6 +274,10 @@ struct App {
     git: crate::app::git::Git,
     git_screen: Option<crate::git::screen::GitScreen>,
     git_screen_visible: bool,
+    /// Whether the terminal Dusty runs in has focus, as far as its focus reports say.
+    host_focused: bool,
+    /// When the dashboard logo's dust started blowing; its frame counts from here.
+    dashboard_logo_epoch: Instant,
     clipboard: crate::app::editing::clipboard::Clipboard,
     macro_replays: Vec<(Vec<CommandInvocation>, usize, u64)>,
     macro_running: bool,
@@ -375,6 +379,7 @@ pub fn run_interactive(
     const IDLE_POLL: Duration = Duration::from_millis(250);
     let mut still_polls = 0u32;
     let mut drawn = None;
+    let mut drawn_logo = None;
     let mut input_arrived = true;
     while !application.should_quit {
         application.process_vfs_results();
@@ -448,6 +453,7 @@ pub fn run_interactive(
         application
             .health
             .set_terminal_capabilities(terminal.capability_summary());
+        let logo_wait = application.advance_dashboard_logo(Instant::now());
         // The frame is a pure function of these, so it is only rebuilt when one moved.
         let inputs = (
             application.state.revision,
@@ -456,6 +462,13 @@ pub fn run_interactive(
             application.window_session.width(),
             application.window_session.height(),
         );
+        let logo_frame = application.ui.dashboard_logo_frame;
+        // A paint that only moved the logo's dust is not activity: an idle dashboard still
+        // slows down and wakes once per frame of dust.
+        let only_dust = !input_arrived
+            && !terminal.needs_full_draw()
+            && drawn == Some(inputs)
+            && drawn_logo != Some(logo_frame);
         let holding = application.hold_first_frame();
         let git_frame = if application.git_screen_visible
             && (input_arrived || terminal.needs_full_draw() || drawn != Some(inputs))
@@ -471,8 +484,13 @@ pub fn run_interactive(
         let painted = application.draw_before_startup_reads(|application| {
             if holding {
                 Ok(false)
-            } else if input_arrived || terminal.needs_full_draw() || drawn != Some(inputs) {
+            } else if input_arrived
+                || terminal.needs_full_draw()
+                || drawn != Some(inputs)
+                || drawn_logo != Some(logo_frame)
+            {
                 drawn = Some(inputs);
+                drawn_logo = Some(logo_frame);
                 let config = application.input_render_config();
                 let mut frame = render_frame(
                     &application.state,
@@ -493,7 +511,7 @@ pub fn run_interactive(
         })?;
         input_arrived &= holding;
         application.schedule_recovery_work();
-        still_polls = if painted {
+        still_polls = if painted && !only_dust {
             0
         } else {
             still_polls.saturating_add(1)
@@ -504,6 +522,7 @@ pub fn run_interactive(
         } else {
             poll.max(IDLE_POLL)
         };
+        let poll = logo_wait.map_or(poll, |wait| poll.min(wait));
         let poll = application
             .terminal_session
             .sync_deadline()

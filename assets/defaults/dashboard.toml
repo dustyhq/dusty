@@ -1,7 +1,8 @@
-# The start screen: the DUSTY wordmark beside the workspace's name, branch, path and last
+# The start screen: the dust logo beside the workspace's name, branch, path and last
 # commit, then boxes for recent files, changes, projects and these actions. A `logo` (a few
-# lines of block letters, say) replaces the wordmark; `identity` and the version start the
-# one-line header that smaller windows show instead.
+# lines of block letters, say) replaces it; `identity` and the version start the one-line
+# header that smaller windows show instead. `[startup] dashboard_animation` in config.toml
+# turns the blowing dust off.
 logo = ""
 show_identity = true
 identity = "dusty"

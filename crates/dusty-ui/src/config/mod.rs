@@ -289,7 +289,7 @@ pub struct DashboardActionConfig {
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct DashboardConfig {
-    /// Lines (block letters, say) drawn in place of the DUSTY wordmark; empty for the wordmark.
+    /// Lines (block letters, say) drawn in place of the dust logo; empty for the logo.
     #[serde(default)]
     pub logo: String,
     pub show_identity: bool,
