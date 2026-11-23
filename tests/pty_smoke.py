@@ -684,9 +684,11 @@ def main() -> None:
             directory,
             [],
             [
-                (0.4, b":workspace.trust.status\r", None),
-                (0.2, b":q\r", None),
+                (0.8, b":workspace.trust.status\r", None),
+                (3.0, b":q\r", None),
             ],
+            # The notice can take a moment on a busy machine; wait for it as the run above does.
+            stage_expectations={1: lambda screen: "workspace is trusted" in screen},
         )
         assert code == 0
         assert "workspace is trusted" in terminal_screen(snapshots[1])
