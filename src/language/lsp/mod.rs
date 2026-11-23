@@ -11,6 +11,9 @@ const MAX_PENDING_REQUESTS: usize = 128;
 const MAX_LOG_LINES: usize = 200;
 const MAX_LOG_LINE_BYTES: usize = 4096;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+/// Starting can take longer than a request: taplo, for one, first downloads the schema list from
+/// schemastore.org and only answers once that finishes or gives up after about ten seconds.
+const INITIALIZE_TIMEOUT: Duration = Duration::from_secs(60);
 mod origins;
 pub(crate) use origins::ApplyEditReply;
 pub(crate) use origins::EditContext;

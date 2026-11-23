@@ -703,8 +703,8 @@ pub(super) fn run_session(
     let mut stopping = false;
     let initialize_deadline = Instant::now()
         + policy
-            .request_timeout
-            .clamp(Duration::from_secs(1), Duration::from_secs(60));
+            .initialize_timeout
+            .clamp(Duration::from_secs(1), Duration::from_secs(120));
 
     let mut captures = WorkspaceCaptures::new(root.clone(), &events);
     let mut recent_commands = RecentEditCommands::default();

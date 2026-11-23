@@ -1,6 +1,7 @@
 //! Language-server definitions and launch configuration.
 
 use crate::editor::text::PositionEncoding;
+use crate::language::lsp::INITIALIZE_TIMEOUT;
 use crate::language::lsp::MAX_LOG_LINES;
 use crate::language::lsp::REQUEST_TIMEOUT;
 use serde_json::Value;
@@ -15,6 +16,8 @@ use crate::language::lsp::messages::LspDocument;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct LspPolicy {
     pub request_timeout: Duration,
+    /// How long a server may take to answer `initialize`.
+    pub initialize_timeout: Duration,
     pub maximum_log_lines: usize,
 }
 
@@ -22,6 +25,7 @@ impl Default for LspPolicy {
     fn default() -> Self {
         Self {
             request_timeout: REQUEST_TIMEOUT,
+            initialize_timeout: INITIALIZE_TIMEOUT,
             maximum_log_lines: MAX_LOG_LINES,
         }
     }

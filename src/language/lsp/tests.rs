@@ -1344,6 +1344,7 @@ fn initialization_timeout_honors_the_one_second_minimum_and_longer_policy() {
                 document: None,
                 policy: LspPolicy {
                     request_timeout: requested,
+                    initialize_timeout: requested,
                     maximum_log_lines: 20,
                 },
                 configuration: crate::language::lsp::LspServerConfiguration::standard(),
@@ -1411,6 +1412,7 @@ fn stopping_does_not_wait_for_a_daemon_that_kept_the_servers_pipes() {
             policy: LspPolicy {
                 request_timeout: Duration::from_secs(10),
                 maximum_log_lines: 20,
+                ..LspPolicy::default()
             },
             configuration: crate::language::lsp::LspServerConfiguration::standard(),
             environment: tool_launch_environment(&definition),
@@ -1604,6 +1606,7 @@ while True:
             policy: LspPolicy {
                 request_timeout: Duration::from_secs(5),
                 maximum_log_lines: 20,
+                ..LspPolicy::default()
             },
             configuration: crate::language::lsp::LspServerConfiguration::standard(),
             environment: tool_launch_environment(&definition),
@@ -2390,6 +2393,7 @@ fn server_that_never_initializes_fails_within_the_request_timeout() {
             document: None,
             policy: LspPolicy {
                 request_timeout: Duration::from_millis(100),
+                initialize_timeout: Duration::from_millis(100),
                 maximum_log_lines: 20,
             },
             configuration: crate::language::lsp::LspServerConfiguration::standard(),

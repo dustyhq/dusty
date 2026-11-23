@@ -606,6 +606,7 @@ impl LspSession {
         let policy = crate::language::lsp::LspPolicy {
             request_timeout: Duration::from_millis(crate::app::language::LSP_REQUEST_TIMEOUT_MS),
             maximum_log_lines: crate::app::language::LSP_MAXIMUM_LOG_LINES,
+            ..crate::language::lsp::LspPolicy::default()
         };
         let mut configuration = crate::language::lsp::LspServerConfiguration::for_server(
             &definition.id,
