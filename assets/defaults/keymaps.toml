@@ -2303,6 +2303,12 @@ keys = "+"
 command = "explorer.git_line_counts.toggle"
 desc = "Show changed line counts"
 [[keymap]]
+id = "builtin.explorer.surface.git-line-counts-toggle.ctrl-g"
+context = "explorer"
+keys = "ctrl-g"
+command = "explorer.git_line_counts.toggle"
+desc = "Show changed line counts"
+[[keymap]]
 id = "builtin.explorer.surface.explorer-create.a"
 context = "explorer"
 keys = "a"

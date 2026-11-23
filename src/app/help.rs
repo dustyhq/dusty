@@ -315,6 +315,18 @@ mod tests {
     use crate::editor::input::{KeymapSequence, MappingResolution};
 
     #[test]
+    fn ctrl_g_and_plus_toggle_changed_line_counts_in_the_explorer() {
+        let (_dirs, mut app) = app();
+        app.open_explorer();
+        let before = app.explorer.git_line_counts();
+        app.handle_configured_key("ctrl-g".parse().unwrap());
+        assert_eq!(app.explorer.git_line_counts(), !before);
+        assert_eq!(app.active_input_context(), "explorer");
+        app.handle_configured_key("+".parse().unwrap());
+        assert_eq!(app.explorer.git_line_counts(), before);
+    }
+
+    #[test]
     fn explorer_help_teaches_keys_and_returns_without_running_the_selected_command() {
         let (_dirs, mut app) = app();
         app.open_explorer();

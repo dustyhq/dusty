@@ -122,14 +122,14 @@ Open the explorer with `e` on the dashboard, `Space e` in Normal mode, or `:expl
 | Yank absolute path | `y` |
 | Refresh | `R` |
 | Toggle hidden / ignored | `.` / `I` |
-| Show changed line counts | `+` |
+| Show changed line counts | `+` or `Ctrl-g` |
 | Open command menu | `:` |
 | Show explorer key help | `?` |
 | Close explorer | `Escape` |
 
 The tree shifts sideways as you select deeply nested entries. Long names keep their beginning and end. If the tree is shifted or the selected name is shortened, the bottom border shows its path relative to the project root.
 
-Press `+` to switch between Git status letters and added/removed line counts in the explorer. Folder counts include changes inside folded folders. Use `ui.explorer.git_line_counts` to make counts the default.
+Press `+` or `Ctrl-g` to switch between Git status letters and added/removed line counts in the explorer. Folder counts include changes inside folded folders. Use `ui.explorer.git_line_counts` to make counts the default.
 
 By default, the explorer colors changed names by change type and shows staged letters in green. A file with both staged and unstaged edits shows two letters, index first. Set `ui.explorer.git_colors` to `single` for one color, or `off` to leave names unchanged and dim the status marks.
 
