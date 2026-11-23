@@ -1,5 +1,6 @@
 # Documentation
 
+- [Install](install.md) — Linux, macOS, Windows, source builds and first run
 - [Linux user guide](user-guide-linux.md) — first run, editing, tools and configuration
 - [Plugin SDK](plugin-sdk.md) — production WIT contract and plugin development
 - [Registry client](registry-client.md) — package installation and verification
