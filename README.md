@@ -5,7 +5,7 @@
   </picture>
 </p>
 
-<h3 align="center">Good-looking terminal apps for everything you do while coding.</h3>
+<h3 align="center">Quality terminal apps for coding needs.</h3>
 
 <p align="center">
   An editor, a Git client and more to come, sharing one look, one set of keys and one config.<br>
