@@ -276,7 +276,8 @@ impl<'a> Scene<'a> {
         let leader = chosen("input.keymaps.leader").unwrap_or(&config.input.keymaps.leader);
         Self {
             explorer: side("ui.explorer.side", config.ui.explorer.side),
-            agent: matches!(preview, "layout" | "agent").then_some(agent),
+            // The explorer page leaves the agent out: where it goes is asked on its own page.
+            agent: (preview == "agent").then_some(agent),
             terminal: (preview == "terminal").then_some(terminal),
             git: (preview == "git").then_some(match chosen("ui.git.placement") {
                 Some("fullscreen") => crate::config::GitPlacement::Fullscreen,

@@ -6,29 +6,19 @@
 skip_help = "s / Esc · Start editing with defaults"
 
 [[page]]
-title = "Layout"
-question = "Where should the file explorer and the AI agent go?"
+title = "Explorer"
+question = "Which side should the file explorer go on?"
 preview = "layout"
 
 [[page.choice]]
-label = "Explorer left, agent right"
-about = "As in VS Code and Cursor."
-settings = { "ui.explorer.side" = "left", "agents.side" = "right" }
+label = "Left"
+about = "As in VS Code and LazyVim."
+settings = { "ui.explorer.side" = "left" }
 
 [[page.choice]]
-label = "Explorer right, agent left"
-about = "The same, mirrored."
-settings = { "ui.explorer.side" = "right", "agents.side" = "left" }
-
-[[page.choice]]
-label = "Both on the left"
-about = "The code keeps the right side to itself."
-settings = { "ui.explorer.side" = "left", "agents.side" = "left" }
-
-[[page.choice]]
-label = "Both on the right"
+label = "Right"
 about = "The code starts at the left edge."
-settings = { "ui.explorer.side" = "right", "agents.side" = "right" }
+settings = { "ui.explorer.side" = "right" }
 
 [[page]]
 title = "Terminal"
@@ -81,26 +71,6 @@ about = "claude, pi, codex and others run as you know them, in a terminal."
 settings = { "agents.connection" = "terminal" }
 
 [[page]]
-title = "Agent Placement"
-question = "Where should the agent open?"
-preview = "agent"
-
-[[page.choice]]
-label = "Docked"
-about = "Open the agent in a split beside the editor."
-settings = { "agents.placement" = "docked" }
-
-[[page.choice]]
-label = "Floating"
-about = "Open the agent in a centred window over the editor."
-settings = { "agents.placement" = "float" }
-
-[[page.choice]]
-label = "Fullscreen"
-about = "Use the whole terminal for the agent."
-settings = { "agents.placement" = "fullscreen" }
-
-[[page]]
 title = "Agent"
 question = "Which agent should <leader> a a start?"
 preview = "agent"
@@ -111,6 +81,31 @@ key = "agents.default"
 label = "Ask every time"
 about = "ctrl-t in the agent panel asks which agent."
 settings = { "agents.default" = "" }
+
+[[page]]
+title = "Agent placement"
+question = "Where should the agent open?"
+preview = "agent"
+
+[[page.choice]]
+label = "Docked on the right"
+about = "A split beside the code, as in VS Code and Cursor."
+settings = { "agents.placement" = "docked", "agents.side" = "right" }
+
+[[page.choice]]
+label = "Docked on the left"
+about = "The same split, on the other side."
+settings = { "agents.placement" = "docked", "agents.side" = "left" }
+
+[[page.choice]]
+label = "Floating"
+about = "A centred window over the code."
+settings = { "agents.placement" = "float" }
+
+[[page.choice]]
+label = "Full screen"
+about = "The whole terminal, until you hide it again."
+settings = { "agents.placement" = "fullscreen" }
 
 [[page]]
 title = "Agent tools"

@@ -237,12 +237,12 @@ mod tests {
         assert_eq!(
             titles,
             [
-                "Layout",
+                "Explorer",
                 "Terminal",
                 "Dusty Git",
                 "AI agent",
-                "Agent Placement",
                 "Agent",
+                "Agent placement",
                 "Agent tools",
                 "Leader key"
             ]

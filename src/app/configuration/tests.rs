@@ -2388,14 +2388,26 @@ pub(in crate::app) fn the_first_start_setup_saves_the_picked_choices_to_a_new_co
     assert!(!path.exists());
     app.open_setup_on_first_start();
     assert_eq!(app.active_input_context(), "setup");
-    // The first page is the layout; its second choice puts the explorer right, agent left.
+    // The first page is the explorer; its second choice puts it on the right.
     app.process_effect(AppEffect::Setup(SetupAction::Move(1)));
     app.process_effect(AppEffect::Setup(SetupAction::Next));
     app.process_effect(AppEffect::Setup(SetupAction::Back));
     let setup = app.ui.settings.as_ref().unwrap().setup.as_ref().unwrap();
     assert_eq!((setup.page, setup.picked[0]), (0, 1));
     let pages = setup.pages.len();
-    for _ in 0..pages {
+    // The agent's side is asked with its placement, after which agent to use:
+    // "Docked on the left" is that page's second choice.
+    let titles: Vec<String> = setup.pages.iter().map(|page| page.title.clone()).collect();
+    let agent = titles.iter().position(|title| title == "AI agent").unwrap();
+    let placement = titles
+        .iter()
+        .position(|title| title == "Agent placement")
+        .unwrap();
+    assert!(agent < placement, "{titles:?}");
+    for page in 0..pages {
+        if page == placement {
+            app.process_effect(AppEffect::Setup(SetupAction::Move(1)));
+        }
         app.process_effect(AppEffect::Setup(SetupAction::Next));
     }
     assert!(app.ui.settings.is_none(), "setup should close once saved");
