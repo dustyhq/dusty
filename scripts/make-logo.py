@@ -1,7 +1,11 @@
 """Draw the pixel-art "dusty" logo with dust blowing off the letters.
 
-python3 scripts/make-logo.py docs/media/dusty-logo.svg      -> the animated README logo
-python3 scripts/make-logo.py frame.svg 8                    -> frame 8 frozen, for checking
+python3 scripts/make-logo.py docs/media/dusty-logo.svg           -> the animated logo for dark pages
+python3 scripts/make-logo.py docs/media/dusty-logo-light.svg light -> the same for light pages
+python3 scripts/make-logo.py frame.svg dark 8                    -> frame 8 frozen, for checking
+
+The colours follow the editor's rule for the dashboard logo: letters in the text colour, and
+the dust and shadow in shades of the accent colour (see LogoColors in crates/dusty-ui).
 """
 import random
 import sys
@@ -22,9 +26,28 @@ LEFT = 13         # matches the room on the right, so the word sits in the middl
 FRAMES = 24       # one loop
 FRAME_MS = 110
 
-INK = "#f4e7c9"       # letters: pale sand
-SHADOW = "#6b3a1f"    # drop shadow: dark earth
-DUST = ["#f7e2a6", "#e8c27a", "#d39a55", "#b8783d", "#8f5a2e"]
+# (page, text, accent) for each kind of page: Dusty's own theme, and GitHub's light one.
+PAGES = {
+    "dark": ("#0d1117", "#c9d1d9", "#58a6ff"),
+    "light": ("#ffffff", "#1f2328", "#0969da"),
+}
+
+
+def rgb(color):
+    return tuple(int(color[i:i + 2], 16) for i in (1, 3, 5))
+
+
+def shade(color, toward, percent):
+    mixed = (((a * (100 - percent) + b * percent) // 100) for a, b in zip(rgb(color), rgb(toward)))
+    return "#" + "".join(f"{part:02x}" for part in mixed)
+
+
+page_kind = sys.argv[2] if len(sys.argv) > 2 else "dark"
+PAGE, TEXT, ACCENT = PAGES[page_kind]
+INK = TEXT
+SHADOW = shade(ACCENT, PAGE, 65)
+# Dust from pale to dark.
+DUST = [shade(ACCENT, TEXT, 50), ACCENT, shade(ACCENT, PAGE, 25), shade(ACCENT, PAGE, 45)]
 
 letters = set()
 x = LEFT
@@ -155,8 +178,8 @@ def svg(body):
 
 
 path = sys.argv[1]
-if len(sys.argv) > 2:
-    body = "".join(static(int(sys.argv[2])))
+if len(sys.argv) > 3:
+    body = "".join(static(int(sys.argv[3])))
 else:
     body = animated()
 with open(path, "w") as f:

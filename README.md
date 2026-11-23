@@ -1,5 +1,8 @@
 <p align="center">
-  <img src="docs/media/dusty-logo.svg" alt="dusty" width="500">
+  <picture>
+    <source media="(prefers-color-scheme: light)" srcset="docs/media/dusty-logo-light.svg">
+    <img src="docs/media/dusty-logo.svg" alt="dusty" width="500">
+  </picture>
 </p>
 
 <h3 align="center">Good-looking terminal apps for everything you do while coding.</h3>
