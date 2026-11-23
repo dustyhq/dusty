@@ -18,7 +18,7 @@ LETTERS = {
 WORD = "dusty"
 GAP = 2
 TOP = 14          # rows of sky above the tallest letter
-LEFT = 2
+LEFT = 13         # matches the room on the right, so the word sits in the middle
 FRAMES = 24       # one loop
 FRAME_MS = 110
 
@@ -36,7 +36,7 @@ for ch in WORD:
             if c == "#":
                 letters.add((x + dx, TOP + y))
     x += width + GAP
-WIDTH = x - GAP + LEFT + 12
+WIDTH = x - GAP + 1 + LEFT  # the letters, their shadow, and LEFT on each side
 HEIGHT = TOP + 12
 
 # The top pixel of every letter column: dust settles there and the wind lifts it off.

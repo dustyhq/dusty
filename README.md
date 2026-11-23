@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/media/dusty-logo.svg" alt="dusty" width="420">
+  <img src="docs/media/dusty-logo.svg" alt="dusty" width="500">
 </p>
 
 <h3 align="center">Good-looking terminal apps for everything you do while coding.</h3>
