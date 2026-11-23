@@ -396,8 +396,6 @@ impl Rect {
         // A blank row under the title when the box has room for it.
         let gap = u16::from(self.height >= 6);
         Content {
-            fill_left: self.x + 1,
-            fill_right: self.x + self.width - 1,
             x: self.x + 2,
             right: self.x + self.width - 2,
             y: self.y + 1 + gap,
@@ -465,10 +463,8 @@ fn column_boxes(
     }
 }
 
-/// Where a box's rows go: the cells a selected row fills and the columns text stays within.
+/// Where a box's rows go: the columns text stays within, which a selected row's highlight fills.
 struct Content {
-    fill_left: u16,
-    fill_right: u16,
     x: u16,
     right: u16,
     y: u16,
@@ -528,8 +524,8 @@ struct Screen<'a> {
     icons: bool,
     focus: DashboardPanel,
     actions: ActionWidths,
-    /// Where the terminal cursor rests: the start of the selected row in the focused box, or
-    /// its first row when it has nothing to select.
+    /// Where the terminal cursor rests: on the first character of the selected row in the
+    /// focused box, or of its first row when it has nothing to select.
     cursor: Option<(u16, u16)>,
 }
 
@@ -738,7 +734,7 @@ impl Screen<'_> {
         }
         let content = rect.content();
         if focused && content.rows > 0 {
-            self.cursor = Some((content.fill_left, content.y));
+            self.cursor = Some((content.x, content.y));
         }
         content
     }
@@ -808,10 +804,10 @@ impl Screen<'_> {
     }
 
     fn fill(&mut self, content: &Content, y: u16) {
-        for x in content.fill_left..content.fill_right {
+        for x in content.x..content.right {
             self.grid.set_cell(x, y, " ", Style::Selection);
         }
-        self.cursor = Some((content.fill_left, y));
+        self.cursor = Some((content.x, y));
     }
 
     /// A path with its folder dimmed so the file name stands out.
@@ -951,11 +947,11 @@ impl Screen<'_> {
                 let column_right = (x + pitch).min(content.right);
                 let chosen = selected == Some(index);
                 if chosen {
-                    let fill_right = (x + pitch - 1).min(content.fill_right);
-                    for fill in x.saturating_sub(1)..fill_right {
+                    let fill_right = (x + pitch - 2).min(content.right);
+                    for fill in x..fill_right {
                         self.grid.set_cell(fill, y, " ", Style::Selection);
                     }
-                    self.cursor = Some((x.saturating_sub(1), y));
+                    self.cursor = Some((x, y));
                 }
                 if let Some(key) = &action.key {
                     self.put(x, y, key, tone(Style::Accent, chosen), column_right);

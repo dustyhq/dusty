@@ -386,8 +386,10 @@ fn a_large_dashboard_shows_the_wordmark_beside_the_workspace_over_four_boxes() {
     assert_eq!(style(&frame, 81, 7), Style::Border);
     assert_eq!(column(&rows[9], "1  src/count.rs"), 4);
     assert!(rows[9].contains("2m │"), "{}", rows[9]);
-    assert_eq!(style(&frame, 3, 9), Style::Selection);
+    // The highlight starts at the row's first character, with no margin before it.
+    assert_ne!(style(&frame, 3, 9), Style::Selection);
     assert_eq!(style(&frame, 4, 9), Style::QueryMatch { selected: true });
+    assert_eq!(style(&frame, 5, 9), Style::Selection);
     // On the selected row the folder stays muted and the name takes the selection's text.
     assert_eq!(
         style(&frame, 8, 9),
@@ -424,26 +426,31 @@ fn a_large_dashboard_shows_the_wordmark_beside_the_workspace_over_four_boxes() {
 
     assert!(rows[38].starts_with(" h j k l move · Enter open · 1-9 recent file"));
     assert_eq!(style(&frame, 0, 38), Style::StatusMuted);
-    // The terminal cursor rests at the start of the selected row.
+    // The terminal cursor rests on the first character of the selected row.
     let (x, y, _) = frame.cursor.expect("the dashboard keeps a cursor");
-    assert_eq!(style(&frame, x, y), Style::Selection);
+    assert_ne!(style(&frame, x - 1, y), Style::Selection);
+    assert_ne!(frame.grid.get(x, y).unwrap().symbol, " ");
 }
 
 #[test]
 fn the_cursor_rests_on_the_selected_row_of_the_focused_box_or_its_first_row() {
     let mut ui = workspace_ui();
-    for (panel, row) in [
-        (DashboardPanel::RecentFiles, 1),
-        (DashboardPanel::Changes, 1),
-        (DashboardPanel::Projects, 1),
-        (DashboardPanel::Start, 4),
+    // On the first character, not the highlight's margin before it.
+    for (panel, row, text) in [
+        (DashboardPanel::RecentFiles, 1, "2 "),
+        (DashboardPanel::Changes, 1, "? notes.txt"),
+        (DashboardPanel::Projects, 1, "dusty"),
+        (DashboardPanel::Start, 4, "t  tutor"),
     ] {
         ui.dashboard_focus = Some(panel);
         ui.dashboard_row = row;
         ui.dashboard_selected = row;
-        let (frame, _) = draw(&ui, 160, 39);
+        let (frame, rows) = draw(&ui, 160, 39);
         let (x, y, _) = frame.cursor.expect("the dashboard keeps a cursor");
-        assert_eq!(style(&frame, x, y), Style::Selection, "{panel:?}");
+        // The highlight starts where the cursor is.
+        assert_ne!(style(&frame, x - 1, y), Style::Selection, "{panel:?}");
+        let from_cursor: String = rows[usize::from(y)].chars().skip(usize::from(x)).collect();
+        assert!(from_cursor.starts_with(text), "{panel:?}: {from_cursor:?}");
     }
     // An empty box can't hold the focus, so the cursor goes with it to the actions.
     ui.dashboard_workspace.recent_files.clear();
@@ -451,9 +458,8 @@ fn the_cursor_rests_on_the_selected_row_of_the_focused_box_or_its_first_row() {
     ui.dashboard_selected = 0;
     let (frame, rows) = draw(&ui, 160, 39);
     let (x, y, _) = frame.cursor.expect("the dashboard keeps a cursor");
-    assert_eq!(style(&frame, x, y), Style::Selection);
     let from_cursor: String = rows[usize::from(y)].chars().skip(usize::from(x)).collect();
-    assert!(from_cursor.starts_with(" f  find file"), "{from_cursor:?}");
+    assert!(from_cursor.starts_with("f  find file"), "{from_cursor:?}");
 }
 
 #[test]
@@ -624,15 +630,15 @@ fn the_selection_follows_the_focused_box_and_falls_back_when_it_is_hidden() {
     let (frame, rows) = draw(&ui, 160, 39);
     assert_eq!(style(&frame, 2, 22), Style::Accent);
     assert_eq!(style(&frame, 2, 7), Style::Border);
-    assert_eq!(style(&frame, 3, 25), Style::Selection);
-    assert_ne!(style(&frame, 3, 24), Style::Selection);
-    assert_ne!(style(&frame, 3, 9), Style::Selection);
+    assert_eq!(style(&frame, 9, 25), Style::Selection);
+    assert_ne!(style(&frame, 9, 24), Style::Selection);
+    assert_ne!(style(&frame, 9, 9), Style::Selection);
     assert_eq!(column(&rows[25], "dusty"), 4);
 
     // At 80x24 there is no projects box, so recent files hold the selection.
     let (frame, _) = draw(&ui, 80, 24);
     assert_eq!(style(&frame, 2, 2), Style::Accent);
-    assert_eq!(style(&frame, 3, 5), Style::Selection);
+    assert_eq!(style(&frame, 5, 5), Style::Selection);
 
     // With no recent files the first action is selected.
     ui.dashboard_focus = None;
@@ -655,8 +661,8 @@ fn the_selection_follows_the_focused_box_and_falls_back_when_it_is_hidden() {
     let plus = u16::try_from(column(&rows[9], "+12")).unwrap();
     let minus = u16::try_from(column(&rows[9], "-3")).unwrap();
     for (x, expected) in [
-        (82, Style::Selection),
         (83, Style::SelectionText(SelectedText::Changed)),
+        (84, Style::Selection),
         (85, Style::SelectionText(SelectedText::Muted)),
         (89, Style::Selection),
         (plus, Style::SelectionText(SelectedText::Added)),
