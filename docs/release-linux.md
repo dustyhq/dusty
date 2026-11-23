@@ -1,6 +1,6 @@
 # Linux release
 
-The current release version is **0.4.2**. Package versions come from `Cargo.toml`;
+The current release version is **0.4.3**. Package versions come from `Cargo.toml`;
 keep its entry in `Cargo.lock` and the AppStream release in
 `packaging/dev.dustyhq.Dusty.metainfo.xml` in sync when releasing.
 
